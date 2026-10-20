@@ -313,7 +313,7 @@ function buildToolSettings(container) {
   function render() {
     body.innerHTML = ''; ctx.fields = [];
     const t = App.tool;
-    head.textContent = { select: 'Select Tool', lasso: 'Lasso Tool', paint: 'Paint Selection Tool', move: 'Move Tool', rotate: 'Rotate Tool', scale: 'Scale Tool', cvCurve: 'CV Curve Tool', epCurve: 'EP Curve Tool', edgeLoop: 'Insert Edge Loop Tool', multiCut: 'Multi-Cut Tool', targetWeld: 'Target Weld Tool', createPoly: 'Create Polygon Tool' }[t] || t;
+    head.textContent = { select: 'Select Tool', lasso: 'Lasso Tool', paint: 'Paint Selection Tool', move: 'Move Tool', rotate: 'Rotate Tool', scale: 'Scale Tool', cvCurve: 'CV Curve Tool', epCurve: 'EP Curve Tool', arc: 'Three Point Circular Arc Tool', edgeLoop: 'Insert Edge Loop Tool', multiCut: 'Multi-Cut Tool', targetWeld: 'Target Weld Tool', createPoly: 'Create Polygon Tool' }[t] || t;
     body.append(h('div', { class: 'ae-row', style: { justifyContent: 'flex-end', padding: '2px 4px' } }, h('button', { text: 'Reset Tool', onclick: () => { P[t] = {}; const m = TRANSFORM_SPACE[t]; if (m) { Manip.space[m] = t === 'move' ? 'world' : 'local'; Manip.discrete[m] = false; Manip.step[m] = { translate: 1, rotate: 15, scale: 1 }[m]; Manip.activeAxis[m] = null; } Manip.soft = { on: false, radius: 2, falloff: 'smooth' }; render(); placeProxy(); App.requestRender(); } })));
     const mode = TRANSFORM_SPACE[t];
     if (mode) {

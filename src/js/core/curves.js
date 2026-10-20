@@ -85,6 +85,33 @@ function orient(p, n) {
   return [p[0], -p[2], p[1]];
 }
 
+// arc through three points: the circular arc from start to end that passes through `through`.
+// Returns the sampled points (start ... end) or null when the three points are collinear.
+export function arcThroughPoints(start, end, through, step = Math.PI / 18) {
+  const u = V3.sub(end, start), v = V3.sub(through, start);
+  const n = V3.cross(u, v);
+  if (V3.len(n) <= 1e-9 * V3.len(u) * V3.len(v)) return null; // collinear: no circumcircle
+  const n2 = V3.dot(n, n);
+  const o = V3.add(start, V3.mul(V3.add(V3.mul(V3.cross(v, n), V3.dot(u, u)), V3.mul(V3.cross(n, u), V3.dot(v, v))), 1 / (2 * n2)));
+  const r = V3.len(V3.sub(start, o));
+  if (r < 1e-12) return null;
+  const e1 = V3.mul(V3.sub(start, o), 1 / r);
+  const e2 = V3.norm(V3.cross(n, e1));
+  const ang = (p) => Math.atan2(V3.dot(V3.sub(p, o), e2), V3.dot(V3.sub(p, o), e1));
+  const TAU = Math.PI * 2, a0 = ang(start), a1 = ang(end);
+  const ccw = ((a1 - a0) % TAU + TAU) % TAU;
+  const via = ((ang(through) - a0) % TAU + TAU) % TAU;
+  const sweep = via <= ccw ? ccw : ccw - TAU; // pick the arc that contains the third point
+  const N = Math.max(2, Math.ceil(Math.abs(sweep) / step));
+  const out = [];
+  for (let i = 0; i <= N; i++) {
+    const a = a0 + sweep * (i / N);
+    out.push(V3.add(o, V3.add(V3.mul(e1, Math.cos(a) * r), V3.mul(e2, Math.sin(a) * r))));
+  }
+  out[0] = start.slice(); out[N] = end.slice();
+  return out;
+}
+
 // Surfaces ------------------------------------------------------------------
 // revolve: rotate profile points around axis through origin of the curve's space
 export function revolve(curve, { axis = 1, startSweep = 0, endSweep = 360, sections = 8, segments = 8, outputSegments = null } = {}) {

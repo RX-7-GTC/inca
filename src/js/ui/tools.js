@@ -5,14 +5,14 @@ import { App } from '../core/app.js';
 import * as S from '../core/scene.js';
 import { Sel } from '../core/selection.js';
 import { Undo } from '../core/undo.js';
-import { Curve } from '../core/curves.js';
+import { Curve, arcThroughPoints } from '../core/curves.js';
 import { PolyMesh, edgeRing, ekey } from '../core/polymesh.js';
 import { Manip, placeProxy } from '../core/manip.js';
 import { toolLineMat, toolPtMat } from './viewport.js';
 
 const C = App.cmds.register;
-const INTERACTIVE = new Set(['cvCurve', 'epCurve', 'pencilCurve', 'createPoly', 'edgeLoop', 'multiCut', 'targetWeld', 'lasso', 'paint', 'sculpt', 'jointTool']);
-const ICONS = { cvCurve: 'cvCurve', epCurve: 'epCurve', pencilCurve: 'pencilCurve', createPoly: 'planar', edgeLoop: 'edgeLoop', multiCut: 'multiCut', targetWeld: 'targetWeld', lasso: 'lasso', paint: 'paintSelect', sculpt: 'softSelect', jointTool: 'joint' };
+const INTERACTIVE = new Set(['cvCurve', 'epCurve', 'pencilCurve', 'arc', 'createPoly', 'edgeLoop', 'multiCut', 'targetWeld', 'lasso', 'paint', 'sculpt', 'jointTool']);
+const ICONS = { cvCurve: 'cvCurve', epCurve: 'epCurve', pencilCurve: 'pencilCurve', arc: 'cvCurve', createPoly: 'planar', edgeLoop: 'edgeLoop', multiCut: 'multiCut', targetWeld: 'targetWeld', lasso: 'lasso', paint: 'paintSelect', sculpt: 'softSelect', jointTool: 'joint' };
 const opt = (k, d) => (App.prefs.opt.tools?.[k] ?? d);
 const setOpt = (k, v) => { (App.prefs.opt.tools ||= {})[k] = v; App.savePrefs(); };
 let st = null; // active tool state
@@ -69,6 +69,40 @@ const TOOLS = {
       const mu = () => { removeEventListener('mousemove', mm); removeEventListener('mouseup', mu); overlay(null); if (pts.length < 2) return; Undo.checkpoint('pencil curve'); const keep = simplify(pts, vp.worldPerPixel() * 4); const o = S.createCurve(new Curve(keep.map(p => p.toArray()), 3, 'open', 'ep'), { name: 'curve1' }); Sel.select([o]); App.emit('echo', `curve -d 3 -ep ${keep.length} points;`); };
       addEventListener('mousemove', mm); addEventListener('mouseup', mu); return true;
     },
+  },
+  // ---------------- three point circular arc
+  arc: {
+    help: 'Three Point Circular Arc: click to place the start point, the end point, then a point on the arc',
+    start() { st.pts = []; st.hoverPt = null; },
+    down(vp, e, px) {
+      const g = vp.groundPoint(px); if (!g) return true;
+      if (st.pts.length === 2) {
+        const arc = arcThroughPoints(st.pts[0].toArray(), st.pts[1].toArray(), g.toArray());
+        if (!arc) { App.help('Three Point Circular Arc: the third point must not be in line with the first two'); return true; }
+        Undo.checkpoint('three point arc');
+        const o = S.createCurve(new Curve(arc, 3, 'open', 'ep'), { name: 'curve1' });
+        Sel.select([o]);
+        App.emit('echo', `curve -d 3 -ep ${arc.length} points;`); App.emit('result', o.inca.name);
+        st.pts = []; st.hoverPt = null; this.draw();
+        return true;
+      }
+      if (st.pts.length === 1 && g.distanceTo(st.pts[0]) < 1e-6) return true;
+      st.pts.push(g); this.draw(); return true;
+    },
+    hover(vp, e, px) { st.hoverPt = vp.groundPoint(px); this.draw(); return true; },
+    draw() {
+      const pts = st.pts, hover = st.hoverPt;
+      const arc = pts.length === 2 && hover ? arcThroughPoints(pts[0].toArray(), pts[1].toArray(), hover.toArray()) : null;
+      overlay(() => {
+        const out = [ptsObj(pts)];
+        if (arc) out.push(lineObj(arc, solidLine));
+        else if (hover && pts.length) out.push(lineObj([...pts, hover], toolLineMat));
+        if (hover) out.push(ptsObj([hover], redPts));
+        return out;
+      });
+    },
+    back() { st.pts.pop(); this.draw(); },
+    complete() { App.help('Three Point Circular Arc: click the start point, the end point, then a point on the arc'); },
   },
   // ---------------- create polygon
   createPoly: {
@@ -341,6 +375,7 @@ addEventListener('mousedown', (e) => { if (e.button === 2 && !e.altKey && st && 
 
 // ------------------------------------------------------------------ commands
 C('pencilCurveTool', 'Pencil Curve Tool', () => App.setTool('pencilCurve'), { icon: 'pencilCurve' });
+C('arcTool', 'Three Point Circular Arc', () => App.setTool('arc'), { icon: 'cvCurve', help: 'Click to place the start point, the end point, then a point on the arc' });
 C('sculptTool', 'Sculpt Tool', () => { setOpt('sculptBrush', 'sculpt'); App.setTool('sculpt'); App.ui.toggleToolSettings(true); }, { icon: 'softSelect' });
 for (const [b, l] of [['smooth', 'Smooth'], ['relax', 'Relax'], ['grab', 'Grab'], ['pinch', 'Pinch'], ['flatten', 'Flatten'], ['inflate', 'Inflate']]) C(b + 'SculptTool', l + ' Sculpt Tool', () => { setOpt('sculptBrush', b); App.setTool('sculpt'); App.dirty('toolSettings'); }, { icon: 'softSelect' });
 C('makeLive', 'Make Live', () => { const o = Sel.lead(); App.liveSurface = App.liveSurface === o ? null : (o?.inca.kind === 'mesh' ? o : null); App.help(App.liveSurface ? 'Live surface: ' + o.inca.name : 'No live surface'); App.dirty('statusline'); }, { noRepeat: true });
