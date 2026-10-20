@@ -12,7 +12,7 @@ import { toolLineMat, toolPtMat } from './viewport.js';
 
 const C = App.cmds.register;
 const INTERACTIVE = new Set(['cvCurve', 'epCurve', 'pencilCurve', 'arc', 'createPoly', 'edgeLoop', 'multiCut', 'targetWeld', 'lasso', 'paint', 'sculpt', 'jointTool']);
-const ICONS = { cvCurve: 'cvCurve', epCurve: 'epCurve', pencilCurve: 'pencilCurve', arc: 'cvCurve', createPoly: 'planar', edgeLoop: 'edgeLoop', multiCut: 'multiCut', targetWeld: 'targetWeld', lasso: 'lasso', paint: 'paintSelect', sculpt: 'softSelect', jointTool: 'joint' };
+const ICONS = { cvCurve: 'cvCurve', epCurve: 'epCurve', pencilCurve: 'pencilCurve', arc: 'arcCurve', createPoly: 'planar', edgeLoop: 'edgeLoop', multiCut: 'multiCut', targetWeld: 'targetWeld', lasso: 'lasso', paint: 'paintSelect', sculpt: 'softSelect', jointTool: 'joint' };
 const opt = (k, d) => (App.prefs.opt.tools?.[k] ?? d);
 const setOpt = (k, v) => { (App.prefs.opt.tools ||= {})[k] = v; App.savePrefs(); };
 let st = null; // active tool state
@@ -375,7 +375,7 @@ addEventListener('mousedown', (e) => { if (e.button === 2 && !e.altKey && st && 
 
 // ------------------------------------------------------------------ commands
 C('pencilCurveTool', 'Pencil Curve Tool', () => App.setTool('pencilCurve'), { icon: 'pencilCurve' });
-C('arcTool', 'Three Point Circular Arc', () => App.setTool('arc'), { icon: 'cvCurve', help: 'Click to place the start point, the end point, then a point on the arc' });
+C('arcTool', 'Three Point Circular Arc', () => App.setTool('arc'), { icon: 'arcCurve', help: 'Click to place the start point, the end point, then a point on the arc' });
 C('sculptTool', 'Sculpt Tool', () => { setOpt('sculptBrush', 'sculpt'); App.setTool('sculpt'); App.ui.toggleToolSettings(true); }, { icon: 'softSelect' });
 for (const [b, l] of [['smooth', 'Smooth'], ['relax', 'Relax'], ['grab', 'Grab'], ['pinch', 'Pinch'], ['flatten', 'Flatten'], ['inflate', 'Inflate']]) C(b + 'SculptTool', l + ' Sculpt Tool', () => { setOpt('sculptBrush', b); App.setTool('sculpt'); App.dirty('toolSettings'); }, { icon: 'softSelect' });
 C('makeLive', 'Make Live', () => { const o = Sel.lead(); App.liveSurface = App.liveSurface === o ? null : (o?.inca.kind === 'mesh' ? o : null); App.help(App.liveSurface ? 'Live surface: ' + o.inca.name : 'No live surface'); App.dirty('statusline'); }, { noRepeat: true });
