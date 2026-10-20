@@ -4,6 +4,7 @@ import * as S from '../core/scene.js';
 import { Undo } from '../core/undo.js';
 import { Sel } from '../core/selection.js';
 import { OPS, niceName } from '../core/ops.js';
+import { arcData } from '../core/curves.js';
 import { MAT_TYPES, TEX_TYPES, MAPPABLE, updateMaterial, swatch, createTexture, getThreeTexture } from '../core/materials.js';
 import { Manip, placeProxy } from '../core/manip.js';
 import { h, menuBar, showMenu, fmt, iconBtn, colorToCss, colorPicker, numField } from './dom.js';
@@ -187,7 +188,12 @@ function layoutFor(rec, ctx) {
         out.push(frame('Orthographic Views', [F({ key: 'ortho', label: 'Orthographic', type: 'bool', set: (v) => { c.ortho = v; const cam = rec.userData.camera; App.viewports.forEach(vp => vp.needsRender = true); App.emit('warning', '// Warning: switching projection takes effect after re-opening the scene'); } }), F({ key: 'orthoWidth', label: 'Orthographic Width', type: 'float', min: 0.01, smin: 1, smax: 100 })], { key: 'orth', closed: true }));
       } else if (inc.kind === 'curve') {
         const cv = inc.curve;
-        out.push(frame('NURBS Curve History', [F({ key: 'deg', label: 'Degree', type: 'enum', options: ['1 Linear', '2', '3 Cubic'], values: [1, 2, 3], get: () => cv.degree, set: (v) => { cv.degree = v; S.rebuildShape(rec); } }), F({ key: 'form', label: 'Form', type: 'enum', options: ['Open', 'Periodic (closed)'], values: ['open', 'periodic'], get: () => cv.form, set: (v) => { cv.form = v; S.rebuildShape(rec); } }), F({ key: 'kind', label: 'Curve Type', type: 'info', get: () => cv.kind === 'ep' ? 'EP (interpolating)' : 'CV' }), F({ key: 'spans', label: 'Spans', type: 'info', get: () => cv.spans }), F({ key: 'cvs', label: 'CVs', type: 'info', get: () => cv.cvs.length }), F({ key: 'len', label: 'Arc Length', type: 'info', get: () => fmt(cv.length()) })], { key: 'crv' }));
+        if (cv.kind === 'arc') {
+          const info = () => arcData(cv.cvs[0], cv.cvs[2], cv.cvs[1]);
+          out.push(frame('Three Point Circular Arc', [F({ key: 'kind', label: 'Curve Type', type: 'info', get: () => 'Three Point Circular Arc' }), F({ key: 'radius', label: 'Radius', type: 'info', get: () => { const d = info(); return d ? fmt(d.radius) + ' cm' : '—'; } }), F({ key: 'sweep', label: 'Sweep', type: 'info', get: () => { const d = info(); return d ? fmt(Math.abs(d.sweep) / D2R, 2) + '°' : '—'; } }), F({ key: 'cvs', label: 'Points', type: 'info', get: () => cv.cvs.length }), F({ key: 'len', label: 'Arc Length', type: 'info', get: () => fmt(cv.length()) })], { key: 'crv' }));
+        } else {
+          out.push(frame('NURBS Curve History', [F({ key: 'deg', label: 'Degree', type: 'enum', options: ['1 Linear', '2', '3 Cubic'], values: [1, 2, 3], get: () => cv.degree, set: (v) => { cv.degree = v; S.rebuildShape(rec); } }), F({ key: 'form', label: 'Form', type: 'enum', options: ['Open', 'Periodic (closed)'], values: ['open', 'periodic'], get: () => cv.form, set: (v) => { cv.form = v; S.rebuildShape(rec); } }), F({ key: 'kind', label: 'Curve Type', type: 'info', get: () => cv.kind === 'ep' ? 'EP (interpolating)' : 'CV' }), F({ key: 'spans', label: 'Spans', type: 'info', get: () => cv.spans }), F({ key: 'cvs', label: 'CVs', type: 'info', get: () => cv.cvs.length }), F({ key: 'len', label: 'Arc Length', type: 'info', get: () => fmt(cv.length()) })], { key: 'crv' }));
+        }
       } else if (inc.kind === 'locator') {
         out.push(frame('Locator Attributes', [F({ key: 'lsc', label: 'Local Scale', type: 'info', get: () => '1 1 1' })], { key: 'loc' }));
       }
