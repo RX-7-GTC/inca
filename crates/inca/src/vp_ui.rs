@@ -99,6 +99,9 @@ pub fn viewports(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame
         let keep: HashSet<String> = app.s.nodes.values().filter(|n| n.mesh().is_some()).map(|n| n.id.clone()).collect();
         g.retain_meshes(&keep);
     }
+    // drop cached mesh statistics of deleted meshes
+    let alive: HashSet<&str> = app.s.nodes.keys().map(|k| k.as_str()).collect();
+    app.stats_cache.retain(|k, _| alive.contains(k.as_str()));
 }
 
 fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: usize, rect: Rect) {
@@ -1431,9 +1434,11 @@ fn finish_drag(app: &mut IncaApp, d: GizmoDrag) {
     }
 }
 
-fn hud(app: &IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
-    let vp = &app.vps[idx];
-    let r = vp.rect;
+fn hud(app: &mut IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
+    let r = app.vps[idx].rect;
+    let camera = app.vps[idx].camera.clone();
+    let isolate = app.vps[idx].isolate.is_some();
+    let hud_on = app.vps[idx].hud;
     let h = app.hud;
     // axis triad
     if h.view_axis {
@@ -1445,33 +1450,17 @@ fn hud(app: &IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
             p.text(e, egui::Align2::CENTER_CENTER, l, egui::FontId::proportional(11.0), c);
         }
     }
-    if !vp.hud {
+    if !hud_on {
         return;
     }
     let text = Color32::from_gray(0xe8);
     if h.cam_names {
-        p.text(pos2(r.center().x, r.max.y - 12.0), egui::Align2::CENTER_CENTER, &vp.camera, egui::FontId::proportional(11.0), Color32::from_gray(0xe6));
+        p.text(pos2(r.center().x, r.max.y - 12.0), egui::Align2::CENTER_CENTER, &camera, egui::FontId::proportional(11.0), Color32::from_gray(0xe6));
     }
     // poly count: totals, the selected objects, selected components (JS drawHud)
     if h.poly_count {
-        let (mut tot, mut sel) = ([0usize; 5], [0usize; 5]);
+        let (tot, sel) = app.hud_poly_stats();
         let hil = app.s.hilite();
-        for id in app.s.all_dag(false) {
-            let Some(m) = app.s.node(&id).and_then(|n| n.mesh()) else { continue };
-            if !app.s.is_visible(&id) {
-                continue;
-            }
-            let pm = &m.mesh;
-            let uvs = pm.uv.as_ref().map(|u| u.iter().flatten().map(|f| f.len()).sum()).unwrap_or(0);
-            let st = [pm.v.len(), pm.topo().edges.len(), pm.f.len(), pm.tri_count(), uvs];
-            let picked = app.s.sel.contains(&id) || hil.contains(&id);
-            for k in 0..5 {
-                tot[k] += st[k];
-                if picked {
-                    sel[k] += st[k];
-                }
-            }
-        }
         let mut comp = [0usize; 3];
         for id in &hil {
             let cs = app.s.comp_sel(id);
@@ -1511,7 +1500,7 @@ fn hud(app: &IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
         let m = if app.uv_mode { "UV" } else { m };
         tag(&format!("{m} mode"), Color32::from_rgb(255, 200, 120));
     }
-    if vp.isolate.is_some() {
+    if isolate {
         tag("Isolate Select", Color32::from_rgb(255, 230, 120));
     }
     if app.pivot_mode {

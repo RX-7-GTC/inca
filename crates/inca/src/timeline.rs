@@ -503,7 +503,7 @@ pub fn command_line(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 pub fn help_line(app: &mut IncaApp, ui: &mut egui::Ui) {
     ui.horizontal_centered(|ui| {
-        let (v, e, f, t) = app.s.poly_count();
+        let (v, e, f, t) = app.scene_poly_count();
         let txt = if app.help.is_empty() { "Hold Alt and drag in a viewport to tumble (LMB), track (MMB) or dolly (RMB)".to_string() } else { app.help.clone() };
         ui.label(RichText::new(txt).color(theme::TEXT_DIM).size(11.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

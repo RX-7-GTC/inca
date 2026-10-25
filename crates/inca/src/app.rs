@@ -184,6 +184,10 @@ pub struct IncaApp {
     pub pivot_mode: bool,
     pub gpu: Option<Gpu>,
     pub smooth_cache: HashMap<String, (u64, inca_core::mesh::PolyMesh)>,
+    /// Per-node mesh statistics (verts, edges, faces, tris, uvs) cached by node revision.
+    /// The edge count needs the whole edge topology, so `Scene::poly_count` on every frame is
+    /// far too slow for heavy meshes (the JS app caches `PolyMesh.topo`).
+    pub stats_cache: HashMap<String, (u64, [usize; 5])>,
     pub vp_state: vp_ui::VpState,
     pub panels: panels::PanelState,
     pub windows_state: windows::WinState,
@@ -341,6 +345,7 @@ impl IncaApp {
             pivot_mode: false,
             gpu,
             smooth_cache: HashMap::new(),
+            stats_cache: HashMap::new(),
             vp_state: Default::default(),
             panels: Default::default(),
             windows_state: Default::default(),
@@ -421,6 +426,71 @@ impl IncaApp {
         }
         app.s.modified = false;
         app
+    }
+
+    // ------------------------------------------------------------ mesh statistics
+
+    /// Mesh statistics of one node (verts, edges, faces, tris, uvs), cached by node revision.
+    /// The edge count needs the full topology, which is too expensive to rebuild for every
+    /// frame of the status bar and the HUD.
+    pub fn node_stats(&mut self, id: &str) -> Option<[usize; 5]> {
+        let rev = self.s.node(id)?.rev;
+        if let Some((cached_rev, st)) = self.stats_cache.get(id) {
+            if *cached_rev == rev {
+                return Some(*st);
+            }
+        }
+        let (rev, st) = {
+            let n = self.s.node(id)?;
+            let m = n.mesh()?;
+            let pm = &m.mesh;
+            let uvs = pm.uv.as_ref().map(|u| u.iter().flatten().map(|f| f.len()).sum()).unwrap_or(0);
+            (n.rev, [pm.v.len(), pm.edge_count(), pm.f.len(), pm.tri_count(), uvs])
+        };
+        self.stats_cache.insert(id.to_string(), (rev, st));
+        Some(st)
+    }
+
+    /// Viewport HUD poly count: totals over the visible meshes and over the picked
+    /// (selected or highlighted) ones, as the JS `drawHud`.
+    pub fn hud_poly_stats(&mut self) -> ([usize; 5], [usize; 5]) {
+        let hil = self.s.hilite();
+        let ids: Vec<(String, bool)> = self
+            .s
+            .all_dag(false)
+            .into_iter()
+            .filter(|id| self.s.is_visible(id))
+            .map(|id| {
+                let picked = self.s.sel.contains(&id) || hil.contains(&id);
+                (id, picked)
+            })
+            .collect();
+        let (mut tot, mut sel) = ([0usize; 5], [0usize; 5]);
+        for (id, picked) in ids {
+            let Some(st) = self.node_stats(&id) else { continue };
+            for k in 0..5 {
+                tot[k] += st[k];
+                if picked {
+                    sel[k] += st[k];
+                }
+            }
+        }
+        (tot, sel)
+    }
+
+    /// Total scene poly count for the status bar: the same numbers as `Scene::poly_count`,
+    /// without rebuilding the edge topology every frame.
+    pub fn scene_poly_count(&mut self) -> (usize, usize, usize, usize) {
+        let ids: Vec<String> = self.s.nodes.keys().cloned().collect();
+        let mut t = [0usize; 4];
+        for id in ids {
+            if let Some(st) = self.node_stats(&id) {
+                for k in 0..4 {
+                    t[k] += st[k];
+                }
+            }
+        }
+        (t[0], t[1], t[2], t[3])
     }
 
     // ------------------------------------------------------------ running commands
@@ -622,6 +692,7 @@ impl IncaApp {
             Ok(_) => {
                 self.echo(format!("file -o \"{}\";", p.display()));
                 self.smooth_cache.clear();
+                self.stats_cache.clear();
                 self.add_recent(p);
             }
             Err(e) => self.last_result = format!("// Error: {e} //"),
