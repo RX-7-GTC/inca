@@ -8,6 +8,7 @@ use glam::{DMat4, DQuat, DVec3};
 use inca_core::mesh::epair;
 use inca_core::scene::{CompMode, SelMode, Shape};
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use transform_gizmo_egui::math::Transform;
 use transform_gizmo_egui::prelude::*;
 
@@ -102,6 +103,7 @@ pub fn viewports(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame
     // drop cached mesh statistics of deleted meshes
     let alive: HashSet<&str> = app.s.nodes.keys().map(|k| k.as_str()).collect();
     app.stats_cache.retain(|k, _| alive.contains(k.as_str()));
+    app.topo_cache.retain(&alive);
 }
 
 fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: usize, rect: Rect) {
@@ -126,7 +128,8 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
             gpu.target(&mut r, idx, px)
         };
         let live = app.vp_state.live_meshes();
-        let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live);
+        let soft = app.soft.on.then_some((app.soft.radius, app.soft.linear));
+        let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.topo_cache, soft);
         draws.extend(crate::anim_extras::draws(&app.viz));
         let fu = viewport::frame_uniform(&app.s, &app.vps[idx], &cv, app.bg_mode);
         gpu.render(idx, &fu, &draws);
@@ -141,7 +144,8 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
     viewport::draw_annotations(&app.s, &app.vps[idx], &cv, &painter);
     crate::anim_extras::overlay(app, &cv, img_rect, &painter);
     let hover = if app.vp_state.drag.is_none() && app.tool.is_select() && app.prefs.preselect { resp.hover_pos() } else { None };
-    viewport::draw_component_overlay(&app.s, &app.vps[idx], &cv, &painter, app.soft.on.then_some((app.soft.radius, app.soft.linear)), hover);
+    let hover_comp = hover.and_then(|h| hover_pick(app, idx, &cv, h));
+    viewport::draw_component_overlay(&app.s, &app.vps[idx], &cv, &painter, hover_comp.as_ref().map(|(id, c)| (id.as_str(), c)));
     viewport::draw_gate(&app.s, &app.vps[idx], &painter);
     mesh_overlays(app, &cv, img_rect, &painter);
     if (resp.hovered() || resp.dragged()) && app.active_vp != idx && (resp.clicked() || resp.drag_started() || ui.input(|i| i.pointer.any_pressed())) {
@@ -624,6 +628,57 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
 
 }
 
+/// Preselection under the cursor, cached: re-picking every frame is what made component
+/// mode crawl on heavy meshes (the JS app also picks on pointer events only).
+fn hover_pick(app: &mut IncaApp, idx: usize, cv: &CamView, h: Pos2) -> Option<(String, Comp)> {
+    let mode = app.s.comp_mode?;
+    if !app.vps[idx].rect.contains(h) {
+        return None;
+    }
+    let ids = app.s.hilite();
+    let mut hh = std::collections::hash_map::DefaultHasher::new();
+    idx.hash(&mut hh);
+    h.x.to_bits().hash(&mut hh);
+    h.y.to_bits().hash(&mut hh);
+    match mode {
+        CompMode::Vertex => 0u8,
+        CompMode::Edge => 1,
+        CompMode::Face => 2,
+    }
+    .hash(&mut hh);
+    let vp = &app.vps[idx];
+    vp.xray.hash(&mut hh);
+    vp.backface.hash(&mut hh);
+    vp.rect.width().to_bits().hash(&mut hh);
+    vp.rect.height().to_bits().hash(&mut hh);
+    for x in cv.view_proj().to_cols_array() {
+        x.to_bits().hash(&mut hh);
+    }
+    // picking depends on the hilited meshes (and their geometry), not on unrelated scene edits
+    for id in &ids {
+        id.hash(&mut hh);
+        if let Some(n) = app.s.node(id) {
+            n.rev.hash(&mut hh);
+        }
+    }
+    let key = hh.finish();
+    if let Some((k, c)) = &app.hover_pick {
+        if *k == key {
+            return c.clone();
+        }
+    }
+    let vp = app.vps[idx].clone();
+    let mut found = None;
+    for id in &ids {
+        if let Some(c) = viewport::pick_component(&app.s, &vp, cv, id, mode, h, &mut app.topo_cache) {
+            found = Some((id.clone(), c));
+            break;
+        }
+    }
+    app.hover_pick = Some((key, found.clone()));
+    found
+}
+
 fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelMode) {
     if app.lock_selection {
         return;
@@ -633,7 +688,7 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
         let hil = app.s.hilite();
         let mut best: Option<(String, Comp)> = None;
         for id in &hil {
-            if let Some(c) = viewport::pick_component(&app.s, &vp, cv, id, cm, p) {
+            if let Some(c) = viewport::pick_component(&app.s, &vp, cv, id, cm, p, &mut app.topo_cache) {
                 best = Some((id.clone(), c));
                 break;
             }
@@ -641,10 +696,10 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
         match best {
             Some((id, c)) => {
                 let name = app.s.name_of(&id);
-                let topo = app.s.node(&id).unwrap().mesh().unwrap().mesh.topo();
+                let topo = app.topo_cache.get(&app.s, &id);
                 let comp = match c {
                     Comp::V(v) => format!("{name}.vtx[{v}]"),
-                    Comp::E(a, b) => format!("{name}.e[{}]", topo.edge(a, b).unwrap_or(0)),
+                    Comp::E(a, b) => format!("{name}.e[{}]", topo.as_ref().and_then(|t| t.edge(a, b)).unwrap_or(0)),
                     Comp::F(f) => format!("{name}.f[{f}]"),
                 };
                 let flag = match mode {
@@ -724,11 +779,11 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
         let mut parts = vec![];
         for id in app.s.hilite() {
             let name = app.s.name_of(&id);
-            let topo = app.s.node(&id).unwrap().mesh().unwrap().mesh.topo();
-            for c in viewport::region_components(&app.s, &vp, cv, &id, cm, region) {
+            let topo = app.topo_cache.get(&app.s, &id);
+            for c in viewport::region_components(&app.s, &vp, cv, &id, cm, region, &mut app.topo_cache) {
                 parts.push(match c {
                     Comp::V(v) => format!("{name}.vtx[{v}]"),
-                    Comp::E(a, b) => format!("{name}.e[{}]", topo.edge(a, b).unwrap_or(0)),
+                    Comp::E(a, b) => format!("{name}.e[{}]", topo.as_ref().and_then(|t| t.edge(a, b)).unwrap_or(0)),
                     Comp::F(f) => format!("{name}.f[{f}]"),
                 });
             }

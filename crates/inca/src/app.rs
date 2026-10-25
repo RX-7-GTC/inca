@@ -188,6 +188,10 @@ pub struct IncaApp {
     /// The edge count needs the whole edge topology, so `Scene::poly_count` on every frame is
     /// far too slow for heavy meshes (the JS app caches `PolyMesh.topo`).
     pub stats_cache: HashMap<String, (u64, [usize; 5])>,
+    /// Per-node edge topology cached by node revision (component picking, culled wires).
+    pub topo_cache: crate::viewport::TopoCache,
+    /// Last component preselection: (cursor/camera/scene key, pick).
+    pub hover_pick: Option<(u64, Option<(String, crate::viewport::Comp)>)>,
     pub vp_state: vp_ui::VpState,
     pub panels: panels::PanelState,
     pub windows_state: windows::WinState,
@@ -346,6 +350,8 @@ impl IncaApp {
             gpu,
             smooth_cache: HashMap::new(),
             stats_cache: HashMap::new(),
+            topo_cache: Default::default(),
+            hover_pick: None,
             vp_state: Default::default(),
             panels: Default::default(),
             windows_state: Default::default(),

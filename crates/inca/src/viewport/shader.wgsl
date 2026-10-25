@@ -165,7 +165,39 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
     return vec4(c, draw.params.y);
 }
 
-// ---------------------------------------------------------------- lines
+// ---------------------------------------------------------------- component dots
+
+struct PointIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) color: vec4<f32>,
+};
+struct PointOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_point(v: PointIn, @builtin(vertex_index) vi: u32) -> PointOut {
+    // two triangles, expanded to a fixed-size screen-space square per instance
+    var corner = array<vec2<f32>, 6>(
+        vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0),
+        vec2(-1.0, 1.0), vec2(1.0, -1.0), vec2(1.0, 1.0),
+    );
+    var o: PointOut;
+    var clip = frame.view_proj * draw.model * vec4(v.pos, 1.0);
+    let size = max(frame.post.zw, vec2(1.0));
+    let off = corner[vi] * vec2(draw.params2.y * 2.0 / size.x, draw.params2.y * 2.0 / size.y) * clip.w;
+    clip = clip + vec4(off, 0.0, 0.0);
+    clip.z = clip.z - draw.params.z * clip.w;
+    o.clip = clip;
+    o.color = v.color;
+    return o;
+}
+
+@fragment
+fn fs_point(i: PointOut) -> @location(0) vec4<f32> {
+    return i.color;
+}
 struct LineIn {
     @location(0) pos: vec3<f32>,
     @location(1) color: vec4<f32>,

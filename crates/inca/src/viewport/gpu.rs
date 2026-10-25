@@ -25,6 +25,14 @@ pub struct LineVertex {
     pub color: [f32; 4],
 }
 
+/// One component-mode dot; drawn as a screen-space quad (instanced).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
+pub struct PointVertex {
+    pub pos: [f32; 3],
+    pub color: [f32; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuLight {
@@ -84,6 +92,11 @@ impl DrawUniform {
         self.params2[0] = rough;
         self
     }
+    /// Half-size in pixels of component dots (see `vs_point`).
+    pub fn point_size(mut self, half: f32) -> Self {
+        self.params2[1] = half;
+        self
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,6 +109,8 @@ pub enum Pass {
     MeshBlend,
     /// depth-tested lines
     Lines,
+    /// depth-tested component dots (screen-space quads)
+    Points,
     /// lines drawn on top of everything
     LinesTop,
 }
@@ -105,6 +120,8 @@ pub enum Geo {
     MeshTris(String),
     /// cached mesh wireframe by key
     MeshWire(String),
+    /// cached component dots by key
+    MeshPoints(String),
     TransientTris(Vec<MeshVertex>),
     TransientLines(Vec<LineVertex>),
 }
@@ -121,6 +138,9 @@ pub struct GpuMesh {
     tri_count: u32,
     wire: Option<wgpu::Buffer>,
     wire_count: u32,
+    points: Option<wgpu::Buffer>,
+    point_count: u32,
+    points_key: Option<u64>,
 }
 
 struct Target {
@@ -144,6 +164,7 @@ pub struct Gpu {
     blend_pipe: wgpu::RenderPipeline,
     line_pipe: wgpu::RenderPipeline,
     line_top_pipe: wgpu::RenderPipeline,
+    point_pipe: wgpu::RenderPipeline,
     draw_buf: wgpu::Buffer,
     draw_cap: u64,
     draw_bg: wgpu::BindGroup,
@@ -181,6 +202,7 @@ impl Gpu {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl)], immediate_size: 0 });
         let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+        let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };
         let depth = |write: bool, compare: wgpu::CompareFunction| {
             Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(write), depth_compare: Some(compare), stencil: Default::default(), bias: Default::default() })
@@ -202,14 +224,18 @@ impl Gpu {
         };
         let mesh_vb = [Some(vb_layout(std::mem::size_of::<MeshVertex>() as u64, &mesh_attrs))];
         let line_vb = [Some(vb_layout(std::mem::size_of::<LineVertex>() as u64, &line_attrs))];
+        let mut point_vb = vb_layout(std::mem::size_of::<PointVertex>() as u64, &point_attrs);
+        point_vb.step_mode = wgpu::VertexStepMode::Instance;
+        let point_vbs = [Some(point_vb)];
         let bg_pipe = mk("bg", "vs_bg", "fs_bg", &[], wgpu::PrimitiveTopology::TriangleList, depth(false, wgpu::CompareFunction::Always), None);
         let mesh_pipe = mk("mesh", "vs_mesh", "fs_mesh", &mesh_vb, wgpu::PrimitiveTopology::TriangleList, depth(true, wgpu::CompareFunction::LessEqual), None);
         let blend_pipe = mk("blend", "vs_mesh", "fs_mesh", &mesh_vb, wgpu::PrimitiveTopology::TriangleList, depth(false, wgpu::CompareFunction::LessEqual), alpha);
         let line_pipe = mk("line", "vs_line", "fs_line", &line_vb, wgpu::PrimitiveTopology::LineList, depth(true, wgpu::CompareFunction::LessEqual), alpha);
         let line_top_pipe = mk("line top", "vs_line", "fs_line", &line_vb, wgpu::PrimitiveTopology::LineList, depth(false, wgpu::CompareFunction::Always), alpha);
+        let point_pipe = mk("points", "vs_point", "fs_point", &point_vbs, wgpu::PrimitiveTopology::TriangleList, depth(true, wgpu::CompareFunction::LessEqual), None);
         let draw_cap = 256;
         let (draw_buf, draw_bg) = Self::make_draw_buf(&device, &draw_bgl, draw_cap);
-        Gpu { device, queue, frame_bgl, draw_bgl, bg_pipe, mesh_pipe, blend_pipe, line_pipe, line_top_pipe, draw_buf, draw_cap, draw_bg, meshes: HashMap::new(), targets: HashMap::new() }
+        Gpu { device, queue, frame_bgl, draw_bgl, bg_pipe, mesh_pipe, blend_pipe, line_pipe, line_top_pipe, point_pipe, draw_buf, draw_cap, draw_bg, meshes: HashMap::new(), targets: HashMap::new() }
     }
 
     fn make_draw_buf(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, cap: u64) -> (wgpu::Buffer, wgpu::BindGroup) {
@@ -237,9 +263,23 @@ impl Gpu {
         self.meshes.get(name).map(|m| m.key)
     }
 
+    pub fn point_key(&self, name: &str) -> Option<u64> {
+        self.meshes.get(name).and_then(|m| m.points_key)
+    }
+
     pub fn upload_mesh(&mut self, name: &str, key: u64, tris: &[MeshVertex], wire: &[LineVertex]) {
-        let m = GpuMesh { key, tris: self.vbuf(bytemuck::cast_slice(tris)), tri_count: tris.len() as u32, wire: self.vbuf(bytemuck::cast_slice(wire)), wire_count: wire.len() as u32 };
+        let m = GpuMesh { key, tris: self.vbuf(bytemuck::cast_slice(tris)), tri_count: tris.len() as u32, wire: self.vbuf(bytemuck::cast_slice(wire)), wire_count: wire.len() as u32, points: None, point_count: 0, points_key: None };
         self.meshes.insert(name.to_string(), m);
+    }
+
+    /// Upload the component dots of a mesh; skipped while `key` is unchanged (the caller
+    /// builds the list only when the key changes).
+    pub fn upload_points(&mut self, name: &str, key: u64, points: &[PointVertex]) {
+        let buf = self.vbuf(bytemuck::cast_slice(points));
+        let m = self.meshes.entry(name.to_string()).or_insert_with(|| GpuMesh { key: 0, tris: None, tri_count: 0, wire: None, wire_count: 0, points: None, point_count: 0, points_key: None });
+        m.points = buf;
+        m.point_count = points.len() as u32;
+        m.points_key = Some(key);
     }
 
     pub fn retain_meshes(&mut self, keep: &std::collections::HashSet<String>) {
@@ -387,12 +427,13 @@ impl Gpu {
             rp.set_bind_group(1, &self.draw_bg, &[0]);
             rp.set_pipeline(&self.bg_pipe);
             rp.draw(0..3, 0..1);
-            for pass in [Pass::LinesUnder, Pass::Mesh, Pass::Lines, Pass::MeshBlend, Pass::LinesTop] {
+            for pass in [Pass::LinesUnder, Pass::Mesh, Pass::Lines, Pass::Points, Pass::MeshBlend, Pass::LinesTop] {
                 rp.set_pipeline(match pass {
                     Pass::LinesUnder => &self.line_top_pipe,
                     Pass::Mesh => &self.mesh_pipe,
                     Pass::MeshBlend => &self.blend_pipe,
                     Pass::Lines => &self.line_pipe,
+                    Pass::Points => &self.point_pipe,
                     Pass::LinesTop => &self.line_top_pipe,
                 });
                 for (i, d) in draws.iter().enumerate() {
@@ -406,6 +447,10 @@ impl Gpu {
                         },
                         Geo::MeshWire(k) => match self.meshes.get(k) {
                             Some(GpuMesh { wire: Some(b), wire_count, .. }) => (b, 0, *wire_count),
+                            _ => continue,
+                        },
+                        Geo::MeshPoints(k) => match self.meshes.get(k) {
+                            Some(GpuMesh { points: Some(b), point_count, .. }) => (b, 0, *point_count),
                             _ => continue,
                         },
                         Geo::TransientTris(_) => match &tri_buf {
@@ -422,7 +467,12 @@ impl Gpu {
                     }
                     rp.set_bind_group(1, &self.draw_bg, &[(i as u64 * DRAW_SLOT) as u32]);
                     rp.set_vertex_buffer(0, buf.slice(..));
-                    rp.draw(start..start + count, 0..1);
+                    if pass == Pass::Points {
+                        // one instanced quad (6 vertices) per dot
+                        rp.draw(0..6, start..start + count);
+                    } else {
+                        rp.draw(start..start + count, 0..1);
+                    }
                 }
             }
         }

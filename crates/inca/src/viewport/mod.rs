@@ -6,11 +6,12 @@ use egui::{Color32, Pos2, Rect};
 use glam::{DMat4, DQuat, DVec3, Mat4};
 use gpu::*;
 use inca_core::math::{euler_deg_from_quat, quat_from_euler_deg, Aabb, Ray};
-use inca_core::mesh::PolyMesh;
+use inca_core::mesh::{PolyMesh, Topo};
 use inca_core::scene::{CompMode, Id, Scene, Shape};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 pub const C_WIRE: [f32; 4] = [0.063, 0.063, 0.43, 1.0];
 pub const C_LEAD: [f32; 4] = [0.36, 0.96, 0.64, 1.0];
@@ -690,6 +691,48 @@ pub fn mesh_key(s: &Scene, id: &str) -> u64 {
     h.finish()
 }
 
+/// Cache key for a mesh's component dots: geometry, vertex selection and soft-selection
+/// settings. Deliberately not `Scene::rev`: camera moves, object transforms and animation
+/// bump that every frame but leave the dots (which live in object space) unchanged.
+fn points_key(s: &Scene, id: &str, soft: Option<(f64, bool)>) -> u64 {
+    let mut h = DefaultHasher::new();
+    if let Some(n) = s.node(id) {
+        n.rev.hash(&mut h);
+    }
+    if let Some(cs) = s.comp.get(id) {
+        cs.v.len().hash(&mut h);
+        for v in &cs.v {
+            v.hash(&mut h);
+        }
+    }
+    soft.map(|(r, lin)| (r.to_bits(), lin)).hash(&mut h);
+    h.finish()
+}
+
+/// One dot per vertex, coloured like the JS overlay (selected, soft falloff, plain).
+fn component_points(s: &Scene, id: &str, soft: Option<(f64, bool)>) -> Vec<PointVertex> {
+    let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return vec![] };
+    let cs = s.comp_sel(id);
+    let weights: HashMap<u32, f64> = match soft {
+        Some((r, lin)) if !cs.v.is_empty() => soft_weights(s, id, &cs.v.iter().copied().collect::<Vec<_>>(), r, lin).into_iter().collect(),
+        _ => HashMap::new(),
+    };
+    let mut pts = Vec::with_capacity(pm.v.len());
+    for (i, p) in pm.v.iter().enumerate() {
+        let i = i as u32;
+        let color = if cs.v.contains(&i) {
+            [1.0, 230.0 / 255.0, 0.0, 1.0]
+        } else if let Some(&w) = weights.get(&i) {
+            let c = falloff_color(w);
+            [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+        } else {
+            [194.0 / 255.0, 58.0 / 255.0, 214.0 / 255.0, 1.0]
+        };
+        pts.push(PointVertex { pos: to_f32(*p), color });
+    }
+    pts
+}
+
 /// Background colours (top, bottom) per Alt+B mode, as the JS `BG` table:
 /// grey, black, dark grey, light grey, gradient.
 pub const BG_MODES: [&str; 5] = ["Gray", "Black", "Dark Gray", "Light Gray", "Gradient"];
@@ -766,13 +809,22 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
         bg_top,
         bg_bottom,
         mode: [light_mode, count as f32, if vp.xray { 1.0 } else { 0.0 }, if vp.backface { 1.0 } else { 0.0 }],
-        post: [vp.exposure, vp.gamma.max(0.05), 0.0, 0.0],
+        post: [vp.exposure, vp.gamma.max(0.05), cv.size[0].max(1.0), cv.size[1].max(1.0)],
         lights,
     }
 }
 
 /// Draw list for one viewport; uploads changed meshes.
-pub fn build_draws(s: &Scene, vp: &Viewport, cv: &CamView, g: &mut Gpu, smooth_cache: &mut std::collections::HashMap<String, (u64, PolyMesh)>, live: &std::collections::HashSet<String>) -> Vec<DrawCmd> {
+pub fn build_draws(
+    s: &Scene,
+    vp: &Viewport,
+    cv: &CamView,
+    g: &mut Gpu,
+    smooth_cache: &mut std::collections::HashMap<String, (u64, PolyMesh)>,
+    live: &std::collections::HashSet<String>,
+    topo_cache: &mut TopoCache,
+    soft: Option<(f64, bool)>,
+) -> Vec<DrawCmd> {
     let mut draws = vec![];
     if vp.grid {
         // drawn first without depth so any geometry (e.g. a ground plane) covers it
@@ -842,17 +894,28 @@ pub fn build_draws(s: &Scene, vp: &Viewport, cv: &CamView, g: &mut Gpu, smooth_c
                             let to_cam = if cv.ortho { -cv.fwd } else { cv.eye - wmd.transform_point3(pm.face_center(f)) };
                             n.dot(to_cam) > 0.0
                         }).collect();
-                        let topo = pm.topo();
-                        let mut l = vec![];
-                        for (e, &(a, b)) in topo.edges.iter().enumerate() {
-                            if topo.edge_faces[e].iter().any(|&f| facing[f]) {
-                                push_line(&mut l, pm.v[a as usize], pm.v[b as usize], c);
+                        if let Some(topo) = topo_cache.get(s, &id) {
+                            let mut l = vec![];
+                            for (e, &(a, b)) in topo.edges.iter().enumerate() {
+                                if topo.edge_faces[e].iter().any(|&f| facing[f]) {
+                                    push_line(&mut l, pm.v[a as usize], pm.v[b as usize], c);
+                                }
                             }
+                            draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(l), u: DrawUniform::new(wm).bias(0.00012) });
                         }
-                        draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(l), u: DrawUniform::new(wm).bias(0.00012) });
                     } else {
                         draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::MeshWire(id.clone()), u: DrawUniform::new(wm).tint([c[0], c[1], c[2]], 1.0).bias(0.00012) });
                     }
+                }
+                if in_comp && s.comp_mode == Some(CompMode::Vertex) {
+                    // vertex dots live on the GPU (cached by geometry + selection): drawing them
+                    // with egui every frame is what made component mode unusable on heavy meshes
+                    let key = points_key(s, &id, soft);
+                    if g.point_key(&id) != Some(key) {
+                        let pts = component_points(s, &id, soft);
+                        g.upload_points(&id, key, &pts);
+                    }
+                    draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(3.0).bias(0.0003) });
                 }
                 if in_comp && s.comp_mode == Some(CompMode::Face) {
                     let cs = s.comp_sel(&id);
@@ -1087,59 +1150,93 @@ fn visible_point(pm: &PolyMesh, wm: &DMat4, cv: &CamView, p: DVec3) -> bool {
     }
 }
 
-/// Component visibility: exact raycasts on small meshes, front-facing tests on big ones.
+/// Per-node edge topology cached by node revision (the JS `PolyMesh.topo`). Picking and
+/// backface-culled wireframes would otherwise rebuild it on every pointer move/frame.
+#[derive(Default)]
+pub struct TopoCache {
+    map: HashMap<String, (u64, Arc<Topo>)>,
+}
+
+impl TopoCache {
+    pub fn get(&mut self, s: &Scene, id: &str) -> Option<Arc<Topo>> {
+        let rev = s.node(id)?.rev;
+        if let Some((r, t)) = self.map.get(id) {
+            if *r == rev {
+                return Some(t.clone());
+            }
+        }
+        let t = Arc::new(s.node(id)?.mesh()?.mesh.topo());
+        self.map.insert(id.to_string(), (rev, t.clone()));
+        Some(t)
+    }
+    pub fn retain(&mut self, alive: &std::collections::HashSet<&str>) {
+        self.map.retain(|k, _| alive.contains(k.as_str()));
+    }
+}
+
+/// Component visibility: exact raycasts on small meshes, front-facing tests when backface
+/// culling is on (as the JS `frontFaces`, which is also a no-op when culling is off).
 pub struct Vis<'a> {
     pm: &'a PolyMesh,
     wm: DMat4,
     cv: &'a CamView,
     exact: bool,
-    facing: Vec<bool>,
-    topo: inca_core::mesh::Topo,
+    facing: Option<Vec<bool>>,
+    topo: Option<Arc<Topo>>,
 }
 
 impl<'a> Vis<'a> {
-    pub fn new(pm: &'a PolyMesh, wm: DMat4, cv: &'a CamView, xray: bool) -> Self {
+    /// `topo` is only needed for the front-facing test (backface culling on).
+    pub fn new(pm: &'a PolyMesh, wm: DMat4, cv: &'a CamView, xray: bool, backface: bool, topo: Option<Arc<Topo>>) -> Self {
         let exact = !xray && pm.f.len() <= 2500;
-        let nm = wm.inverse().transpose();
-        let facing = if xray {
-            vec![true; pm.f.len()]
+        let facing = if xray || !backface {
+            None
         } else {
-            (0..pm.f.len())
-                .map(|f| {
-                    let c = wm.transform_point3(pm.face_center(f));
-                    let n = nm.transform_vector3(pm.face_normal(f));
-                    let to = if cv.ortho { -cv.fwd } else { cv.eye - c };
-                    n.dot(to) > 0.0
-                })
-                .collect()
+            let nm = wm.inverse().transpose();
+            Some(
+                (0..pm.f.len())
+                    .map(|f| {
+                        let c = wm.transform_point3(pm.face_center(f));
+                        let n = nm.transform_vector3(pm.face_normal(f));
+                        let to = if cv.ortho { -cv.fwd } else { cv.eye - c };
+                        n.dot(to) > 0.0
+                    })
+                    .collect(),
+            )
         };
-        Vis { pm, wm, cv, exact, facing, topo: pm.topo() }
+        Vis { pm, wm, cv, exact, facing, topo }
     }
     pub fn vertex(&self, v: u32) -> bool {
-        if !self.topo.vert_faces[v as usize].iter().any(|&f| self.facing[f]) && !self.topo.vert_faces[v as usize].is_empty() {
-            return false;
+        if let (Some(facing), Some(topo)) = (&self.facing, &self.topo) {
+            let fs = &topo.vert_faces[v as usize];
+            if !fs.is_empty() && !fs.iter().any(|&f| facing[f]) {
+                return false;
+            }
         }
         !self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.v[v as usize])
     }
     pub fn edge(&self, a: u32, b: u32) -> bool {
-        let Some(e) = self.topo.edge(a, b) else { return false };
-        if !self.topo.edge_faces[e].iter().any(|&f| self.facing[f]) {
-            return false;
+        if let (Some(facing), Some(topo)) = (&self.facing, &self.topo) {
+            let Some(e) = topo.edge(a, b) else { return false };
+            if !topo.edge_faces[e].iter().any(|&f| facing[f]) {
+                return false;
+            }
         }
         !self.exact || visible_point(self.pm, &self.wm, self.cv, (self.pm.v[a as usize] + self.pm.v[b as usize]) * 0.5)
     }
     pub fn face(&self, f: usize) -> bool {
-        self.facing[f] && (!self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.face_center(f)))
+        self.facing.as_ref().is_none_or(|x| x[f]) && (!self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.face_center(f)))
     }
 }
 
-pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, pos: Pos2) -> Option<Comp> {
+pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, pos: Pos2, topo_cache: &mut TopoCache) -> Option<Comp> {
     let n = s.node(id)?;
     let pm = &n.mesh()?.mesh;
     let wm = s.world_matrix(id);
     match mode {
         CompMode::Vertex => {
-            let vis = Vis::new(pm, wm, cv, vp.xray);
+            let topo = if vp.backface && !vp.xray { topo_cache.get(s, id) } else { None };
+            let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, topo);
             let mut best: Option<(f32, u32)> = None;
             for (i, p) in pm.v.iter().enumerate() {
                 if let Some(q) = cv.project(wm.transform_point3(*p), vp.rect) {
@@ -1152,16 +1249,15 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
             best.map(|b| Comp::V(b.1))
         }
         CompMode::Edge => {
-            let vis = Vis::new(pm, wm, cv, vp.xray);
-            let topo = pm.topo();
+            let topo = topo_cache.get(s, id)?;
+            let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, Some(topo.clone()));
+            let screen: Vec<Option<Pos2>> = pm.v.iter().map(|p| cv.project(wm.transform_point3(*p), vp.rect)).collect();
             let mut best: Option<(f32, (u32, u32))> = None;
             for &(a, b) in &topo.edges {
-                let (pa, pb) = (wm.transform_point3(pm.v[a as usize]), wm.transform_point3(pm.v[b as usize]));
-                if let (Some(qa), Some(qb)) = (cv.project(pa, vp.rect), cv.project(pb, vp.rect)) {
-                    let d = seg_dist(pos, qa, qb);
-                    if d < 8.0 && best.is_none_or(|x| d < x.0) && vis.edge(a, b) {
-                        best = Some((d, (a, b)));
-                    }
+                let (Some(qa), Some(qb)) = (screen[a as usize], screen[b as usize]) else { continue };
+                let d = seg_dist(pos, qa, qb);
+                if d < 8.0 && best.is_none_or(|x| d < x.0) && vis.edge(a, b) {
+                    best = Some((d, (a, b)));
                 }
             }
             best.map(|b| Comp::E(b.1 .0, b.1 .1))
@@ -1176,17 +1272,29 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
 
 #[cfg(test)]
 pub fn marquee_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, r: Rect) -> Vec<Comp> {
-    region_components(s, vp, cv, id, mode, &|q| r.contains(q))
+    region_components(s, vp, cv, id, mode, &|q| r.contains(q), &mut TopoCache::default())
 }
 
-pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, region: &dyn Fn(Pos2) -> bool) -> Vec<Comp> {
+pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, region: &dyn Fn(Pos2) -> bool, topo_cache: &mut TopoCache) -> Vec<Comp> {
     let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return vec![] };
     let wm = s.world_matrix(id);
-    let vis = Vis::new(pm, wm, cv, vp.xray);
+    let topo = if mode == CompMode::Edge || (mode == CompMode::Vertex && vp.backface && !vp.xray) { topo_cache.get(s, id) } else { None };
+    let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, topo.clone());
     let inside = |p: DVec3| cv.project(wm.transform_point3(p), vp.rect).is_some_and(region);
     match mode {
         CompMode::Vertex => (0..pm.v.len()).filter(|&i| inside(pm.v[i]) && vis.vertex(i as u32)).map(|i| Comp::V(i as u32)).collect(),
-        CompMode::Edge => pm.topo().edges.iter().filter(|&&(a, b)| inside((pm.v[a as usize] + pm.v[b as usize]) * 0.5) && vis.edge(a, b)).map(|&(a, b)| Comp::E(a, b)).collect(),
+        CompMode::Edge => {
+            let Some(topo) = topo else { return vec![] };
+            let screen: Vec<Option<Pos2>> = pm.v.iter().map(|p| cv.project(wm.transform_point3(*p), vp.rect)).collect();
+            topo.edges
+                .iter()
+                .filter(|&&(a, b)| {
+                    let postedge = screen[a as usize].is_some_and(region) && screen[b as usize].is_some_and(region);
+                    (postedge || inside((pm.v[a as usize] + pm.v[b as usize]) * 0.5)) && vis.edge(a, b)
+                })
+                .map(|&(a, b)| Comp::E(a, b))
+                .collect()
+        }
         CompMode::Face => (0..pm.f.len()).filter(|&f| inside(pm.face_center(f)) && vis.face(f)).map(Comp::F).collect(),
     }
 }
@@ -1320,78 +1428,33 @@ pub fn falloff_color(w: f64) -> Color32 {
     }
 }
 
-pub fn draw_component_overlay(s: &Scene, vp: &Viewport, cv: &CamView, painter: &egui::Painter, soft: Option<(f64, bool)>, hover: Option<Pos2>) {
-    let Some(mode) = s.comp_mode else { return };
-    for id in s.hilite() {
-        let Some(pm) = s.node(&id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { continue };
-        let wm = s.world_matrix(&id);
-        let cs = s.comp_sel(&id);
-        match mode {
-            CompMode::Vertex => {
-                // exact occlusion only for small meshes (it runs every frame)
-                let mut vis = Vis::new(pm, wm, cv, vp.xray);
-                vis.exact &= pm.f.len() <= 600;
-                let weights: HashMap<u32, f64> = match soft {
-                    Some((r, lin)) if !cs.v.is_empty() => soft_weights(s, &id, &cs.v.iter().copied().collect::<Vec<_>>(), r, lin).into_iter().collect(),
-                    _ => HashMap::new(),
-                };
-                for (i, p) in pm.v.iter().enumerate() {
-                    let sel = cs.v.contains(&(i as u32));
-                    let shown = vis.vertex(i as u32);
-                    if !sel && !shown {
-                        continue;
-                    }
-                    if let Some(q) = cv.project(wm.transform_point3(*p), vp.rect) {
-                        let c = match weights.get(&(i as u32)) {
-                            Some(&w) if !sel => falloff_color(w),
-                            _ if sel => Color32::from_rgb(255, 230, 0),
-                            _ => Color32::from_rgb(194, 58, 214),
-                        };
-                        painter.rect_filled(Rect::from_center_size(q, egui::vec2(4.0, 4.0)), 0.0, c);
-                    }
-                }
-            }
-            CompMode::Face => {
-                for f in 0..pm.f.len() {
-                    if let Some(q) = cv.project(wm.transform_point3(pm.face_center(f)), vp.rect) {
-                        if !cs.f.contains(&f) && pm.f.len() < 3000 {
-                            painter.rect_filled(Rect::from_center_size(q, egui::vec2(3.0, 3.0)), 0.0, Color32::from_rgb(80, 150, 220));
-                        }
-                    }
-                }
-            }
-            CompMode::Edge => {}
-        }
-    }
-    // pre-selection highlight: the component under the cursor in red
-    let Some(h) = hover.filter(|h| vp.rect.contains(*h)) else { return };
+/// Component dots are drawn by the GPU (`build_draws`); this adds only the preselection
+/// highlight, which is at most one component.
+pub fn draw_component_overlay(s: &Scene, vp: &Viewport, cv: &CamView, painter: &egui::Painter, hover: Option<(&str, &Comp)>) {
+    let Some((id, c)) = hover else { return };
+    let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return };
+    let wm = s.world_matrix(id);
     let red = Color32::from_rgb(255, 42, 42);
-    for id in s.hilite() {
-        let Some(c) = pick_component(s, vp, cv, &id, mode, h) else { continue };
-        let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
-        let wm = s.world_matrix(&id);
-        let pr = |v: u32| cv.project(wm.transform_point3(pm.v[v as usize]), vp.rect);
-        match c {
-            Comp::V(v) => {
-                if let Some(q) = pr(v) {
-                    painter.rect_filled(Rect::from_center_size(q, egui::vec2(7.0, 7.0)), 0.0, red);
-                }
-            }
-            Comp::E(a, b) => {
-                if let (Some(qa), Some(qb)) = (pr(a), pr(b)) {
-                    painter.line_segment([qa, qb], egui::Stroke::new(2.5, red));
-                }
-            }
-            Comp::F(f) => {
-                let pts: Vec<Pos2> = pm.f[f].iter().filter_map(|&v| pr(v)).collect();
-                if pts.len() >= 3 {
-                    let mut l = pts.clone();
-                    l.push(pts[0]);
-                    painter.add(egui::Shape::line(l, egui::Stroke::new(2.0, red)));
-                }
+    let pr = |v: u32| cv.project(wm.transform_point3(pm.v[v as usize]), vp.rect);
+    match c {
+        Comp::V(v) => {
+            if let Some(q) = pr(*v) {
+                painter.rect_filled(Rect::from_center_size(q, egui::vec2(7.0, 7.0)), 0.0, red);
             }
         }
-        break;
+        Comp::E(a, b) => {
+            if let (Some(qa), Some(qb)) = (pr(*a), pr(*b)) {
+                painter.line_segment([qa, qb], egui::Stroke::new(2.5, red));
+            }
+        }
+        Comp::F(f) => {
+            let pts: Vec<Pos2> = pm.f[*f].iter().filter_map(|&v| pr(v)).collect();
+            if pts.len() >= 3 {
+                let mut l = pts.clone();
+                l.push(pts[0]);
+                painter.add(egui::Shape::line(l, egui::Stroke::new(2.0, red)));
+            }
+        }
     }
 }
 
@@ -1467,15 +1530,15 @@ mod tests {
         let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
         let vi = pm.v.iter().position(|v| v.x > 0.0 && v.y > 0.0 && v.z > 0.0).unwrap();
         let q = cv.project(pm.v[vi], vp.rect).unwrap();
-        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q + egui::vec2(3.0, 2.0)), Some(Comp::V(vi as u32)));
+        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q + egui::vec2(3.0, 2.0), &mut TopoCache::default()), Some(Comp::V(vi as u32)));
         // the hidden corner is not picked through the cube
         let hidden = pm.v.iter().position(|v| v.x < 0.0 && v.y < 0.0 && v.z < 0.0).unwrap();
         let hq = cv.project(pm.v[hidden], vp.rect).unwrap();
-        assert_ne!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, hq), Some(Comp::V(hidden as u32)));
+        assert_ne!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, hq, &mut TopoCache::default()), Some(Comp::V(hidden as u32)));
         // top face under the cursor
         let top = (0..pm.f.len()).find(|&f| pm.face_normal(f).y > 0.9).unwrap();
         let tq = cv.project(pm.face_center(top), vp.rect).unwrap();
-        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Face, tq), Some(Comp::F(top)));
+        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Face, tq, &mut TopoCache::default()), Some(Comp::F(top)));
         // marquee over everything selects the cube and only visible vertices
         assert_eq!(marquee_objects(&s, &vp, &cv, vp.rect), vec![id.clone()]);
         let vs = marquee_components(&s, &vp, &cv, &id, CompMode::Vertex, vp.rect);
