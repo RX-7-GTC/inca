@@ -89,7 +89,7 @@ fn hardware(app: &mut IncaApp, cam: &str) {
     vp.lights = if lit { crate::viewport::LightMode::All } else { crate::viewport::LightMode::Default };
     vp.exposure = settings.exposure;
     let cv = crate::viewport::cam_view(&app.s, cam, [size[0] as f32, size[1] as f32]);
-    let draws = crate::viewport::build_draws(&app.s, &vp, &cv, gpu, &mut app.smooth_cache, &Default::default(), &mut app.topo_cache, None);
+    let draws = crate::viewport::build_draws(&app.s, &vp, &cv, gpu, &mut app.smooth_cache, &Default::default(), &mut app.mesh_cache, None);
     let fu = crate::viewport::frame_uniform(&app.s, &vp, &cv, 1);
     let px = gpu.render_offscreen(size, &fu, &draws);
     if px.len() != (size[0] * size[1] * 4) as usize {

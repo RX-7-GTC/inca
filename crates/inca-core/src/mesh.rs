@@ -50,6 +50,154 @@ pub struct PolyMesh {
     pub display_edges: Option<Vec<[u32; 2]>>,
 }
 
+/// One triangle of a BVH: its corners and the face it belongs to.
+struct BvhTri {
+    face: u32,
+    v: [u32; 3],
+    /// centroid, used for the split
+    c: DVec3,
+}
+
+struct BvhNode {
+    min: DVec3,
+    max: DVec3,
+    /// first triangle (leaf) or unused (inner node)
+    start: u32,
+    /// triangles in a leaf, 0 for an inner node
+    count: u32,
+    /// right child of an inner node (the left child follows it directly), `u32::MAX` in a leaf
+    right: u32,
+}
+
+/// Bounding volume hierarchy over a mesh's triangles. `PolyMesh::raycast` scans every face,
+/// which takes ~60 ms on a 400k-face mesh; face picking uses this instead (cached per
+/// revision by the viewport).
+pub struct TriBvh {
+    nodes: Vec<BvhNode>,
+    tris: Vec<BvhTri>,
+}
+
+const BVH_LEAF: usize = 8;
+
+impl TriBvh {
+    pub fn build(pm: &PolyMesh) -> Self {
+        let mut tris = Vec::with_capacity(pm.tri_count());
+        for (fi, f) in pm.f.iter().enumerate() {
+            if f.len() < 3 {
+                continue;
+            }
+            let mut push = |c: [u32; 3]| {
+                let (a, b, d) = (pm.v[c[0] as usize], pm.v[c[1] as usize], pm.v[c[2] as usize]);
+                tris.push(BvhTri { face: fi as u32, v: c, c: (a + b + d) / 3.0 });
+            };
+            // triangles and quads are the overwhelming majority: fan them without an allocation
+            if f.len() == 3 {
+                push([f[0], f[1], f[2]]);
+            } else if f.len() == 4 {
+                push([f[0], f[1], f[2]]);
+                push([f[0], f[2], f[3]]);
+            } else {
+                for t in pm.triangulate_face(fi) {
+                    push([f[t[0]], f[t[1]], f[t[2]]]);
+                }
+            }
+        }
+        let mut nodes = Vec::new();
+        if !tris.is_empty() {
+            build_node(pm, &mut tris, 0, &mut nodes);
+        }
+        TriBvh { nodes, tris }
+    }
+
+    pub fn tri_count(&self) -> usize {
+        self.tris.len()
+    }
+
+    /// Nearest triangle hit: (distance along the ray, face index).
+    pub fn raycast(&self, pm: &PolyMesh, r: &Ray, cull_back: bool) -> Option<(f64, usize)> {
+        let root = self.nodes.first()?;
+        slab(r, root.min, root.max, f64::INFINITY)?;
+        let mut best: Option<(f64, usize)> = None;
+        let mut stack = vec![0u32];
+        while let Some(ni) = stack.pop() {
+            let n = &self.nodes[ni as usize];
+            if slab(r, n.min, n.max, best.map_or(f64::INFINITY, |b| b.0)).is_none() {
+                continue;
+            }
+            if n.right == u32::MAX {
+                let s = n.start as usize;
+                for t in &self.tris[s..s + n.count as usize] {
+                    let (a, b, c) = (pm.v[t.v[0] as usize], pm.v[t.v[1] as usize], pm.v[t.v[2] as usize]);
+                    if let Some(d) = crate::math::ray_triangle(r, a, b, c, cull_back) {
+                        if best.is_none_or(|(bt, _)| d < bt) {
+                            best = Some((d, t.face as usize));
+                        }
+                    }
+                }
+            } else {
+                // visit the near side first; it only changes the order, not the result
+                stack.push(n.right);
+                stack.push(ni + 1);
+            }
+        }
+        best
+    }
+}
+
+fn build_node(pm: &PolyMesh, tris: &mut [BvhTri], base: usize, nodes: &mut Vec<BvhNode>) -> usize {
+    let (mut mn, mut mx) = (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
+    for t in tris.iter() {
+        for &i in &t.v {
+            let p = pm.v[i as usize];
+            mn = mn.min(p);
+            mx = mx.max(p);
+        }
+    }
+    let ni = nodes.len();
+    nodes.push(BvhNode { min: mn, max: mx, start: base as u32, count: tris.len() as u32, right: u32::MAX });
+    if tris.len() <= BVH_LEAF {
+        return ni;
+    }
+    let ext = mx - mn;
+    let axis = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
+    let mid = tris.len() / 2;
+    tris.select_nth_unstable_by(mid, |a, b| a.c[axis].total_cmp(&b.c[axis]));
+    let (l, r) = tris.split_at_mut(mid);
+    build_node(pm, l, base, nodes);
+    let right = build_node(pm, r, base + mid, nodes);
+    nodes[ni].right = right as u32;
+    ni
+}
+
+/// Slab test: entry/exit distance of the ray through an axis-aligned box, clipped to `max_t`.
+fn slab(r: &Ray, mn: DVec3, mx: DVec3, max_t: f64) -> Option<(f64, f64)> {
+    let (mut t0, mut t1) = (0.0f64, max_t);
+    for k in 0..3 {
+        let (o, d) = (r.origin[k], r.dir[k]);
+        if d.abs() < 1e-12 {
+            if o < mn[k] || o > mx[k] {
+                return None;
+            }
+        } else {
+            let inv = 1.0 / d;
+            let (mut a, mut b) = ((mn[k] - o) * inv, (mx[k] - o) * inv);
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if a > t0 {
+                t0 = a;
+            }
+            if b < t1 {
+                t1 = b;
+            }
+            if t0 > t1 {
+                return None;
+            }
+        }
+    }
+    Some((t0, t1))
+}
+
 /// Edge/face adjacency, computed on demand.
 #[derive(Clone, Debug, Default)]
 pub struct Topo {
@@ -246,6 +394,11 @@ impl PolyMesh {
             }
         }
         best
+    }
+
+    /// Build a triangle BVH for fast ray picking (the JS app's three-mesh-bvh).
+    pub fn tri_bvh(&self) -> TriBvh {
+        TriBvh::build(self)
     }
 
     pub fn transformed(&self, m: &DMat4) -> PolyMesh {
@@ -1740,6 +1893,38 @@ mod tests {
         assert_eq!(c.edge_count(), 12);
         assert!(is_closed(&c));
         assert!((c.signed_volume() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bvh_matches_brute_force_raycast() {
+        let mut p = serde_json::Map::new();
+        p.insert("subdivisionsAxis".into(), serde_json::json!(12));
+        p.insert("subdivisionsHeight".into(), serde_json::json!(8));
+        let m = primitives::generate("polySphere", &p).unwrap();
+        let b = m.tri_bvh();
+        assert_eq!(b.tri_count(), m.tri_count());
+        let mut hits = 0;
+        for i in 0..64 {
+            let a = i as f64 * 0.37;
+            let d = DVec3::new(a.cos(), (a * 1.7).sin(), (a * 0.9).cos()).normalize();
+            let r = Ray { origin: d * 3.0, dir: -d };
+            for cull in [false, true] {
+                let brute = m.raycast(&r, cull);
+                let fast = b.raycast(&m, &r, cull);
+                let (bt, bf) = brute.unwrap();
+                let (ft, ff) = fast.unwrap();
+                assert_eq!(bf, ff);
+                assert!((bt - ft).abs() < 1e-9);
+            }
+            hits += 1;
+        }
+        assert_eq!(hits, 64);
+        // a ray that misses the mesh entirely
+        let r = Ray { origin: DVec3::new(0.0, 0.0, 5.0), dir: DVec3::new(1.0, 0.0, 0.0) };
+        assert_eq!(b.raycast(&m, &r, false), None);
+        assert_eq!(m.raycast(&r, false), None);
+        // an empty mesh builds an empty tree
+        assert_eq!(PolyMesh::default().tri_bvh().raycast(&m, &r, false), None);
     }
 
     #[test]

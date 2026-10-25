@@ -103,7 +103,7 @@ pub fn viewports(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame
     // drop cached mesh statistics of deleted meshes
     let alive: HashSet<&str> = app.s.nodes.keys().map(|k| k.as_str()).collect();
     app.stats_cache.retain(|k, _| alive.contains(k.as_str()));
-    app.topo_cache.retain(&alive);
+    app.mesh_cache.retain(&alive);
 }
 
 fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: usize, rect: Rect) {
@@ -129,7 +129,7 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
         };
         let live = app.vp_state.live_meshes();
         let soft = app.soft.on.then_some((app.soft.radius, app.soft.linear));
-        let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.topo_cache, soft);
+        let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.mesh_cache, soft);
         draws.extend(crate::anim_extras::draws(&app.viz));
         let fu = viewport::frame_uniform(&app.s, &app.vps[idx], &cv, app.bg_mode);
         gpu.render(idx, &fu, &draws);
@@ -144,7 +144,7 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
     viewport::draw_annotations(&app.s, &app.vps[idx], &cv, &painter);
     crate::anim_extras::overlay(app, &cv, img_rect, &painter);
     let hover = if app.vp_state.drag.is_none() && app.tool.is_select() && app.prefs.preselect { resp.hover_pos() } else { None };
-    let hover_comp = hover.and_then(|h| hover_pick(app, idx, &cv, h));
+    let hover_comp = hover.and_then(|h| hover_pick(app, ui.ctx(), idx, &cv, h));
     viewport::draw_component_overlay(&app.s, &app.vps[idx], &cv, &painter, hover_comp.as_ref().map(|(id, c)| (id.as_str(), c)));
     viewport::draw_gate(&app.s, &app.vps[idx], &painter);
     mesh_overlays(app, &cv, img_rect, &painter);
@@ -630,7 +630,7 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
 
 /// Preselection under the cursor, cached: re-picking every frame is what made component
 /// mode crawl on heavy meshes (the JS app also picks on pointer events only).
-fn hover_pick(app: &mut IncaApp, idx: usize, cv: &CamView, h: Pos2) -> Option<(String, Comp)> {
+fn hover_pick(app: &mut IncaApp, ctx: &egui::Context, idx: usize, cv: &CamView, h: Pos2) -> Option<(String, Comp)> {
     let mode = app.s.comp_mode?;
     if !app.vps[idx].rect.contains(h) {
         return None;
@@ -667,15 +667,22 @@ fn hover_pick(app: &mut IncaApp, idx: usize, cv: &CamView, h: Pos2) -> Option<(S
             return c.clone();
         }
     }
+    // like the JS `onHover`, re-pick at most every 30 ms while the cursor moves: at 400k
+    // faces an edge pick is ~15 ms and would otherwise nearly double the frame time
+    if app.hover_pick.is_some() && app.hover_at.elapsed() < std::time::Duration::from_millis(30) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        return app.hover_pick.as_ref().and_then(|(_, c)| c.clone());
+    }
     let vp = app.vps[idx].clone();
     let mut found = None;
     for id in &ids {
-        if let Some(c) = viewport::pick_component(&app.s, &vp, cv, id, mode, h, &mut app.topo_cache) {
+        if let Some(c) = viewport::pick_component(&app.s, &vp, cv, id, mode, h, &mut app.mesh_cache) {
             found = Some((id.clone(), c));
             break;
         }
     }
     app.hover_pick = Some((key, found.clone()));
+    app.hover_at = std::time::Instant::now();
     found
 }
 
@@ -688,7 +695,7 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
         let hil = app.s.hilite();
         let mut best: Option<(String, Comp)> = None;
         for id in &hil {
-            if let Some(c) = viewport::pick_component(&app.s, &vp, cv, id, cm, p, &mut app.topo_cache) {
+            if let Some(c) = viewport::pick_component(&app.s, &vp, cv, id, cm, p, &mut app.mesh_cache) {
                 best = Some((id.clone(), c));
                 break;
             }
@@ -696,7 +703,7 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
         match best {
             Some((id, c)) => {
                 let name = app.s.name_of(&id);
-                let topo = app.topo_cache.get(&app.s, &id);
+                let topo = app.mesh_cache.topo(&app.s, &id);
                 let comp = match c {
                     Comp::V(v) => format!("{name}.vtx[{v}]"),
                     Comp::E(a, b) => format!("{name}.e[{}]", topo.as_ref().and_then(|t| t.edge(a, b)).unwrap_or(0)),
@@ -779,8 +786,8 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
         let mut parts = vec![];
         for id in app.s.hilite() {
             let name = app.s.name_of(&id);
-            let topo = app.topo_cache.get(&app.s, &id);
-            for c in viewport::region_components(&app.s, &vp, cv, &id, cm, region, &mut app.topo_cache) {
+            let topo = app.mesh_cache.topo(&app.s, &id);
+            for c in viewport::region_components(&app.s, &vp, cv, &id, cm, region, &mut app.mesh_cache) {
                 parts.push(match c {
                     Comp::V(v) => format!("{name}.vtx[{v}]"),
                     Comp::E(a, b) => format!("{name}.e[{}]", topo.as_ref().and_then(|t| t.edge(a, b)).unwrap_or(0)),

@@ -822,7 +822,7 @@ pub fn build_draws(
     g: &mut Gpu,
     smooth_cache: &mut std::collections::HashMap<String, (u64, PolyMesh)>,
     live: &std::collections::HashSet<String>,
-    topo_cache: &mut TopoCache,
+    mesh_cache: &mut MeshCache,
     soft: Option<(f64, bool)>,
 ) -> Vec<DrawCmd> {
     let mut draws = vec![];
@@ -894,7 +894,7 @@ pub fn build_draws(
                             let to_cam = if cv.ortho { -cv.fwd } else { cv.eye - wmd.transform_point3(pm.face_center(f)) };
                             n.dot(to_cam) > 0.0
                         }).collect();
-                        if let Some(topo) = topo_cache.get(s, &id) {
+                        if let Some(topo) = mesh_cache.topo(s, &id) {
                             let mut l = vec![];
                             for (e, &(a, b)) in topo.edges.iter().enumerate() {
                                 if topo.edge_faces[e].iter().any(|&f| facing[f]) {
@@ -1135,12 +1135,16 @@ pub enum Comp {
 }
 
 /// Is a world point visible (not hidden behind its own mesh)?
-fn visible_point(pm: &PolyMesh, wm: &DMat4, cv: &CamView, p: DVec3) -> bool {
+fn visible_point(pm: &PolyMesh, wm: &DMat4, cv: &CamView, p: DVec3, bvh: Option<&inca_core::mesh::TriBvh>) -> bool {
     let wp = wm.transform_point3(p);
     let to = if cv.ortho { -cv.fwd } else { (cv.eye - wp).normalize() };
     let r = Ray { origin: wp + to * 1e-4 * (1.0 + wp.length()), dir: to };
     let lr = r.transformed(&wm.inverse());
-    match pm.raycast(&lr, false) {
+    let hit = match bvh {
+        Some(b) => b.raycast(pm, &lr, false),
+        None => pm.raycast(&lr, false),
+    };
+    match hit {
         Some((t, _)) => {
             let hit = wm.transform_point3(lr.at(t));
             let dist = if cv.ortho { f64::INFINITY } else { (cv.eye - wp).length() };
@@ -1150,28 +1154,52 @@ fn visible_point(pm: &PolyMesh, wm: &DMat4, cv: &CamView, p: DVec3) -> bool {
     }
 }
 
-/// Per-node edge topology cached by node revision (the JS `PolyMesh.topo`). Picking and
-/// backface-culled wireframes would otherwise rebuild it on every pointer move/frame.
+/// Derived per-mesh data cached by node revision: edge topology (the JS `PolyMesh.topo`) and
+/// the face-picking BVH (the JS three-mesh-bvh). Both would otherwise be rebuilt on every
+/// pointer move, which is far too slow on heavy meshes.
 #[derive(Default)]
-pub struct TopoCache {
-    map: HashMap<String, (u64, Arc<Topo>)>,
+pub struct MeshCache {
+    topo: HashMap<String, (u64, Arc<Topo>)>,
+    /// `None` = the mesh is small enough to raycast triangle by triangle
+    bvh: HashMap<String, (u64, Option<Arc<inca_core::mesh::TriBvh>>)>,
 }
 
-impl TopoCache {
-    pub fn get(&mut self, s: &Scene, id: &str) -> Option<Arc<Topo>> {
+impl MeshCache {
+    pub fn topo(&mut self, s: &Scene, id: &str) -> Option<Arc<Topo>> {
         let rev = s.node(id)?.rev;
-        if let Some((r, t)) = self.map.get(id) {
+        if let Some((r, t)) = self.topo.get(id) {
             if *r == rev {
                 return Some(t.clone());
             }
         }
         let t = Arc::new(s.node(id)?.mesh()?.mesh.topo());
-        self.map.insert(id.to_string(), (rev, t.clone()));
+        self.topo.insert(id.to_string(), (rev, t.clone()));
         Some(t)
     }
-    pub fn retain(&mut self, alive: &std::collections::HashSet<&str>) {
-        self.map.retain(|k, _| alive.contains(k.as_str()));
+
+    /// Face picking BVH, like the JS `computeBoundsTree` (built lazily above 300 faces).
+    pub fn bvh(&mut self, s: &Scene, id: &str) -> Option<Arc<inca_core::mesh::TriBvh>> {
+        let rev = s.node(id)?.rev;
+        if let Some((r, b)) = self.bvh.get(id) {
+            if *r == rev {
+                return b.clone();
+            }
+        }
+        let pm = &s.node(id)?.mesh()?.mesh;
+        let b = (pm.f.len() > 300).then(|| Arc::new(pm.tri_bvh()));
+        self.bvh.insert(id.to_string(), (rev, b.clone()));
+        b
     }
+
+    pub fn retain(&mut self, alive: &std::collections::HashSet<&str>) {
+        self.topo.retain(|k, _| alive.contains(k.as_str()));
+        self.bvh.retain(|k, _| alive.contains(k.as_str()));
+    }
+}
+
+/// Meshes small enough for the per-component exact occlusion test (one raycast per component).
+fn exact_vis(pm: &PolyMesh) -> bool {
+    pm.f.len() <= 2500
 }
 
 /// Component visibility: exact raycasts on small meshes, front-facing tests when backface
@@ -1183,12 +1211,22 @@ pub struct Vis<'a> {
     exact: bool,
     facing: Option<Vec<bool>>,
     topo: Option<Arc<Topo>>,
+    bvh: Option<Arc<inca_core::mesh::TriBvh>>,
 }
 
 impl<'a> Vis<'a> {
-    /// `topo` is only needed for the front-facing test (backface culling on).
-    pub fn new(pm: &'a PolyMesh, wm: DMat4, cv: &'a CamView, xray: bool, backface: bool, topo: Option<Arc<Topo>>) -> Self {
-        let exact = !xray && pm.f.len() <= 2500;
+    /// `topo` is only needed for the front-facing test (backface culling on), `bvh` only for
+    /// the exact occlusion test on meshes small enough for it.
+    pub fn new(
+        pm: &'a PolyMesh,
+        wm: DMat4,
+        cv: &'a CamView,
+        xray: bool,
+        backface: bool,
+        topo: Option<Arc<Topo>>,
+        bvh: Option<Arc<inca_core::mesh::TriBvh>>,
+    ) -> Self {
+        let exact = !xray && exact_vis(pm);
         let facing = if xray || !backface {
             None
         } else {
@@ -1204,7 +1242,7 @@ impl<'a> Vis<'a> {
                     .collect(),
             )
         };
-        Vis { pm, wm, cv, exact, facing, topo }
+        Vis { pm, wm, cv, exact, facing, topo, bvh }
     }
     pub fn vertex(&self, v: u32) -> bool {
         if let (Some(facing), Some(topo)) = (&self.facing, &self.topo) {
@@ -1213,7 +1251,7 @@ impl<'a> Vis<'a> {
                 return false;
             }
         }
-        !self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.v[v as usize])
+        !self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.v[v as usize], self.bvh.as_deref())
     }
     pub fn edge(&self, a: u32, b: u32) -> bool {
         if let (Some(facing), Some(topo)) = (&self.facing, &self.topo) {
@@ -1222,21 +1260,22 @@ impl<'a> Vis<'a> {
                 return false;
             }
         }
-        !self.exact || visible_point(self.pm, &self.wm, self.cv, (self.pm.v[a as usize] + self.pm.v[b as usize]) * 0.5)
+        !self.exact || visible_point(self.pm, &self.wm, self.cv, (self.pm.v[a as usize] + self.pm.v[b as usize]) * 0.5, self.bvh.as_deref())
     }
     pub fn face(&self, f: usize) -> bool {
-        self.facing.as_ref().is_none_or(|x| x[f]) && (!self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.face_center(f)))
+        self.facing.as_ref().is_none_or(|x| x[f]) && (!self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.face_center(f), self.bvh.as_deref()))
     }
 }
 
-pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, pos: Pos2, topo_cache: &mut TopoCache) -> Option<Comp> {
+pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, pos: Pos2, mesh_cache: &mut MeshCache) -> Option<Comp> {
     let n = s.node(id)?;
     let pm = &n.mesh()?.mesh;
     let wm = s.world_matrix(id);
     match mode {
         CompMode::Vertex => {
-            let topo = if vp.backface && !vp.xray { topo_cache.get(s, id) } else { None };
-            let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, topo);
+            let topo = if vp.backface && !vp.xray { mesh_cache.topo(s, id) } else { None };
+            let bvh = if exact_vis(pm) { mesh_cache.bvh(s, id) } else { None };
+            let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, topo, bvh);
             let mut best: Option<(f32, u32)> = None;
             for (i, p) in pm.v.iter().enumerate() {
                 if let Some(q) = cv.project(wm.transform_point3(*p), vp.rect) {
@@ -1249,8 +1288,9 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
             best.map(|b| Comp::V(b.1))
         }
         CompMode::Edge => {
-            let topo = topo_cache.get(s, id)?;
-            let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, Some(topo.clone()));
+            let topo = mesh_cache.topo(s, id)?;
+            let bvh = if exact_vis(pm) { mesh_cache.bvh(s, id) } else { None };
+            let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, Some(topo.clone()), bvh);
             let screen: Vec<Option<Pos2>> = pm.v.iter().map(|p| cv.project(wm.transform_point3(*p), vp.rect)).collect();
             let mut best: Option<(f32, (u32, u32))> = None;
             for &(a, b) in &topo.edges {
@@ -1265,21 +1305,27 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
         CompMode::Face => {
             let ray = cv.ray(pos, vp.rect);
             let lr = ray.transformed(&wm.inverse());
-            pm.raycast(&lr, vp.backface).map(|(_, f)| Comp::F(f))
+            // the BVH turns this from an O(faces) scan (~60 ms at 400k) into a few µs
+            let hit = match mesh_cache.bvh(s, id) {
+                Some(b) => b.raycast(pm, &lr, vp.backface),
+                None => pm.raycast(&lr, vp.backface),
+            };
+            hit.map(|(_, f)| Comp::F(f))
         }
     }
 }
 
 #[cfg(test)]
 pub fn marquee_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, r: Rect) -> Vec<Comp> {
-    region_components(s, vp, cv, id, mode, &|q| r.contains(q), &mut TopoCache::default())
+    region_components(s, vp, cv, id, mode, &|q| r.contains(q), &mut MeshCache::default())
 }
 
-pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, region: &dyn Fn(Pos2) -> bool, topo_cache: &mut TopoCache) -> Vec<Comp> {
+pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, region: &dyn Fn(Pos2) -> bool, mesh_cache: &mut MeshCache) -> Vec<Comp> {
     let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return vec![] };
     let wm = s.world_matrix(id);
-    let topo = if mode == CompMode::Edge || (mode == CompMode::Vertex && vp.backface && !vp.xray) { topo_cache.get(s, id) } else { None };
-    let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, topo.clone());
+    let topo = if mode == CompMode::Edge || (mode == CompMode::Vertex && vp.backface && !vp.xray) { mesh_cache.topo(s, id) } else { None };
+    let bvh = if exact_vis(pm) { mesh_cache.bvh(s, id) } else { None };
+    let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, topo.clone(), bvh);
     let inside = |p: DVec3| cv.project(wm.transform_point3(p), vp.rect).is_some_and(region);
     match mode {
         CompMode::Vertex => (0..pm.v.len()).filter(|&i| inside(pm.v[i]) && vis.vertex(i as u32)).map(|i| Comp::V(i as u32)).collect(),
@@ -1530,15 +1576,15 @@ mod tests {
         let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
         let vi = pm.v.iter().position(|v| v.x > 0.0 && v.y > 0.0 && v.z > 0.0).unwrap();
         let q = cv.project(pm.v[vi], vp.rect).unwrap();
-        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q + egui::vec2(3.0, 2.0), &mut TopoCache::default()), Some(Comp::V(vi as u32)));
+        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q + egui::vec2(3.0, 2.0), &mut MeshCache::default()), Some(Comp::V(vi as u32)));
         // the hidden corner is not picked through the cube
         let hidden = pm.v.iter().position(|v| v.x < 0.0 && v.y < 0.0 && v.z < 0.0).unwrap();
         let hq = cv.project(pm.v[hidden], vp.rect).unwrap();
-        assert_ne!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, hq, &mut TopoCache::default()), Some(Comp::V(hidden as u32)));
+        assert_ne!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, hq, &mut MeshCache::default()), Some(Comp::V(hidden as u32)));
         // top face under the cursor
         let top = (0..pm.f.len()).find(|&f| pm.face_normal(f).y > 0.9).unwrap();
         let tq = cv.project(pm.face_center(top), vp.rect).unwrap();
-        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Face, tq, &mut TopoCache::default()), Some(Comp::F(top)));
+        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Face, tq, &mut MeshCache::default()), Some(Comp::F(top)));
         // marquee over everything selects the cube and only visible vertices
         assert_eq!(marquee_objects(&s, &vp, &cv, vp.rect), vec![id.clone()]);
         let vs = marquee_components(&s, &vp, &cv, &id, CompMode::Vertex, vp.rect);

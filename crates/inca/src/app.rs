@@ -189,9 +189,11 @@ pub struct IncaApp {
     /// far too slow for heavy meshes (the JS app caches `PolyMesh.topo`).
     pub stats_cache: HashMap<String, (u64, [usize; 5])>,
     /// Per-node edge topology cached by node revision (component picking, culled wires).
-    pub topo_cache: crate::viewport::TopoCache,
+    pub mesh_cache: crate::viewport::MeshCache,
     /// Last component preselection: (cursor/camera/scene key, pick).
     pub hover_pick: Option<(u64, Option<(String, crate::viewport::Comp)>)>,
+    /// When the preselection was last picked (the JS app throttles it to 30 ms).
+    pub hover_at: std::time::Instant,
     pub vp_state: vp_ui::VpState,
     pub panels: panels::PanelState,
     pub windows_state: windows::WinState,
@@ -350,8 +352,9 @@ impl IncaApp {
             gpu,
             smooth_cache: HashMap::new(),
             stats_cache: HashMap::new(),
-            topo_cache: Default::default(),
+            mesh_cache: Default::default(),
             hover_pick: None,
+            hover_at: std::time::Instant::now(),
             vp_state: Default::default(),
             panels: Default::default(),
             windows_state: Default::default(),
