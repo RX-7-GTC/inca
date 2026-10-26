@@ -928,35 +928,48 @@ pub fn build_draws(
                     draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(3.0).bias(0.0003) });
                 }
                 if in_comp && s.comp_mode == Some(CompMode::Face) {
-                    let cs = s.comp_sel(&id);
-                    if !cs.f.is_empty() {
-                        let mut tris = vec![];
-                        let pm = &m.mesh;
-                        for &fi in &cs.f {
-                            let Some(f) = pm.f.get(fi) else { continue };
-                            for t in pm.triangulate_face(fi) {
-                                for &c in &t {
-                                    tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: [0.0, 1.0, 0.0], color: C_FACE_SEL });
+                    if s.comp.get(&id).is_some_and(|c| !c.f.is_empty()) {
+                        // cached by geometry + selected faces: rebuilding this list every frame
+                        // made large face selections crawl (100k faces was ~44 ms/frame)
+                        if let Some(key) = mesh_cache.comp_key(s, &id, CompMode::Face) {
+                            if g.comp_tri_key(&id) != Some(key) {
+                                let cs = s.comp_sel(&id);
+                                let mut tris = vec![];
+                                let pm = &m.mesh;
+                                for &fi in &cs.f {
+                                    let Some(f) = pm.f.get(fi) else { continue };
+                                    for t in pm.triangulate_face(fi) {
+                                        for &c in &t {
+                                            tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: [0.0, 1.0, 0.0], color: C_FACE_SEL });
+                                        }
+                                    }
                                 }
+                                g.upload_comp_tris(&id, key, &tris);
                             }
+                            draws.push(DrawCmd { pass: Pass::MeshBlend, geo: Geo::CompTris(id.clone()), u: DrawUniform::new(wm).unlit().alpha(0.45).bias(0.0002) });
                         }
-                        draws.push(DrawCmd { pass: Pass::MeshBlend, geo: Geo::TransientTris(tris), u: DrawUniform::new(wm).unlit().alpha(0.45).bias(0.0002) });
                     }
                 }
                 if in_comp && s.comp_mode == Some(CompMode::Edge) {
-                    let cs = s.comp_sel(&id);
-                    if !cs.e.is_empty() {
-                        let pm = &m.mesh;
-                        let topo = mesh_cache.topo(s, &id);
-                        let fnorm: Vec<DVec3> = topo.as_ref().map_or_else(Vec::new, |_| (0..pm.f.len()).map(|f| pm.face_normal(f)).collect());
-                        let mut l = vec![];
-                        for &(a, b) in &cs.e {
-                            if (a as usize) < pm.v.len() && (b as usize) < pm.v.len() {
-                                let (na, nb) = topo.as_ref().map_or((DVec3::ZERO, DVec3::ZERO), |t| edge_normals(t, &fnorm, a, b));
-                                push_line_n(&mut l, pm.v[a as usize], pm.v[b as usize], [1.0, 0.54, 0.12, 1.0], na, nb);
+                    if s.comp.get(&id).is_some_and(|c| !c.e.is_empty()) {
+                        // same for the selected-edge overlay (200k edges was ~110 ms/frame)
+                        if let Some(key) = mesh_cache.comp_key(s, &id, CompMode::Edge) {
+                            if g.comp_line_key(&id) != Some(key) {
+                                let cs = s.comp_sel(&id);
+                                let pm = &m.mesh;
+                                let topo = mesh_cache.topo(s, &id);
+                                let fnorm: Vec<DVec3> = topo.as_ref().map_or_else(Vec::new, |_| (0..pm.f.len()).map(|f| pm.face_normal(f)).collect());
+                                let mut l = vec![];
+                                for &(a, b) in &cs.e {
+                                    if (a as usize) < pm.v.len() && (b as usize) < pm.v.len() {
+                                        let (na, nb) = topo.as_ref().map_or((DVec3::ZERO, DVec3::ZERO), |t| edge_normals(t, &fnorm, a, b));
+                                        push_line_n(&mut l, pm.v[a as usize], pm.v[b as usize], [1.0, 0.54, 0.12, 1.0], na, nb);
+                                    }
+                                }
+                                g.upload_comp_lines(&id, key, &l);
                             }
+                            draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::CompLines(id.clone()), u: DrawUniform::new(wm).bias(0.0004).cull_wire(vp.backface) });
                         }
-                        draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(l), u: DrawUniform::new(wm).bias(0.0004).cull_wire(vp.backface) });
                     }
                 }
             }
@@ -1180,6 +1193,9 @@ pub struct MeshCache {
     topo: HashMap<String, (u64, Arc<Topo>)>,
     /// `None` = the mesh is small enough to raycast triangle by triangle
     bvh: HashMap<String, (u64, Option<Arc<inca_core::mesh::TriBvh>>)>,
+    /// Hash of the component selection per node/mode, reused while `Scene::rev` is unchanged
+    /// (all viewports draw the same frame). Edge/face overlay buffers are cached by this.
+    sel: HashMap<(String, u8), (u64, usize, u64)>,
 }
 
 impl MeshCache {
@@ -1209,9 +1225,39 @@ impl MeshCache {
         b
     }
 
+    /// Cache key of a node's component selection for the edge/face overlays: geometry revision
+    /// plus the selected set. Selection changes bump `Scene::rev` (transforms do too, but the
+    /// cached hash is just recomputed then, not the GPU buffers).
+    pub fn comp_key(&mut self, s: &Scene, id: &str, mode: CompMode) -> Option<u64> {
+        let n = s.node(id)?;
+        let cs = s.comp.get(id);
+        let len = match mode {
+            CompMode::Vertex => cs.map_or(0, |c| c.v.len()),
+            CompMode::Edge => cs.map_or(0, |c| c.e.len()),
+            CompMode::Face => cs.map_or(0, |c| c.f.len()),
+        };
+        let k = (id.to_string(), mode as u8);
+        if let Some((rev, cached_len, h)) = self.sel.get(&k) {
+            if *rev == s.rev && *cached_len == len {
+                return Some(*h);
+            }
+        }
+        let mut h = DefaultHasher::new();
+        n.rev.hash(&mut h);
+        match mode {
+            CompMode::Vertex => cs.map(|c| c.v.iter().for_each(|v| v.hash(&mut h))),
+            CompMode::Edge => cs.map(|c| c.e.iter().for_each(|e| e.hash(&mut h))),
+            CompMode::Face => cs.map(|c| c.f.iter().for_each(|f| f.hash(&mut h))),
+        };
+        let h = h.finish();
+        self.sel.insert(k, (s.rev, len, h));
+        Some(h)
+    }
+
     pub fn retain(&mut self, alive: &std::collections::HashSet<&str>) {
         self.topo.retain(|k, _| alive.contains(k.as_str()));
         self.bvh.retain(|k, _| alive.contains(k.as_str()));
+        self.sel.retain(|(k, _), _| alive.contains(k.as_str()));
     }
 }
 
@@ -1582,6 +1628,33 @@ mod tests {
         // the ray through the projected point passes the point
         let t = (p - r.origin).dot(r.dir);
         assert!((r.at(t) - p).length() < 1e-6);
+    }
+
+    #[test]
+    fn comp_key_tracks_selection_and_geometry() {
+        let (mut s, _vp, _cv, id) = setup();
+        let mut cache = MeshCache::default();
+        let k0 = cache.comp_key(&s, &id, CompMode::Face).unwrap();
+        // four viewports redraw the same frame: the hash is computed once
+        assert_eq!(cache.comp_key(&s, &id, CompMode::Face), Some(k0));
+        // a different selection with the same number of faces must change the key
+        s.comp.entry(id.clone()).or_default().f.insert(0);
+        s.rev += 1;
+        let k1 = cache.comp_key(&s, &id, CompMode::Face).unwrap();
+        assert_ne!(k0, k1);
+        let f = &mut s.comp.get_mut(&id).unwrap().f;
+        f.clear();
+        f.insert(1);
+        s.rev += 1;
+        let k2 = cache.comp_key(&s, &id, CompMode::Face).unwrap();
+        assert_ne!(k1, k2);
+        // geometry edits bump both revisions (see `Scene::touch`)
+        s.node_mut(&id).unwrap().rev += 1;
+        s.touch();
+        let k3 = cache.comp_key(&s, &id, CompMode::Face).unwrap();
+        assert_ne!(k2, k3);
+        // edge and face overlays have independent keys
+        assert_ne!(cache.comp_key(&s, &id, CompMode::Edge).unwrap(), k3);
     }
 
     #[test]

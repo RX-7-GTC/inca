@@ -132,6 +132,10 @@ pub enum Geo {
     MeshWire(String),
     /// cached component dots by key
     MeshPoints(String),
+    /// cached selected-edge overlay by key
+    CompLines(String),
+    /// cached selected-face overlay by key
+    CompTris(String),
     TransientTris(Vec<MeshVertex>),
     TransientLines(Vec<LineVertex>),
 }
@@ -151,6 +155,35 @@ pub struct GpuMesh {
     points: Option<wgpu::Buffer>,
     point_count: u32,
     points_key: Option<u64>,
+    /// selected-edge overlay (object space), cached by selection key
+    comp_lines: Option<wgpu::Buffer>,
+    comp_line_count: u32,
+    comp_line_key: Option<u64>,
+    /// selected-face overlay (object space), cached by selection key
+    comp_tris: Option<wgpu::Buffer>,
+    comp_tri_count: u32,
+    comp_tri_key: Option<u64>,
+}
+
+impl Default for GpuMesh {
+    fn default() -> Self {
+        GpuMesh {
+            key: 0,
+            tris: None,
+            tri_count: 0,
+            wire: None,
+            wire_count: 0,
+            points: None,
+            point_count: 0,
+            points_key: None,
+            comp_lines: None,
+            comp_line_count: 0,
+            comp_line_key: None,
+            comp_tris: None,
+            comp_tri_count: 0,
+            comp_tri_key: None,
+        }
+    }
 }
 
 struct Target {
@@ -277,8 +310,16 @@ impl Gpu {
         self.meshes.get(name).and_then(|m| m.points_key)
     }
 
+    pub fn comp_line_key(&self, name: &str) -> Option<u64> {
+        self.meshes.get(name).and_then(|m| m.comp_line_key)
+    }
+
+    pub fn comp_tri_key(&self, name: &str) -> Option<u64> {
+        self.meshes.get(name).and_then(|m| m.comp_tri_key)
+    }
+
     pub fn upload_mesh(&mut self, name: &str, key: u64, tris: &[MeshVertex], wire: &[LineVertex]) {
-        let m = GpuMesh { key, tris: self.vbuf(bytemuck::cast_slice(tris)), tri_count: tris.len() as u32, wire: self.vbuf(bytemuck::cast_slice(wire)), wire_count: wire.len() as u32, points: None, point_count: 0, points_key: None };
+        let m = GpuMesh { key, tri_count: tris.len() as u32, wire_count: wire.len() as u32, tris: self.vbuf(bytemuck::cast_slice(tris)), wire: self.vbuf(bytemuck::cast_slice(wire)), ..Default::default() };
         self.meshes.insert(name.to_string(), m);
     }
 
@@ -286,10 +327,28 @@ impl Gpu {
     /// builds the list only when the key changes).
     pub fn upload_points(&mut self, name: &str, key: u64, points: &[PointVertex]) {
         let buf = self.vbuf(bytemuck::cast_slice(points));
-        let m = self.meshes.entry(name.to_string()).or_insert_with(|| GpuMesh { key: 0, tris: None, tri_count: 0, wire: None, wire_count: 0, points: None, point_count: 0, points_key: None });
+        let m = self.meshes.entry(name.to_string()).or_default();
         m.points = buf;
         m.point_count = points.len() as u32;
         m.points_key = Some(key);
+    }
+
+    /// Upload the selected-edge overlay; skipped while `key` is unchanged.
+    pub fn upload_comp_lines(&mut self, name: &str, key: u64, lines: &[LineVertex]) {
+        let buf = self.vbuf(bytemuck::cast_slice(lines));
+        let m = self.meshes.entry(name.to_string()).or_default();
+        m.comp_lines = buf;
+        m.comp_line_count = lines.len() as u32;
+        m.comp_line_key = Some(key);
+    }
+
+    /// Upload the selected-face overlay; skipped while `key` is unchanged.
+    pub fn upload_comp_tris(&mut self, name: &str, key: u64, tris: &[MeshVertex]) {
+        let buf = self.vbuf(bytemuck::cast_slice(tris));
+        let m = self.meshes.entry(name.to_string()).or_default();
+        m.comp_tris = buf;
+        m.comp_tri_count = tris.len() as u32;
+        m.comp_tri_key = Some(key);
     }
 
     pub fn retain_meshes(&mut self, keep: &std::collections::HashSet<String>) {
@@ -461,6 +520,14 @@ impl Gpu {
                         },
                         Geo::MeshPoints(k) => match self.meshes.get(k) {
                             Some(GpuMesh { points: Some(b), point_count, .. }) => (b, 0, *point_count),
+                            _ => continue,
+                        },
+                        Geo::CompLines(k) => match self.meshes.get(k) {
+                            Some(GpuMesh { comp_lines: Some(b), comp_line_count, .. }) => (b, 0, *comp_line_count),
+                            _ => continue,
+                        },
+                        Geo::CompTris(k) => match self.meshes.get(k) {
+                            Some(GpuMesh { comp_tris: Some(b), comp_tri_count, .. }) => (b, 0, *comp_tri_count),
                             _ => continue,
                         },
                         Geo::TransientTris(_) => match &tri_buf {
