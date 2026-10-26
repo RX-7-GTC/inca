@@ -1020,7 +1020,7 @@ pub fn build_draws(
 // ------------------------------------------------------------------ picking
 
 /// Nearest object under the cursor.
-pub fn pick_object(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2) -> Option<Id> {
+pub fn pick_object(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_cache: &mut MeshCache) -> Option<Id> {
     let ray = cv.ray(pos, vp.rect);
     let mut best: Option<(f64, Id)> = None;
     for id in s.all_dag(false) {
@@ -1044,7 +1044,12 @@ pub fn pick_object(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2) -> Option<
                 if inca_core::math::ray_aabb(&lr, &bb).is_none() {
                     continue;
                 }
-                if let Some((t, _)) = m.mesh.raycast(&lr, vp.backface) {
+                // the cached BVH makes this a few microseconds even at 400k faces
+                let hit = match mesh_cache.bvh(s, &id) {
+                    Some(b) => b.raycast(&m.mesh, &lr, vp.backface),
+                    None => m.mesh.raycast(&lr, vp.backface),
+                };
+                if let Some((t, _)) = hit {
                     let wp = wm.transform_point3(lr.at(t));
                     let d = cv.depth(wp);
                     if best.as_ref().is_none_or(|b| d < b.0) {
@@ -1583,8 +1588,8 @@ mod tests {
     fn pick_object_and_components() {
         let (s, vp, cv, id) = setup();
         let c = cv.project(DVec3::ZERO, vp.rect).unwrap();
-        assert_eq!(pick_object(&s, &vp, &cv, c), Some(id.clone()));
-        assert_eq!(pick_object(&s, &vp, &cv, Pos2::new(2.0, 2.0)), None);
+        assert_eq!(pick_object(&s, &vp, &cv, c, &mut MeshCache::default()), Some(id.clone()));
+        assert_eq!(pick_object(&s, &vp, &cv, Pos2::new(2.0, 2.0), &mut MeshCache::default()), None);
         // the corner facing the camera (+x +y +z) is visible and pickable
         let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
         let vi = pm.v.iter().position(|v| v.x > 0.0 && v.y > 0.0 && v.z > 0.0).unwrap();

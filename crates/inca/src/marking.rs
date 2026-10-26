@@ -108,7 +108,7 @@ pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: eg
         app.marking = Some(menu(pos, idx, r, None, radial, vec![], now));
         return;
     }
-    let under = viewport::pick_object(&app.s, &vp, cv, pos);
+    let under = viewport::pick_object(&app.s, &vp, cv, pos, &mut app.mesh_cache);
     let target = under.clone().filter(|o| app.s.node(o).is_some_and(|n| matches!(n.shape, Shape::Mesh(_) | Shape::Curve(_)))).or_else(|| app.s.comp_mode.and_then(|_| app.s.hilite().first().cloned()));
     if let Some(t) = target {
         let is_curve = matches!(app.s.node(&t).map(|n| &n.shape), Some(Shape::Curve(_)));

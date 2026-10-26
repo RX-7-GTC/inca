@@ -731,7 +731,7 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
             None => {
                 if mode == SelMode::Replace {
                     // clicking empty space clears components; clicking another mesh hilites it
-                    if let Some(o) = viewport::pick_object(&app.s, &vp, cv, p) {
+                    if let Some(o) = viewport::pick_object(&app.s, &vp, cv, p, &mut app.mesh_cache) {
                         if !hil.contains(&o) && app.s.node(&o).is_some_and(|n| n.mesh().is_some()) {
                             app.select_names(&[o], SelMode::Replace);
                             return;
@@ -746,7 +746,7 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
         }
         return;
     }
-    let hit = viewport::pick_object(&app.s, &vp, cv, p).and_then(|h| filter_picks(app, vec![h]).pop());
+    let hit = viewport::pick_object(&app.s, &vp, cv, p, &mut app.mesh_cache).and_then(|h| filter_picks(app, vec![h]).pop());
     match hit {
         Some(id) => app.select_names(&[id], mode),
         None => {
