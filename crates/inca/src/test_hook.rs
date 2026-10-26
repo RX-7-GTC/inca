@@ -3,31 +3,65 @@
 //! `INCA_TEST=script.mel INCA_SHOT=out.png inca` runs the MEL script once the window is up,
 //! saves a screenshot of the whole window and exits. With `INCA_SHOT_WAIT=<file>` it stays open
 //! (for driving it with xdotool) and takes the screenshot once that file appears.
+//!
+//! `INCA_TEST2=script.mel INCA_TEST2_FRAME=<n>` runs a second script later (e.g. a new
+//! selection), to check that cached overlays follow interactive changes.
+//! `INCA_TEST_FPS=1` prints frame-time statistics when the screenshot is taken.
 
 use crate::app::IncaApp;
 
+/// Frame timing for `INCA_TEST_FPS=1` (temporary diagnostics).
+static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+static DTS: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
+
+/// Run a test script: MEL lines plus `//!ui <action>` lines (e.g. `//!ui layoutFour`).
+fn run_script(app: &mut IncaApp, src: &str) {
+    let (ui_lines, mel): (Vec<&str>, Vec<&str>) = src.lines().partition(|l| l.starts_with("//!ui "));
+    let mel = mel.join("\n");
+    if let Err(e) = app.run_mel("test script", &mel) {
+        eprintln!("INCA_TEST error: {e}");
+    }
+    for l in ui_lines {
+        let a = l.trim_start_matches("//!ui ").trim();
+        match a.strip_prefix("workspace ") {
+            Some(w) => crate::workspace::apply(app, w),
+            None => app.action(a),
+        }
+    }
+}
+
 pub fn step(app: &mut IncaApp, ctx: &egui::Context) {
+    if std::env::var_os("INCA_TEST_FPS").is_some() {
+        let now = std::time::Instant::now();
+        let mut l = LAST.lock().unwrap();
+        if let Some(prev) = *l {
+            DTS.lock().unwrap().push(now.duration_since(prev).as_secs_f32() * 1000.0);
+        }
+        *l = Some(now);
+    }
     let Some(t) = app.test.as_mut() else { return };
     t.frame += 1;
     ctx.request_repaint();
     if t.frame == 3 {
         if let Some(src) = t.script.take() {
-            // lines starting with "//!ui " are app actions (e.g. //!ui layoutFour)
-            let (ui_lines, mel): (Vec<&str>, Vec<&str>) = src.lines().partition(|l| l.starts_with("//!ui "));
-            let mel = mel.join("\n");
-            if let Err(e) = app.run_mel("test script", &mel) {
-                eprintln!("INCA_TEST error: {e}");
-            }
-            for l in ui_lines {
-                let a = l.trim_start_matches("//!ui ").trim();
-                match a.strip_prefix("workspace ") {
-                    Some(w) => crate::workspace::apply(app, w),
-                    None => app.action(a),
-                }
+            run_script(app, &src);
+        }
+    }
+    let t = app.test.as_mut().unwrap();
+    if let Ok(path) = std::env::var("INCA_TEST2") {
+        let at = std::env::var("INCA_TEST2_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        if t.frame == at {
+            match std::fs::read_to_string(&path) {
+                Ok(src) => run_script(app, &src),
+                Err(e) => eprintln!("INCA_TEST2 error: {e}"),
             }
         }
     }
     let t = app.test.as_mut().unwrap();
+    // skip window setup / scene load / first upload when reporting frame times
+    if t.frame == 10 {
+        DTS.lock().unwrap().clear();
+    }
     let wait = std::env::var("INCA_SHOT_WAIT").ok();
     let shot_frame: u32 = match &wait {
         Some(f) if std::path::Path::new(f).exists() => {
@@ -51,6 +85,22 @@ pub fn step(app: &mut IncaApp, ctx: &egui::Context) {
         })
     });
     if let (Some(img), Some(path)) = (shot, t.shot.clone()) {
+        if std::env::var_os("INCA_TEST_FPS").is_some() {
+            let dts = DTS.lock().unwrap();
+            if !dts.is_empty() {
+                let mut v = dts.clone();
+                v.sort_by(|a, b| a.total_cmp(b));
+                let sum: f32 = v.iter().sum();
+                println!(
+                    "frames {} avg {:.1} ms  p50 {:.1}  p95 {:.1}  max {:.1}",
+                    v.len(),
+                    sum / v.len() as f32,
+                    v[v.len() / 2],
+                    v[(v.len() * 95) / 100],
+                    v[v.len() - 1]
+                );
+            }
+        }
         let [w, h] = img.size;
         let px: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
         match image::save_buffer(&path, &px, w as u32, h as u32, image::ColorType::Rgba8) {
