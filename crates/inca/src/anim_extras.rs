@@ -113,8 +113,8 @@ pub fn draws(viz: &AnimViz) -> Vec<DrawCmd> {
     for tr in &viz.trails {
         let mut l = vec![];
         for w in tr.windows(2) {
-            l.push(LineVertex { pos: w[0].as_vec3().to_array(), color: col });
-            l.push(LineVertex { pos: w[1].as_vec3().to_array(), color: col });
+            l.push(LineVertex { pos: w[0].as_vec3().to_array(), color: col, ..Default::default() });
+            l.push(LineVertex { pos: w[1].as_vec3().to_array(), color: col, ..Default::default() });
         }
         d.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(l), u: DrawUniform::new(Mat4::IDENTITY) });
     }

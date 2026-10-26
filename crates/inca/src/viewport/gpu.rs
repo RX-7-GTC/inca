@@ -18,11 +18,16 @@ pub struct MeshVertex {
     pub color: [f32; 3],
 }
 
+/// One line endpoint. `normal`/`normal_b` are the normals of up to two faces sharing the edge
+/// (the JS `cullA`/`cullB`), used to hide wires of faces turned away from the camera; zeros mean
+/// never culled.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
 pub struct LineVertex {
     pub pos: [f32; 3],
     pub color: [f32; 4],
+    pub normal: [f32; 3],
+    pub normal_b: [f32; 3],
 }
 
 /// One component-mode dot; drawn as a screen-space quad (instanced).
@@ -95,6 +100,11 @@ impl DrawUniform {
     /// Half-size in pixels of component dots (see `vs_point`).
     pub fn point_size(mut self, half: f32) -> Self {
         self.params2[1] = half;
+        self
+    }
+    /// Cull line endpoints whose normals face away from the camera (see `vs_line`).
+    pub fn cull_wire(mut self, on: bool) -> Self {
+        self.params2[2] = if on { 1.0 } else { 0.0 };
         self
     }
 }
@@ -201,7 +211,7 @@ impl Gpu {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl)], immediate_size: 0 });
         let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
-        let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+        let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
         let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };
         let depth = |write: bool, compare: wgpu::CompareFunction| {

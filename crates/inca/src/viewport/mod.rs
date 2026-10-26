@@ -423,14 +423,20 @@ pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [
     match &pm.display_edges {
         Some(de) => {
             for e in de {
-                wire.push(LineVertex { pos: to_f32(pm.v[e[0] as usize]), color: col });
-                wire.push(LineVertex { pos: to_f32(pm.v[e[1] as usize]), color: col });
+                wire.push(LineVertex { pos: to_f32(pm.v[e[0] as usize]), color: col, ..Default::default() });
+                wire.push(LineVertex { pos: to_f32(pm.v[e[1] as usize]), color: col, ..Default::default() });
             }
         }
         None => {
-            for (a, b) in pm.topo().edges {
-                wire.push(LineVertex { pos: to_f32(pm.v[a as usize]), color: col });
-                wire.push(LineVertex { pos: to_f32(pm.v[b as usize]), color: col });
+            // each edge carries the normals of its (up to two) faces so the shader can hide
+            // wires of back-facing faces, like the JS `cullA` / `cullB`
+            let topo = pm.topo();
+            let fnorm: Vec<DVec3> = (0..pm.f.len()).map(|i| pm.face_normal(i)).collect();
+            for &(a, b) in &topo.edges {
+                let (na, nb) = edge_normals(&topo, &fnorm, a, b);
+                for &v in &[a, b] {
+                    wire.push(LineVertex { pos: to_f32(pm.v[v as usize]), color: col, normal: to_f32(na), normal_b: to_f32(nb) });
+                }
             }
         }
     }
@@ -461,16 +467,34 @@ pub fn grid_lines(cv: &CamView, cfg: (f64, f64, i32)) -> Vec<LineVertex> {
         let c = if i == 0 { axis } else if i % major.max(1) == 0 { maj } else { sub };
         let k = i as f64 * step;
         for (a, b) in [(u * k - v * size, u * k + v * size), (v * k - u * size, v * k + u * size)] {
-            out.push(LineVertex { pos: to_f32(a), color: c });
-            out.push(LineVertex { pos: to_f32(b), color: c });
+            out.push(LineVertex { pos: to_f32(a), color: c, ..Default::default() });
+            out.push(LineVertex { pos: to_f32(b), color: c, ..Default::default() });
         }
     }
     out
 }
 
 fn push_line(out: &mut Vec<LineVertex>, a: DVec3, b: DVec3, c: [f32; 4]) {
-    out.push(LineVertex { pos: to_f32(a), color: c });
-    out.push(LineVertex { pos: to_f32(b), color: c });
+    out.push(LineVertex { pos: to_f32(a), color: c, ..Default::default() });
+    out.push(LineVertex { pos: to_f32(b), color: c, ..Default::default() });
+}
+
+/// A line that participates in backface culling: `na`/`nb` are the normals of the (up to two)
+/// faces sharing the edge, as the JS `cullA`/`cullB`.
+fn push_line_n(out: &mut Vec<LineVertex>, a: DVec3, b: DVec3, c: [f32; 4], na: DVec3, nb: DVec3) {
+    out.push(LineVertex { pos: to_f32(a), color: c, normal: to_f32(na), normal_b: to_f32(nb) });
+    out.push(LineVertex { pos: to_f32(b), color: c, normal: to_f32(na), normal_b: to_f32(nb) });
+}
+
+/// The (up to two) face normals of one edge of a mesh, zero-filled when absent. Matches the
+/// JS `edgeCullNormals`: a single face duplicates its normal, more than two mean never culled.
+fn edge_normals(topo: &Topo, fnorm: &[DVec3], a: u32, b: u32) -> (DVec3, DVec3) {
+    let fs = topo.edge(a, b).map_or(&[][..], |ei| topo.edge_faces[ei].as_slice());
+    match fs {
+        [f] => (fnorm[*f], fnorm[*f]),
+        [f, g] => (fnorm[*f], fnorm[*g]),
+        _ => (DVec3::ZERO, DVec3::ZERO),
+    }
 }
 
 fn circle(out: &mut Vec<LineVertex>, c: DVec3, u: DVec3, v: DVec3, r: f64, col: [f32; 4]) {
@@ -885,27 +909,13 @@ pub fn build_draws(
                     } else {
                         [0.0, 0.0, 0.0, 1.0]
                     };
-                    if vp.backface {
-                        // backface culling: only edges of faces turned towards the camera
-                        let pm = &m.mesh;
-                        let wmd = s.world_matrix(&id);
-                        let facing: Vec<bool> = (0..pm.f.len()).map(|f| {
-                            let n = wmd.inverse().transpose().transform_vector3(pm.face_normal(f));
-                            let to_cam = if cv.ortho { -cv.fwd } else { cv.eye - wmd.transform_point3(pm.face_center(f)) };
-                            n.dot(to_cam) > 0.0
-                        }).collect();
-                        if let Some(topo) = mesh_cache.topo(s, &id) {
-                            let mut l = vec![];
-                            for (e, &(a, b)) in topo.edges.iter().enumerate() {
-                                if topo.edge_faces[e].iter().any(|&f| facing[f]) {
-                                    push_line(&mut l, pm.v[a as usize], pm.v[b as usize], c);
-                                }
-                            }
-                            draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(l), u: DrawUniform::new(wm).bias(0.00012) });
-                        }
-                    } else {
-                        draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::MeshWire(id.clone()), u: DrawUniform::new(wm).tint([c[0], c[1], c[2]], 1.0).bias(0.00012) });
-                    }
+                    // wires of back-facing faces are culled in the shader from the cached
+                    // per-edge normals (the JS `cullable`), so no per-frame Edge rebuild
+                    draws.push(DrawCmd {
+                        pass: Pass::Lines,
+                        geo: Geo::MeshWire(id.clone()),
+                        u: DrawUniform::new(wm).tint([c[0], c[1], c[2]], 1.0).bias(0.00012).cull_wire(vp.backface),
+                    });
                 }
                 if in_comp && s.comp_mode == Some(CompMode::Vertex) {
                     // vertex dots live on the GPU (cached by geometry + selection): drawing them
@@ -937,13 +947,16 @@ pub fn build_draws(
                     let cs = s.comp_sel(&id);
                     if !cs.e.is_empty() {
                         let pm = &m.mesh;
+                        let topo = mesh_cache.topo(s, &id);
+                        let fnorm: Vec<DVec3> = topo.as_ref().map_or_else(Vec::new, |_| (0..pm.f.len()).map(|f| pm.face_normal(f)).collect());
                         let mut l = vec![];
                         for &(a, b) in &cs.e {
                             if (a as usize) < pm.v.len() && (b as usize) < pm.v.len() {
-                                push_line(&mut l, pm.v[a as usize], pm.v[b as usize], [1.0, 0.54, 0.12, 1.0]);
+                                let (na, nb) = topo.as_ref().map_or((DVec3::ZERO, DVec3::ZERO), |t| edge_normals(t, &fnorm, a, b));
+                                push_line_n(&mut l, pm.v[a as usize], pm.v[b as usize], [1.0, 0.54, 0.12, 1.0], na, nb);
                             }
                         }
-                        draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(l), u: DrawUniform::new(wm).bias(0.0004) });
+                        draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(l), u: DrawUniform::new(wm).bias(0.0004).cull_wire(vp.backface) });
                     }
                 }
             }

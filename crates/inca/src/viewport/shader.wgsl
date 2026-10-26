@@ -201,6 +201,8 @@ fn fs_point(i: PointOut) -> @location(0) vec4<f32> {
 struct LineIn {
     @location(0) pos: vec3<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) normal: vec3<f32>,
+    @location(3) normal_b: vec3<f32>,
 };
 struct LineOut {
     @builtin(position) clip: vec4<f32>,
@@ -210,7 +212,18 @@ struct LineOut {
 @vertex
 fn vs_line(v: LineIn) -> LineOut {
     var o: LineOut;
-    o.clip = frame.view_proj * draw.model * vec4(v.pos, 1.0);
+    let world = draw.model * vec4(v.pos, 1.0);
+    o.clip = frame.view_proj * world;
+    // wires belonging only to faces turned away from the camera are skipped (the JS `cullable`)
+    if (draw.params2.z > 0.5 && dot(v.normal, v.normal) > 0.0) {
+        let d = frame.cam_pos.xyz - world.xyz;
+        let to_cam = select(normalize(d), -frame.cam_dir.xyz, frame.cam_pos.w > 0.5);
+        let na = (draw.normal * vec4(v.normal, 0.0)).xyz;
+        let nb = (draw.normal * vec4(v.normal_b, 0.0)).xyz;
+        if (dot(na, to_cam) <= 0.0 && dot(nb, to_cam) <= 0.0) {
+            o.clip = vec4(0.0, 0.0, 2.0, 1.0);
+        }
+    }
     o.clip.z = o.clip.z - draw.params.z * o.clip.w;
     o.color = mix(v.color, vec4(draw.tint.rgb, v.color.a), draw.tint.a);
     return o;
