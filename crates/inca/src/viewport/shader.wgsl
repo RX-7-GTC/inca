@@ -22,9 +22,10 @@ struct Frame {
 struct Draw {
     model: mat4x4<f32>,
     normal: mat4x4<f32>,
+    mvp: mat4x4<f32>,    // view_proj * model, filled per viewport
     tint: vec4<f32>,     // rgb, a = mix amount
     params: vec4<f32>,   // x unlit, y alpha, z depth bias, w specular
-    params2: vec4<f32>,  // x roughness
+    params2: vec4<f32>,  // x roughness, y dot half-size, z cull wires/dots
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -170,6 +171,7 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
 struct PointIn {
     @location(0) pos: vec3<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) normal: vec3<f32>,
 };
 struct PointOut {
     @builtin(position) clip: vec4<f32>,
@@ -184,13 +186,22 @@ fn vs_point(v: PointIn, @builtin(vertex_index) vi: u32) -> PointOut {
         vec2(-1.0, 1.0), vec2(1.0, -1.0), vec2(1.0, 1.0),
     );
     var o: PointOut;
-    var clip = frame.view_proj * draw.model * vec4(v.pos, 1.0);
+    o.color = v.color;
+    var clip = draw.mvp * vec4(v.pos, 1.0);
+    // dots of faces turned away from the camera are skipped (the JS face-centre `dotMat`)
+    if (draw.params2.z > 0.5 && dot(v.normal, v.normal) > 0.0) {
+        let world = draw.model * vec4(v.pos, 1.0);
+        let d = frame.cam_pos.xyz - world.xyz;
+        let to_cam = select(normalize(d), -frame.cam_dir.xyz, frame.cam_pos.w > 0.5);
+        if (dot((draw.normal * vec4(v.normal, 0.0)).xyz, to_cam) <= 0.0) {
+            clip = vec4(0.0, 0.0, 2.0, 1.0);
+        }
+    }
     let size = max(frame.post.zw, vec2(1.0));
     let off = corner[vi] * vec2(draw.params2.y * 2.0 / size.x, draw.params2.y * 2.0 / size.y) * clip.w;
     clip = clip + vec4(off, 0.0, 0.0);
     clip.z = clip.z - draw.params.z * clip.w;
     o.clip = clip;
-    o.color = v.color;
     return o;
 }
 
@@ -212,19 +223,20 @@ struct LineOut {
 @vertex
 fn vs_line(v: LineIn) -> LineOut {
     var o: LineOut;
-    let world = draw.model * vec4(v.pos, 1.0);
-    o.clip = frame.view_proj * world;
+    var clip = draw.mvp * vec4(v.pos, 1.0);
     // wires belonging only to faces turned away from the camera are skipped (the JS `cullable`)
     if (draw.params2.z > 0.5 && dot(v.normal, v.normal) > 0.0) {
+        let world = draw.model * vec4(v.pos, 1.0);
         let d = frame.cam_pos.xyz - world.xyz;
         let to_cam = select(normalize(d), -frame.cam_dir.xyz, frame.cam_pos.w > 0.5);
         let na = (draw.normal * vec4(v.normal, 0.0)).xyz;
         let nb = (draw.normal * vec4(v.normal_b, 0.0)).xyz;
         if (dot(na, to_cam) <= 0.0 && dot(nb, to_cam) <= 0.0) {
-            o.clip = vec4(0.0, 0.0, 2.0, 1.0);
+            clip = vec4(0.0, 0.0, 2.0, 1.0);
         }
     }
-    o.clip.z = o.clip.z - draw.params.z * o.clip.w;
+    clip.z = clip.z - draw.params.z * clip.w;
+    o.clip = clip;
     o.color = mix(v.color, vec4(draw.tint.rgb, v.color.a), draw.tint.a);
     return o;
 }

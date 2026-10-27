@@ -23,6 +23,8 @@ pub const C_TEMPLATE_SEL: [f32; 4] = [1.0, 0.6, 0.6, 1.0];
 pub const C_ICON: [f32; 4] = [0.063, 0.063, 0.063, 1.0];
 pub const C_CURVE: [f32; 4] = [0.05, 0.05, 0.4, 1.0];
 pub const C_FACE_SEL: [f32; 3] = [1.0, 0.54, 0.12];
+/// unselected face-centre dots in face mode (the JS `COMP.dot`)
+pub const C_DOT: [f32; 3] = [74.0 / 255.0, 138.0 / 255.0, 214.0 / 255.0];
 /// objects driven by the selection (JS COLORS.affected)
 pub const C_AFFECTED: [f32; 4] = [0.78, 0.235, 0.82, 1.0];
 
@@ -715,18 +717,30 @@ pub fn mesh_key(s: &Scene, id: &str) -> u64 {
     h.finish()
 }
 
-/// Cache key for a mesh's component dots: geometry, vertex selection and soft-selection
-/// settings. Deliberately not `Scene::rev`: camera moves, object transforms and animation
-/// bump that every frame but leave the dots (which live in object space) unchanged.
-fn points_key(s: &Scene, id: &str, soft: Option<(f64, bool)>) -> u64 {
+/// Cache key for a mesh's component dots: mode, geometry, the relevant selection and
+/// soft-selection settings. Deliberately not `Scene::rev`: camera moves, object transforms and
+/// animation bump that every frame but leave the dots (which live in object space) unchanged.
+fn points_key(s: &Scene, id: &str, mode: CompMode, soft: Option<(f64, bool)>) -> u64 {
     let mut h = DefaultHasher::new();
     if let Some(n) = s.node(id) {
         n.rev.hash(&mut h);
     }
+    mode.hash(&mut h);
     if let Some(cs) = s.comp.get(id) {
-        cs.v.len().hash(&mut h);
-        for v in &cs.v {
-            v.hash(&mut h);
+        match mode {
+            CompMode::Vertex => {
+                cs.v.len().hash(&mut h);
+                for v in &cs.v {
+                    v.hash(&mut h);
+                }
+            }
+            CompMode::Face => {
+                cs.f.len().hash(&mut h);
+                for f in &cs.f {
+                    f.hash(&mut h);
+                }
+            }
+            CompMode::Edge => {}
         }
     }
     soft.map(|(r, lin)| (r.to_bits(), lin)).hash(&mut h);
@@ -752,7 +766,23 @@ fn component_points(s: &Scene, id: &str, soft: Option<(f64, bool)>) -> Vec<Point
         } else {
             [194.0 / 255.0, 58.0 / 255.0, 214.0 / 255.0, 1.0]
         };
-        pts.push(PointVertex { pos: to_f32(*p), color });
+        pts.push(PointVertex { pos: to_f32(*p), color, normal: [0.0; 3] });
+    }
+    pts
+}
+
+/// One dot per face centre, as the JS face-mode overlay: selected faces orange, the rest blue.
+/// The face normal lets the shader cull dots of back-facing faces.
+fn face_center_points(s: &Scene, id: &str, geo: &FaceGeo) -> Vec<PointVertex> {
+    let cs = s.comp_sel(id);
+    let mut pts = Vec::with_capacity(geo.centers.len());
+    for (fi, (&c, &n)) in geo.centers.iter().zip(&geo.normals).enumerate() {
+        let color = if cs.f.contains(&fi) {
+            [C_FACE_SEL[0], C_FACE_SEL[1], C_FACE_SEL[2], 1.0]
+        } else {
+            [C_DOT[0], C_DOT[1], C_DOT[2], 1.0]
+        };
+        pts.push(PointVertex { pos: to_f32(c), color, normal: to_f32(n.normalize_or_zero()) });
     }
     pts
 }
@@ -917,15 +947,31 @@ pub fn build_draws(
                         u: DrawUniform::new(wm).tint([c[0], c[1], c[2]], 1.0).bias(0.00012).cull_wire(vp.backface),
                     });
                 }
-                if in_comp && s.comp_mode == Some(CompMode::Vertex) {
-                    // vertex dots live on the GPU (cached by geometry + selection): drawing them
-                    // with egui every frame is what made component mode unusable on heavy meshes
-                    let key = points_key(s, &id, soft);
-                    if g.point_key(&id) != Some(key) {
-                        let pts = component_points(s, &id, soft);
-                        g.upload_points(&id, key, &pts);
+                if in_comp {
+                    match s.comp_mode {
+                        Some(CompMode::Vertex) => {
+                            // dots live on the GPU (cached by geometry + selection): drawing them
+                            // with egui every frame is what made component mode unusable on heavy meshes
+                            let key = points_key(s, &id, CompMode::Vertex, soft);
+                            if g.point_key(&id) != Some(key) {
+                                let pts = component_points(s, &id, soft);
+                                g.upload_points(&id, key, &pts);
+                            }
+                            draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(3.0).bias(0.0003).cull_wire(vp.backface) });
+                        }
+                        Some(CompMode::Face) => {
+                            // the JS face mode shows a dot on every face centre, not just the selection
+                            if let Some(geo) = mesh_cache.faces(s, &id) {
+                                let key = points_key(s, &id, CompMode::Face, soft);
+                                if g.point_key(&id) != Some(key) {
+                                    let pts = face_center_points(s, &id, &geo);
+                                    g.upload_points(&id, key, &pts);
+                                }
+                                draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(2.0).bias(0.0003).cull_wire(vp.backface) });
+                            }
+                        }
+                        _ => {}
                     }
-                    draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(3.0).bias(0.0003) });
                 }
                 if in_comp && s.comp_mode == Some(CompMode::Face) {
                     if s.comp.get(&id).is_some_and(|c| !c.f.is_empty()) {
@@ -1739,6 +1785,26 @@ mod tests {
         let far = (0..pm.v.len()).max_by(|&a, &b| depth(a).total_cmp(&depth(b))).unwrap();
         let fq = cv.project(pm.v[far], vp.rect).unwrap();
         assert_ne!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, fq, &mut cache), Some(Comp::V(far as u32)));
+    }
+
+    #[test]
+    fn face_center_dots_follow_selection() {
+        let (mut s, _vp, _cv, id) = setup();
+        let mut cache = MeshCache::default();
+        let geo = cache.faces(&s, &id).unwrap();
+        let pts = face_center_points(&s, &id, &geo);
+        assert_eq!(pts.len(), geo.centers.len());
+        for (p, c) in pts.iter().zip(&geo.centers) {
+            assert_eq!(p.pos, to_f32(*c));
+            assert_eq!(p.color, [C_DOT[0], C_DOT[1], C_DOT[2], 1.0]);
+            // face normals drive the shader's backface culling of the dots
+            assert!(p.normal.iter().any(|x| *x != 0.0));
+        }
+        // selecting a face turns only its dot orange
+        s.comp.entry(id.clone()).or_default().f.insert(0);
+        let pts = face_center_points(&s, &id, &geo);
+        assert_eq!(pts[0].color, [C_FACE_SEL[0], C_FACE_SEL[1], C_FACE_SEL[2], 1.0]);
+        assert_eq!(pts[1].color, [C_DOT[0], C_DOT[1], C_DOT[2], 1.0]);
     }
 
     #[test]

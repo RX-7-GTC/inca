@@ -30,12 +30,14 @@ pub struct LineVertex {
     pub normal_b: [f32; 3],
 }
 
-/// One component-mode dot; drawn as a screen-space quad (instanced).
+/// One component-mode dot; drawn as a screen-space quad (instanced). `normal` is the owning
+/// face's normal for culling (zero means never culled, e.g. vertex dots).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
 pub struct PointVertex {
     pub pos: [f32; 3],
     pub color: [f32; 4],
+    pub normal: [f32; 3],
 }
 
 #[repr(C)]
@@ -66,6 +68,9 @@ pub struct FrameUniform {
 pub struct DrawUniform {
     pub model: [[f32; 4]; 4],
     pub normal: [[f32; 4]; 4],
+    /// `view_proj * model`, filled per viewport when the draw list is uploaded: lines and dots
+    /// would otherwise multiply two matrices for every vertex.
+    pub mvp: [[f32; 4]; 4],
     pub tint: [f32; 4],
     pub params: [f32; 4],
     pub params2: [f32; 4],
@@ -74,7 +79,7 @@ pub struct DrawUniform {
 impl DrawUniform {
     pub fn new(model: glam::Mat4) -> Self {
         let n = model.inverse().transpose();
-        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 0.0, 0.0], params2: [0.5, 0.0, 0.0, 0.0] }
+        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), mvp: model.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 0.0, 0.0], params2: [0.5, 0.0, 0.0, 0.0] }
     }
     pub fn tint(mut self, c: [f32; 3], a: f32) -> Self {
         self.tint = [c[0], c[1], c[2], a];
@@ -245,7 +250,7 @@ impl Gpu {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl)], immediate_size: 0 });
         let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
-        let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+        let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };
         let depth = |write: bool, compare: wgpu::CompareFunction| {
             Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(write), depth_compare: Some(compare), stencil: Default::default(), bias: Default::default() })
@@ -449,8 +454,11 @@ impl Gpu {
         let n = draws.len() as u64;
         self.queue.write_buffer(&t.frame_buf, 0, bytemuck::bytes_of(frame));
         let mut slots = vec![0u8; (n.max(1) * DRAW_SLOT) as usize];
+        let vp = glam::Mat4::from_cols_array_2d(&frame.view_proj);
         for (i, d) in draws.iter().enumerate() {
-            let b = bytemuck::bytes_of(&d.u);
+            let mut u = d.u;
+            u.mvp = (vp * glam::Mat4::from_cols_array_2d(&u.model)).to_cols_array_2d();
+            let b = bytemuck::bytes_of(&u);
             slots[i * DRAW_SLOT as usize..i * DRAW_SLOT as usize + b.len()].copy_from_slice(b);
         }
         self.queue.write_buffer(&self.draw_buf, 0, &slots);
