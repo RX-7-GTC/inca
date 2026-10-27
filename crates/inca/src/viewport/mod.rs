@@ -1140,10 +1140,15 @@ pub fn pick_object(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_cache
     best.map(|b| b.1)
 }
 
-pub fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+/// Distance from `p` to the segment `ab` and the closest parameter along it.
+fn seg_closest(p: Pos2, a: Pos2, b: Pos2) -> (f32, f32) {
     let ab = b - a;
     let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
-    (a + ab * t).distance(p)
+    ((a + ab * t).distance(p), t)
+}
+
+pub fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    seg_closest(p, a, b).0
 }
 
 /// Objects inside a marquee (any projected vertex or the centre inside).
@@ -1211,24 +1216,50 @@ pub enum Comp {
     F(usize),
 }
 
-/// Is a world point visible (not hidden behind its own mesh)?
-fn visible_point(pm: &PolyMesh, wm: &DMat4, cv: &CamView, p: DVec3, bvh: Option<&inca_core::mesh::TriBvh>) -> bool {
-    let wp = wm.transform_point3(p);
+/// A mesh that can hide a component: the JS `occluded` checks every visible mesh, so a vertex
+/// behind another object must not be pickable either.
+struct Occluder<'a> {
+    pm: &'a PolyMesh,
+    wm: DMat4,
+    bvh: Option<Arc<inca_core::mesh::TriBvh>>,
+}
+
+/// All visible meshes, with their cached BVHs; rebuilt per pick (the list is short and the
+/// BVHs are reused).
+fn scene_occluders<'a>(s: &'a Scene, mesh_cache: &mut MeshCache) -> Vec<Occluder<'a>> {
+    let mut out = vec![];
+    for id in s.all_dag(false) {
+        if !s.is_visible(&id) {
+            continue;
+        }
+        let Some(n) = s.node(&id) else { continue };
+        let Some(m) = n.mesh() else { continue };
+        let bvh = mesh_cache.bvh(s, &id);
+        out.push(Occluder { pm: &m.mesh, wm: s.world_matrix(&id), bvh });
+    }
+    out
+}
+
+/// Is a world point visible (not hidden behind any visible mesh)?
+fn visible_point(occluders: &[Occluder], cv: &CamView, wp: DVec3) -> bool {
     let to = if cv.ortho { -cv.fwd } else { (cv.eye - wp).normalize() };
     let r = Ray { origin: wp + to * 1e-4 * (1.0 + wp.length()), dir: to };
-    let lr = r.transformed(&wm.inverse());
-    let hit = match bvh {
-        Some(b) => b.raycast(pm, &lr, false),
-        None => pm.raycast(&lr, false),
-    };
-    match hit {
-        Some((t, _)) => {
-            let hit = wm.transform_point3(lr.at(t));
-            let dist = if cv.ortho { f64::INFINITY } else { (cv.eye - wp).length() };
-            (hit - wp).length() > dist - 1e-6
+    let dist = if cv.ortho { f64::INFINITY } else { (cv.eye - wp).length() };
+    for o in occluders {
+        let lr = r.transformed(&o.wm.inverse());
+        let hit = match &o.bvh {
+            Some(b) => b.raycast(o.pm, &lr, false),
+            None => o.pm.raycast(&lr, false),
+        };
+        if let Some((t, _)) = hit {
+            let hit = o.wm.transform_point3(lr.at(t));
+            // a hit at or beyond the point is the far side of a mesh, which cannot hide it
+            if (hit - wp).length() < dist - 1e-6 {
+                return false;
+            }
         }
-        None => true,
     }
+    true
 }
 
 /// Per-face normals and centres, computed once per revision. Besides the front-facing test
@@ -1382,38 +1413,40 @@ impl MeshCache {
     }
 }
 
-/// Meshes small enough for the per-component exact occlusion test (one raycast per component).
-fn exact_vis(pm: &PolyMesh) -> bool {
-    pm.f.len() <= 2500
+/// The JS marquee skips per-component raycasts above 4000 vertices (its `many`).
+fn marquee_exact(pm: &PolyMesh) -> bool {
+    pm.v.len() <= 4000
 }
 
-/// Component visibility: exact raycasts on small meshes, front-facing tests when backface
-/// culling is on (as the JS `frontFaces`, which is also a no-op when culling is off).
+/// Component visibility: exact raycasts where the JS does them, plus the front-facing test
+/// when backface culling is on (the JS `frontFaces`, which is a no-op when culling is off).
 pub struct Vis<'a> {
     pm: &'a PolyMesh,
     wm: DMat4,
     cv: &'a CamView,
     exact: bool,
-    /// Front-facing flags from `MeshCache::facing`, `None` when backface culling is off.
+    /// Front-facing flags from `MeshCache::facing`, `None` when the test does not apply.
     facing: Option<Arc<Vec<bool>>>,
     topo: Option<Arc<Topo>>,
-    bvh: Option<Arc<inca_core::mesh::TriBvh>>,
+    occluders: &'a [Occluder<'a>],
 }
 
 impl<'a> Vis<'a> {
-    /// `facing` and its `topo` are only needed for the front-facing test (backface culling
-    /// on), `bvh` only for the exact occlusion test on meshes small enough for it.
+    /// `facing` and its `topo` are only needed for the front-facing test, `occluders` only
+    /// when `exact` is set.
     pub fn new(
         pm: &'a PolyMesh,
         wm: DMat4,
         cv: &'a CamView,
-        xray: bool,
+        exact: bool,
         facing: Option<Arc<Vec<bool>>>,
         topo: Option<Arc<Topo>>,
-        bvh: Option<Arc<inca_core::mesh::TriBvh>>,
+        occluders: &'a [Occluder<'a>],
     ) -> Self {
-        let exact = !xray && exact_vis(pm);
-        Vis { pm, wm, cv, exact, facing, topo, bvh }
+        Vis { pm, wm, cv, exact, facing, topo, occluders }
+    }
+    fn visible(&self, p: DVec3) -> bool {
+        !self.exact || visible_point(self.occluders, self.cv, self.wm.transform_point3(p))
     }
     pub fn vertex(&self, v: u32) -> bool {
         if let (Some(facing), Some(topo)) = (&self.facing, &self.topo) {
@@ -1422,21 +1455,27 @@ impl<'a> Vis<'a> {
                 return false;
             }
         }
-        !self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.v[v as usize], self.bvh.as_deref())
+        self.visible(self.pm.v[v as usize])
     }
     /// `e` is the index in `topo.edges`; doing the front-facing lookup by index avoids a
     /// hash probe per edge, which added ~150 ms to a 798k-edge marquee.
     pub fn edge_idx(&self, e: usize, a: u32, b: u32) -> bool {
+        self.edge_idx_at(e, a, b, 0.5)
+    }
+    /// Visibility at parameter `t` along the edge, as the JS click picker uses the point
+    /// closest to the cursor rather than the midpoint.
+    pub fn edge_idx_at(&self, e: usize, a: u32, b: u32, t: f64) -> bool {
         if let Some(facing) = &self.facing {
             let Some(topo) = &self.topo else { return false };
             if !topo.edge_faces[e].iter().any(|&f| facing[f]) {
                 return false;
             }
         }
-        !self.exact || visible_point(self.pm, &self.wm, self.cv, (self.pm.v[a as usize] + self.pm.v[b as usize]) * 0.5, self.bvh.as_deref())
+        let (pa, pb) = (self.pm.v[a as usize], self.pm.v[b as usize]);
+        self.visible(pa + (pb - pa) * t)
     }
     pub fn face(&self, f: usize) -> bool {
-        self.facing.as_ref().is_none_or(|x| x[f]) && (!self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.face_center(f), self.bvh.as_deref()))
+        self.facing.as_ref().is_none_or(|x| x[f]) && self.visible(self.pm.face_center(f))
     }
 }
 
@@ -1444,17 +1483,19 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
     let n = s.node(id)?;
     let pm = &n.mesh()?.mesh;
     let wm = s.world_matrix(id);
+    // the JS `occluded` returns false in x-ray and wireframe
+    let opaque = !vp.xray && vp.shade != ShadeMode::Wire;
     match mode {
         CompMode::Vertex => {
-            let facing = if vp.backface && !vp.xray { mesh_cache.facing(s, id, wm, cv) } else { None };
+            let facing = if vp.backface { mesh_cache.facing(s, id, wm, cv) } else { None };
             let topo = if facing.is_some() { mesh_cache.topo(s, id) } else { None };
-            let bvh = if exact_vis(pm) { mesh_cache.bvh(s, id) } else { None };
-            let vis = Vis::new(pm, wm, cv, vp.xray, facing, topo, bvh);
+            let occ = if opaque { scene_occluders(s, mesh_cache) } else { vec![] };
+            let vis = Vis::new(pm, wm, cv, opaque, facing, topo, &occ);
             let mut best: Option<(f32, u32)> = None;
             for (i, p) in pm.v.iter().enumerate() {
                 if let Some(q) = cv.project(wm.transform_point3(*p), vp.rect) {
                     let d = q.distance(pos);
-                    if d < 10.0 && best.is_none_or(|b| d < b.0) && vis.vertex(i as u32) {
+                    if d < 12.0 && best.is_none_or(|b| d < b.0) && vis.vertex(i as u32) {
                         best = Some((d, i as u32));
                     }
                 }
@@ -1462,16 +1503,16 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
             best.map(|b| Comp::V(b.1))
         }
         CompMode::Edge => {
-            let facing = if vp.backface && !vp.xray { mesh_cache.facing(s, id, wm, cv) } else { None };
+            let facing = if vp.backface { mesh_cache.facing(s, id, wm, cv) } else { None };
             let topo = mesh_cache.topo(s, id)?;
-            let bvh = if exact_vis(pm) { mesh_cache.bvh(s, id) } else { None };
-            let vis = Vis::new(pm, wm, cv, vp.xray, facing, Some(topo.clone()), bvh);
+            let occ = if opaque { scene_occluders(s, mesh_cache) } else { vec![] };
+            let vis = Vis::new(pm, wm, cv, opaque, facing, Some(topo.clone()), &occ);
             let screen: Vec<Option<Pos2>> = pm.v.iter().map(|p| cv.project(wm.transform_point3(*p), vp.rect)).collect();
             let mut best: Option<(f32, (u32, u32))> = None;
             for (ei, &(a, b)) in topo.edges.iter().enumerate() {
                 let (Some(qa), Some(qb)) = (screen[a as usize], screen[b as usize]) else { continue };
-                let d = seg_dist(pos, qa, qb);
-                if d < 8.0 && best.is_none_or(|x| d < x.0) && vis.edge_idx(ei, a, b) {
+                let (d, t) = seg_closest(pos, qa, qb);
+                if d < 9.0 && best.is_none_or(|x| d < x.0) && vis.edge_idx_at(ei, a, b, t as f64) {
                     best = Some((d, (a, b)));
                 }
             }
@@ -1485,7 +1526,27 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
                 Some(b) => b.raycast(pm, &lr, vp.backface),
                 None => pm.raycast(&lr, vp.backface),
             };
-            hit.map(|(_, f)| Comp::F(f))
+            if hit.is_some() {
+                return hit.map(|(_, f)| Comp::F(f));
+            }
+            // the JS fallback picks the nearest face-centre dot in wireframe/x-ray
+            if !(vp.shade == ShadeMode::Wire || vp.xray) {
+                return None;
+            }
+            let facing = if vp.backface { mesh_cache.facing(s, id, wm, cv) } else { None };
+            let geo = mesh_cache.faces(s, id)?;
+            let mut best: Option<(f32, usize)> = None;
+            for (fi, c) in geo.centers.iter().enumerate() {
+                if facing.as_ref().is_some_and(|ff| !ff[fi]) {
+                    continue;
+                }
+                let Some(q) = cv.project(wm.transform_point3(*c), vp.rect) else { continue };
+                let d = q.distance(pos);
+                if d < 10.0 && best.is_none_or(|b| d < b.0) {
+                    best = Some((d, fi));
+                }
+            }
+            best.map(|b| Comp::F(b.1))
         }
     }
 }
@@ -1498,10 +1559,14 @@ pub fn marquee_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode
 pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, region: &dyn Fn(Pos2) -> bool, mesh_cache: &mut MeshCache) -> Vec<Comp> {
     let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return vec![] };
     let wm = s.world_matrix(id);
-    let facing = if vp.backface && !vp.xray { mesh_cache.facing(s, id, wm, cv) } else { None };
+    let shaded = !vp.xray && vp.shade != ShadeMode::Wire;
+    // in shaded mode the JS marquee hides back faces even with backface culling off: you
+    // cannot select what you cannot see (wireframe and x-ray show every face)
+    let facing = if vp.backface || (mode == CompMode::Face && shaded) { mesh_cache.facing(s, id, wm, cv) } else { None };
     let topo = if mode == CompMode::Edge || (facing.is_some() && mode == CompMode::Vertex) { mesh_cache.topo(s, id) } else { None };
-    let bvh = if exact_vis(pm) { mesh_cache.bvh(s, id) } else { None };
-    let vis = Vis::new(pm, wm, cv, vp.xray, facing, topo.clone(), bvh);
+    let exact = shaded && marquee_exact(pm);
+    let occ = if exact { scene_occluders(s, mesh_cache) } else { vec![] };
+    let vis = Vis::new(pm, wm, cv, exact, facing, topo.clone(), &occ);
     let inside = |p: DVec3| cv.project(wm.transform_point3(p), vp.rect).is_some_and(region);
     match mode {
         CompMode::Vertex => (0..pm.v.len()).filter(|&i| inside(pm.v[i]) && vis.vertex(i as u32)).map(|i| Comp::V(i as u32)).collect(),
@@ -1763,7 +1828,7 @@ mod tests {
 
         // edge visibility by index matches the per-edge face test (xray skips exact occlusion)
         let topo = cache.topo(&s, &id).unwrap();
-        let vis = Vis::new(pm, wm, &cv, true, Some(facing.clone()), Some(topo.clone()), None);
+        let vis = Vis::new(pm, wm, &cv, false, Some(facing.clone()), Some(topo.clone()), &[]);
         for (ei, &(a, b)) in topo.edges.iter().enumerate() {
             assert_eq!(vis.edge_idx(ei, a, b), topo.edge_faces[ei].iter().any(|&f| facing[f]), "edge {ei}");
         }
@@ -1785,6 +1850,59 @@ mod tests {
         let far = (0..pm.v.len()).max_by(|&a, &b| depth(a).total_cmp(&depth(b))).unwrap();
         let fq = cv.project(pm.v[far], vp.rect).unwrap();
         assert_ne!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, fq, &mut cache), Some(Comp::V(far as u32)));
+    }
+
+    #[test]
+    fn picks_respect_other_meshes() {
+        let (mut s, vp, cv, id) = setup();
+        let (near, wp, q) = {
+            let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
+            let near = (0..pm.v.len()).min_by(|&a, &b| cv.depth(pm.v[a]).total_cmp(&cv.depth(pm.v[b]))).unwrap();
+            let wp = s.world_matrix(&id).transform_point3(pm.v[near]);
+            (near, wp, cv.project(wp, vp.rect).unwrap())
+        };
+        let mut cache = MeshCache::default();
+        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q, &mut cache), Some(Comp::V(near as u32)));
+        // a big cube between the camera and the vertex hides it (the JS `occluded` checks all meshes)
+        let mid = (cv.eye + wp) * 0.5;
+        let occ = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_world_matrix(&occ, DMat4::from_scale_rotation_translation(DVec3::splat(0.6), DQuat::IDENTITY, mid));
+        assert_ne!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q, &mut cache), Some(Comp::V(near as u32)));
+    }
+
+    #[test]
+    fn pick_radii_match_js() {
+        let (s, vp, cv, id) = setup();
+        let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
+        let near = (0..pm.v.len()).min_by(|&a, &b| cv.depth(pm.v[a]).total_cmp(&cv.depth(pm.v[b]))).unwrap();
+        let q = cv.project(pm.v[near], vp.rect).unwrap();
+        let mut cache = MeshCache::default();
+        // the JS vertex radius is 12 px (was 10)
+        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q + egui::vec2(11.0, 0.0), &mut cache), Some(Comp::V(near as u32)));
+        // the JS edge radius is 9 px (was 8), measured from the closest point on the segment
+        let topo = cache.topo(&s, &id).unwrap();
+        let e = topo.edges.iter().position(|&(a, b)| a == near as u32 || b == near as u32).unwrap();
+        let (a, b) = topo.edges[e];
+        let (qa, qb) = (cv.project(pm.v[a as usize], vp.rect).unwrap(), cv.project(pm.v[b as usize], vp.rect).unwrap());
+        let mid = egui::pos2((qa.x + qb.x) * 0.5, (qa.y + qb.y) * 0.5);
+        let dir = (qb - qa).normalized();
+        let p = mid + egui::vec2(-dir.y, dir.x) * 8.5;
+        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Edge, p, &mut cache), Some(Comp::E(a, b)));
+    }
+
+    #[test]
+    fn marquee_face_skips_backfaces_when_shaded() {
+        let (s, vp, cv, id) = setup();
+        let faces = s.node(&id).unwrap().mesh().unwrap().mesh.f.len();
+        let mut cache = MeshCache::default();
+        let shaded = region_components(&s, &vp, &cv, &id, CompMode::Face, &|_| true, &mut cache);
+        assert!(shaded.len() < faces, "back faces are not selectable in shaded mode");
+        assert!(!shaded.is_empty());
+        // x-ray shows every face, so all of them can be selected
+        let mut xray = vp;
+        xray.xray = true;
+        let all = region_components(&s, &xray, &cv, &id, CompMode::Face, &|_| true, &mut cache);
+        assert_eq!(all.len(), faces);
     }
 
     #[test]
