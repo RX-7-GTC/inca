@@ -294,7 +294,19 @@ impl PolyMesh {
     }
 
     pub fn face_normal(&self, fi: usize) -> DVec3 {
-        newell(&self.f[fi].iter().map(|&i| self.v[i as usize]).collect::<Vec<_>>())
+        // the Newell sum straight from the vertex indices: this is called per face on
+        // every component overlay, so the old collect-into-a-Vec allocated 400k times
+        let f = &self.f[fi];
+        let k = f.len();
+        let mut n = DVec3::ZERO;
+        for i in 0..k {
+            let a = self.v[f[i] as usize];
+            let b = self.v[f[(i + 1) % k] as usize];
+            n.x += (a.y - b.y) * (a.z + b.z);
+            n.y += (a.z - b.z) * (a.x + b.x);
+            n.z += (a.x - b.x) * (a.y + b.y);
+        }
+        n * 0.5
     }
     pub fn face_center(&self, fi: usize) -> DVec3 {
         let f = &self.f[fi];

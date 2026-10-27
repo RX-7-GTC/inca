@@ -1185,6 +1185,15 @@ fn visible_point(pm: &PolyMesh, wm: &DMat4, cv: &CamView, p: DVec3, bvh: Option<
     }
 }
 
+/// Per-face normals and centres, computed once per revision. Besides the front-facing test
+/// this feeds the face-centre dots and marquee selection, which would otherwise call
+/// `face_normal` / `face_center` for every face on every pick.
+#[derive(Default)]
+pub struct FaceGeo {
+    pub normals: Vec<DVec3>,
+    pub centers: Vec<DVec3>,
+}
+
 /// Derived per-mesh data cached by node revision: edge topology (the JS `PolyMesh.topo`) and
 /// the face-picking BVH (the JS three-mesh-bvh). Both would otherwise be rebuilt on every
 /// pointer move, which is far too slow on heavy meshes.
@@ -1193,9 +1202,29 @@ pub struct MeshCache {
     topo: HashMap<String, (u64, Arc<Topo>)>,
     /// `None` = the mesh is small enough to raycast triangle by triangle
     bvh: HashMap<String, (u64, Option<Arc<inca_core::mesh::TriBvh>>)>,
+    faces: HashMap<String, (u64, Arc<FaceGeo>)>,
+    /// Last camera-dependent front-facing test per node. Hovering picks every 30 ms and the
+    /// marquee picks every component, but the camera only moves while hovering is disabled,
+    /// so recomputing the 400k face tests each time is wasted work.
+    facing: HashMap<String, (u64, Arc<Vec<bool>>)>,
     /// Hash of the component selection per node/mode, reused while `Scene::rev` is unchanged
     /// (all viewports draw the same frame). Edge/face overlay buffers are cached by this.
     sel: HashMap<(String, u8), (u64, usize, u64)>,
+}
+
+fn hash_f64s(h: &mut impl Hasher, vals: impl IntoIterator<Item = f64>) {
+    for v in vals {
+        v.to_bits().hash(h);
+    }
+}
+
+fn facing_key(rev: u64, wm: &DMat4, cv: &CamView) -> u64 {
+    let mut h = DefaultHasher::new();
+    rev.hash(&mut h);
+    hash_f64s(&mut h, wm.to_cols_array());
+    hash_f64s(&mut h, [cv.eye.x, cv.eye.y, cv.eye.z, cv.fwd.x, cv.fwd.y, cv.fwd.z]);
+    cv.ortho.hash(&mut h);
+    h.finish()
 }
 
 impl MeshCache {
@@ -1223,6 +1252,50 @@ impl MeshCache {
         let b = (pm.f.len() > 300).then(|| Arc::new(pm.tri_bvh()));
         self.bvh.insert(id.to_string(), (rev, b.clone()));
         b
+    }
+
+    /// Per-face normals and centres of a mesh, cached by revision.
+    pub fn faces(&mut self, s: &Scene, id: &str) -> Option<Arc<FaceGeo>> {
+        let rev = s.node(id)?.rev;
+        if let Some((r, f)) = self.faces.get(id) {
+            if *r == rev {
+                return Some(f.clone());
+            }
+        }
+        let pm = &s.node(id)?.mesh()?.mesh;
+        let mut normals = Vec::with_capacity(pm.f.len());
+        let mut centers = Vec::with_capacity(pm.f.len());
+        for fi in 0..pm.f.len() {
+            normals.push(pm.face_normal(fi));
+            centers.push(pm.face_center(fi));
+        }
+        let f = Arc::new(FaceGeo { normals, centers });
+        self.faces.insert(id.to_string(), (rev, f.clone()));
+        Some(f)
+    }
+
+    /// Backface culling's front-facing flags for a node and camera (the JS `frontFaces`),
+    /// cached while the mesh, its world matrix and the camera stay put.
+    pub fn facing(&mut self, s: &Scene, id: &str, wm: DMat4, cv: &CamView) -> Option<Arc<Vec<bool>>> {
+        let rev = s.node(id)?.rev;
+        let key = facing_key(rev, &wm, cv);
+        if let Some((k, f)) = self.facing.get(id) {
+            if *k == key {
+                return Some(f.clone());
+            }
+        }
+        let geo = self.faces(s, id)?;
+        let inv = wm.inverse();
+        let out: Vec<bool> = if cv.ortho {
+            let to = -inv.transform_vector3(cv.fwd);
+            geo.normals.iter().map(|n| n.dot(to) > 0.0).collect()
+        } else {
+            let eye = inv.transform_point3(cv.eye);
+            geo.normals.iter().zip(&geo.centers).map(|(n, c)| n.dot(eye - *c) > 0.0).collect()
+        };
+        let out = Arc::new(out);
+        self.facing.insert(id.to_string(), (key, out.clone()));
+        Some(out)
     }
 
     /// Cache key of a node's component selection for the edge/face overlays: geometry revision
@@ -1257,6 +1330,8 @@ impl MeshCache {
     pub fn retain(&mut self, alive: &std::collections::HashSet<&str>) {
         self.topo.retain(|k, _| alive.contains(k.as_str()));
         self.bvh.retain(|k, _| alive.contains(k.as_str()));
+        self.faces.retain(|k, _| alive.contains(k.as_str()));
+        self.facing.retain(|k, _| alive.contains(k.as_str()));
         self.sel.retain(|(k, _), _| alive.contains(k.as_str()));
     }
 }
@@ -1273,39 +1348,25 @@ pub struct Vis<'a> {
     wm: DMat4,
     cv: &'a CamView,
     exact: bool,
-    facing: Option<Vec<bool>>,
+    /// Front-facing flags from `MeshCache::facing`, `None` when backface culling is off.
+    facing: Option<Arc<Vec<bool>>>,
     topo: Option<Arc<Topo>>,
     bvh: Option<Arc<inca_core::mesh::TriBvh>>,
 }
 
 impl<'a> Vis<'a> {
-    /// `topo` is only needed for the front-facing test (backface culling on), `bvh` only for
-    /// the exact occlusion test on meshes small enough for it.
+    /// `facing` and its `topo` are only needed for the front-facing test (backface culling
+    /// on), `bvh` only for the exact occlusion test on meshes small enough for it.
     pub fn new(
         pm: &'a PolyMesh,
         wm: DMat4,
         cv: &'a CamView,
         xray: bool,
-        backface: bool,
+        facing: Option<Arc<Vec<bool>>>,
         topo: Option<Arc<Topo>>,
         bvh: Option<Arc<inca_core::mesh::TriBvh>>,
     ) -> Self {
         let exact = !xray && exact_vis(pm);
-        let facing = if xray || !backface {
-            None
-        } else {
-            let nm = wm.inverse().transpose();
-            Some(
-                (0..pm.f.len())
-                    .map(|f| {
-                        let c = wm.transform_point3(pm.face_center(f));
-                        let n = nm.transform_vector3(pm.face_normal(f));
-                        let to = if cv.ortho { -cv.fwd } else { cv.eye - c };
-                        n.dot(to) > 0.0
-                    })
-                    .collect(),
-            )
-        };
         Vis { pm, wm, cv, exact, facing, topo, bvh }
     }
     pub fn vertex(&self, v: u32) -> bool {
@@ -1317,9 +1378,11 @@ impl<'a> Vis<'a> {
         }
         !self.exact || visible_point(self.pm, &self.wm, self.cv, self.pm.v[v as usize], self.bvh.as_deref())
     }
-    pub fn edge(&self, a: u32, b: u32) -> bool {
-        if let (Some(facing), Some(topo)) = (&self.facing, &self.topo) {
-            let Some(e) = topo.edge(a, b) else { return false };
+    /// `e` is the index in `topo.edges`; doing the front-facing lookup by index avoids a
+    /// hash probe per edge, which added ~150 ms to a 798k-edge marquee.
+    pub fn edge_idx(&self, e: usize, a: u32, b: u32) -> bool {
+        if let Some(facing) = &self.facing {
+            let Some(topo) = &self.topo else { return false };
             if !topo.edge_faces[e].iter().any(|&f| facing[f]) {
                 return false;
             }
@@ -1337,9 +1400,10 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
     let wm = s.world_matrix(id);
     match mode {
         CompMode::Vertex => {
-            let topo = if vp.backface && !vp.xray { mesh_cache.topo(s, id) } else { None };
+            let facing = if vp.backface && !vp.xray { mesh_cache.facing(s, id, wm, cv) } else { None };
+            let topo = if facing.is_some() { mesh_cache.topo(s, id) } else { None };
             let bvh = if exact_vis(pm) { mesh_cache.bvh(s, id) } else { None };
-            let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, topo, bvh);
+            let vis = Vis::new(pm, wm, cv, vp.xray, facing, topo, bvh);
             let mut best: Option<(f32, u32)> = None;
             for (i, p) in pm.v.iter().enumerate() {
                 if let Some(q) = cv.project(wm.transform_point3(*p), vp.rect) {
@@ -1352,15 +1416,16 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
             best.map(|b| Comp::V(b.1))
         }
         CompMode::Edge => {
+            let facing = if vp.backface && !vp.xray { mesh_cache.facing(s, id, wm, cv) } else { None };
             let topo = mesh_cache.topo(s, id)?;
             let bvh = if exact_vis(pm) { mesh_cache.bvh(s, id) } else { None };
-            let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, Some(topo.clone()), bvh);
+            let vis = Vis::new(pm, wm, cv, vp.xray, facing, Some(topo.clone()), bvh);
             let screen: Vec<Option<Pos2>> = pm.v.iter().map(|p| cv.project(wm.transform_point3(*p), vp.rect)).collect();
             let mut best: Option<(f32, (u32, u32))> = None;
-            for &(a, b) in &topo.edges {
+            for (ei, &(a, b)) in topo.edges.iter().enumerate() {
                 let (Some(qa), Some(qb)) = (screen[a as usize], screen[b as usize]) else { continue };
                 let d = seg_dist(pos, qa, qb);
-                if d < 8.0 && best.is_none_or(|x| d < x.0) && vis.edge(a, b) {
+                if d < 8.0 && best.is_none_or(|x| d < x.0) && vis.edge_idx(ei, a, b) {
                     best = Some((d, (a, b)));
                 }
             }
@@ -1387,9 +1452,10 @@ pub fn marquee_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode
 pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, region: &dyn Fn(Pos2) -> bool, mesh_cache: &mut MeshCache) -> Vec<Comp> {
     let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return vec![] };
     let wm = s.world_matrix(id);
-    let topo = if mode == CompMode::Edge || (mode == CompMode::Vertex && vp.backface && !vp.xray) { mesh_cache.topo(s, id) } else { None };
+    let facing = if vp.backface && !vp.xray { mesh_cache.facing(s, id, wm, cv) } else { None };
+    let topo = if mode == CompMode::Edge || (facing.is_some() && mode == CompMode::Vertex) { mesh_cache.topo(s, id) } else { None };
     let bvh = if exact_vis(pm) { mesh_cache.bvh(s, id) } else { None };
-    let vis = Vis::new(pm, wm, cv, vp.xray, vp.backface, topo.clone(), bvh);
+    let vis = Vis::new(pm, wm, cv, vp.xray, facing, topo.clone(), bvh);
     let inside = |p: DVec3| cv.project(wm.transform_point3(p), vp.rect).is_some_and(region);
     match mode {
         CompMode::Vertex => (0..pm.v.len()).filter(|&i| inside(pm.v[i]) && vis.vertex(i as u32)).map(|i| Comp::V(i as u32)).collect(),
@@ -1398,11 +1464,12 @@ pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode:
             let screen: Vec<Option<Pos2>> = pm.v.iter().map(|p| cv.project(wm.transform_point3(*p), vp.rect)).collect();
             topo.edges
                 .iter()
-                .filter(|&&(a, b)| {
+                .enumerate()
+                .filter(|(ei, &(a, b))| {
                     let postedge = screen[a as usize].is_some_and(region) && screen[b as usize].is_some_and(region);
-                    (postedge || inside((pm.v[a as usize] + pm.v[b as usize]) * 0.5)) && vis.edge(a, b)
+                    (postedge || inside((pm.v[a as usize] + pm.v[b as usize]) * 0.5)) && vis.edge_idx(*ei, a, b)
                 })
-                .map(|&(a, b)| Comp::E(a, b))
+                .map(|(_, &(a, b))| Comp::E(a, b))
                 .collect()
         }
         CompMode::Face => (0..pm.f.len()).filter(|&f| inside(pm.face_center(f)) && vis.face(f)).map(Comp::F).collect(),
@@ -1628,6 +1695,50 @@ mod tests {
         // the ray through the projected point passes the point
         let t = (p - r.origin).dot(r.dir);
         assert!((r.at(t) - p).length() < 1e-6);
+    }
+
+    #[test]
+    fn cached_facing_matches_direct_and_reuses() {
+        let (s, _vp, cv, id) = setup();
+        let wm = s.world_matrix(&id);
+        let mut cache = MeshCache::default();
+        let facing = cache.facing(&s, &id, wm, &cv).unwrap();
+        let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
+        // the cached local-space test is equivalent to the world-space inverse-transpose one
+        let eye = wm.inverse().transform_point3(cv.eye);
+        for f in 0..pm.f.len() {
+            assert_eq!(facing[f], pm.face_normal(f).dot(eye - pm.face_center(f)) > 0.0, "face {f}");
+        }
+        // the same camera reuses the flags; a moved camera is a different key
+        assert!(Arc::ptr_eq(&facing, &cache.facing(&s, &id, wm, &cv).unwrap()));
+        let mut moved = cv;
+        moved.eye += DVec3::X * 2.0;
+        assert!(!Arc::ptr_eq(&facing, &cache.facing(&s, &id, wm, &moved).unwrap()));
+
+        // edge visibility by index matches the per-edge face test (xray skips exact occlusion)
+        let topo = cache.topo(&s, &id).unwrap();
+        let vis = Vis::new(pm, wm, &cv, true, Some(facing.clone()), Some(topo.clone()), None);
+        for (ei, &(a, b)) in topo.edges.iter().enumerate() {
+            assert_eq!(vis.edge_idx(ei, a, b), topo.edge_faces[ei].iter().any(|&f| facing[f]), "edge {ei}");
+        }
+    }
+
+    #[test]
+    fn backface_pick_uses_cached_facing() {
+        let (s, mut vp, cv, id) = setup();
+        vp.backface = true;
+        let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
+        let depth = |i: usize| cv.depth(pm.v[i]);
+        let near = (0..pm.v.len()).min_by(|&a, &b| depth(a).total_cmp(&depth(b))).unwrap();
+        let q = cv.project(pm.v[near], vp.rect).unwrap();
+        let mut cache = MeshCache::default();
+        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q, &mut cache), Some(Comp::V(near as u32)));
+        // the warm cache returns the same pick
+        assert_eq!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q, &mut cache), Some(Comp::V(near as u32)));
+        // the far corner is culled
+        let far = (0..pm.v.len()).max_by(|&a, &b| depth(a).total_cmp(&depth(b))).unwrap();
+        let fq = cv.project(pm.v[far], vp.rect).unwrap();
+        assert_ne!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, fq, &mut cache), Some(Comp::V(far as u32)));
     }
 
     #[test]
