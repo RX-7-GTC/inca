@@ -1830,14 +1830,15 @@ pub fn mirror_point(p: DVec3, mode: usize) -> DVec3 {
     q
 }
 
-/// Soft Selection falloff colour (black - red - yellow), as Maya shows it.
+/// Soft Selection falloff colour, as the JS vertex overlay:
+/// `0x111111.lerp(1, 0.85k + 0.1, 0), 0.3 + 0.7k)`.
 pub fn falloff_color(w: f64) -> Color32 {
-    let w = w.clamp(0.0, 1.0) as f32;
-    if w < 0.5 {
-        Color32::from_rgb((w * 2.0 * 255.0) as u8, 0, 0)
-    } else {
-        Color32::from_rgb(255, ((w - 0.5) * 2.0 * 255.0) as u8, 0)
-    }
+    let k = w.clamp(0.0, 1.0) as f32;
+    let base = 0x11 as f32 / 255.0;
+    let t = 0.3 + 0.7 * k;
+    let target = [1.0, 0.85 * k + 0.1, 0.0];
+    let ch = |tg: f32| ((base + (tg - base) * t) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(ch(target[0]), ch(target[1]), ch(target[2]))
 }
 
 /// Component dots are drawn by the GPU (`build_draws`); this adds only the preselection
