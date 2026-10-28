@@ -301,7 +301,7 @@ pub fn toggle_state(app: &IncaApp, id: &str) -> Option<bool> {
         "hudViewAxis" => app.hud.view_axis,
         "toggleWireOnShaded" => v.wire_on_shaded,
         "toggleXray" => v.xray,
-        "toggleBackface" => v.backface,
+        "toggleBackface" => app.backface,
         "toggleShelf" => app.shown("shelf"),
         "toggleTimeline" => app.shown("timeslider"),
         "toggleCmdline" => app.shown("cmdline"),

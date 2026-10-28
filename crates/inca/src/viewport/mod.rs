@@ -984,8 +984,10 @@ pub fn build_draws(
                     if pbr.unlit {
                         u = u.unlit();
                     }
-                    if vp.xray || pbr.opacity < 0.99 {
-                        let a = if vp.xray { 0.45 } else { pbr.opacity.max(0.1) };
+                    let xray = vp.xray || n.xray;
+                    if xray || pbr.opacity < 0.99 {
+                        // JS: opacity = min(material opacity, 0.5), depth write off
+                        let a = if xray { pbr.opacity.min(0.5) } else { pbr.opacity.max(0.1) };
                         draws.push(DrawCmd { pass: Pass::MeshBlend, geo: Geo::MeshTris(id.clone()), u: u.alpha(a) });
                     } else {
                         draws.push(DrawCmd { pass: Pass::Mesh, geo: Geo::MeshTris(id.clone()), u });

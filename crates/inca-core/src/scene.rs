@@ -156,6 +156,8 @@ pub struct Node {
     pub visible: bool,
     pub layer: Option<Id>,
     pub template: bool,
+    /// per-object x-ray (Attribute Editor > Render Stats)
+    pub xray: bool,
     pub locks: Map<String, Value>,
     pub shape_name: Option<String>,
     pub extra: Value,
@@ -561,6 +563,7 @@ impl Scene {
             visible: true,
             layer: None,
             template: false,
+            xray: false,
             locks: Map::new(),
             shape_name,
             extra: Value::Null,
@@ -1231,6 +1234,7 @@ impl Scene {
                     "rotatePivot" | "scalePivot" => return Some(json!(n.xf.p)),
                     "visibility" => return Some(json!(if n.visible { 1 } else { 0 })),
                     "template" => return Some(json!(if n.template { 1 } else { 0 })),
+                    "xray" => return Some(json!(if n.xray { 1 } else { 0 })),
                     "rotateOrder" => return Some(json!(n.xf.ro)),
                     _ => {}
                 }
@@ -1290,6 +1294,7 @@ impl Scene {
                         }
                         "visibility" => n.visible = f.unwrap_or(1.0) != 0.0,
                         "template" => n.template = f.unwrap_or(0.0) != 0.0,
+                        "xray" => n.xray = f.unwrap_or(0.0) != 0.0,
                         "rotateOrder" => {
                             n.xf.ro = match &v {
                                 Value::Number(k) => crate::math::ROTATE_ORDERS.get(k.as_u64().unwrap_or(0) as usize).copied().unwrap_or("xyz").to_string(),
@@ -1741,7 +1746,7 @@ impl Scene {
         let mut d = json!({
             "id": n.id, "name": n.name, "kind": n.kind, "parent": n.parent,
             "t": n.xf.t, "r": n.xf.r, "s": n.xf.s, "ro": n.xf.ro, "p": n.xf.p, "pt": n.xf.pt,
-            "visible": n.visible, "layer": n.layer, "template": n.template, "locks": n.locks,
+            "visible": n.visible, "layer": n.layer, "template": n.template, "xray": n.xray, "locks": n.locks,
             "shapeName": n.shape_name, "extra": n.extra,
         });
         let o = d.as_object_mut().unwrap();
@@ -1849,6 +1854,7 @@ impl Scene {
         n.visible = d["visible"].as_bool().unwrap_or(true);
         n.layer = d["layer"].as_str().map(String::from);
         n.template = d["template"].as_bool().unwrap_or(false);
+        n.xray = d["xray"].as_bool().unwrap_or(false);
         n.locks = d["locks"].as_object().cloned().unwrap_or_default();
         n.extra = d["extra"].clone();
         for k in ["rig", "extraAttrs"] {
@@ -2209,6 +2215,20 @@ mod tests {
         s.set_attr_f(&a, "ry", 180.0);
         let after = s.world_matrix(&a).transform_point3(DVec3::ZERO);
         assert!((after - DVec3::new(4.0, 0.0, 0.0)).length() < 1e-6, "{after}");
+    }
+
+    #[test]
+    fn object_xray_round_trips_and_undoes() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polySphere", &Params::new(), None);
+        s.checkpoint("object xray");
+        s.nodes.get_mut(&a).unwrap().xray = true;
+        let data = s.serialize();
+        let mut s2 = Scene::new();
+        s2.load(&data).unwrap();
+        assert!(s2.node(&a).unwrap().xray);
+        s.undo();
+        assert!(!s.node(&a).unwrap().xray);
     }
 
     #[test]

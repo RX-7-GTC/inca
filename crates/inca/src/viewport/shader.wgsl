@@ -96,8 +96,11 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
     let rough = max(draw.params2.x, 0.03);
     let shin = 2.0 / (rough * rough) - 2.0;
     if (frame.mode.x < 0.5) {
-        // default lighting: a headlight slightly above the camera
-        let l = normalize(v + vec3(0.0, 0.15, 0.0));
+        // JS `prepareScene`: the default light sits at camera + (-0.15, 0.2, 0) in camera
+        // space and aims down the view axis, so the surface-to-light vector is constant
+        let right = normalize(vec3(frame.view[0][0], frame.view[1][0], frame.view[2][0]));
+        let up = normalize(vec3(frame.view[0][1], frame.view[1][1], frame.view[2][1]));
+        let l = normalize(-0.15 * right + 0.2 * up - frame.cam_dir.xyz);
         let d = max(dot(n, l), 0.0);
         let h = normalize(l + v);
         let s = spec_k * pow(max(dot(n, h), 0.0), max(shin, 1.0)) * 0.5;

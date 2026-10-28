@@ -927,7 +927,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "toggleHud" => app.vps[vp].hud = !app.vps[vp].hud,
         "toggleWireOnShaded" => app.vps[vp].wire_on_shaded = !app.vps[vp].wire_on_shaded,
         "toggleXray" => app.vps[vp].xray = !app.vps[vp].xray,
-        "toggleBackface" => app.vps[vp].backface = !app.vps[vp].backface,
+        "toggleBackface" => app.set_backface(!app.backface),
         "shadeWire" => app.vps[vp].shade = ShadeMode::Wire,
         "shadeSmooth" => app.vps[vp].shade = ShadeMode::Shaded,
         "shadeTextured" => app.vps[vp].shade = ShadeMode::Textured,

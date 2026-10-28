@@ -158,6 +158,8 @@ pub struct IncaApp {
     pub layout: Layout,
     pub active_vp: usize,
     pub vps: Vec<Viewport>,
+    /// global backface culling (JS `App.backfaceCulling`), mirrored into every viewport
+    pub backface: bool,
     pub menu_set: MenuSet,
     pub win: Windows,
     pub right_tab: RightTab,
@@ -341,6 +343,13 @@ impl IncaApp {
             self.hidden.insert(element.to_string());
         }
     }
+    /// Backface culling is one global switch in the JS (`App.backfaceCulling`), shared by every pane.
+    pub fn set_backface(&mut self, on: bool) {
+        self.backface = on;
+        for v in &mut self.vps {
+            v.backface = on;
+        }
+    }
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         let gpu = cc.wgpu_render_state.as_ref().map(Gpu::new);
@@ -357,6 +366,7 @@ impl IncaApp {
             layout: Layout::Single,
             active_vp: 0,
             vps: vec![Viewport::new("persp"), Viewport::new("top"), Viewport::new("front"), Viewport::new("side")],
+            backface: false,
             menu_set: crate::prefs::default_menu_set(&prefs),
             win: Windows::default(),
             right_tab: cc.storage.and_then(|s| eframe::get_value(s, "rightTab")).unwrap_or(RightTab::ChannelBox),

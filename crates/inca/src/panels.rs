@@ -1475,6 +1475,7 @@ fn shape_tab(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
         ui.label(RichText::new("Select objects and the field, then Fields > Affect Selected Object(s)").color(theme::TEXT_DIM));
     }
     let Some(n) = app.s.node(id) else { return };
+    let xray = n.xray;
     match &n.shape {
         Shape::Mesh(m) => {
             let (v, f, t) = (m.mesh.v.len(), m.mesh.f.len(), m.mesh.tri_count());
@@ -1482,6 +1483,15 @@ fn shape_tab(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
             if theme::fold(ui, "Mesh") {
                 ui.label(format!("{v} vertices, {f} faces, {t} triangles"));
                 channel_row(app, ui, std::slice::from_ref(&r), "smoothLevel", "Smooth Mesh Preview", ChanKind::Int, Some(0.0), Some(3.0));
+            }
+            if theme::fold(ui, "Render Stats") {
+                let mut on = xray;
+                if ui.checkbox(&mut on, "X-Ray (object)").changed() {
+                    app.s.checkpoint("object x-ray");
+                    if let Some(n) = app.s.nodes.get_mut(id) {
+                        n.xray = on;
+                    }
+                }
             }
             if !theme::fold(ui, "Shading") {
                 return;

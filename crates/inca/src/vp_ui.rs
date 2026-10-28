@@ -303,6 +303,7 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
             }
         });
     });
+    let mut backface = app.backface;
     ui.menu_button(small("Shading"), |ui| {
         let v = &mut app.vps[idx];
         ui.radio_value(&mut v.shade, ShadeMode::Wire, "Wireframe  4");
@@ -314,13 +315,16 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         ui.separator();
         ui.checkbox(&mut v.wire_on_shaded, "Wireframe on Shaded");
         ui.checkbox(&mut v.xray, "X-Ray  Alt+A");
-        ui.checkbox(&mut v.backface, "Backface Culling");
+        ui.checkbox(&mut backface, "Backface Culling");
         ui.separator();
         let mut tex = v.shade == ShadeMode::Textured;
         if ui.checkbox(&mut tex, "Hardware Texturing  6").clicked() {
             v.shade = if tex { ShadeMode::Textured } else { ShadeMode::Shaded };
         }
     });
+    if backface != app.backface {
+        app.set_backface(backface);
+    }
     ui.menu_button(small("Lighting"), |ui| {
         let v = &mut app.vps[idx];
         ui.radio_value(&mut v.lights, LightMode::Default, "Use Default Lighting");
@@ -512,12 +516,11 @@ fn panel_toolbar(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         app.active_vp = idx;
         app.action("isolateSelect");
     }
-    let v = &mut app.vps[idx];
-    if ib(ui, "xray", "X-Ray (Alt+A)", v.xray) {
-        v.xray = !v.xray;
+    if ib(ui, "xray", "X-Ray (Alt+A)", app.vps[idx].xray) {
+        app.vps[idx].xray = !app.vps[idx].xray;
     }
-    if ib(ui, "backface", "Backface culling", v.backface) {
-        v.backface = !v.backface;
+    if ib(ui, "backface", "Backface culling", app.backface) {
+        app.set_backface(!app.backface);
     }
     if ib(ui, "hud", "Poly count HUD", app.hud.poly_count) {
         app.hud.poly_count = !app.hud.poly_count;
