@@ -175,7 +175,12 @@ pub fn open_tool(app: &mut IncaApp, idx: usize, tool: Tool, pos: Pos2, now: f64)
         Tool::Scale => ("Discrete Scale", &[0.1, 0.25, 0.5, 1.0], ""),
         _ => ("Discrete Move", &[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0], ""),
     };
-    let step = if tool == Tool::Rotate { app.vp_state.snap_angle } else { app.vp_state.snap_step };
+    let step = match tool {
+        Tool::Rotate => app.vp_state.snap_angle,
+        Tool::Scale => app.vp_state.snap_scale,
+        _ => app.vp_state.snap_step,
+    };
+    let mi = crate::vp_ui::mode_index(tool);
     let sym = ["Off", "Object X", "World X", "World Y", "World Z"];
     let radial = vec![
         ("N", checked(it("World", Act::WorldSpace(true)), app.space_world(tool))),
@@ -183,7 +188,7 @@ pub fn open_tool(app: &mut IncaApp, idx: usize, tool: Tool, pos: Pos2, now: f64)
         ("E", checked(cmd("Edit Pivot", "pivotEdit"), app.pivot_mode)),
         ("SE", checked(cmd("Soft Select", "softSelect"), app.soft.on)),
         ("S", it("Tool Settings...", Act::ToolSettings)),
-        ("SW", checked(it(discrete, Act::Discrete), app.snap_grid)),
+        ("SW", checked(it(discrete, Act::Discrete), app.vp_state.discrete[mi])),
         ("W", sub("Step Size", steps.iter().map(|&v| checked(it(&format!("{}{unit}", inca_core::math::fmt_num(v)), Act::Step(v)), (step - v).abs() < 1e-9)).collect())),
         ("NW", sub("Symmetry", sym.iter().enumerate().map(|(i, l)| checked(it(l, Act::Symmetry(i)), app.symmetry == i)).collect())),
     ];
@@ -234,14 +239,26 @@ fn run(app: &mut IncaApp, act: Act) {
             app.action("frameSelected");
         }
         Act::WorldSpace(w) => app.set_space_world(app.tool, w),
-        Act::Discrete => app.snap_grid = !app.snap_grid,
+        Act::Discrete => {
+            let i = crate::vp_ui::mode_index(app.tool);
+            app.vp_state.discrete[i] = !app.vp_state.discrete[i];
+        }
         Act::Step(v) => {
-            if app.tool == Tool::Rotate {
-                app.vp_state.snap_angle = v;
-            } else {
-                app.vp_state.snap_step = v;
-            }
-            app.snap_grid = true;
+            let i = match app.tool {
+                Tool::Rotate => {
+                    app.vp_state.snap_angle = v;
+                    1
+                }
+                Tool::Scale => {
+                    app.vp_state.snap_scale = v;
+                    2
+                }
+                _ => {
+                    app.vp_state.snap_step = v;
+                    0
+                }
+            };
+            app.vp_state.discrete[i] = true;
         }
         Act::Symmetry(i) => app.symmetry = i,
         Act::ToolSettings => {
@@ -252,11 +269,16 @@ fn run(app: &mut IncaApp, act: Act) {
             app.vp_state.reset_active_handle(app.tool);
         }
         Act::ResetTool => {
-            // JS Reset Tool: move goes back to world, rotate and scale to object space
+            // JS Reset Tool: move goes back to world, rotate and scale to object space; this
+            // tool's discrete flag and step reset (the grid toggle and other tools' steps stay)
             app.set_space_world(app.tool, app.tool == Tool::Move);
-            app.snap_grid = false;
-            app.vp_state.snap_step = 1.0;
-            app.vp_state.snap_angle = 15.0;
+            let i = crate::vp_ui::mode_index(app.tool);
+            app.vp_state.discrete[i] = false;
+            match app.tool {
+                Tool::Rotate => app.vp_state.snap_angle = 15.0,
+                Tool::Scale => app.vp_state.snap_scale = 1.0,
+                _ => app.vp_state.snap_step = 1.0,
+            }
             app.pivot_mode = false;
             app.vp_state.reset_active_handle(app.tool);
         }

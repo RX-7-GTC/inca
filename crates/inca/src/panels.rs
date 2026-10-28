@@ -1567,12 +1567,22 @@ fn tool_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
                 app.set_space_world(app.tool, world);
             }
         });
-        ui.checkbox(&mut app.snap_grid, "Discrete / grid snapping");
+        // JS Tool Settings: each tool has its own discrete toggle and step size
+        let mi = crate::vp_ui::mode_index(app.tool);
+        let label = match app.tool {
+            Tool::Rotate => "Discrete rotate",
+            Tool::Scale => "Discrete scale",
+            _ => "Discrete move",
+        };
+        ui.checkbox(&mut app.vp_state.discrete[mi], label);
         ui.horizontal(|ui| {
-            ui.label("Step");
-            ui.add(egui::DragValue::new(&mut app.vp_state.snap_step).speed(0.05).range(0.01..=100.0));
-            ui.label("Angle");
-            ui.add(egui::DragValue::new(&mut app.vp_state.snap_angle).speed(0.5).range(1.0..=180.0));
+            ui.label(if app.tool == Tool::Rotate { "Step size (deg)" } else { "Step size" });
+            let (var, speed, max): (&mut f64, f64, f64) = match app.tool {
+                Tool::Rotate => (&mut app.vp_state.snap_angle, 0.5, 90.0),
+                Tool::Scale => (&mut app.vp_state.snap_scale, 0.01, 5.0),
+                _ => (&mut app.vp_state.snap_step, 0.05, 5.0),
+            };
+            ui.add(egui::DragValue::new(var).speed(speed).range(0.001..=max));
         });
         ui.horizontal(|ui| {
             ui.label("Manipulator size");

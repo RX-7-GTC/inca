@@ -28,12 +28,37 @@ pub fn convert(s: &mut Scene, to: CompMode) {
                             out.e.insert((a, b));
                         }
                     }
+                    // JS `convertComp`: vertices with no complete edge select their incident edges
+                    if out.e.is_empty() {
+                        for &(a, b) in &topo.edges {
+                            if verts.contains(&a) || verts.contains(&b) {
+                                out.e.insert((a, b));
+                            }
+                        }
+                    }
                 }
             }
             CompMode::Face => {
-                for (fi, f) in pm.f.iter().enumerate() {
-                    if f.iter().all(|v| verts.contains(v)) {
-                        out.f.insert(fi);
+                if !c.e.is_empty() {
+                    // JS: the faces of the selected edges
+                    for (fi, f) in pm.f.iter().enumerate() {
+                        if (0..f.len()).any(|i| c.e.contains(&epair(f[i], f[(i + 1) % f.len()]))) {
+                            out.f.insert(fi);
+                        }
+                    }
+                } else {
+                    for (fi, f) in pm.f.iter().enumerate() {
+                        if f.iter().all(|v| verts.contains(v)) {
+                            out.f.insert(fi);
+                        }
+                    }
+                    // JS fallback: a lone vertex selects the faces it belongs to
+                    if out.f.is_empty() {
+                        for (fi, f) in pm.f.iter().enumerate() {
+                            if f.iter().any(|v| verts.contains(v)) {
+                                out.f.insert(fi);
+                            }
+                        }
                     }
                 }
             }
@@ -174,5 +199,29 @@ mod tests {
         assert_eq!(s.comp_sel(&id).f.len(), 6);
         grow(&mut s, true);
         assert_eq!(s.comp_sel(&id).f.len(), 6);
+    }
+
+    #[test]
+    fn set_comp_mode_converts_and_keeps_the_selection() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        s.select(std::slice::from_ref(&id), crate::scene::SelMode::Replace);
+        s.set_comp_mode(Some(CompMode::Vertex));
+        let face0 = s.node(&id).unwrap().mesh().unwrap().mesh.f[0].clone();
+        s.comp.insert(id.clone(), CompSel { v: face0.iter().copied().collect(), ..Default::default() });
+        // switching component types converts (JS `Sel.setMode`), it does not drop the selection
+        s.set_comp_mode(Some(CompMode::Face));
+        assert_eq!(s.comp_sel(&id).f.iter().copied().collect::<Vec<_>>(), vec![0]);
+        // the per-object component sets survive a trip through object mode
+        s.set_comp_mode(None);
+        assert!(s.comp_mode.is_none());
+        assert!(!s.comp_sel(&id).f.is_empty());
+        s.set_comp_mode(Some(CompMode::Face));
+        assert_eq!(s.comp_sel(&id).f.iter().copied().collect::<Vec<_>>(), vec![0]);
+        // a lone vertex converts to the faces around it (JS fallback)
+        s.set_comp_mode(Some(CompMode::Vertex));
+        s.comp.insert(id.clone(), CompSel { v: [face0[0]].into_iter().collect(), ..Default::default() });
+        s.set_comp_mode(Some(CompMode::Face));
+        assert!(s.comp_sel(&id).f.len() >= 1);
     }
 }

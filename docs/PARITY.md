@@ -30,7 +30,7 @@ registry, menus, UI modules and a 0.1.12 screenshot.
 - [x] B8. UV: UV Editor (select / move / rotate / scale UVs, flip, rotate 90, normalize, layout, unfold/relax, shells, checker / shading)
 - [x] B8b. UV component mode in the viewport (F12) and the texture image behind the UV Editor
 - [x] B9. Selection: Lasso and Paint tools, Soft Select (B, B+drag radius, falloff colours, smooth / linear), Symmetry (object X, world X/Y/Z), cycle component type (Shift+Q), pre-selection highlight
-- [x] B10. Manipulators: hold V point snap, hold X grid snap, hold J discrete rotate, W/E/R + LMB marking menus, manipulator size (+/-) readout + reset
+- [x] B10. Manipulators: hold V point snap, hold X grid snap, hold J discrete rotate, W/E/R + LMB marking menus, manipulator size (+/-) readout + reset; per-tool Discrete Move/Rotate/Scale toggles and steps as JS `Manip.discrete` (grid snap is separate and uses the grid spacing); `snapDuringDrag` point snapping (mesh verts + curve CVs, no radius cap, selected objects excluded in object mode, moved components skipped, projected onto the dragged axis/plane, point snap beats the grid); centre-handle grid snap on the ground plane (persp) or view plane (ortho) preserving the grab offset
 - [x] B10b. Ctrl+click axis lock and MMB drag along the active handle (needs a custom manipulator instead of transform-gizmo)
 - [x] B11. Marking menus: RMB object/component menus, Shift+RMB tool menus, Ctrl+RMB conversion; In-View Editor for new history nodes; option boxes (smooth, mirror, add divisions, extrude, bridge, bevel, merge, planar map, revolve, group, chamfer, duplicate special)
 - [x] B12. Rigging: IK handles (RP / SC, pole vector, twist), Insert / Mirror / Orient Joint, Unbind Skin, Paint Skin Weights, Cluster, Lattice (+ point tool), Soft Modification, Blend Shape, Delete Deformers, Pole Vector constraint, Remove Constraints, Set Driven Key window; load the JS rig nodes (joints, IK, lattices, constraints) instead of keeping them as locators
@@ -49,6 +49,7 @@ registry, menus, UI modules and a 0.1.12 screenshot.
 - [x] C2. Preferences persisted to a prefs file (JS stores menu set, workspace, HUD, shelves, hotkeys)
 - [x] C3. Viewport visuals: pre-selection highlight, component colours, wire colours, selected-face colour as in JS
 - [x] C4. Channel Box: MMB virtual slider in viewport, Ctrl/MMB drag in fields, expressions (`+=2`), int/enum stepping
+- [x] C5. Component selection: switching vertex/edge/face converts the selection with the JS `convertComp` fallbacks (lone vertex → incident edges / faces), and per-object component sets survive a trip through object mode (JS `Sel.setMode`)
 
 ## Closed GitHub issues re-checked against the Rust version
 

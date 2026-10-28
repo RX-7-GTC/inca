@@ -1587,10 +1587,15 @@ impl Scene {
     }
 
     pub fn set_comp_mode(&mut self, m: Option<CompMode>) {
-        self.comp_mode = m;
-        if m.is_none() {
-            self.comp.clear();
+        // JS `Sel.setMode`: switching between component types converts the selection, and going
+        // back to object mode keeps the per-object component sets (they are hidden, not cleared)
+        if let (Some(prev), Some(to)) = (self.comp_mode, m) {
+            if prev != to {
+                crate::selection::convert(self, to);
+                return;
+            }
         }
+        self.comp_mode = m;
         self.rev += 1;
     }
 

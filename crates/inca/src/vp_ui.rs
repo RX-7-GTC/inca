@@ -41,6 +41,9 @@ pub struct VpState {
     pub nav: Option<(usize, NavMode)>,
     pub snap_step: f64,
     pub snap_angle: f64,
+    pub snap_scale: f64,
+    /// Discrete move / rotate / scale, as JS `Manip.discrete` (separate from the grid toggle)
+    pub discrete: [bool; 3],
     /// points placed by the curve / polygon creation tools
     pub tool_pts: Vec<DVec3>,
     /// the manipulator's active handle per mode (move, rotate, scale), as JS `Manip.activeAxis`;
@@ -69,6 +72,8 @@ impl Default for VpState {
             nav: None,
             snap_step: 1.0,
             snap_angle: 15.0,
+            snap_scale: 1.0,
+            discrete: [false; 3],
             tool_pts: vec![],
             active_handles: [None; 3],
             mmb: None,
@@ -125,6 +130,9 @@ pub struct GizmoDrag {
     /// press position of a JS-style drag (MMB / Shift auto-axis), where rotate and scale use
     /// `middleDrag`'s dx maths rather than the TransformControls handle geometry
     pub js_drag: Option<Pos2>,
+    /// where the drag was pressed; the JS grid snap slides the start point's screen position by
+    /// the mouse delta from here (`_dragPx0`), preserving the grab offset on the centre handle
+    pub press_px: Pos2,
 }
 
 impl VpState {
@@ -1341,6 +1349,30 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     if app.vp_state.mmb == Some(idx) && !pointer.button_down(egui::PointerButton::Middle) {
         app.vp_state.mmb = None;
     }
+    // JS `dragStep`: grid snap (X) snaps translation to the grid spacing; discrete move / rotate /
+    // scale each have their own step; holding J is a 15 degree rotate snap
+    let key_x = tool == Tool::Move && ui.input(|i| i.key_down(egui::Key::X));
+    let key_j = tool == Tool::Rotate && ui.input(|i| i.key_down(egui::Key::J));
+    let trans_step = if app.snap_grid || key_x {
+        Some(app.prefs.grid_spacing)
+    } else if app.vp_state.discrete[0] {
+        Some(app.vp_state.snap_step)
+    } else {
+        None
+    };
+    let rot_step = if key_j {
+        Some(15.0)
+    } else if app.vp_state.discrete[1] {
+        Some(app.vp_state.snap_angle)
+    } else {
+        None
+    };
+    let scl_step = app.vp_state.discrete[2].then_some(app.vp_state.snap_scale);
+    let (snapping, snap_distance, snap_angle, snap_scale) = match tool {
+        Tool::Move => (trans_step.is_some(), trans_step.unwrap_or(1.0) as f32, 0.0, 0.0),
+        Tool::Rotate => (rot_step.is_some(), 0.0, (rot_step.unwrap_or(15.0) as f32).to_radians(), 0.0),
+        _ => (scl_step.is_some(), 0.0, 0.0, scl_step.unwrap_or(1.0) as f32),
+    };
     let mut base = GizmoConfig {
         view_matrix: cv.view.into(),
         projection_matrix: cv.proj.into(),
@@ -1349,11 +1381,10 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         orientation: if space_world && tool != Tool::Scale && app.s.comp_mode.is_none() { GizmoOrientation::Global } else { GizmoOrientation::Local },
         // MMB: drag the active handle from anywhere in the view; Ctrl+LMB / auto-axis force a handle
         mode_override: app.vp_state.force_handle.filter(|f| f.0 == idx).map(|f| f.1).or(if app.vp_state.mmb == Some(idx) { active } else { None }),
-        // hold X: grid snap while moving; hold J: discrete rotate (Maya)
-        snapping: app.snap_grid || ui.input(|i| (app.tool == Tool::Move && i.key_down(egui::Key::X)) || (app.tool == Tool::Rotate && i.key_down(egui::Key::J))),
-        snap_distance: app.vp_state.snap_step as f32,
-        snap_angle: (app.vp_state.snap_angle as f32).to_radians(),
-        snap_scale: 0.1,
+        snapping,
+        snap_distance,
+        snap_angle,
+        snap_scale,
         visuals,
         pixels_per_point: ppp,
         ..Default::default()
@@ -1571,7 +1602,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     Some((id.clone(), i, DVec3::new(g("translateX"), g("translateY"), g("translateZ"))))
                 });
                 let (comps, weights, mirror) = if extrude.is_some() { (vec![], vec![], vec![]) } else { (comps, weights, mirror) };
-                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag: auto_origin.or(mmb_press) });
+                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag: auto_origin.or(mmb_press), press_px: auto_origin.or(mmb_press).unwrap_or(cursor) });
             }
             let d = app.vp_state.drag.as_mut().unwrap();
             if let Some(n) = new_tfs.first() {
@@ -1582,17 +1613,25 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             // TransformControls' tangential / radial behaviour.
             if let (Some(origin), Some(handle)) = (d.js_drag, d.handle) {
                 let dx = (cursor.x - origin.x) as f64;
-                let snap_on = app.snap_grid || (app.tool == Tool::Rotate && ui.input(|i| i.key_down(egui::Key::J)));
+                // JS `dragStep`: holding J is a 15 degree rotation snap, otherwise the mode's
+                // discrete step (if enabled)
+                let key_j = ui.input(|i| i.key_down(egui::Key::J));
                 match handle {
                     GizmoMode::RotateX | GizmoMode::RotateY | GizmoMode::RotateZ | GizmoMode::RotateView => {
-                        let snap = snap_on.then_some(app.vp_state.snap_angle);
+                        let snap = if key_j {
+                            Some(15.0)
+                        } else if app.vp_state.discrete[1] {
+                            Some(app.vp_state.snap_angle)
+                        } else {
+                            None
+                        };
                         d.cur.rotation = js_rotate(DQuat::from(d.start.rotation), handle, dx, snap, cv.fwd).into();
                         d.cur.translation = d.start.translation;
                         d.cur.scale = d.start.scale;
                     }
                     GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ | GizmoMode::ScaleXY | GizmoMode::ScaleXZ | GizmoMode::ScaleYZ | GizmoMode::ScaleUniform => {
-                        // the gizmo's scale snap step (JS `dragStep('scale')`, default 0.1)
-                        let m = js_scale(handle, dx, snap_on.then_some(0.1));
+                        let snap = app.vp_state.discrete[2].then_some(app.vp_state.snap_scale);
+                        let m = js_scale(handle, dx, snap);
                         d.cur.scale = (m * DVec3::from(d.start.scale)).into();
                         d.cur.rotation = d.start.rotation;
                         d.cur.translation = d.start.translation;
@@ -1600,36 +1639,42 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     _ => {}
                 }
             }
-            // centre handle with grid snap in a perspective view: slide on the ground plane through the
-            // start point and snap X/Z to the grid (not every axis in 3D)
-            if d.tool == Tool::Move && d.handle == Some(GizmoMode::TranslateView) && !cv.ortho && (app.snap_grid || ui.input(|i| i.key_down(egui::Key::X))) {
-                let y0 = DVec3::from(d.start.translation).y;
-                let ray = cv.ray(cursor, app.vps[idx].rect);
-                if ray.dir.y.abs() > 1e-6 {
-                    let t = (y0 - ray.origin.y) / ray.dir.y;
-                    if t > 0.0 {
-                        let p = ray.at(t);
-                        let st = app.vp_state.snap_step.max(1e-6);
-                        d.cur.translation = DVec3::new((p.x / st).round() * st, y0, (p.z / st).round() * st).into();
-                    }
-                }
-            }
-            let d = app.vp_state.drag.as_mut().unwrap();
             // hold C (or the status line toggle): the moved pivot snaps to the nearest curve point
-            if d.tool == Tool::Move && (app.snap_curve || ui.input(|i| i.key_down(egui::Key::C))) {
+            // (a Rust extension; the point and grid snaps below take priority as in the JS)
+            if d.handle.is_some_and(|m| m.is_translate()) && (app.snap_curve || ui.input(|i| i.key_down(egui::Key::C))) {
                 let moving: HashSet<String> = d.objects.iter().map(|o| o.0.clone()).collect();
                 if let Some(w) = snap_curve_point(&app.s, &app.vps[idx], cv, cursor, &moving) {
-                    let d = app.vp_state.drag.as_mut().unwrap();
                     d.cur.translation = w.into();
                 }
             }
-            let d = app.vp_state.drag.as_mut().unwrap();
-            // hold V (or the status line toggle): the moved pivot snaps to the vertex nearest the cursor
-            if d.tool == Tool::Move && (app.snap_point || ui.input(|i| i.key_down(egui::Key::V))) {
-                let moving: HashSet<String> = d.comps.iter().map(|c| c.0.clone()).chain(d.objects.iter().map(|o| o.0.clone())).collect();
-                if let Some(w) = snap_vertex(&app.s, &app.vps[idx], cv, cursor, &moving) {
-                    let d = app.vp_state.drag.as_mut().unwrap();
-                    d.cur.translation = w.into();
+            // JS `snapDuringDrag`: the point snap runs first and wins over the grid; the centre
+            // handle with grid snap slides on the ground grid (persp) or the view plane's grid (ortho)
+            if d.handle.is_some_and(|m| m.is_translate()) {
+                let point_on = app.snap_point || ui.input(|i| i.key_down(egui::Key::V));
+                let comp = app.s.comp_mode.is_some();
+                let pivot = d.pivots.is_some();
+                if point_on {
+                    // object mode never snaps to a selected object (moved or not); a pivot may snap
+                    // to its own object, and moved components never snap onto themselves
+                    let excl: HashSet<String> = if comp || pivot { HashSet::new() } else { app.s.sel.iter().cloned().collect() };
+                    let skip: std::collections::HashMap<String, HashSet<u32>> = if comp {
+                        d.comps.iter().map(|(id, v, _)| (id.clone(), v.iter().copied().collect())).collect()
+                    } else {
+                        Default::default()
+                    };
+                    if let Some(sp) = snap_point_near(&app.s, &app.vps[idx], &app.sel_mask_off, cv, cursor, &excl, &skip, f32::INFINITY) {
+                        let st = DVec3::from(d.start.translation);
+                        let handle = d.handle.unwrap_or(GizmoMode::TranslateView);
+                        d.cur.translation = project_snap_point(sp, st, DQuat::from(d.start.rotation), handle).into();
+                        d.cur.rotation = d.start.rotation;
+                        d.cur.scale = d.start.scale;
+                    }
+                }
+                if d.handle == Some(GizmoMode::TranslateView) && (app.snap_grid || ui.input(|i| i.key_down(egui::Key::X))) {
+                    let st = DVec3::from(d.start.translation);
+                    if let Some(w) = grid_snap_center(cv, app.vps[idx].rect, st, cursor, d.press_px, app.prefs.grid_spacing.max(1e-6)) {
+                        d.cur.translation = w.into();
+                    }
                 }
             }
             let d = app.vp_state.drag.as_mut().unwrap();
@@ -1750,7 +1795,7 @@ fn place_point(cv: &CamView, rect: Rect, p: Pos2, snap: Option<f64>) -> Option<D
 
 fn creation_tool(app: &mut IncaApp, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter) {
     let rect = app.vps[idx].rect;
-    let snap = app.snap_grid.then_some(app.vp_state.snap_step);
+    let snap = app.snap_grid.then_some(app.prefs.grid_spacing);
     // a live surface takes the points (Make Live)
     let live = |app: &IncaApp, p: Pos2| crate::mesh_tools::live_point(app, cv, rect, p).or_else(|| place_point(cv, rect, p, snap));
     if app.tool == Tool::Pencil {
@@ -1830,7 +1875,7 @@ fn creation_tool(app: &mut IncaApp, idx: usize, resp: &egui::Response, cv: &CamV
 /// Backspace steps back, Esc cancels. Returns true when it handled the input.
 fn arc_edit(app: &mut IncaApp, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter) -> bool {
     let rect = app.vps[idx].rect;
-    let snap = app.snap_grid.then_some(app.vp_state.snap_step);
+    let snap = app.snap_grid.then_some(app.prefs.grid_spacing);
     let [a, m, b] = [app.vp_state.tool_pts[0], app.vp_state.tool_pts[1], app.vp_state.tool_pts[2]];
     let yellow = Color32::from_rgb(255, 225, 74);
     let line = inca_core::curves::arc_through_points(a, b, m, 0.04).unwrap_or(vec![a, m, b]);
@@ -1989,25 +2034,116 @@ fn snap_curve_point(s: &inca_core::scene::Scene, vp: &viewport::Viewport, cv: &C
     best.map(|b| b.1)
 }
 
-fn snap_vertex(s: &inca_core::scene::Scene, vp: &viewport::Viewport, cv: &CamView, cursor: Pos2, skip: &HashSet<String>) -> Option<DVec3> {
+/// The JS `snapPointNear`: the mesh vertex or curve CV nearest the cursor among visible nodes.
+///
+/// `exclude` drops whole objects (the selected objects in object mode), `skip` drops individual
+/// vertices of moved components, and `radius` caps the screen distance (`Infinity` during a drag:
+/// the nearest point always wins, so the manipulator stays on it until another is closer).
+#[allow(clippy::too_many_arguments)]
+fn snap_point_near(
+    s: &inca_core::scene::Scene,
+    vp: &viewport::Viewport,
+    off: &HashSet<String>,
+    cv: &CamView,
+    cursor: Pos2,
+    exclude: &HashSet<String>,
+    skip: &std::collections::HashMap<String, HashSet<u32>>,
+    radius: f32,
+) -> Option<DVec3> {
     let mut best: Option<(f32, DVec3)> = None;
     for id in s.all_dag(false) {
-        if skip.contains(&id) || !s.is_visible(&id) {
+        if exclude.contains(&id) || !s.is_visible(&id) || s.is_template(&id) || !crate::toolbar::mask_allows_scene(s, off, &id) {
             continue;
         }
-        let Some(pm) = s.node(&id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { continue };
+        if let Some(iso) = &vp.isolate {
+            if !iso.iter().any(|r| r == &id || s.is_ancestor(r, &id)) {
+                continue;
+            }
+        }
+        let Some(node) = s.node(&id) else { continue };
         let wm = s.world_matrix(&id);
-        for p in &pm.v {
-            let w = wm.transform_point3(*p);
+        let sk = skip.get(&id);
+        let mut test = |p: DVec3| {
+            let w = wm.transform_point3(p);
             if let Some(q) = cv.project(w, vp.rect) {
                 let d = q.distance(cursor);
-                if d < 40.0 && best.is_none_or(|b| d < b.0) {
+                if d < radius && best.is_none_or(|b| d < b.0) {
                     best = Some((d, w));
                 }
             }
+        };
+        match &node.shape {
+            Shape::Mesh(m) => {
+                for (i, p) in m.mesh.v.iter().enumerate() {
+                    if sk.is_some_and(|s| s.contains(&(i as u32))) {
+                        continue;
+                    }
+                    test(*p);
+                }
+            }
+            Shape::Curve(c) => {
+                for (i, p) in c.cvs.iter().enumerate() {
+                    if sk.is_some_and(|s| s.contains(&(i as u32))) {
+                        continue;
+                    }
+                    test(*p);
+                }
+            }
+            _ => {}
         }
     }
     best.map(|b| b.1)
+}
+
+/// JS `snapDuringDrag`: project a snapped point onto the dragged axis, or onto the dragged
+/// plane (dropping the component along the plane's normal). Centre handles take the point as is.
+///
+/// transform-gizmo names its plane handles after the corner they sit at, so `TranslateXY` keeps
+/// X fixed (normal X) and `TranslateYZ` keeps Z fixed (normal Z).
+fn project_snap_point(sp: DVec3, st: DVec3, rot: DQuat, handle: GizmoMode) -> DVec3 {
+    let d = sp - st;
+    let axis = |a: DVec3| st + a * d.dot(a);
+    let plane = |n: DVec3| sp - n * d.dot(n);
+    match handle {
+        GizmoMode::TranslateX => axis(rot * DVec3::X),
+        GizmoMode::TranslateY => axis(rot * DVec3::Y),
+        GizmoMode::TranslateZ => axis(rot * DVec3::Z),
+        GizmoMode::TranslateXY => plane(rot * DVec3::X),
+        GizmoMode::TranslateXZ => plane(rot * DVec3::Y),
+        GizmoMode::TranslateYZ => plane(rot * DVec3::Z),
+        _ => sp,
+    }
+}
+
+/// JS `snapDuringDrag` grid branch for the centre handle: the start point's screen position
+/// plus the mouse delta picks a point on the ground plane (persp, y = 0) or the view plane
+/// through the start (ortho, keeping the depth along the dominant view axis), then X/Z snap
+/// to the grid spacing.
+fn grid_snap_center(cv: &CamView, rect: Rect, st: DVec3, cursor: Pos2, press: Pos2, spacing: f64) -> Option<DVec3> {
+    let a = cv.project(st, rect)?;
+    let ray = cv.ray(a + (cursor - press), rect);
+    let snap = |x: f64| (x / spacing).round() * spacing;
+    if cv.ortho {
+        let n = cv.fwd;
+        let denom = ray.dir.dot(n);
+        if denom.abs() < 1e-9 {
+            return None;
+        }
+        let t = (st - ray.origin).dot(n) / denom;
+        let p = ray.at(t);
+        let back = [n.x.abs(), n.y.abs(), n.z.abs()];
+        let depth = if back[0] >= back[1] && back[0] >= back[2] { 0 } else if back[1] >= back[2] { 1 } else { 2 };
+        let mut out = [snap(p.x), snap(p.y), snap(p.z)];
+        out[depth] = [st.x, st.y, st.z][depth];
+        Some(DVec3::from(out))
+    } else {
+        if ray.dir.y.abs() < 1e-9 {
+            return None;
+        }
+        let t = (0.0 - ray.origin.y) / ray.dir.y;
+        let p = ray.at(t);
+        Some(DVec3::new(snap(p.x), 0.0, snap(p.z)))
+    }
 }
 
 fn finish_drag(app: &mut IncaApp, d: GizmoDrag) {
@@ -2287,10 +2423,87 @@ mod tests {
         assert!((s - DVec3::new(1.0, std::f64::consts::E, std::f64::consts::E)).length() < 1e-9, "{s:?}");
         let s = js_scale(GizmoMode::ScaleYZ, 100.0, None);
         assert!((s - DVec3::new(std::f64::consts::E, std::f64::consts::E, 1.0)).length() < 1e-9, "{s:?}");
-        // and the discrete scale step rounds up to at least the step itself
+        // the discrete scale step (JS default 1) rounds the factor and never goes below it
         let dx = 100.0 * 1.24f64.ln();
-        assert!((js_scale(GizmoMode::ScaleUniform, dx, Some(0.1)) - DVec3::splat(1.2)).length() < 1e-9);
-        assert_eq!(js_scale(GizmoMode::ScaleUniform, -10_000.0, Some(0.1)), DVec3::splat(0.1));
+        assert_eq!(js_scale(GizmoMode::ScaleUniform, dx, Some(1.0)), DVec3::splat(1.0));
+        let dx = 100.0 * 1.6f64.ln();
+        assert_eq!(js_scale(GizmoMode::ScaleUniform, dx, Some(1.0)), DVec3::splat(2.0));
+        assert_eq!(js_scale(GizmoMode::ScaleUniform, -10_000.0, Some(1.0)), DVec3::splat(1.0));
+    }
+
+    #[test]
+    fn point_snap_projects_onto_the_dragged_handle() {
+        let st = DVec3::ZERO;
+        let sp = DVec3::new(3.0, 4.0, 5.0);
+        let id = DQuat::IDENTITY;
+        // single axes: slide the start pivot along that axis
+        assert_eq!(project_snap_point(sp, st, id, GizmoMode::TranslateX), DVec3::new(3.0, 0.0, 0.0));
+        assert_eq!(project_snap_point(sp, st, id, GizmoMode::TranslateY), DVec3::new(0.0, 4.0, 0.0));
+        assert_eq!(project_snap_point(sp, st, id, GizmoMode::TranslateZ), DVec3::new(0.0, 0.0, 5.0));
+        // transform-gizmo's corner names: XY keeps X, XZ keeps Y, YZ keeps Z
+        assert_eq!(project_snap_point(sp, st, id, GizmoMode::TranslateXY), DVec3::new(0.0, 4.0, 5.0));
+        assert_eq!(project_snap_point(sp, st, id, GizmoMode::TranslateXZ), DVec3::new(3.0, 0.0, 5.0));
+        assert_eq!(project_snap_point(sp, st, id, GizmoMode::TranslateYZ), DVec3::new(3.0, 4.0, 0.0));
+        // the centre handle takes the point itself
+        assert_eq!(project_snap_point(sp, st, id, GizmoMode::TranslateView), sp);
+        // object-space axes are rotated by the manipulator's start orientation
+        let rot = DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2);
+        let a = rot * DVec3::Y;
+        let p = project_snap_point(sp, st, rot, GizmoMode::TranslateY);
+        assert!((p - a * sp.dot(a)).length() < 1e-9);
+    }
+
+    #[test]
+    fn grid_snap_center_lands_on_the_ground_or_view_plane() {
+        let s = Scene::new();
+        let cv = viewport::cam_view(&s, "persp", [800.0, 600.0]);
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let p = pos2(400.0, 300.0);
+        let st = DVec3::new(1.3, 5.0, -2.6);
+        let w = grid_snap_center(&cv, rect, st, p, p, 1.0).unwrap();
+        // perspective: the centre handle slides on the ground grid (y = 0)
+        assert!(w.y.abs() < 1e-9, "{w:?}");
+        assert!((w.x - w.x.round()).abs() < 1e-9 && (w.z - w.z.round()).abs() < 1e-9, "{w:?}");
+        // orthographic: the view plane through the start keeps the depth, snaps the other two
+        let cv = viewport::cam_view(&s, "front", [800.0, 600.0]);
+        assert!(cv.ortho);
+        let w = grid_snap_center(&cv, rect, st, p, p, 1.0).unwrap();
+        assert!((w.x - 1.0).abs() < 1e-9 && (w.y - 5.0).abs() < 1e-9 && (w.z - st.z).abs() < 1e-9, "{w:?}");
+        // moving the mouse keeps the grab offset from where the start projects
+        let w2 = grid_snap_center(&cv, rect, st, p + vec2(17.0, 0.0), p, 1.0).unwrap();
+        assert_ne!(w2, w);
+    }
+
+    #[test]
+    fn snap_point_near_has_no_radius_cap_and_includes_curves() {
+        use inca_core::curves::Curve;
+        let mut s = Scene::new();
+        let mesh = s.create_mesh("polyCube", &Params::new(), None);
+        let mut vp = viewport::Viewport::new("persp");
+        vp.rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let cv = viewport::cam_view(&s, "persp", [800.0, 600.0]);
+        let off = pos2(5.0, 5.0);
+        let none = HashSet::new();
+        let empty = std::collections::HashMap::new();
+        // the cube sits near the middle of the view: with a 40 px cap the corner finds nothing,
+        // during a drag (Infinity) the nearest vertex always wins
+        assert!(snap_point_near(&s, &vp, &none, &cv, off, &none, &empty, 40.0).is_none());
+        assert!(snap_point_near(&s, &vp, &none, &cv, off, &none, &empty, f32::INFINITY).is_some());
+        // selected objects are excluded in object mode
+        let mut excl = HashSet::new();
+        excl.insert(mesh.clone());
+        assert!(snap_point_near(&s, &vp, &none, &cv, off, &excl, &empty, f32::INFINITY).is_none());
+        // every vertex can be skipped (moved components never snap to themselves)
+        let verts: HashSet<u32> = (0..s.node(&mesh).unwrap().mesh().unwrap().mesh.v.len() as u32).collect();
+        let mut skip = std::collections::HashMap::new();
+        skip.insert(mesh, verts);
+        assert!(snap_point_near(&s, &vp, &none, &cv, off, &none, &skip, f32::INFINITY).is_none());
+        // curve CVs count as snap points too
+        let curve = s.create_curve(Curve::new(vec![DVec3::ZERO], 1, "open", "cv"), "curve1");
+        let q = cv.project(DVec3::ZERO, vp.rect).unwrap();
+        let hit = snap_point_near(&s, &vp, &none, &cv, q, &none, &empty, f32::INFINITY).unwrap();
+        assert!(hit.length() < 1e-9, "{hit:?}");
+        assert!(s.node(&curve).is_some());
     }
 
     #[test]
