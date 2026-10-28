@@ -256,7 +256,8 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
             ui.close();
         }
         if ui.button("Look at Selection").clicked() {
-            let b = viewport::selection_bbox(&app.s);
+            // JS `lookAtSelection` unions the selected objects' bounding boxes, not components
+            let b = viewport::selected_objects_bbox(&app.s);
             if !b.is_empty() {
                 viewport::look_at(&mut app.s, &cam, b.center());
             }
@@ -306,6 +307,10 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         let v = &mut app.vps[idx];
         ui.radio_value(&mut v.shade, ShadeMode::Wire, "Wireframe  4");
         ui.radio_value(&mut v.shade, ShadeMode::Shaded, "Smooth Shade All  5");
+        // JS "Bounding Box" also switches to wireframe in this release
+        if ui.selectable_label(false, "Bounding Box").clicked() {
+            v.shade = ShadeMode::Wire;
+        }
         ui.separator();
         ui.checkbox(&mut v.wire_on_shaded, "Wireframe on Shaded");
         ui.checkbox(&mut v.xray, "X-Ray  Alt+A");
@@ -362,6 +367,7 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         }
         ui.separator();
         ui.checkbox(&mut v.show_curves, "NURBS Curves");
+        ui.checkbox(&mut v.show_nurbs, "NURBS Surfaces");
         ui.checkbox(&mut v.show_meshes, "Polygons");
         ui.checkbox(&mut v.show_lights, "Lights");
         ui.checkbox(&mut v.show_cameras, "Cameras");

@@ -16,6 +16,8 @@ pub struct Prefs {
     pub ortho_tumble: bool,
     pub grid_size: f64,
     pub grid_spacing: f64,
+    /// visual grid line count over the grid length (JS `grid.divisions`)
+    pub grid_divisions: i32,
     pub grid_major: i32,
     pub tangent_in: String,
     pub tangent_out: String,
@@ -41,7 +43,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true }
+        Prefs { ui_scale: 1.0, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true }
     }
 }
 
@@ -72,7 +74,9 @@ pub fn apply(app: &mut IncaApp, ctx: &egui::Context) {
         ctx.global_style_mut(|s| s.interaction.tooltip_delay = delay);
     }
     for v in app.vps.iter_mut() {
-        v.grid_cfg = (p.grid_size.max(0.01), p.grid_spacing.max(0.001), p.grid_major.max(1));
+        // the JS grid divides the length into `divisions` lines; `spacing` only feeds snapping
+        let step = (p.grid_size / p.grid_divisions.max(1) as f64).max(0.001);
+        v.grid_cfg = (p.grid_size.max(0.01), step, p.grid_major.max(1));
     }
     app.recent.truncate(p.recent_count.max(1));
     app.recent_projects.truncate(p.recent_projects_count.max(1));
@@ -180,10 +184,13 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
                 ui.add(egui::DragValue::new(&mut app.prefs.grid_size).speed(0.5).range(0.01..=10000.0).suffix(" units"));
             });
             row(ui, "Grid lines every", |ui| {
-                ui.add(egui::DragValue::new(&mut app.prefs.grid_spacing).speed(0.1).range(0.001..=1000.0).suffix(" units"));
+                ui.add(egui::DragValue::new(&mut app.prefs.grid_spacing).speed(0.1).range(0.001..=1000.0).suffix(" units (snapping)"));
+            });
+            row(ui, "Subdivisions", |ui| {
+                ui.add(egui::DragValue::new(&mut app.prefs.grid_divisions).range(1..=200));
             });
             row(ui, "Major line every", |ui| {
-                ui.add(egui::DragValue::new(&mut app.prefs.grid_major).range(1..=100).suffix(" lines"));
+                ui.add(egui::DragValue::new(&mut app.prefs.grid_major).range(1..=100).suffix(" subdivisions"));
             });
             theme::section_header(ui, "Heads Up Display");
             ui.end_row();

@@ -56,6 +56,8 @@ pub struct Viewport {
     pub show_cameras: bool,
     pub show_curves: bool,
     pub show_meshes: bool,
+    /// NURBS surfaces imported/converted into meshes (JS `show.nurbsSurfaces`)
+    pub show_nurbs: bool,
     pub show_locators: bool,
     pub show_manips: bool,
     pub show_sel_highlight: bool,
@@ -76,7 +78,7 @@ impl Viewport {
     /// Show menu filters by object type.
     pub fn shows(&self, n: &inca_core::scene::Node) -> bool {
         match &n.shape {
-            Shape::Mesh(_) => self.show_meshes,
+            Shape::Mesh(m) => if m.nurbs { self.show_nurbs } else { self.show_meshes },
             Shape::Light(_) => self.show_lights,
             Shape::Camera(_) => self.show_cameras,
             Shape::Curve(_) => self.show_curves,
@@ -90,6 +92,7 @@ impl Viewport {
         self.show_lights = on;
         self.show_cameras = on;
         self.show_curves = on;
+        self.show_nurbs = on;
         self.show_locators = on;
         self.grid = on;
         self.show_sel_highlight = on;
@@ -108,6 +111,7 @@ impl Viewport {
             show_cameras: true,
             show_curves: true,
             show_meshes: true,
+            show_nurbs: true,
             show_locators: true,
             show_manips: true,
             show_sel_highlight: true,
@@ -205,31 +209,24 @@ pub fn cam_view(s: &Scene, cam: &str, size: [f32; 2]) -> CamView {
 /// Alt+LMB tumble around the centre of interest.
 pub fn tumble(s: &mut Scene, cam: &str, dx: f32, dy: f32, allow_ortho: bool) {
     let Some(id) = camera_id(s, cam) else { return };
-    let Some(n) = s.nodes.get(&id) else { return };
-    let Shape::Camera(c) = &n.shape else { return };
-    if c.ortho && !allow_ortho {
-        return;
-    }
-    let coi = c.coi;
-    let q = quat_from_euler_deg(n.xf.r, &n.xf.ro);
-    let eye = glam::DVec3::from_array(n.xf.t);
-    let fwd = q * -DVec3::Z;
-    let center = eye + fwd * coi;
-    let r = euler_deg_from_quat(q, "xyz");
-    // derive yaw / pitch, then apply
-    let yaw = fwd.x.atan2(fwd.z).to_degrees() + 180.0;
-    let pitch = fwd.y.clamp(-1.0, 1.0).asin().to_degrees();
-    let _ = r;
-    let yaw = yaw - dx as f64 * 0.4;
-    let pitch = (pitch - dy as f64 * 0.4).clamp(-89.9, 89.9);
-    let nq = DQuat::from_euler(glam::EulerRot::YXZ, yaw.to_radians(), pitch.to_radians(), 0.0);
-    let nf = nq * -DVec3::Z;
-    let ne = center - nf * coi;
-    let e = euler_deg_from_quat(nq, "xyz");
+    let (coi, mut r, ro, t) = {
+        let Some(n) = s.nodes.get(&id) else { return };
+        let Shape::Camera(c) = &n.shape else { return };
+        if c.ortho && !allow_ortho {
+            return;
+        }
+        (c.coi, n.xf.r, n.xf.ro.clone(), n.xf.t)
+    };
+    let q = quat_from_euler_deg(r, &ro);
+    let target = DVec3::from_array(t) + (q * -DVec3::Z) * coi;
+    // JS `tumble` adjusts the stored Euler angles directly: `r[1] -= dx*0.4; r[0] -= dy*0.4`.
+    // It does not clamp at the poles and keeps the rotate order, so the view flips over.
+    r[1] -= dx as f64 * 0.4;
+    r[0] -= dy as f64 * 0.4;
+    let q = quat_from_euler_deg(r, &ro);
     let n = s.nodes.get_mut(&id).unwrap();
-    n.xf.t = ne.to_array();
-    n.xf.r = e;
-    n.xf.ro = "xyz".into();
+    n.xf.r = r;
+    n.xf.t = (target + (q * DVec3::Z) * coi).to_array();
     s.rev += 1;
 }
 
@@ -269,7 +266,7 @@ pub fn set_view(s: &mut Scene, cam: &str, t: [f64; 3], r: [f64; 3], coi: Option<
     let Some(n) = s.nodes.get_mut(&id) else { return };
     n.xf.t = t;
     n.xf.r = r;
-    n.xf.ro = "xyz".into();
+    // JS camera helpers set `inc.r` in place and never touch `inc.ro`
     if let (Shape::Camera(c), Some(d)) = (&mut n.shape, coi) {
         c.coi = d;
     }
@@ -305,9 +302,7 @@ pub fn default_view(s: &mut Scene, cam: &str) {
 pub fn look_at(s: &mut Scene, cam: &str, target: DVec3) {
     let Some(id) = camera_id(s, cam) else { return };
     let Some(n) = s.nodes.get(&id) else { return };
-    if matches!(&n.shape, Shape::Camera(c) if c.ortho) {
-        return;
-    }
+    // the JS `lookAtSelection` works in orthographic views too (it only aims the camera)
     let eye = DVec3::from_array(n.xf.t);
     let d = target - eye;
     if d.length() < 1e-9 {
@@ -375,10 +370,11 @@ pub fn frame_box(s: &mut Scene, cam: &str, b: &Aabb, aspect: f64) {
     }
     if let Shape::Camera(c) = &mut n.shape {
         if c.ortho {
-            // JS: orthoWidth = radius * 2.4 * max(1, viewportAspect / 1.5)
+            // JS: orthoWidth = radius * 2.4 * max(1, viewportAspect / 1.5), then park the
+            // camera 1000 units back and set coi = 1000
             c.ortho_width = radius * 2.4 * (aspect / 1.5).max(1.0);
-            let d = c.coi;
-            n.xf.t = (center - fwd * d).to_array();
+            c.coi = 1000.0;
+            n.xf.t = (center - fwd * 1000.0).to_array();
         } else {
             let fov = c.fov_y(aspect).min(2.0 * ((c.fov_y(aspect) / 2.0).tan() * aspect).atan());
             let d = radius / (fov / 2.0).sin() * 1.05;
@@ -508,13 +504,16 @@ fn edge_normals(topo: &Topo, fnorm: &[DVec3], a: u32, b: u32) -> (DVec3, DVec3) 
     }
 }
 
-fn circle(out: &mut Vec<LineVertex>, c: DVec3, u: DVec3, v: DVec3, r: f64, col: [f32; 4]) {
-    let n = 24;
+fn circle_n(out: &mut Vec<LineVertex>, c: DVec3, u: DVec3, v: DVec3, r: f64, n: usize, col: [f32; 4]) {
     for i in 0..n {
         let a0 = std::f64::consts::TAU * i as f64 / n as f64;
         let a1 = std::f64::consts::TAU * (i + 1) as f64 / n as f64;
         push_line(out, c + (u * a0.cos() + v * a0.sin()) * r, c + (u * a1.cos() + v * a1.sin()) * r, col);
     }
+}
+
+fn circle(out: &mut Vec<LineVertex>, c: DVec3, u: DVec3, v: DVec3, r: f64, col: [f32; 4]) {
+    circle_n(out, c, u, v, r, 24, col);
 }
 
 /// s/t/u divisions of a lattice node.
@@ -627,54 +626,94 @@ pub fn icon_lines(s: &Scene, id: &str, col: [f32; 4]) -> Vec<LineVertex> {
             }
         }
         Shape::Light(l) => {
+            // the JS `lightIcon` geometry, one branch per light type
             let z = DVec3::ZERO;
             match l.ty.as_str() {
                 "directionalLight" => {
-                    for dx in [-0.3, 0.0, 0.3] {
-                        let a = DVec3::new(dx, 0.0, 0.0);
-                        push_line(&mut o, a, a - DVec3::Z * 1.5, col);
-                        push_line(&mut o, a - DVec3::Z * 1.5, a - DVec3::Z * 1.2 + DVec3::Y * 0.15, col);
+                    for (x, y) in [(-0.3, 0.0), (0.3, 0.0), (0.0, 0.3)] {
+                        let a = DVec3::new(x, y, 0.5);
+                        let b = DVec3::new(x, y, -0.5);
+                        push_line(&mut o, a, b, col);
+                        for (dx, dy) in [(0.08, 0.0), (-0.08, 0.0), (0.0, 0.08), (0.0, -0.08)] {
+                            push_line(&mut o, b, DVec3::new(x + dx, y + dy, -0.3), col);
+                        }
                     }
                 }
                 "spotLight" => {
-                    let ang = l.attrs.get("coneAngle").and_then(|v| v.as_f64()).unwrap_or(40.0).to_radians() / 2.0;
-                    let r = ang.tan() * 1.5;
-                    circle(&mut o, -DVec3::Z * 1.5, DVec3::X, DVec3::Y, r, col);
+                    circle(&mut o, z, DVec3::X, DVec3::Y, 0.15, col);
+                    let r = 0.5;
+                    let back = -DVec3::Z * 1.2;
+                    circle(&mut o, back, DVec3::X, DVec3::Y, r, col);
                     for k in 0..4 {
                         let a = k as f64 * std::f64::consts::FRAC_PI_2;
-                        push_line(&mut o, z, -DVec3::Z * 1.5 + (DVec3::X * a.cos() + DVec3::Y * a.sin()) * r, col);
+                        let u = DVec3::X * a.cos() + DVec3::Y * a.sin();
+                        push_line(&mut o, u * 0.15, back + u * r, col);
                     }
+                    push_line(&mut o, z, -DVec3::Z * 1.5, col);
                 }
                 "areaLight" => {
                     let c = [DVec3::new(-1.0, -1.0, 0.0), DVec3::new(1.0, -1.0, 0.0), DVec3::new(1.0, 1.0, 0.0), DVec3::new(-1.0, 1.0, 0.0)];
                     for i in 0..4 {
                         push_line(&mut o, c[i], c[(i + 1) % 4], col);
                     }
+                    push_line(&mut o, c[0], c[2], col);
+                    push_line(&mut o, c[1], c[3], col);
                     push_line(&mut o, z, -DVec3::Z, col);
                 }
-                "ambientLight" | "skyDomeLight" => {
-                    circle(&mut o, z, DVec3::X, DVec3::Y, 0.5, col);
-                    circle(&mut o, z, DVec3::X, DVec3::Z, 0.5, col);
-                }
-                _ => {
-                    for ax in [DVec3::X, DVec3::Y, DVec3::Z] {
-                        push_line(&mut o, -ax * 0.4, ax * 0.4, col);
-                    }
+                "ambientLight" => {
                     circle(&mut o, z, DVec3::X, DVec3::Y, 0.3, col);
                     circle(&mut o, z, DVec3::Y, DVec3::Z, 0.3, col);
+                    circle(&mut o, z, DVec3::X, DVec3::Z, 0.3, col);
+                    circle_n(&mut o, z, DVec3::X, DVec3::Z, 0.5, 6, col);
+                }
+                "skyDomeLight" => {
+                    circle(&mut o, z, DVec3::X, DVec3::Z, 0.6, col);
+                    for k in 0..8 {
+                        let a = k as f64 / 8.0 * std::f64::consts::TAU;
+                        let d = DVec3::new(a.cos(), 0.0, a.sin());
+                        push_line(&mut o, d * 0.6, d * 0.3 + DVec3::Y * 0.5, col);
+                    }
+                    circle(&mut o, DVec3::Y * 0.5, DVec3::X, DVec3::Z, 0.3, col);
+                }
+                _ => {
+                    // pointLight
+                    circle(&mut o, z, DVec3::X, DVec3::Y, 0.25, col);
+                    circle(&mut o, z, DVec3::Y, DVec3::Z, 0.25, col);
+                    circle(&mut o, z, DVec3::Z, DVec3::X, 0.25, col);
+                    for d in [
+                        DVec3::new(1.0, 0.0, 0.0),
+                        DVec3::new(0.0, 1.0, 0.0),
+                        DVec3::new(0.0, 0.0, 1.0),
+                        DVec3::new(0.7, 0.7, 0.0),
+                        DVec3::new(0.7, -0.7, 0.0),
+                        DVec3::new(0.0, 0.7, 0.7),
+                        DVec3::new(0.0, 0.7, -0.7),
+                        DVec3::new(0.7, 0.0, 0.7),
+                        DVec3::new(-0.7, 0.0, 0.7),
+                    ] {
+                        push_line(&mut o, d * 0.35, d * 0.6, col);
+                        push_line(&mut o, -d * 0.35, -d * 0.6, col);
+                    }
                 }
             }
         }
         Shape::Camera(c) if !c.startup => {
-            let b = [DVec3::new(-0.4, -0.3, 0.6), DVec3::new(0.4, -0.3, 0.6), DVec3::new(0.4, 0.3, 0.6), DVec3::new(-0.4, 0.3, 0.6), DVec3::new(-0.4, -0.3, -0.4), DVec3::new(0.4, -0.3, -0.4), DVec3::new(0.4, 0.3, -0.4), DVec3::new(-0.4, 0.3, -0.4)];
-            for i in 0..4 {
-                push_line(&mut o, b[i], b[(i + 1) % 4], col);
-                push_line(&mut o, b[i + 4], b[(i + 1) % 4 + 4], col);
-                push_line(&mut o, b[i], b[i + 4], col);
+            // JS `cameraIcon`: a body box, a lens cone and two film reels
+            let b = [DVec3::new(-0.25, -0.3, 0.6), DVec3::new(0.25, -0.3, 0.6), DVec3::new(0.25, 0.3, 0.6), DVec3::new(-0.25, 0.3, 0.6), DVec3::new(-0.25, -0.3, -0.2), DVec3::new(0.25, -0.3, -0.2), DVec3::new(0.25, 0.3, -0.2), DVec3::new(-0.25, 0.3, -0.2)];
+            for (i, j) in [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)] {
+                push_line(&mut o, b[i], b[j], col);
             }
-            let lens = [DVec3::new(-0.2, -0.2, -0.4), DVec3::new(0.2, -0.2, -0.4), DVec3::new(0.2, 0.2, -0.4), DVec3::new(-0.2, 0.2, -0.4)];
             for i in 0..4 {
-                push_line(&mut o, lens[i], lens[i] * DVec3::new(1.6, 1.6, 2.0), col);
+                let a = i as f64 / 4.0 * std::f64::consts::TAU + std::f64::consts::FRAC_PI_4;
+                let b = a + std::f64::consts::FRAC_PI_2;
+                let u = DVec3::new(a.cos(), a.sin(), 0.0);
+                let v = DVec3::new(b.cos(), b.sin(), 0.0);
+                push_line(&mut o, u * 0.12 + DVec3::new(0.0, 0.0, -0.2), u * 0.25 + DVec3::new(0.0, 0.0, -0.6), col);
+                push_line(&mut o, u * 0.25 + DVec3::new(0.0, 0.0, -0.6), v * 0.25 + DVec3::new(0.0, 0.0, -0.6), col);
+            }
+            for zz in [0.15, 0.45] {
+                let c = DVec3::new(0.0, 0.45, zz);
+                circle_n(&mut o, c, DVec3::Y, DVec3::Z, 0.15, 12, col);
             }
         }
         _ => {}
@@ -1042,11 +1081,13 @@ pub fn build_draws(
                 }
             }
             Shape::Light(_) => {
-                let c = if selected || is_affected { sel_col } else { [0.9, 0.85, 0.3, 1.0] };
+                // JS light icons use `WIRE_MATS.icon` (near-black), not yellow; selection,
+                // affected, lead and template colours replace it through `wireMat`
+                let c = if template || selected || is_affected { sel_col } else { C_ICON };
                 draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(icon_lines(s, &id, c)), u: DrawUniform::new(wm) });
             }
             Shape::Camera(_) => {
-                let c = if selected || is_affected { sel_col } else { C_ICON };
+                let c = if template || selected || is_affected { sel_col } else { C_ICON };
                 draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(icon_lines(s, &id, c)), u: DrawUniform::new(wm) });
             }
             Shape::Curve(_) => {
@@ -1056,7 +1097,7 @@ pub fn build_draws(
                 draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(icon_lines(s, &id, c)), u: DrawUniform::new(wm) });
             }
             Shape::Locator => {
-                let c = if selected || is_affected {
+                let c = if template || selected || is_affected {
                     sel_col
                 } else if n.kind == "joint" {
                     [0.1, 0.35, 0.9, 1.0]
@@ -2100,6 +2141,12 @@ pub fn selection_bbox(s: &Scene) -> Aabb {
             return b;
         }
     }
+    selected_objects_bbox(s)
+}
+
+/// World bbox of the selected objects only (JS `lookAtSelection` ignores components).
+pub fn selected_objects_bbox(s: &Scene) -> Aabb {
+    let mut b = Aabb::EMPTY;
     for id in &s.sel {
         b.union(&s.world_bbox(id));
         if s.world_bbox(id).is_empty() {
@@ -2171,6 +2218,78 @@ mod tests {
         let Shape::Camera(c) = &s.node(&id).unwrap().shape else { panic!("top is not a camera") };
         let radius = DVec3::splat(2.0).length() * 0.5;
         assert!((c.ortho_width - radius * 2.4 * (2.0f64 / 1.5)).abs() < 1e-9, "ortho width {}", c.ortho_width);
+        // JS `frame` always parks an ortho camera 1000 units back and sets coi = 1000
+        assert!((c.coi - 1000.0).abs() < 1e-9);
+        let n = s.node(&id).unwrap();
+        assert!((DVec3::from_array(n.xf.t) - DVec3::new(0.0, 1000.0, 0.0)).length() < 1e-9, "t {:?}", n.xf.t);
+    }
+
+    #[test]
+    fn nurbs_surfaces_have_their_own_show_filter() {
+        // JS `show.nurbsSurfaces` is separate from `show.polymeshes`
+        let mut s = Scene::new();
+        let id = s.create_mesh("nurbsSphere", &Params::new(), None);
+        let mut vp = Viewport::new("persp");
+        assert!(vp.shows(s.node(&id).unwrap()));
+        vp.show_nurbs = false;
+        assert!(!vp.shows(s.node(&id).unwrap()));
+        vp.show_nurbs = true;
+        vp.show_meshes = false;
+        assert!(vp.shows(s.node(&id).unwrap()));
+        let cube = s.create_mesh("polyCube", &Params::new(), None);
+        assert!(!vp.shows(s.node(&cube).unwrap()));
+        vp.show_meshes = true;
+        vp.show_all(false);
+        assert!(!vp.shows(s.node(&id).unwrap()) && !vp.shows(s.node(&cube).unwrap()));
+    }
+
+    #[test]
+    fn tumble_follows_the_js_euler_accumulation() {
+        // JS `tumble`: `r[1] -= dx * 0.4; r[0] -= dy * 0.4`, with no pole clamp
+        let (mut s, _, _, _) = setup();
+        let id = camera_id(&s, "persp").unwrap();
+        let (r0, t0) = {
+            let n = s.node(&id).unwrap();
+            (n.xf.r, n.xf.t)
+        };
+        tumble(&mut s, "persp", 0.0, 300.0, false);
+        let n = s.node(&id).unwrap();
+        assert!((n.xf.r[0] - (r0[0] - 120.0)).abs() < 1e-9);
+        assert!((n.xf.r[1] - r0[1]).abs() < 1e-9);
+        assert!(n.xf.r[0] < -90.0, "the JS tumble flips past the pole");
+        // the centre of interest stays put
+        let cv = cam_view(&s, "persp", [800.0, 600.0]);
+        let old_q = quat_from_euler_deg(r0, "xyz");
+        let center = DVec3::from_array(t0) + (old_q * -DVec3::Z) * cv.coi;
+        assert!(((cv.eye + cv.fwd * cv.coi) - center).length() < 1e-6);
+    }
+
+    #[test]
+    fn look_at_selection_works_in_ortho_views() {
+        let mut s = Scene::new();
+        look_at(&mut s, "top", DVec3::new(10.0, 0.0, 0.0));
+        let id = camera_id(&s, "top").unwrap();
+        let Shape::Camera(c) = &s.node(&id).unwrap().shape else { panic!("top is not a camera") };
+        let eye = DVec3::from_array(s.node(&id).unwrap().xf.t);
+        assert!((c.coi - (DVec3::new(10.0, 0.0, 0.0) - eye).length()).abs() < 1e-6);
+        // it aims at the target: the forward vector points at it
+        let cv = cam_view(&s, "top", [800.0, 600.0]);
+        let dir = (DVec3::new(10.0, 0.0, 0.0) - eye).normalize();
+        assert!((cv.fwd - dir).length() < 1e-6);
+    }
+
+    #[test]
+    fn look_at_selection_ignores_component_selection() {
+        let (mut s, _, _, id) = setup();
+        s.sel = vec![id.clone()];
+        s.hilite = vec![id.clone()];
+        s.set_comp_mode(Some(CompMode::Vertex));
+        s.comp.entry(id.clone()).or_default().v.insert(0);
+        let all = s.world_bbox(&id);
+        let obj = selected_objects_bbox(&s);
+        assert!((obj.min - all.min).length() < 1e-9 && (obj.max - all.max).length() < 1e-9);
+        // the component box used by framing is just the single vertex
+        assert!(selection_bbox(&s).size().length() < all.size().length() * 0.01);
     }
 
     #[test]

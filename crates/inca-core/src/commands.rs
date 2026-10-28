@@ -691,6 +691,10 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "camera" => {
             let cam = CamShape { focal_length: a.f(&["fl", "focalLength"]).unwrap_or(35.0), ortho: a.b(&["o", "orthographic"], false), ortho_width: a.f(&["ow"]).unwrap_or(30.0), ..Default::default() };
             let id = s.create_camera("camera1", cam, false);
+            // JS `createCamera` drops a new camera at (0, 2, 10) looking down -Z
+            if let Some(n) = s.nodes.get_mut(&id) {
+                n.xf.t = [0.0, 2.0, 10.0];
+            }
             place_new(s, &id, &a);
             let n = s.node(&id).unwrap();
             Ok(Val::Array(vec![Val::Str(n.name.clone()), Val::Str(n.shape_name.clone().unwrap_or_default())]))
@@ -2729,6 +2733,15 @@ mod tests {
     }
 
     #[test]
+    fn camera_command_matches_the_js_default_placement() {
+        let mut s = Scene::new();
+        mel(&mut s, "select -cl; camera -n camA;").unwrap();
+        let id = s.find("camA").unwrap();
+        assert_eq!(s.node(&id).unwrap().xf.t, [0.0, 2.0, 10.0]);
+        assert_eq!(s.sel, vec![id]);
+    }
+
+    #[test]
     fn chamfer_connect_collapse_to_curve() {
         let mut s = Scene::new();
         mel(&mut s, "polyCube -n c; selectMode -component; selectType -v 1; select -r c.vtx[0]; polyChamferVtx -w 0.2;").unwrap();
@@ -2935,7 +2948,8 @@ mod more_tests {
         let mut s = Scene::new();
         Interp::new().run(&mut s, &mut NoHost, "camera; move -r 6 3 6; spotLight; move -r 1 2 3;").unwrap();
         let c = s.find("camera1").unwrap();
-        assert_eq!(s.node(&c).unwrap().xf.t, [6.0, 3.0, 6.0]);
+        // JS `createCamera` starts at (0, 2, 10)
+        assert_eq!(s.node(&c).unwrap().xf.t, [6.0, 5.0, 16.0]);
         let l = s.find("spotLight1").unwrap();
         assert_eq!(s.node(&l).unwrap().xf.t, [1.0, 2.0, 3.0]);
     }
