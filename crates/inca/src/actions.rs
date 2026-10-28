@@ -997,7 +997,8 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "about" => app.win.about = true,
         "mergeToCenter" => {
             let mut m = String::new();
-            for id in app.s.hilite() {
+            // mesh-only, as the JS `mergeToCenter` (`kind === 'mesh'`)
+            for id in app.s.hilite().into_iter().filter(|id| app.s.node(id).is_some_and(|n| n.mesh().is_some())) {
                 let v = app.s.comp_verts(&id);
                 if v.len() > 1 {
                     m += &format!("polyMergeVertex -d 1000000 {};\n", v.iter().map(|x| format!("{}.vtx[{x}]", app.s.name_of(&id))).collect::<Vec<_>>().join(" "));

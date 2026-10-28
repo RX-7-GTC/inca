@@ -132,8 +132,16 @@ pub fn border(s: &mut Scene) {
 pub fn all_components(s: &mut Scene, invert: bool) {
     let Some(mode) = s.comp_mode else { return };
     for id in s.hilite() {
-        let Some(pm) = s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.clone()) else { continue };
         let c = s.comp_sel(&id);
+        if let Some(len) = s.node(&id).and_then(|n| n.curve()).map(|c| c.cvs.len()) {
+            // curves only have CVs; `e[*]` / `f[*]` in the JS would be empty too
+            if mode == CompMode::Vertex {
+                let v = (0..len as u32).filter(|v| !invert || !c.v.contains(v)).collect();
+                s.comp.insert(id, CompSel { v, ..Default::default() });
+            }
+            continue;
+        }
+        let Some(pm) = s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.clone()) else { continue };
         let mut out = CompSel::default();
         match mode {
             CompMode::Vertex => out.v = (0..pm.v.len() as u32).filter(|v| !invert || !c.v.contains(v)).collect(),

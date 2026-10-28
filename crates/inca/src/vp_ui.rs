@@ -40,12 +40,19 @@ impl Default for VpState {
     }
 }
 
+/// Geometry snapshot at drag start: components move differently for meshes (polyTweak
+/// history) and curves (CVs are the shape).
+pub enum DragGeom {
+    Mesh(inca_core::mesh::PolyMesh),
+    Curve(inca_core::curves::Curve),
+}
+
 pub struct GizmoDrag {
     pub vp: usize,
     pub start: Transform,
     pub cur: Transform,
     pub objects: Vec<(String, DMat4)>,
-    pub comps: Vec<(String, Vec<u32>, inca_core::mesh::PolyMesh)>,
+    pub comps: Vec<(String, Vec<u32>, DragGeom)>,
     pub tool: Tool,
     /// Edit Pivot drag: start world pivots of the objects
     pub pivots: Option<Vec<DVec3>>,
@@ -146,6 +153,7 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
     let hover = if app.vp_state.drag.is_none() && app.tool.is_select() && app.prefs.preselect { resp.hover_pos() } else { None };
     let hover_comp = hover.and_then(|h| hover_pick(app, ui.ctx(), idx, &cv, h));
     viewport::draw_component_overlay(&app.s, &app.vps[idx], &cv, &painter, hover_comp.as_ref().map(|(id, c)| (id.as_str(), c)));
+    viewport::draw_curve_components(&app.s, &app.vps[idx], &cv, &painter);
     viewport::draw_gate(&app.s, &app.vps[idx], &painter);
     mesh_overlays(app, &cv, img_rect, &painter);
     if (resp.hovered() || resp.dragged()) && app.active_vp != idx && (resp.clicked() || resp.drag_started() || ui.input(|i| i.pointer.any_pressed())) {
@@ -674,13 +682,8 @@ fn hover_pick(app: &mut IncaApp, ctx: &egui::Context, idx: usize, cv: &CamView, 
         return app.hover_pick.as_ref().and_then(|(_, c)| c.clone());
     }
     let vp = app.vps[idx].clone();
-    let mut found = None;
-    for id in &ids {
-        if let Some(c) = viewport::pick_component(&app.s, &vp, cv, id, mode, h, &mut app.mesh_cache) {
-            found = Some((id.clone(), c));
-            break;
-        }
-    }
+    // the JS picker compares components across every highlighted mesh
+    let found = viewport::pick_best_component(&app.s, &vp, cv, &ids, mode, h, &mut app.mesh_cache);
     app.hover_pick = Some((key, found.clone()));
     app.hover_at = std::time::Instant::now();
     found
@@ -693,19 +696,15 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
     let vp = app.vps[idx].clone();
     if let Some(cm) = app.s.comp_mode {
         let hil = app.s.hilite();
-        let mut best: Option<(String, Comp)> = None;
-        for id in &hil {
-            if let Some(c) = viewport::pick_component(&app.s, &vp, cv, id, cm, p, &mut app.mesh_cache) {
-                best = Some((id.clone(), c));
-                break;
-            }
-        }
+        let best = viewport::pick_best_component(&app.s, &vp, cv, &hil, cm, p, &mut app.mesh_cache);
         match best {
             Some((id, c)) => {
                 let name = app.s.name_of(&id);
                 let topo = app.mesh_cache.topo(&app.s, &id);
+                // curve CVs echo as `.cv[...]` (the JS MEL parser)
+                let is_curve = app.s.node(&id).is_some_and(|n| n.curve().is_some());
                 let comp = match c {
-                    Comp::V(v) => format!("{name}.vtx[{v}]"),
+                    Comp::V(v) => format!("{name}.{}[{v}]", if is_curve { "cv" } else { "vtx" }),
                     Comp::E(a, b) => format!("{name}.e[{}]", topo.as_ref().and_then(|t| t.edge(a, b)).unwrap_or(0)),
                     Comp::F(f) => format!("{name}.f[{f}]"),
                 };
@@ -732,7 +731,7 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
                 if mode == SelMode::Replace {
                     // clicking empty space clears components; clicking another mesh hilites it
                     if let Some(o) = viewport::pick_object(&app.s, &vp, cv, p, &mut app.mesh_cache) {
-                        if !hil.contains(&o) && app.s.node(&o).is_some_and(|n| n.mesh().is_some()) {
+                        if !hil.contains(&o) && app.s.node(&o).is_some_and(|n| n.mesh().is_some() || n.curve().is_some()) {
                             app.select_names(&[o], SelMode::Replace);
                             return;
                         }
@@ -787,9 +786,10 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
         for id in app.s.hilite() {
             let name = app.s.name_of(&id);
             let topo = app.mesh_cache.topo(&app.s, &id);
+            let is_curve = app.s.node(&id).is_some_and(|n| n.curve().is_some());
             for c in viewport::region_components(&app.s, &vp, cv, &id, cm, region, &mut app.mesh_cache) {
                 parts.push(match c {
-                    Comp::V(v) => format!("{name}.vtx[{v}]"),
+                    Comp::V(v) => format!("{name}.{}[{v}]", if is_curve { "cv" } else { "vtx" }),
                     Comp::E(a, b) => format!("{name}.e[{}]", topo.as_ref().and_then(|t| t.edge(a, b)).unwrap_or(0)),
                     Comp::F(f) => format!("{name}.f[{f}]"),
                 });
@@ -887,10 +887,16 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         let mut n = 0;
         for (id, vs) in &comp_targets {
             let wm = app.s.world_matrix(id);
-            let pm = &app.s.node(id).unwrap().mesh().unwrap().mesh;
+            let Some(node) = app.s.node(id) else { continue };
             for v in vs {
-                c += wm.transform_point3(pm.v[*v as usize]);
-                n += 1;
+                let p = match node.curve() {
+                    Some(cu) => cu.cvs.get(*v as usize).copied(),
+                    None => node.mesh().and_then(|m| m.mesh.v.get(*v as usize).copied()),
+                };
+                if let Some(p) = p {
+                    c += wm.transform_point3(p);
+                    n += 1;
+                }
             }
         }
         (c / n.max(1) as f64, DQuat::IDENTITY)
@@ -1038,13 +1044,23 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                 let mut comps = vec![];
                 let (mut weights, mut mirror) = (vec![], vec![]);
                 for (id, v) in &comp_targets {
-                    let (mut verts, mut w): (Vec<u32>, Vec<f64>) = if app.soft.on {
+                    let Some(node) = app.s.node(id) else { continue };
+                    // the JS applies soft selection to meshes only (`kind === 'mesh'`)
+                    let soft_mesh = app.soft.on && node.mesh().is_some();
+                    let (mut verts, mut w): (Vec<u32>, Vec<f64>) = if soft_mesh {
                         viewport::soft_weights(&app.s, id, v, app.soft.radius, app.soft.linear).into_iter().unzip()
                     } else {
                         (v.clone(), vec![])
                     };
                     let m = viewport::symmetry_partners(&app.s, id, &mut verts, &mut w, app.symmetry);
-                    comps.push((id.clone(), verts, app.s.node(id).unwrap().mesh().unwrap().mesh.clone()));
+                    let geom = if let Shape::Mesh(m) = &node.shape {
+                        DragGeom::Mesh(m.mesh.clone())
+                    } else if let Some(c) = node.curve() {
+                        DragGeom::Curve(c.clone())
+                    } else {
+                        continue;
+                    };
+                    comps.push((id.clone(), verts, geom));
                     weights.push(w);
                     mirror.push(m);
                 }
@@ -1112,7 +1128,10 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             let delta = tf_matrix(&d.cur) * tf_matrix(&d.start).inverse();
             let objs = d.objects.clone();
             let pivots = d.pivots.clone();
-            let comps: Vec<(String, Vec<u32>, inca_core::mesh::PolyMesh)> = d.comps.iter().map(|(a, b, c)| (a.clone(), b.clone(), c.clone())).collect();
+            let comps: Vec<(String, Vec<u32>, DragGeom)> = d.comps.iter().map(|(a, b, c)| match c {
+                DragGeom::Mesh(pm) => (a.clone(), b.clone(), DragGeom::Mesh(pm.clone())),
+                DragGeom::Curve(cu) => (a.clone(), b.clone(), DragGeom::Curve(cu.clone())),
+            }).collect();
             let (weights, mirror) = (d.weights.clone(), d.mirror.clone());
             let sym = app.symmetry;
             match pivots {
@@ -1132,8 +1151,12 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                 let inv = wm.inverse();
                 let local = inv * delta * wm;
                 let w = &weights[ci];
+                let src: &[DVec3] = match &orig {
+                    DragGeom::Mesh(pm) => &pm.v,
+                    DragGeom::Curve(c) => &c.cvs,
+                };
                 let mut out: Vec<DVec3> = verts.iter().enumerate().map(|(i, v)| {
-                    let o = orig.v[*v as usize];
+                    let o = src[*v as usize];
                     o.lerp(local.transform_point3(o), w.get(i).copied().unwrap_or(1.0))
                 }).collect();
                 if let Some(map) = &mirror[ci] {
@@ -1144,9 +1167,21 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                         }
                     }
                 }
-                if let Some(m) = app.s.nodes.get_mut(&id).and_then(|n| n.mesh_mut()) {
-                    for (v, p) in verts.iter().zip(out) {
-                        m.mesh.v[*v as usize] = p;
+                match orig {
+                    DragGeom::Mesh(_) => {
+                        if let Some(m) = app.s.nodes.get_mut(&id).and_then(|n| n.mesh_mut()) {
+                            for (v, p) in verts.iter().zip(out) {
+                                m.mesh.v[*v as usize] = p;
+                            }
+                        }
+                    }
+                    // a curve has no history for its shape: the CVs are it (the JS rebuildShape)
+                    DragGeom::Curve(_) => {
+                        if let Some(c) = app.s.nodes.get_mut(&id).and_then(|n| n.curve_mut()) {
+                            for (v, p) in verts.iter().zip(out) {
+                                c.cvs[*v as usize] = p;
+                            }
+                        }
                     }
                 }
                 if let Some(n) = app.s.nodes.get_mut(&id) {
@@ -1457,8 +1492,10 @@ fn finish_drag(app: &mut IncaApp, d: GizmoDrag) {
     let (s, r, t) = delta.to_scale_rotation_translation();
     let names: Vec<String> = d.objects.iter().map(|o| app.s.name_of(&o.0)).collect();
     let f = inca_core::math::fmt_num;
-    // components: commit as a polyTweak history node
+    // components: commit as a polyTweak history node (curves have no shape history: the
+    // JS skips them in `endDrag`, their CVs are the curve)
     for (id, verts, orig) in &d.comps {
+        let DragGeom::Mesh(orig) = orig else { continue };
         let cur = app.s.node(id).unwrap().mesh().unwrap().mesh.clone();
         let deltas: Vec<[f64; 3]> = verts.iter().map(|&v| (cur.v[v as usize] - orig.v[v as usize]).to_array()).collect();
         if let Some(m) = app.s.nodes.get_mut(id).and_then(|n| n.mesh_mut()) {

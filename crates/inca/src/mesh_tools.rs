@@ -66,7 +66,8 @@ pub fn is_mesh_tool(t: Tool) -> bool {
 }
 
 fn meshes(app: &IncaApp) -> Vec<String> {
-    let hil = app.s.hilite();
+    // hilite now includes curves (component mode), but these tools only edit meshes
+    let hil: Vec<String> = app.s.hilite().into_iter().filter(|i| app.s.node(i).is_some_and(|n| n.mesh().is_some())).collect();
     if !hil.is_empty() {
         return hil;
     }

@@ -182,6 +182,18 @@ impl Node {
             _ => None,
         }
     }
+    pub fn curve(&self) -> Option<&crate::curves::Curve> {
+        match &self.shape {
+            Shape::Curve(c) => Some(c),
+            _ => None,
+        }
+    }
+    pub fn curve_mut(&mut self) -> Option<&mut crate::curves::Curve> {
+        match &mut self.shape {
+            Shape::Curve(c) => Some(c),
+            _ => None,
+        }
+    }
     pub fn is_locked(&self, attr: &str) -> bool {
         self.locks.get(attr).and_then(|v| v.as_bool()).unwrap_or(false)
     }
@@ -1565,12 +1577,13 @@ impl Scene {
         self.sel.last()
     }
 
-    /// Objects whose components are being edited (the selected meshes in component mode).
+    /// Objects whose components are being edited (the selected meshes and curves in
+    /// component mode).
     pub fn hilite(&self) -> Vec<Id> {
         if self.comp_mode.is_none() {
             return vec![];
         }
-        self.sel.iter().filter(|i| self.nodes.get(*i).is_some_and(|n| n.mesh().is_some())).cloned().collect()
+        self.sel.iter().filter(|i| self.nodes.get(*i).is_some_and(|n| n.mesh().is_some() || n.curve().is_some())).cloned().collect()
     }
 
     pub fn set_comp_mode(&mut self, m: Option<CompMode>) {
@@ -1585,9 +1598,14 @@ impl Scene {
         self.comp.get(id).cloned().unwrap_or_default()
     }
 
-    /// Component selection converted to vertex indices.
+    /// Component selection converted to vertex indices. Curve CVs count as vertices
+    /// (`o.inca.curve.cvs` in the JS `Sel.vertsOf`).
     pub fn comp_verts(&self, id: &str) -> Vec<u32> {
-        let Some(pm) = self.nodes.get(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return vec![] };
+        let Some(n) = self.nodes.get(id) else { return vec![] };
+        if let Some(c) = n.curve() {
+            return self.comp_sel(id).v.into_iter().filter(|&v| (v as usize) < c.cvs.len()).collect();
+        }
+        let Some(pm) = n.mesh().map(|m| &m.mesh) else { return vec![] };
         let c = self.comp_sel(id);
         let mut s: BTreeSet<u32> = c.v.clone();
         for (a, b) in &c.e {

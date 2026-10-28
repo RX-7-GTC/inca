@@ -139,17 +139,28 @@ pub fn parse_component(s: &Scene, txt: &str) -> Option<(Id, CompMode, Vec<usize>
     let (kind, range) = rest.split_once('[')?;
     let range = range.trim_end_matches(']');
     let mode = match kind {
-        "vtx" | "v" => CompMode::Vertex,
+        // curve CVs use `.cv[...]` in the JS MEL parser, meshes `.vtx[...]`
+        "vtx" | "v" | "cv" => CompMode::Vertex,
         "e" => CompMode::Edge,
         "f" => CompMode::Face,
         _ => return None,
     };
     let id = s.find(obj)?;
-    let n = s.node(&id)?.mesh()?;
-    let count = match mode {
-        CompMode::Vertex => n.mesh.v.len(),
-        CompMode::Edge => n.mesh.topo().edges.len(),
-        CompMode::Face => n.mesh.f.len(),
+    let n = s.node(&id)?;
+    let count = match n.curve() {
+        // curve CVs are vertices (the JS `Sel.vertsOf`)
+        Some(c) => match mode {
+            CompMode::Vertex => c.cvs.len(),
+            _ => return None,
+        },
+        None => {
+            let m = n.mesh()?;
+            match mode {
+                CompMode::Vertex => m.mesh.v.len(),
+                CompMode::Edge => m.mesh.topo().edges.len(),
+                CompMode::Face => m.mesh.f.len(),
+            }
+        }
     };
     let idx: Vec<usize> = if range == "*" {
         (0..count).collect()
@@ -164,7 +175,6 @@ pub fn parse_component(s: &Scene, txt: &str) -> Option<(Id, CompMode, Vec<usize>
 /// Component selection as strings (for `ls -sl`).
 pub fn component_names(s: &Scene, id: &str) -> Vec<String> {
     let Some(n) = s.node(id) else { return vec![] };
-    let Some(m) = n.mesh() else { return vec![] };
     let c = s.comp_sel(id);
     let mut out = vec![];
     let ranges = |v: Vec<usize>| -> Vec<String> {
@@ -180,6 +190,13 @@ pub fn component_names(s: &Scene, id: &str) -> Vec<String> {
         }
         r
     };
+    if n.curve().is_some() {
+        for r in ranges(c.v.iter().map(|&x| x as usize).collect()) {
+            out.push(format!("{}.cv[{r}]", n.name));
+        }
+        return out;
+    }
+    let Some(m) = n.mesh() else { return vec![] };
     for r in ranges(c.v.iter().map(|&x| x as usize).collect()) {
         out.push(format!("{}.vtx[{r}]", n.name));
     }
@@ -249,8 +266,9 @@ fn op_verts(s: &Scene, a: &Args, id: &str) -> Vec<u32> {
 fn mesh_targets(s: &Scene, a: &Args) -> Vec<Id> {
     let mut out: Vec<Id> = vec![];
     for t in a.strings() {
+        // mesh ops skip curves (the JS `kind !== 'mesh'` guards)
         if let Some((id, _, _)) = parse_component(s, &t) {
-            if !out.contains(&id) {
+            if s.node(&id).is_some_and(|n| n.mesh().is_some()) && !out.contains(&id) {
                 out.push(id);
             }
         } else if let Some(id) = s.find(&t) {
@@ -378,17 +396,26 @@ fn transform_cmd(s: &mut Scene, name: &str, a: &Args) -> Result<Val, String> {
     let comp_targets: Vec<(Id, Vec<u32>)> = if !comps.is_empty() {
         comps
             .iter()
-            .map(|(id, m, idx)| {
-                let pm = &s.node(id).unwrap().mesh().unwrap().mesh;
+            .filter_map(|(id, m, idx)| {
+                let n = s.node(id)?;
+                // a curve has CVs only; `.cv[...]` parses as vertex mode
+                if let Some(c) = n.curve() {
+                    if *m != CompMode::Vertex {
+                        return None;
+                    }
+                    let verts: BTreeSet<u32> = idx.iter().filter(|&&i| i < c.cvs.len()).map(|&i| i as u32).collect();
+                    return Some((id.clone(), verts.into_iter().collect()));
+                }
+                let pm = &n.mesh()?.mesh;
                 let verts: BTreeSet<u32> = match m {
                     CompMode::Vertex => idx.iter().map(|&i| i as u32).collect(),
-                    CompMode::Face => idx.iter().flat_map(|&f| pm.f[f].iter().copied()).collect(),
+                    CompMode::Face => idx.iter().flat_map(|&f| pm.f.get(f).into_iter().flatten().copied()).collect(),
                     CompMode::Edge => {
                         let t = pm.topo();
-                        idx.iter().flat_map(|&e| [t.edges[e].0, t.edges[e].1]).collect()
+                        idx.iter().filter_map(|&e| t.edges.get(e).copied()).flat_map(|(a, b)| [a, b]).collect()
                     }
                 };
-                (id.clone(), verts.into_iter().collect())
+                Some((id.clone(), verts.into_iter().collect()))
             })
             .collect()
     } else if s.comp_mode.is_some() && a.strings().is_empty() {
@@ -400,8 +427,17 @@ fn transform_cmd(s: &mut Scene, name: &str, a: &Args) -> Result<Val, String> {
         for (id, verts) in comp_targets {
             let wm = s.world_matrix(&id);
             let inv = wm.inverse();
-            let pm = s.node(&id).unwrap().mesh().unwrap().mesh.clone();
-            let pts: Vec<DVec3> = verts.iter().map(|&i| wm.transform_point3(pm.v[i as usize])).collect();
+            let Some(node) = s.node(&id) else { continue };
+            let pts: Vec<DVec3> = match node.curve() {
+                Some(c) => verts.iter().filter_map(|&i| c.cvs.get(i as usize).map(|p| wm.transform_point3(*p))).collect(),
+                None => {
+                    let Some(pm) = node.mesh().map(|m| &m.mesh) else { continue };
+                    verts.iter().filter_map(|&i| pm.v.get(i as usize).map(|p| wm.transform_point3(*p))).collect()
+                }
+            };
+            if pts.len() != verts.len() {
+                continue;
+            }
             let c = pts.iter().copied().sum::<DVec3>() / pts.len().max(1) as f64;
             let deltas: Vec<DVec3> = pts
                 .iter()
@@ -420,6 +456,21 @@ fn transform_cmd(s: &mut Scene, name: &str, a: &Args) -> Result<Val, String> {
                     inv.transform_point3(np) - inv.transform_point3(p)
                 })
                 .collect();
+            // a curve stores its shape as CVs; there is no polyTweak history to feed
+            if s.node(&id).is_some_and(|n| n.curve().is_some()) {
+                if let Some(curve) = s.nodes.get_mut(&id).and_then(|n| n.curve_mut()) {
+                    for (&i, d) in verts.iter().zip(&deltas) {
+                        if let Some(p) = curve.cvs.get_mut(i as usize) {
+                            *p += *d;
+                        }
+                    }
+                }
+                if let Some(n) = s.nodes.get_mut(&id) {
+                    n.rev += 1;
+                }
+                s.refresh_dependents(&id);
+                continue;
+            }
             let mut p = Params::new();
             p.insert("verts".into(), json!(verts));
             p.insert("deltas".into(), json!(deltas.iter().map(|d| [d.x, d.y, d.z]).collect::<Vec<_>>()));
@@ -2403,7 +2454,8 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
         }
         let mut owners = vec![];
         for (id, m, idx) in comps {
-            let topo = s.node(&id).unwrap().mesh().unwrap().mesh.topo();
+            // curves have no edges/faces; `parse_component` already restricts them to CVs
+            let topo = s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.topo());
             let c = s.comp.entry(id.clone()).or_default();
             for i in idx {
                 match (m, mode) {
@@ -2420,10 +2472,14 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
                         c.f.insert(i);
                     }
                     (CompMode::Edge, SelMode::Remove) => {
-                        c.e.remove(&topo.edges[i]);
+                        if let Some(e) = topo.as_ref().and_then(|t| t.edges.get(i)) {
+                            c.e.remove(e);
+                        }
                     }
                     (CompMode::Edge, _) => {
-                        c.e.insert(topo.edges[i]);
+                        if let Some(e) = topo.as_ref().and_then(|t| t.edges.get(i)) {
+                            c.e.insert(*e);
+                        }
                     }
                 }
             }
@@ -2858,6 +2914,29 @@ mod more_tests {
         assert_eq!(s.node(&c).unwrap().xf.t, [6.0, 3.0, 6.0]);
         let l = s.find("spotLight1").unwrap();
         assert_eq!(s.node(&l).unwrap().xf.t, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn curve_cvs_select_and_move() {
+        let mut s = Scene::new();
+        let mut i = Interp::new();
+        i.run(&mut s, &mut NoHost, "curve -d 3 -p 0 0 0 -p 1 2 0 -p 2 0 0 -p 3 2 0 -n c1;").unwrap();
+        i.run(&mut s, &mut NoHost, "select -r c1.cv[1];").unwrap();
+        let c = s.find("c1").unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Vertex));
+        assert_eq!(s.comp_verts(&c), vec![1]);
+        assert_eq!(component_names(&s, &c), vec!["c1.cv[1]".to_string()]);
+        let before = s.node(&c).unwrap().curve().unwrap().cvs[1];
+        i.run(&mut s, &mut NoHost, "move -r 0 1 0;").unwrap();
+        let after = s.node(&c).unwrap().curve().unwrap().cvs[1];
+        assert!((after - before - DVec3::new(0.0, 1.0, 0.0)).length() < 1e-9, "{before:?} {after:?}");
+        // `cv[*]` / ranges select CVs, and all/invert understand a curve's vertex count
+        i.run(&mut s, &mut NoHost, "select -r c1.cv[0:1];").unwrap();
+        assert_eq!(s.comp_verts(&c), vec![0, 1]);
+        crate::selection::all_components(&mut s, false);
+        assert_eq!(s.comp_verts(&c), vec![0, 1, 2, 3]);
+        crate::selection::all_components(&mut s, true);
+        assert!(s.comp_verts(&c).is_empty());
     }
 }
 

@@ -2,7 +2,7 @@
 
 pub mod gpu;
 
-use egui::{Color32, Pos2, Rect};
+use egui::{Color32, Pos2, Rect, Stroke};
 use glam::{DMat4, DQuat, DVec3, Mat4};
 use gpu::*;
 use inca_core::math::{euler_deg_from_quat, quat_from_euler_deg, Aabb, Ray};
@@ -747,14 +747,18 @@ fn points_key(s: &Scene, id: &str, mode: CompMode, soft: Option<(f64, bool)>) ->
     h.finish()
 }
 
-/// One dot per vertex, coloured like the JS overlay (selected, soft falloff, plain).
-fn component_points(s: &Scene, id: &str, soft: Option<(f64, bool)>) -> Vec<PointVertex> {
+/// One dot per vertex face corner, coloured like the JS overlay (selected, soft falloff,
+/// plain). Duplicating the dot per adjacent face normal lets backface culling hide a dot
+/// only when every adjacent face is turned away, which one dot per vertex cannot express.
+fn component_points(s: &Scene, id: &str, soft: Option<(f64, bool)>, mesh_cache: &mut MeshCache) -> Vec<PointVertex> {
     let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return vec![] };
     let cs = s.comp_sel(id);
     let weights: HashMap<u32, f64> = match soft {
         Some((r, lin)) if !cs.v.is_empty() => soft_weights(s, id, &cs.v.iter().copied().collect::<Vec<_>>(), r, lin).into_iter().collect(),
         _ => HashMap::new(),
     };
+    let topo = mesh_cache.topo(s, id);
+    let geo = mesh_cache.faces(s, id);
     let mut pts = Vec::with_capacity(pm.v.len());
     for (i, p) in pm.v.iter().enumerate() {
         let i = i as u32;
@@ -766,7 +770,15 @@ fn component_points(s: &Scene, id: &str, soft: Option<(f64, bool)>) -> Vec<Point
         } else {
             [194.0 / 255.0, 58.0 / 255.0, 214.0 / 255.0, 1.0]
         };
-        pts.push(PointVertex { pos: to_f32(*p), color, normal: [0.0; 3] });
+        let fs = topo.as_ref().map(|t| &t.vert_faces[i as usize]);
+        let ns = match (fs, geo.as_ref()) {
+            (Some(fs), Some(geo)) if !fs.is_empty() => fs.iter().map(|&f| to_f32(geo.normals[f].normalize_or_zero())).collect::<Vec<_>>(),
+            // no topology (or an isolated vertex): a zero normal is never culled
+            _ => vec![[0.0; 3]],
+        };
+        for n in ns {
+            pts.push(PointVertex { pos: to_f32(*p), color, normal: n });
+        }
     }
     pts
 }
@@ -954,7 +966,7 @@ pub fn build_draws(
                             // with egui every frame is what made component mode unusable on heavy meshes
                             let key = points_key(s, &id, CompMode::Vertex, soft);
                             if g.point_key(&id) != Some(key) {
-                                let pts = component_points(s, &id, soft);
+                                let pts = component_points(s, &id, soft, mesh_cache);
                                 g.upload_points(&id, key, &pts);
                             }
                             draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(3.0).bias(0.0003).cull_wire(vp.backface) });
@@ -1420,7 +1432,7 @@ fn marquee_exact(pm: &PolyMesh) -> bool {
 
 /// Component visibility: exact raycasts where the JS does them, plus the front-facing test
 /// when backface culling is on (the JS `frontFaces`, which is a no-op when culling is off).
-pub struct Vis<'a> {
+struct Vis<'a> {
     pm: &'a PolyMesh,
     wm: DMat4,
     cv: &'a CamView,
@@ -1434,7 +1446,7 @@ pub struct Vis<'a> {
 impl<'a> Vis<'a> {
     /// `facing` and its `topo` are only needed for the front-facing test, `occluders` only
     /// when `exact` is set.
-    pub fn new(
+    fn new(
         pm: &'a PolyMesh,
         wm: DMat4,
         cv: &'a CamView,
@@ -1479,10 +1491,41 @@ impl<'a> Vis<'a> {
     }
 }
 
-pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, pos: Pos2, mesh_cache: &mut MeshCache) -> Option<Comp> {
+/// One component hit plus the values the JS `pickComponent` compares between meshes.
+pub struct CompHit {
+    pub comp: Comp,
+    /// Cursor distance in pixels (vertex, edge and face-dot picks).
+    d: f32,
+    /// Eye distance for vertices, world distance along the pick ray for faces.
+    z: f64,
+    /// Face-centre dot fallback (wireframe/x-ray): only used when no face is hit.
+    dot: bool,
+}
+
+/// Score one mesh's closest component; `pick_best_component` merges the hits of all
+/// highlighted meshes.
+pub fn pick_component_hit(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, pos: Pos2, mesh_cache: &mut MeshCache) -> Option<CompHit> {
     let n = s.node(id)?;
-    let pm = &n.mesh()?.mesh;
     let wm = s.world_matrix(id);
+    // a curve is a vertex cloud to the JS picker (`o.inca.curve.cvs`); there are no edges or faces
+    if let Some(c) = n.curve() {
+        if mode != CompMode::Vertex {
+            return None;
+        }
+        let mut best: Option<CompHit> = None;
+        for (i, p) in c.cvs.iter().enumerate() {
+            let wp = wm.transform_point3(*p);
+            let Some(q) = cv.project(wp, vp.rect) else { continue };
+            let d = q.distance(pos);
+            let wins = best.as_ref().is_none_or(|b| d < b.d - 0.5 || ((d - b.d).abs() < 0.5 && cv.depth(wp) < b.z));
+            if d < 12.0 && wins {
+                best = Some(CompHit { comp: Comp::V(i as u32), d, z: cv.depth(wp), dot: false });
+            }
+        }
+        // the JS `occluded` always returns false for curve owners
+        return best;
+    }
+    let pm = &n.mesh()?.mesh;
     // the JS `occluded` returns false in x-ray and wireframe
     let opaque = !vp.xray && vp.shade != ShadeMode::Wire;
     match mode {
@@ -1491,16 +1534,18 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
             let topo = if facing.is_some() { mesh_cache.topo(s, id) } else { None };
             let occ = if opaque { scene_occluders(s, mesh_cache) } else { vec![] };
             let vis = Vis::new(pm, wm, cv, opaque, facing, topo, &occ);
-            let mut best: Option<(f32, u32)> = None;
+            let mut best: Option<CompHit> = None;
             for (i, p) in pm.v.iter().enumerate() {
-                if let Some(q) = cv.project(wm.transform_point3(*p), vp.rect) {
-                    let d = q.distance(pos);
-                    if d < 12.0 && best.is_none_or(|b| d < b.0) && vis.vertex(i as u32) {
-                        best = Some((d, i as u32));
-                    }
+                let wp = wm.transform_point3(*p);
+                let Some(q) = cv.project(wp, vp.rect) else { continue };
+                let d = q.distance(pos);
+                // the JS keeps a vertex within half a pixel of the best when it is nearer
+                let wins = best.as_ref().is_none_or(|b| d < b.d - 0.5 || ((d - b.d).abs() < 0.5 && cv.depth(wp) < b.z));
+                if d < 12.0 && wins && vis.vertex(i as u32) {
+                    best = Some(CompHit { comp: Comp::V(i as u32), d, z: cv.depth(wp), dot: false });
                 }
             }
-            best.map(|b| Comp::V(b.1))
+            best
         }
         CompMode::Edge => {
             let facing = if vp.backface { mesh_cache.facing(s, id, wm, cv) } else { None };
@@ -1508,15 +1553,15 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
             let occ = if opaque { scene_occluders(s, mesh_cache) } else { vec![] };
             let vis = Vis::new(pm, wm, cv, opaque, facing, Some(topo.clone()), &occ);
             let screen: Vec<Option<Pos2>> = pm.v.iter().map(|p| cv.project(wm.transform_point3(*p), vp.rect)).collect();
-            let mut best: Option<(f32, (u32, u32))> = None;
+            let mut best: Option<CompHit> = None;
             for (ei, &(a, b)) in topo.edges.iter().enumerate() {
                 let (Some(qa), Some(qb)) = (screen[a as usize], screen[b as usize]) else { continue };
                 let (d, t) = seg_closest(pos, qa, qb);
-                if d < 9.0 && best.is_none_or(|x| d < x.0) && vis.edge_idx_at(ei, a, b, t as f64) {
-                    best = Some((d, (a, b)));
+                if d < 9.0 && best.as_ref().is_none_or(|x| d < x.d) && vis.edge_idx_at(ei, a, b, t as f64) {
+                    best = Some(CompHit { comp: Comp::E(a, b), d, z: 0.0, dot: false });
                 }
             }
-            best.map(|b| Comp::E(b.1 .0, b.1 .1))
+            best
         }
         CompMode::Face => {
             let ray = cv.ray(pos, vp.rect);
@@ -1526,8 +1571,10 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
                 Some(b) => b.raycast(pm, &lr, vp.backface),
                 None => pm.raycast(&lr, vp.backface),
             };
-            if hit.is_some() {
-                return hit.map(|(_, f)| Comp::F(f));
+            if let Some((t, f)) = hit {
+                // compare hits across meshes by world distance along the pick ray
+                let wp = wm.transform_point3(lr.at(t));
+                return Some(CompHit { comp: Comp::F(f), d: 0.0, z: (wp - ray.origin).dot(ray.dir), dot: false });
             }
             // the JS fallback picks the nearest face-centre dot in wireframe/x-ray
             if !(vp.shade == ShadeMode::Wire || vp.xray) {
@@ -1535,20 +1582,54 @@ pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: Co
             }
             let facing = if vp.backface { mesh_cache.facing(s, id, wm, cv) } else { None };
             let geo = mesh_cache.faces(s, id)?;
-            let mut best: Option<(f32, usize)> = None;
+            let mut best: Option<CompHit> = None;
             for (fi, c) in geo.centers.iter().enumerate() {
                 if facing.as_ref().is_some_and(|ff| !ff[fi]) {
                     continue;
                 }
                 let Some(q) = cv.project(wm.transform_point3(*c), vp.rect) else { continue };
                 let d = q.distance(pos);
-                if d < 10.0 && best.is_none_or(|b| d < b.0) {
-                    best = Some((d, fi));
+                if d < 10.0 && best.as_ref().is_none_or(|b| d < b.d) {
+                    best = Some(CompHit { comp: Comp::F(fi), d, z: 0.0, dot: true });
                 }
             }
-            best.map(|b| Comp::F(b.1))
+            best
         }
     }
+}
+
+/// Pick one mesh's component (no cross-mesh comparison).
+#[cfg(test)]
+pub fn pick_component(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, pos: Pos2, mesh_cache: &mut MeshCache) -> Option<Comp> {
+    pick_component_hit(s, vp, cv, id, mode, pos, mesh_cache).map(|h| h.comp)
+}
+
+/// Pick the nearest component over several meshes, as the JS `pickComponent` scans the
+/// whole highlight list: a closer edge on another object beats a farther one here.
+pub fn pick_best_component(s: &Scene, vp: &Viewport, cv: &CamView, ids: &[Id], mode: CompMode, pos: Pos2, mesh_cache: &mut MeshCache) -> Option<(Id, Comp)> {
+    let mut best: Option<(Id, CompHit)> = None;
+    let mut best_dot: Option<(Id, CompHit)> = None;
+    for id in ids {
+        let Some(hit) = pick_component_hit(s, vp, cv, id, mode, pos, mesh_cache) else { continue };
+        if hit.dot {
+            if best_dot.as_ref().is_none_or(|(_, b)| hit.d < b.d) {
+                best_dot = Some((id.clone(), hit));
+            }
+            continue;
+        }
+        let wins = match &best {
+            None => true,
+            Some((_, b)) => match mode {
+                CompMode::Vertex => hit.d < b.d - 0.5 || ((hit.d - b.d).abs() < 0.5 && hit.z < b.z),
+                CompMode::Edge => hit.d < b.d,
+                CompMode::Face => hit.z < b.z,
+            },
+        };
+        if wins {
+            best = Some((id.clone(), hit));
+        }
+    }
+    best.or(best_dot).map(|(id, hit)| (id, hit.comp))
 }
 
 #[cfg(test)]
@@ -1557,8 +1638,17 @@ pub fn marquee_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode
 }
 
 pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, region: &dyn Fn(Pos2) -> bool, mesh_cache: &mut MeshCache) -> Vec<Comp> {
-    let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return vec![] };
+    let Some(n) = s.node(id) else { return vec![] };
     let wm = s.world_matrix(id);
+    let inside = |p: DVec3| cv.project(wm.transform_point3(p), vp.rect).is_some_and(region);
+    // curve CVs behave like vertices (and are never occluded)
+    if let Some(c) = n.curve() {
+        if mode != CompMode::Vertex {
+            return vec![];
+        }
+        return (0..c.cvs.len()).filter(|&i| inside(c.cvs[i])).map(|i| Comp::V(i as u32)).collect();
+    }
+    let Some(pm) = n.mesh().map(|m| &m.mesh) else { return vec![] };
     let shaded = !vp.xray && vp.shade != ShadeMode::Wire;
     // in shaded mode the JS marquee hides back faces even with backface culling off: you
     // cannot select what you cannot see (wireframe and x-ray show every face)
@@ -1567,7 +1657,6 @@ pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode:
     let exact = shaded && marquee_exact(pm);
     let occ = if exact { scene_occluders(s, mesh_cache) } else { vec![] };
     let vis = Vis::new(pm, wm, cv, exact, facing, topo.clone(), &occ);
-    let inside = |p: DVec3| cv.project(wm.transform_point3(p), vp.rect).is_some_and(region);
     match mode {
         CompMode::Vertex => (0..pm.v.len()).filter(|&i| inside(pm.v[i]) && vis.vertex(i as u32)).map(|i| Comp::V(i as u32)).collect(),
         CompMode::Edge => {
@@ -1647,10 +1736,15 @@ pub fn symmetry_partners(s: &Scene, id: &str, verts: &mut Vec<u32>, weights: &mu
     if mode == 0 || verts.is_empty() {
         return None;
     }
-    let pm = &s.node(id)?.mesh()?.mesh;
+    let node = s.node(id)?;
+    // curves mirror their CVs too (the JS passes `curve.cvs` as the point list)
+    let pts: &[DVec3] = match node.curve() {
+        Some(c) => &c.cvs,
+        None => &node.mesh()?.mesh.v,
+    };
     let ax = if mode == 1 { 0 } else { mode - 2 };
     let wm = s.world_matrix(id);
-    let p: Vec<DVec3> = pm.v.iter().map(|q| if mode == 1 { *q } else { wm.transform_point3(*q) }).collect();
+    let p: Vec<DVec3> = pts.iter().map(|q| if mode == 1 { *q } else { wm.transform_point3(*q) }).collect();
     let b = p.iter().fold(Aabb::EMPTY, |mut b, q| {
         b.add(*q);
         b
@@ -1720,27 +1814,71 @@ pub fn falloff_color(w: f64) -> Color32 {
 /// highlight, which is at most one component.
 pub fn draw_component_overlay(s: &Scene, vp: &Viewport, cv: &CamView, painter: &egui::Painter, hover: Option<(&str, &Comp)>) {
     let Some((id, c)) = hover else { return };
-    let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return };
+    let Some(n) = s.node(id) else { return };
     let wm = s.world_matrix(id);
     let red = Color32::from_rgb(255, 42, 42);
-    let pr = |v: u32| cv.project(wm.transform_point3(pm.v[v as usize]), vp.rect);
+    // curve CVs are the curve's vertices (the JS hover point uses `curve.cvs`)
+    let pr = |v: u32| {
+        let p = match n.curve() {
+            Some(cu) => cu.cvs.get(v as usize).copied()?,
+            None => n.mesh()?.mesh.v.get(v as usize).copied()?,
+        };
+        cv.project(wm.transform_point3(p), vp.rect)
+    };
     match c {
         Comp::V(v) => {
             if let Some(q) = pr(*v) {
-                painter.rect_filled(Rect::from_center_size(q, egui::vec2(7.0, 7.0)), 0.0, red);
+                // the JS hover point is 9 px, square, always on top
+                painter.rect_filled(Rect::from_center_size(q, egui::vec2(9.0, 9.0)), 0.0, red);
             }
         }
         Comp::E(a, b) => {
             if let (Some(qa), Some(qb)) = (pr(*a), pr(*b)) {
-                painter.line_segment([qa, qb], egui::Stroke::new(2.5, red));
+                painter.line_segment([qa, qb], egui::Stroke::new(2.0, red));
             }
         }
         Comp::F(f) => {
+            let Some(pm) = n.mesh().map(|m| &m.mesh) else { return };
+            // the JS hover face is a translucent red fill (0.35, no outline)
             let pts: Vec<Pos2> = pm.f[*f].iter().filter_map(|&v| pr(v)).collect();
             if pts.len() >= 3 {
-                let mut l = pts.clone();
-                l.push(pts[0]);
-                painter.add(egui::Shape::line(l, egui::Stroke::new(2.0, red)));
+                painter.add(egui::Shape::convex_polygon(pts, Color32::from_rgba_unmultiplied(255, 42, 42, 89), egui::Stroke::NONE));
+            }
+        }
+    }
+}
+
+/// Component overlay for curves: 6 px CV dots (purple, selected yellow, always on top — the
+/// JS `pointsMatX` has depthTest off) and the dashed CV hull, as `updateComponentOverlays`.
+pub fn draw_curve_components(s: &Scene, vp: &Viewport, cv: &CamView, painter: &egui::Painter) {
+    if s.comp_mode.is_none() {
+        return;
+    }
+    let dot = Color32::from_rgb(0xd1, 0x6f, 0xf0);
+    let dot_sel = Color32::from_rgb(0xff, 0xe6, 0x00);
+    let hull = Color32::from_rgb(0xc0, 0x70, 0xff);
+    for id in s.hilite() {
+        let Some(c) = s.node(&id).and_then(|n| n.curve()) else { continue };
+        let wm = s.world_matrix(&id);
+        let sel = s.comp_sel(&id);
+        let pts: Vec<Option<Pos2>> = c.cvs.iter().map(|p| cv.project(wm.transform_point3(*p), vp.rect)).collect();
+        // the hull is a line through the CVs in order (the JS `THREE.Line`, not the sampled curve)
+        let mut run: Vec<Pos2> = vec![];
+        for p in pts.iter().chain(std::iter::once(&None)) {
+            match p {
+                Some(q) => run.push(*q),
+                None => {
+                    if run.len() > 1 {
+                        painter.add(egui::Shape::dashed_line(&run, Stroke::new(1.0, hull), 6.0, 5.0));
+                    }
+                    run.clear();
+                }
+            }
+        }
+        for (i, p) in pts.iter().enumerate() {
+            if let Some(q) = p {
+                let color = if sel.v.contains(&(i as u32)) { dot_sel } else { dot };
+                painter.rect_filled(Rect::from_center_size(*q, egui::vec2(6.0, 6.0)), 0.0, color);
             }
         }
     }
@@ -1751,10 +1889,18 @@ pub fn selection_bbox(s: &Scene) -> Aabb {
     let mut b = Aabb::EMPTY;
     if s.comp_mode.is_some() {
         for id in s.hilite() {
+            let Some(n) = s.node(&id) else { continue };
             let wm = s.world_matrix(&id);
-            let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
             for v in s.comp_verts(&id) {
-                b.add(wm.transform_point3(pm.v[v as usize]));
+                if let Some(c) = n.curve() {
+                    if let Some(p) = c.cvs.get(v as usize) {
+                        b.add(wm.transform_point3(*p));
+                    }
+                } else if let Some(pm) = n.mesh() {
+                    if let Some(p) = pm.mesh.v.get(v as usize) {
+                        b.add(wm.transform_point3(*p));
+                    }
+                }
             }
         }
         if !b.is_empty() {
@@ -1868,6 +2014,67 @@ mod tests {
         let occ = s.create_mesh("polyCube", &Params::new(), None);
         s.set_world_matrix(&occ, DMat4::from_scale_rotation_translation(DVec3::splat(0.6), DQuat::IDENTITY, mid));
         assert_ne!(pick_component(&s, &vp, &cv, &id, CompMode::Vertex, q, &mut cache), Some(Comp::V(near as u32)));
+    }
+
+    #[test]
+    fn pick_prefers_nearer_mesh_across_objects() {
+        let (mut s, vp, cv, a) = setup();
+        let (v, p) = {
+            let pm = &s.node(&a).unwrap().mesh().unwrap().mesh;
+            let v = (0..pm.v.len()).min_by(|&i, &j| cv.depth(pm.v[i]).total_cmp(&cv.depth(pm.v[j]))).unwrap();
+            (v, s.world_matrix(&a).transform_point3(pm.v[v]))
+        };
+        let q = cv.project(p, vp.rect).unwrap();
+        // put the second cube behind the first along the eye-to-vertex ray, so its vertex
+        // projects to the same pixel but is farther away
+        let b = s.create_mesh("polyCube", &Params::new(), None);
+        let local = s.node(&a).unwrap().mesh().unwrap().mesh.v[v];
+        let far = p + (p - cv.eye).normalize() * 3.0;
+        s.set_world_matrix(&b, DMat4::from_translation(far - local));
+        let mut cache = MeshCache::default();
+        // the farther cube comes first in the highlight list, as it might by DAG order
+        let (id, c) = pick_best_component(&s, &vp, &cv, &[b, a.clone()], CompMode::Vertex, q, &mut cache).unwrap();
+        assert_eq!(id, a);
+        assert_eq!(c, Comp::V(v as u32));
+    }
+
+    #[test]
+    fn face_pick_prefers_nearer_mesh_across_objects() {
+        let (mut s, vp, cv, a) = setup();
+        let center = s.world_bbox(&a).center();
+        let q = cv.project(center, vp.rect).unwrap();
+        // a cube behind the first along the same ray: both are hit, the nearer wins
+        let b = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_world_matrix(&b, DMat4::from_translation((center - cv.eye).normalize() * 3.0));
+        let mut cache = MeshCache::default();
+        let (id, _) = pick_best_component(&s, &vp, &cv, &[b, a.clone()], CompMode::Face, q, &mut cache).unwrap();
+        assert_eq!(id, a);
+    }
+
+    #[test]
+    fn curve_cvs_pick_and_region() {
+        use inca_core::curves::Curve;
+        let mut s = Scene::new();
+        let c = s.create_curve(Curve::new(vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.5, 0.5, 0.0)], 1, "open", "cv"), "curve1");
+        let mut vp = Viewport::new("persp");
+        vp.rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let b = s.world_bbox(&c);
+        frame_box(&mut s, "persp", &b, 800.0 / 600.0);
+        let cv = cam_view(&s, "persp", [800.0, 600.0]);
+        let p = s.world_matrix(&c).transform_point3(DVec3::ZERO);
+        let q = cv.project(p, vp.rect).unwrap();
+        let mut cache = MeshCache::default();
+        // a small cube between the eye and the CV: mesh picks would be occluded, curves never are
+        let mesh = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_world_matrix(&mesh, DMat4::from_translation(cv.eye + (p - cv.eye) * 0.5) * DMat4::from_scale(DVec3::splat(0.2)));
+        let (id, comp) = pick_best_component(&s, &vp, &cv, &[mesh, c.clone()], CompMode::Vertex, q, &mut cache).unwrap();
+        assert_eq!(id, c);
+        assert_eq!(comp, Comp::V(0));
+        // the marquee treats CVs like vertices
+        let inside = |r: Pos2| vp.rect.contains(r);
+        assert_eq!(region_components(&s, &vp, &cv, &c, CompMode::Vertex, &inside, &mut cache), vec![Comp::V(0), Comp::V(1)]);
+        // curves have no edge or face components
+        assert!(region_components(&s, &vp, &cv, &c, CompMode::Edge, &inside, &mut cache).is_empty());
     }
 
     #[test]
