@@ -220,8 +220,8 @@ pub fn tumble(s: &mut Scene, cam: &str, dx: f32, dy: f32, allow_ortho: bool) {
     let yaw = fwd.x.atan2(fwd.z).to_degrees() + 180.0;
     let pitch = fwd.y.clamp(-1.0, 1.0).asin().to_degrees();
     let _ = r;
-    let yaw = yaw - dx as f64 * 0.3;
-    let pitch = (pitch - dy as f64 * 0.3).clamp(-89.9, 89.9);
+    let yaw = yaw - dx as f64 * 0.4;
+    let pitch = (pitch - dy as f64 * 0.4).clamp(-89.9, 89.9);
     let nq = DQuat::from_euler(glam::EulerRot::YXZ, yaw.to_radians(), pitch.to_radians(), 0.0);
     let nf = nq * -DVec3::Z;
     let ne = center - nf * coi;

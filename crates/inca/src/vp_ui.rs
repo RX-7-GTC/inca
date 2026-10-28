@@ -12,13 +12,21 @@ use std::hash::{Hash, Hasher};
 use transform_gizmo_egui::math::Transform;
 use transform_gizmo_egui::prelude::*;
 
+/// Camera navigation mode of an Alt+drag in progress (JS `onDown`).
+#[derive(Clone, Copy, PartialEq)]
+pub enum NavMode {
+    Tumble,
+    Track,
+    Dolly,
+}
+
 pub struct VpState {
     pub gizmos: Vec<Gizmo>,
     pub drag: Option<GizmoDrag>,
     pub marquee: Option<(usize, Pos2)>,
     /// Lasso outline / paint stroke points of the drag in progress.
     pub stroke: Vec<Pos2>,
-    pub nav: Option<(usize, egui::PointerButton)>,
+    pub nav: Option<(usize, NavMode)>,
     pub snap_step: f64,
     pub snap_angle: f64,
     /// points placed by the curve / polygon creation tools
@@ -494,25 +502,33 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
     let cam = app.vps[idx].camera.clone();
     // ---- navigation (Alt + mouse, wheel)
     if resp.hovered() && scroll != 0.0 {
-        viewport::dolly(&mut app.s, &cam, scroll as f64 * 0.0025);
+        // JS wheel: dolly(-deltaY * 0.35); dolly uses exp(-d * 0.006)
+        let amount = scroll as f64 * 0.0021;
+        match resp.hover_pos() {
+            Some(c) => dolly_at(app, idx, cv, c, amount),
+            None => viewport::dolly(&mut app.s, &cam, amount),
+        }
     }
     if mods.alt && resp.drag_started() {
-        let b = if pointer.button_down(egui::PointerButton::Middle) {
-            egui::PointerButton::Middle
+        // Alt+LMB tumble, Alt+Ctrl+LMB dolly (the JS "boxzoom" branch), MMB track, RMB dolly
+        let mode = if pointer.button_down(egui::PointerButton::Middle) {
+            NavMode::Track
         } else if pointer.button_down(egui::PointerButton::Secondary) {
-            egui::PointerButton::Secondary
+            NavMode::Dolly
+        } else if mods.ctrl || mods.command {
+            NavMode::Dolly
         } else {
-            egui::PointerButton::Primary
+            NavMode::Tumble
         };
-        app.vp_state.nav = Some((idx, b));
+        app.vp_state.nav = Some((idx, mode));
     }
-    if let Some((v, b)) = app.vp_state.nav {
+    if let Some((v, mode)) = app.vp_state.nav {
         if v == idx {
             let d = pointer.delta();
-            match b {
-                egui::PointerButton::Primary => viewport::tumble(&mut app.s, &cam, d.x, d.y, app.prefs.ortho_tumble),
-                egui::PointerButton::Middle => viewport::track(&mut app.s, cv, &cam, d.x, d.y),
-                _ => viewport::dolly(&mut app.s, &cam, (d.x + d.y) as f64 * 0.01),
+            match mode {
+                NavMode::Tumble => viewport::tumble(&mut app.s, &cam, d.x, d.y, app.prefs.ortho_tumble),
+                NavMode::Track => viewport::track(&mut app.s, cv, &cam, d.x, d.y),
+                NavMode::Dolly => viewport::dolly(&mut app.s, &cam, (d.x - d.y) as f64 * 0.0072),
             }
             if !pointer.any_down() {
                 app.vp_state.nav = None;
@@ -765,6 +781,25 @@ fn pick_masked(app: &mut IncaApp, vp: &viewport::Viewport, cv: &CamView, p: Pos2
     let s = &app.s;
     let off = &app.sel_mask_off;
     viewport::pick_object_if(s, vp, cv, p, &mut app.mesh_cache, &|id| crate::toolbar::mask_allows_scene(s, off, id))
+}
+
+/// Wheel dolly; in ortho views keep the world point under the cursor fixed (JS `dolly(cursor)`).
+fn dolly_at(app: &mut IncaApp, idx: usize, cv: &CamView, cursor: Pos2, amount: f64) {
+    let cam = app.vps[idx].camera.clone();
+    if !cv.ortho {
+        viewport::dolly(&mut app.s, &cam, amount);
+        return;
+    }
+    let rect = app.vps[idx].rect;
+    let before = cv.ray(cursor, rect).origin;
+    viewport::dolly(&mut app.s, &cam, amount);
+    let after = viewport::cam_view(&app.s, &cam, [rect.width(), rect.height()]).ray(cursor, rect).origin;
+    if let Some(id) = viewport::camera_id(&app.s, &cam) {
+        if let Some(n) = app.s.nodes.get_mut(&id) {
+            n.xf.t = (DVec3::from_array(n.xf.t) + before - after).to_array();
+        }
+        app.s.rev += 1;
+    }
 }
 
 /// JS `onDbl`: double-clicking an edge selects its loop, a face selects the faces of the
