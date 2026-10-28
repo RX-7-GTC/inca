@@ -193,7 +193,9 @@ pub struct IncaApp {
     /// Per-node edge topology cached by node revision (component picking, culled wires).
     pub mesh_cache: crate::viewport::MeshCache,
     /// Last component preselection: (cursor/camera/scene key, pick).
-    pub hover_pick: Option<(u64, Option<(String, crate::viewport::Comp)>)>,
+    /// Last component preselection: (viewport, cursor/camera/scene key, pick). The JS keeps
+    /// `hover`/`_ht` per viewport, so a pick from another pane must not satisfy the throttle.
+    pub hover_pick: Option<(usize, u64, Option<(String, crate::viewport::Comp)>)>,
     /// When the preselection was last picked (the JS app throttles it to 30 ms).
     pub hover_at: std::time::Instant,
     pub vp_state: vp_ui::VpState,

@@ -927,9 +927,16 @@ pub fn op_bevel(pm: &PolyMesh, edges: &[(u32, u32)], fraction: f64) -> OpOut {
 /// Walk the edge ring (across quads) starting at edge (a,b). Returns directed ring edges,
 /// all oriented the same way as (a,b).
 pub fn edge_ring(pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> Vec<(u32, u32)> {
-    let Some(e0) = topo.edge(a, b) else { return vec![(a, b)] };
+    edge_ring_faces(pm, topo, a, b).0
+}
+
+/// The edge ring through (a,b) and the quad faces it crosses (the JS `edgeRing`).
+pub fn edge_ring_faces(pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> (Vec<(u32, u32)>, Vec<usize>) {
+    let Some(e0) = topo.edge(a, b) else { return (vec![(a, b)], vec![]) };
     let mut seen_e = HashSet::new();
     seen_e.insert(epair(a, b));
+    let mut seen_f = HashSet::new();
+    let mut faces = vec![];
     let mut sides: Vec<Vec<(u32, u32)>> = vec![];
     for &start_f in topo.edge_faces[e0].iter().take(2) {
         let mut cur = (a, b);
@@ -939,6 +946,9 @@ pub fn edge_ring(pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> Vec<(u32, u32)> 
             let face = &pm.f[f];
             if face.len() != 4 {
                 break;
+            }
+            if seen_f.insert(f) {
+                faces.push(f);
             }
             let i = face.iter().position(|&x| x == cur.0).unwrap();
             let j = face.iter().position(|&x| x == cur.1).unwrap();
@@ -966,7 +976,7 @@ pub fn edge_ring(pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> Vec<(u32, u32)> 
     if let Some(s) = sides.first() {
         ring.extend(s.iter().copied());
     }
-    ring
+    (ring, faces)
 }
 
 /// Edge loop through the edge (a,b): continue through 4-valent vertices.
@@ -1954,6 +1964,23 @@ mod tests {
         assert_eq!(s.f.len(), 24);
         assert!(is_closed(&s));
         assert!(s.signed_volume() < 1.0 && s.signed_volume() > 0.3);
+    }
+
+    #[test]
+    fn edge_ring_reports_its_faces() {
+        let c = cube();
+        let topo = c.topo();
+        let (a, b) = topo.edges[0];
+        let (ring, faces) = edge_ring_faces(&c, &topo, a, b);
+        assert_eq!(ring, edge_ring(&c, &topo, a, b));
+        // a cube edge ring crosses the four quads around it (the JS `edgeRing().faces`)
+        let mut fs = faces.clone();
+        fs.sort_unstable();
+        fs.dedup();
+        assert_eq!(fs.len(), 4);
+        for f in fs {
+            assert_eq!(c.f[f].len(), 4);
+        }
     }
 
     #[test]

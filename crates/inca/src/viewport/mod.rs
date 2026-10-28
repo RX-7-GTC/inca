@@ -1535,6 +1535,10 @@ pub struct CompHit {
 /// Score one mesh's closest component; `pick_best_component` merges the hits of all
 /// highlighted meshes.
 pub fn pick_component_hit(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, pos: Pos2, mesh_cache: &mut MeshCache) -> Option<CompHit> {
+    // the JS picker skips hidden hilited objects (`if (!o.visible) continue`)
+    if !s.is_visible(id) {
+        return None;
+    }
     let n = s.node(id)?;
     let wm = s.world_matrix(id);
     // a curve is a vertex cloud to the JS picker (`o.inca.curve.cvs`); JS picks its CVs in

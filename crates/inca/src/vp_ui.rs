@@ -628,10 +628,11 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
             click_select(app, idx, cv, p, sel_mode(mods));
         }
     }
-    // double-click an edge: its loop (on an open border, the whole rim)
-    if resp.double_clicked() && app.s.comp_mode == Some(inca_core::scene::CompMode::Edge) {
-        inca_core::selection::loops(&mut app.s, false);
-        app.echo("SelectEdgeLoopSp;");
+    // double-click: edge/face loops in component mode, Tool Settings on an object (JS onDbl)
+    if resp.double_clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            double_click(app, idx, cv, p, mods.shift);
+        }
     }
 
 }
@@ -670,21 +671,21 @@ fn hover_pick(app: &mut IncaApp, ctx: &egui::Context, idx: usize, cv: &CamView, 
         }
     }
     let key = hh.finish();
-    if let Some((k, c)) = &app.hover_pick {
-        if *k == key {
+    if let Some((i, k, c)) = &app.hover_pick {
+        if *i == idx && *k == key {
             return c.clone();
         }
     }
     // like the JS `onHover`, re-pick at most every 30 ms while the cursor moves: at 400k
     // faces an edge pick is ~15 ms and would otherwise nearly double the frame time
-    if app.hover_pick.is_some() && app.hover_at.elapsed() < std::time::Duration::from_millis(30) {
+    if app.hover_pick.as_ref().is_some_and(|(i, _, _)| *i == idx) && app.hover_at.elapsed() < std::time::Duration::from_millis(30) {
         ctx.request_repaint_after(std::time::Duration::from_millis(30));
-        return app.hover_pick.as_ref().and_then(|(_, c)| c.clone());
+        return app.hover_pick.as_ref().and_then(|(_, _, c)| c.clone());
     }
     let vp = app.vps[idx].clone();
     // the JS picker compares components across every highlighted mesh
     let found = viewport::pick_best_component(&app.s, &vp, cv, &ids, mode, h, &mut app.mesh_cache);
-    app.hover_pick = Some((key, found.clone()));
+    app.hover_pick = Some((idx, key, found.clone()));
     app.hover_at = std::time::Instant::now();
     found
 }
@@ -754,6 +755,50 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
             }
         }
     }
+}
+
+/// JS `onDbl`: double-clicking an edge selects its loop, a face selects the faces of the
+/// edge ring under the cursor, and an object opens Tool Settings.
+fn double_click(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, shift: bool) {
+    if app.lock_selection {
+        return;
+    }
+    let Some(mode) = app.s.comp_mode else {
+        if let Some(id) = viewport::pick_object(&app.s, &app.vps[idx].clone(), cv, p, &mut app.mesh_cache) {
+            if app.s.node(&id).is_some_and(|n| n.kind != "camera") {
+                app.action("toolSettings");
+            }
+        }
+        return;
+    };
+    if mode == CompMode::Vertex {
+        return;
+    }
+    let vp = app.vps[idx].clone();
+    let mut ids = app.s.hilite();
+    if mode == CompMode::Face {
+        // the JS `forTool` picker uses hilited plus selected meshes (never curves)
+        ids.retain(|id| app.s.node(id).is_some_and(|n| n.mesh().is_some()));
+        for id in &app.s.sel {
+            if !ids.contains(id) && app.s.node(id).is_some_and(|n| n.mesh().is_some()) {
+                ids.push(id.clone());
+            }
+        }
+    }
+    let Some((id, Comp::E(a, b))) = viewport::pick_best_component(&app.s, &vp, cv, &ids, CompMode::Edge, p, &mut app.mesh_cache) else { return };
+    let topo = app.mesh_cache.topo(&app.s, &id);
+    let Some(pm) = app.s.node(&id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return };
+    let Some(topo) = topo else { return };
+    let name = app.s.name_of(&id);
+    let list: Vec<String> = if mode == CompMode::Edge {
+        inca_core::mesh::edge_loop(pm, &topo, a, b).iter().filter_map(|&(x, y)| topo.edge(x, y)).map(|i| i.to_string()).collect()
+    } else {
+        inca_core::mesh::edge_ring_faces(pm, &topo, a, b).1.iter().map(|f| f.to_string()).collect()
+    };
+    if list.is_empty() {
+        return;
+    }
+    let _ = app.exec_mel(&format!("select {} {name}.{}[{}];", if shift { "-add" } else { "-r" }, if mode == CompMode::Edge { "e" } else { "f" }, list.join(",")), true);
 }
 
 /// Status line settings applied to picked objects: masks, hierarchy mode and the lock.
