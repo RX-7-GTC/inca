@@ -1560,8 +1560,12 @@ fn tool_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
     if app.tool.is_manip() {
         ui.horizontal(|ui| {
             ui.label("Axis Orientation");
-            ui.radio_value(&mut app.world_space, true, "World");
-            ui.radio_value(&mut app.world_space, false, "Object");
+            let mut world = app.space_world(app.tool);
+            ui.radio_value(&mut world, true, "World");
+            ui.radio_value(&mut world, false, "Object");
+            if world != app.space_world(app.tool) {
+                app.set_space_world(app.tool, world);
+            }
         });
         ui.checkbox(&mut app.snap_grid, "Discrete / grid snapping");
         ui.horizontal(|ui| {

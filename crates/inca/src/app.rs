@@ -176,7 +176,9 @@ pub struct IncaApp {
     pub script_log: Vec<(MsgKind, String)>,
     pub script_lang_rhai: bool,
     pub shelf_tab: usize,
-    pub world_space: bool,
+    /// Axis orientation per manipulator (move, rotate, scale): true = world, false = object.
+    /// The JS defaults are `Manip.space = { translate: 'world', rotate: 'local', scale: 'local' }`.
+    pub world_space: [bool; 3],
     pub snap_grid: bool,
     pub history_on: bool,
     pub manip_size: f32,
@@ -305,6 +307,31 @@ impl IncaApp {
     pub fn shown(&self, element: &str) -> bool {
         !self.hidden.contains(element)
     }
+    /// The manipulator tool the settings/marking menus act on (the active manip tool, or the
+    /// last one when another tool is active).
+    pub fn manip_tool(&self) -> Tool {
+        if self.tool.is_manip() {
+            self.tool
+        } else {
+            self.last_tool
+        }
+    }
+    /// Axis orientation of a manipulator: true = world, false = object (JS `Manip.space`).
+    pub fn space_world(&self, tool: Tool) -> bool {
+        self.world_space[match tool {
+            Tool::Rotate => 1,
+            Tool::Scale => 2,
+            _ => 0,
+        }]
+    }
+    pub fn set_space_world(&mut self, tool: Tool, world: bool) {
+        let i = match tool {
+            Tool::Rotate => 1,
+            Tool::Scale => 2,
+            _ => 0,
+        };
+        self.world_space[i] = world;
+    }
     pub fn set_shown(&mut self, element: &str, on: bool) {
         if on {
             self.hidden.remove(element);
@@ -344,7 +371,7 @@ impl IncaApp {
             script_log: vec![],
             script_lang_rhai: false,
             shelf_tab: cc.storage.and_then(|s| eframe::get_value(s, "shelfTab")).unwrap_or(1),
-            world_space: true,
+            world_space: [true, false, false],
             snap_grid: false,
             history_on: true,
             manip_size: cc.storage.and_then(|s| eframe::get_value(s, "manipSize")).unwrap_or(1.0),

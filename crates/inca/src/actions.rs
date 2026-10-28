@@ -1067,7 +1067,10 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
                 app.set_tool(Tool::Move);
             }
         }
-        "toggleWorld" => app.world_space = !app.world_space,
+        "toggleWorld" => {
+            let t = app.manip_tool();
+            app.set_space_world(t, !app.space_world(t));
+        }
         "toggleHistory" => app.history_on = !app.history_on,
         "toggleShelf" => app.set_shown("shelf", !app.shown("shelf")),
         "toggleTimeline" => app.set_shown("timeslider", !app.shown("timeslider")),

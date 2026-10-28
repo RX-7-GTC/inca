@@ -175,8 +175,8 @@ pub fn open_tool(app: &mut IncaApp, idx: usize, tool: Tool, pos: Pos2, now: f64)
     let step = if tool == Tool::Rotate { app.vp_state.snap_angle } else { app.vp_state.snap_step };
     let sym = ["Off", "Object X", "World X", "World Y", "World Z"];
     let radial = vec![
-        ("N", checked(it("World", Act::WorldSpace(true)), app.world_space)),
-        ("NE", checked(it("Object", Act::WorldSpace(false)), !app.world_space)),
+        ("N", checked(it("World", Act::WorldSpace(true)), app.space_world(tool))),
+        ("NE", checked(it("Object", Act::WorldSpace(false)), !app.space_world(tool))),
         ("E", checked(cmd("Edit Pivot", "pivotEdit"), app.pivot_mode)),
         ("SE", checked(cmd("Soft Select", "softSelect"), app.soft.on)),
         ("S", it("Tool Settings...", Act::ToolSettings)),
@@ -227,7 +227,7 @@ fn run(app: &mut IncaApp, act: Act) {
             app.active_vp = vp;
             app.action("frameSelected");
         }
-        Act::WorldSpace(w) => app.world_space = w,
+        Act::WorldSpace(w) => app.set_space_world(app.tool, w),
         Act::Discrete => app.snap_grid = !app.snap_grid,
         Act::Step(v) => {
             if app.tool == Tool::Rotate {
@@ -243,7 +243,8 @@ fn run(app: &mut IncaApp, act: Act) {
             app.show_right = true;
         }
         Act::ResetTool => {
-            app.world_space = app.tool != Tool::Scale;
+            // JS Reset Tool: move goes back to world, rotate and scale to object space
+            app.set_space_world(app.tool, app.tool == Tool::Move);
             app.snap_grid = false;
             app.vp_state.snap_step = 1.0;
             app.vp_state.snap_angle = 15.0;

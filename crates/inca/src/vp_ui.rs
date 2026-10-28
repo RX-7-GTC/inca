@@ -880,11 +880,17 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     if comp_targets.is_empty() && objects.is_empty() && app.vp_state.drag.is_none() {
         return false;
     }
+    let pivot_mode = app.pivot_mode && app.s.comp_mode.is_none();
+    let tool = chan.map(|c| c.0).unwrap_or(app.tool);
     let (pivot, rot) = if let Some(d) = &app.vp_state.drag {
         (DVec3::from(d.cur.translation), DQuat::from(d.cur.rotation))
     } else if !comp_targets.is_empty() {
         let mut c = DVec3::ZERO;
         let mut n = 0;
+        // the JS `placeProxy`: component rotate/scale (and object-space translate) use the
+        // last hilited object's world quaternion for the manipulator axes
+        let comp_local = tool != Tool::Move || !app.space_world(Tool::Move);
+        let mut rot = DQuat::IDENTITY;
         for (id, vs) in &comp_targets {
             let wm = app.s.world_matrix(id);
             let Some(node) = app.s.node(id) else { continue };
@@ -898,15 +904,16 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     n += 1;
                 }
             }
+            if comp_local {
+                rot = wm.to_scale_rotation_translation().1;
+            }
         }
-        (c / n.max(1) as f64, DQuat::IDENTITY)
+        (c / n.max(1) as f64, rot)
     } else {
         let lead = objects.last().unwrap();
-        let rot = if app.world_space && app.tool != Tool::Scale { DQuat::IDENTITY } else { app.s.world_matrix(lead).to_scale_rotation_translation().1 };
+        let rot = if app.space_world(tool) && tool != Tool::Scale { DQuat::IDENTITY } else { app.s.world_matrix(lead).to_scale_rotation_translation().1 };
         (app.s.world_pivot(lead), rot)
     };
-    let pivot_mode = app.pivot_mode && app.s.comp_mode.is_none();
-    let tool = chan.map(|c| c.0).unwrap_or(app.tool);
     let modes = match tool {
         _ if pivot_mode => GizmoMode::all_translate(),
         _ if chan.is_some() => chan.unwrap().1,
@@ -922,6 +929,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     };
     let active = app.vp_state.active_handle.filter(|m| modes.contains(*m)).or_else(|| modes.contains(default_handle).then_some(default_handle)).or_else(|| modes.iter().next());
     let ppp = ui.ctx().pixels_per_point();
+    let space_world = app.space_world(tool);
     let g = &mut app.vp_state.gizmos[idx];
     let mut visuals = GizmoVisuals { gizmo_size: 75.0 * app.manip_size, stroke_width: 3.0, ..Default::default() };
     visuals.x_color = Color32::from_rgb(230, 57, 62);
@@ -933,7 +941,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         projection_matrix: cv.proj.into(),
         viewport: resp.rect,
         modes,
-        orientation: if app.world_space && tool != Tool::Scale && app.s.comp_mode.is_none() { GizmoOrientation::Global } else { GizmoOrientation::Local },
+        orientation: if space_world && tool != Tool::Scale && app.s.comp_mode.is_none() { GizmoOrientation::Global } else { GizmoOrientation::Local },
         // MMB: drag the active handle from anywhere in the view
         mode_override: if app.vp_state.mmb { active } else { None },
         // hold X: grid snap while moving; hold J: discrete rotate (Maya)
