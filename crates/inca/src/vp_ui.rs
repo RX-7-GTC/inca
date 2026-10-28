@@ -598,18 +598,18 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
                     app.vp_state.stroke.clear();
                     let mode = sel_mode(mods);
                     match tool {
-                        Tool::Lasso if stroke.len() >= 3 => region_select(app, idx, cv, &|q| viewport::in_polygon(&stroke, q), mode),
+                        Tool::Lasso if stroke.len() >= 3 => region_select(app, idx, cv, &|q| viewport::in_polygon(&stroke, q), None, mode),
                         Tool::Paint => {
                             let r = app.paint_radius;
                             // paint adds; Ctrl paints a deselection
                             let mode = if mods.ctrl { SelMode::Remove } else if mode == SelMode::Replace { SelMode::Add } else { mode };
-                            region_select(app, idx, cv, &|q| viewport::on_stroke(&stroke, r, q), mode)
+                            region_select(app, idx, cv, &|q| viewport::on_stroke(&stroke, r, q), None, mode)
                         }
                         Tool::Lasso => {}
                         _ => {
                             let r = Rect::from_two_pos(start, cur);
                             if r.width() >= 3.0 || r.height() >= 3.0 {
-                                region_select(app, idx, cv, &|q| r.contains(q), mode);
+                                region_select(app, idx, cv, &|q| r.contains(q), Some(r.center()), mode);
                             }
                         }
                     }
@@ -729,14 +729,17 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
                 }
             }
             None => {
-                if mode == SelMode::Replace {
-                    // clicking empty space clears components; clicking another mesh hilites it
-                    if let Some(o) = viewport::pick_object(&app.s, &vp, cv, p, &mut app.mesh_cache) {
-                        if !hil.contains(&o) && app.s.node(&o).is_some_and(|n| n.mesh().is_some() || n.curve().is_some()) {
-                            app.select_names(&[o], SelMode::Replace);
-                            return;
-                        }
+                // clicking another object in component mode selects and hilites it; the JS
+                // keeps the current components and only clears them on a replace-click
+                // over the already-hilited object (or empty space)
+                if let Some(o) = pick_masked(app, &vp, cv, p) {
+                    if !hil.contains(&o) {
+                        let flag = if mode == SelMode::Replace { SelMode::Replace } else { SelMode::Add };
+                        app.select_names(&[o], flag);
+                        return;
                     }
+                }
+                if mode == SelMode::Replace {
                     for id in hil {
                         app.s.comp.remove(&id);
                     }
@@ -746,7 +749,7 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
         }
         return;
     }
-    let hit = viewport::pick_object(&app.s, &vp, cv, p, &mut app.mesh_cache).and_then(|h| filter_picks(app, vec![h]).pop());
+    let hit = pick_masked(app, &vp, cv, p).and_then(|h| filter_picks(app, vec![h]).pop());
     match hit {
         Some(id) => app.select_names(&[id], mode),
         None => {
@@ -757,14 +760,22 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
     }
 }
 
+/// Object pick honouring the status-line selection mask, as the JS `visibleNodes`.
+fn pick_masked(app: &mut IncaApp, vp: &viewport::Viewport, cv: &CamView, p: Pos2) -> Option<String> {
+    let s = &app.s;
+    let off = &app.sel_mask_off;
+    viewport::pick_object_if(s, vp, cv, p, &mut app.mesh_cache, &|id| crate::toolbar::mask_allows_scene(s, off, id))
+}
+
 /// JS `onDbl`: double-clicking an edge selects its loop, a face selects the faces of the
 /// edge ring under the cursor, and an object opens Tool Settings.
 fn double_click(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, shift: bool) {
     if app.lock_selection {
         return;
     }
+    let vp = app.vps[idx].clone();
     let Some(mode) = app.s.comp_mode else {
-        if let Some(id) = viewport::pick_object(&app.s, &app.vps[idx].clone(), cv, p, &mut app.mesh_cache) {
+        if let Some(id) = pick_masked(app, &vp, cv, p) {
             if app.s.node(&id).is_some_and(|n| n.kind != "camera") {
                 app.action("toolSettings");
             }
@@ -774,7 +785,6 @@ fn double_click(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, shift: boo
     if mode == CompMode::Vertex {
         return;
     }
-    let vp = app.vps[idx].clone();
     let mut ids = app.s.hilite();
     if mode == CompMode::Face {
         // the JS `forTool` picker uses hilited plus selected meshes (never curves)
@@ -821,7 +831,7 @@ fn filter_picks(app: &IncaApp, ids: Vec<String>) -> Vec<String> {
     out
 }
 
-fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Pos2) -> bool, mode: SelMode) {
+fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Pos2) -> bool, center: Option<Pos2>, mode: SelMode) {
     if app.lock_selection {
         return;
     }
@@ -829,6 +839,9 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
     if let Some(cm) = app.s.comp_mode {
         let mut parts = vec![];
         for id in app.s.hilite() {
+            if !app.s.is_visible(&id) {
+                continue;
+            }
             let name = app.s.name_of(&id);
             let topo = app.mesh_cache.topo(&app.s, &id);
             let is_curve = app.s.node(&id).is_some_and(|n| n.curve().is_some());
@@ -859,7 +872,11 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
         let _ = app.exec_mel(&mel, parts.len() < 200);
         return;
     }
-    let ids = filter_picks(app, viewport::region_objects(&app.s, &vp, cv, region));
+    let ids = {
+        let s = &app.s;
+        viewport::region_objects(s, &vp, cv, region, center, &mut app.mesh_cache)
+    };
+    let ids = filter_picks(app, ids);
     app.select_names(&ids, if mode == SelMode::Toggle && ids.is_empty() { SelMode::Add } else { mode });
 }
 

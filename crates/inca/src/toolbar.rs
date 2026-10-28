@@ -648,15 +648,42 @@ pub fn tool_box(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 /// Status line selection masks: may this object be picked?
 pub fn mask_allows(app: &IncaApp, id: &str) -> bool {
-    use inca_core::scene::Shape;
-    let Some(n) = app.s.node(id) else { return false };
-    let k = match &n.shape {
-        Shape::Mesh(_) => "mesh",
-        Shape::Curve(_) => "curve",
-        Shape::Light(_) => "light",
-        Shape::Camera(_) => "camera",
-        Shape::Locator => "locator",
-        Shape::Group => "group",
+    mask_allows_scene(&app.s, &app.sel_mask_off, id)
+}
+
+/// The JS `visibleNodes` mask test, keyed by the node's kind (only the six mask
+/// buttons are maskable; joints, handles and other rig kinds always pass).
+pub fn mask_allows_scene(s: &inca_core::scene::Scene, off: &std::collections::HashSet<String>, id: &str) -> bool {
+    let Some(n) = s.node(id) else { return false };
+    let k = match n.kind.as_str() {
+        "mesh" => "mesh",
+        "curve" => "curve",
+        "light" => "light",
+        "camera" => "camera",
+        "locator" => "locator",
+        "group" => "group",
+        _ => return true,
     };
-    !app.sel_mask_off.contains(k)
+    !off.contains(k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_mask_only_covers_the_six_kinds() {
+        let mut s = inca_core::scene::Scene::new();
+        let m = s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        let l = s.create_locator("loc1");
+        let j = s.create_handle("joint", "j1");
+        let mut off = std::collections::HashSet::new();
+        // a locator mask hides locators, but not joints (JS keys the mask by kind)
+        off.insert("locator".to_string());
+        assert!(!mask_allows_scene(&s, &off, &l));
+        assert!(mask_allows_scene(&s, &off, &j));
+        assert!(mask_allows_scene(&s, &off, &m));
+        off.insert("mesh".to_string());
+        assert!(!mask_allows_scene(&s, &off, &m));
+    }
 }

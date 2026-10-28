@@ -1092,10 +1092,20 @@ pub fn build_draws(
 // ------------------------------------------------------------------ picking
 
 /// Nearest object under the cursor.
+/// Nearest visible object under the cursor (unfiltered; production picks pass a mask).
+#[cfg(test)]
 pub fn pick_object(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_cache: &mut MeshCache) -> Option<Id> {
+    pick_object_if(s, vp, cv, pos, mesh_cache, &|_| true)
+}
+
+/// Picking with a candidate filter (the JS `visibleNodes` selection mask).
+pub fn pick_object_if(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_cache: &mut MeshCache, allow: &dyn Fn(&str) -> bool) -> Option<Id> {
     let ray = cv.ray(pos, vp.rect);
     let mut best: Option<(f64, Id)> = None;
     for id in s.all_dag(false) {
+        if !allow(&id) {
+            continue;
+        }
         if !s.is_visible(&id) || s.is_template(&id) {
             continue;
         }
@@ -1220,6 +1230,16 @@ fn seg_closest(p: Pos2, a: Pos2, b: Pos2) -> (f32, f32) {
     ((a + ab * t).distance(p), t)
 }
 
+/// Whether an icon object has a JS invisible pick volume at all.
+fn icon_has_pick(shape: &Shape, kind: &str) -> bool {
+    match (shape, kind) {
+        (Shape::Locator, "joint" | "locator" | "emitter" | "field" | "ikHandle" | "clusterHandle" | "lattice" | "deformer" | "deformHandle") => true,
+        (Shape::Light(_), _) => true,
+        (Shape::Camera(c), _) => !c.startup,
+        _ => false,
+    }
+}
+
 /// Invisible local-space pick volume of an icon object (the JS `addPick` geometry).
 fn icon_pick_local(shape: &Shape, kind: &str, r: &Ray) -> Option<f64> {
     let bx = |h: DVec3| inca_core::math::ray_aabb(r, &Aabb { min: -h, max: h });
@@ -1301,7 +1321,7 @@ pub fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 /// Objects inside a marquee (any projected vertex or the centre inside).
 #[cfg(test)]
 pub fn marquee_objects(s: &Scene, vp: &Viewport, cv: &CamView, r: Rect) -> Vec<Id> {
-    region_objects(s, vp, cv, &|q| r.contains(q))
+    region_objects(s, vp, cv, &|q| r.contains(q), Some(r.center()), &mut MeshCache::default())
 }
 
 /// Screen-space point-in-polygon (even-odd), for the lasso.
@@ -1328,7 +1348,7 @@ pub fn on_stroke(stroke: &[Pos2], r: f32, p: Pos2) -> bool {
 }
 
 /// Objects with a projected vertex (or icon point) satisfying `inside`.
-pub fn region_objects(s: &Scene, vp: &Viewport, cv: &CamView, inside: &dyn Fn(Pos2) -> bool) -> Vec<Id> {
+pub fn region_objects(s: &Scene, vp: &Viewport, cv: &CamView, inside: &dyn Fn(Pos2) -> bool, center: Option<Pos2>, mesh_cache: &mut MeshCache) -> Vec<Id> {
     let mut out = vec![];
     for id in s.all_dag(false) {
         if !s.is_visible(&id) || s.is_template(&id) {
@@ -1339,14 +1359,41 @@ pub fn region_objects(s: &Scene, vp: &Viewport, cv: &CamView, inside: &dyn Fn(Po
             continue;
         }
         let wm = s.world_matrix(&id);
+        let at = |p: DVec3| cv.project(wm.transform_point3(p), vp.rect).is_some_and(inside);
         let hit = match &n.shape {
             Shape::Mesh(m) => {
-                let step = (m.mesh.v.len() / 4000).max(1);
-                m.mesh.v.iter().step_by(step).any(|p| cv.project(wm.transform_point3(*p), vp.rect).is_some_and(inside))
+                // the JS marquee tests every vertex, or every 7th above 20k
+                let step = if m.mesh.v.len() > 20000 { 7 } else { 1 };
+                let mut hit = m.mesh.v.iter().step_by(step).any(|p| at(*p));
+                // a marquee inside one big face has no vertex inside; JS then casts a
+                // ray through the marquee centre and selects the mesh it hits
+                if !hit {
+                    if let Some(c) = center {
+                        let lr = cv.ray(c, vp.rect).transformed(&wm.inverse());
+                        let h = match mesh_cache.bvh(s, &id) {
+                            Some(b) => b.raycast(&m.mesh, &lr, vp.backface),
+                            None => m.mesh.raycast(&lr, vp.backface),
+                        };
+                        hit = h.is_some();
+                    }
+                }
+                hit
             }
             Shape::Group => false,
             Shape::Camera(c) if c.startup => false,
-            _ => icon_lines(s, &id, [1.0; 4]).iter().any(|v| cv.project(wm.transform_point3(DVec3::new(v.pos[0] as f64, v.pos[1] as f64, v.pos[2] as f64)), vp.rect).is_some_and(inside)),
+            // the JS samples the marquee curve 4 times per span
+            Shape::Curve(c) => c.sample(4).iter().any(|p| at(*p)),
+            _ => {
+                if icon_has_pick(&n.shape, &n.kind) {
+                    // JS tests icon pick nodes by their pivot only
+                    at(DVec3::ZERO)
+                } else if n.kind == "constraint" {
+                    false
+                } else {
+                    // Rust-only kinds without a JS pick mesh (distance dimensions)
+                    icon_lines(s, &id, [1.0; 4]).iter().any(|v| at(DVec3::new(v.pos[0] as f64, v.pos[1] as f64, v.pos[2] as f64)))
+                }
+            }
         };
         if hit {
             out.push(id);
@@ -2356,6 +2403,39 @@ mod tests {
     }
 
     #[test]
+    fn masked_objects_do_not_block_picks() {
+        let (mut s, vp, cv, cube) = setup();
+        let q = cv.project(DVec3::ZERO, vp.rect).unwrap();
+        let front = cv.eye + cv.fwd * (cv.coi * 0.5);
+        let l = s.create_locator("loc1");
+        s.set_world_matrix(&l, DMat4::from_translation(front));
+        assert_eq!(pick_object(&s, &vp, &cv, q, &mut MeshCache::default()), Some(l.clone()));
+        // masked off, the pick passes through to the cube rather than returning nothing
+        assert_eq!(pick_object_if(&s, &vp, &cv, q, &mut MeshCache::default(), &|id| id != l), Some(cube));
+    }
+
+    #[test]
+    fn marquee_selects_by_js_rules() {
+        let (mut s, vp, cv, cube) = setup();
+        let q = cv.project(DVec3::ZERO, vp.rect).unwrap();
+        // a little box at the centre contains no vertex, but the centre ray hits the face
+        let inner = Rect::from_center_size(q, egui::vec2(20.0, 20.0));
+        let inside = |p: Pos2| inner.contains(p);
+        assert_eq!(region_objects(&s, &vp, &cv, &inside, None, &mut MeshCache::default()), Vec::<String>::new());
+        assert_eq!(region_objects(&s, &vp, &cv, &inside, Some(inner.center()), &mut MeshCache::default()), vec![cube.clone()]);
+        // icons are marquee-tested at their pivot, not along their drawn lines
+        let l = s.create_locator("loc1");
+        let at = cv.eye + cv.fwd * (cv.coi * 0.6) + cv.right * 1.5;
+        s.set_world_matrix(&l, DMat4::from_translation(at));
+        let arm = cv.project(at + DVec3::X * 0.9, vp.rect).unwrap();
+        let r = Rect::from_center_size(arm, egui::vec2(12.0, 12.0));
+        assert!(!region_objects(&s, &vp, &cv, &|p| r.contains(p), None, &mut MeshCache::default()).contains(&l));
+        let p = cv.project(at, vp.rect).unwrap();
+        let r = Rect::from_center_size(p, egui::vec2(12.0, 12.0));
+        assert!(region_objects(&s, &vp, &cv, &|p| r.contains(p), None, &mut MeshCache::default()).contains(&l));
+    }
+
+    #[test]
     fn curve_object_pick_competes_by_depth() {
         // the JS intersects the sampled curve line at ray distance (-0.001): a mesh in front wins
         let (mut s, vp, cv, mesh) = setup();
@@ -2425,6 +2505,6 @@ mod tests {
         let (s, vp, cv, id) = setup();
         let r = vp.rect;
         let poly = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
-        assert_eq!(region_objects(&s, &vp, &cv, &|q| in_polygon(&poly, q)), vec![id]);
+        assert_eq!(region_objects(&s, &vp, &cv, &|q| in_polygon(&poly, q), None, &mut MeshCache::default()), vec![id]);
     }
 }
