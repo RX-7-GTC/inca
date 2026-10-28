@@ -1286,7 +1286,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 s.comp.remove(&m);
                 out.push(last_history_name(s, &m));
             }
-            s.comp_mode = None;
+            s.set_comp_mode(None);
             s.select(std::slice::from_ref(&h), SelMode::Replace);
             out.push(s.name_of(&h));
             Ok(strs(out))
@@ -2022,7 +2022,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let c = crate::curves::Curve::new(pts, 1, if closed { "periodic" } else { "open" }, "cv");
             let nm = a.s(&["n", "name"]).unwrap_or_else(|| "polyToCurve1".into());
             let cid = s.create_curve(c, &nm);
-            s.comp_mode = None;
+            s.set_comp_mode(None);
             s.select(std::slice::from_ref(&cid), SelMode::Replace);
             Ok(Val::Array(vec![Val::Str(s.name_of(&cid))]))
         }
@@ -2413,8 +2413,8 @@ fn curve_surface(s: &mut Scene, a: &Args, ty: &str) -> Result<Val, String> {
 
 fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
     if a.has(&["cl", "clear"]) {
+        // JS `select -cl` clears the object selection but keeps component mode and its selection
         s.select(&[], SelMode::Replace);
-        s.comp.clear();
         return Ok(Val::None);
     }
     let mode = if a.has(&["add", "af", "addFirst"]) {
@@ -2427,6 +2427,11 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
         SelMode::Replace
     };
     if a.has(&["all"]) {
+        // JS `selectAll` selects every component of the hilited objects in component mode
+        if s.comp_mode.is_some() {
+            crate::selection::all_components(s, false);
+            return Ok(Val::None);
+        }
         let all: Vec<Id> = s.roots.iter().filter(|i| !s.node(i).unwrap().startup()).cloned().collect();
         s.select(&all, SelMode::Replace);
         return Ok(Val::None);
@@ -2449,11 +2454,32 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
         }
     }
     if !comps.is_empty() {
-        if mode == SelMode::Replace {
-            s.comp.clear();
+        let kind = comps.last().map(|c| c.1).unwrap();
+        let owners: Vec<Id> = comps.iter().map(|c| c.0.clone()).collect();
+        let old_hilite = s.hilite();
+        let same = s.comp_mode == Some(kind);
+        if !same {
+            // JS mel `select`: a different component type re-hilites the owners
+            s.set_hilite(&owners);
+            s.set_comp_mode(Some(kind));
+        } else {
+            s.rev += 1;
         }
-        let mut owners = vec![];
+        if mode == SelMode::Replace {
+            // JS `Sel.selectComponents`: replace clears only the component sets of the objects
+            // that were hilited before the new owners were appended
+            let clear: &[Id] = if same { &old_hilite } else { &owners };
+            for id in clear {
+                if let Some(c) = s.comp.get_mut(id) {
+                    c.v.clear();
+                    c.e.clear();
+                    c.f.clear();
+                }
+            }
+        }
         for (id, m, idx) in comps {
+            // JS `Sel.selectComponents` hilites every object whose components are selected
+            s.add_hilite(&id);
             // curves have no edges/faces; `parse_component` already restricts them to CVs
             let topo = s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.topo());
             let c = s.comp.entry(id.clone()).or_default();
@@ -2483,8 +2509,6 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
                     }
                 }
             }
-            s.comp_mode = Some(m);
-            owners.push(id);
         }
         if !owners.iter().all(|o| s.sel.contains(o)) {
             s.select(&owners, SelMode::Add);

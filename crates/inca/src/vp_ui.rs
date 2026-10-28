@@ -807,13 +807,19 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
                 }
             }
             None => {
-                // clicking another object in component mode selects and hilites it; the JS
-                // keeps the current components and only clears them on a replace-click
-                // over the already-hilited object (or empty space)
+                // clicking another object in component mode hilites it (Maya behaviour) and
+                // appends it to the selection, but never drops the previous selection
                 if let Some(o) = pick_masked(app, &vp, cv, p) {
                     if !hil.contains(&o) {
-                        let flag = if mode == SelMode::Replace { SelMode::Replace } else { SelMode::Add };
-                        app.select_names(&[o], flag);
+                        if mode == SelMode::Replace {
+                            app.s.set_hilite(std::slice::from_ref(&o));
+                        } else {
+                            app.s.add_hilite(&o);
+                        }
+                        if !app.s.sel.contains(&o) {
+                            app.s.sel.push(o);
+                        }
+                        app.s.rev += 1;
                         return;
                     }
                 }

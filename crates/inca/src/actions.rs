@@ -786,7 +786,17 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
                 let _ = app.exec_mel("select -all;", true);
             }
         }
-        "deselectAll" => app.select_names(&[], SelMode::Replace),
+        "deselectAll" => {
+            // JS `deselectAll` in component mode clears the hilited components, not the objects
+            if app.s.comp_mode.is_some() {
+                for id in app.s.hilite() {
+                    app.s.comp.remove(&id);
+                }
+                app.s.rev += 1;
+            } else {
+                app.select_names(&[], SelMode::Replace);
+            }
+        }
         "selectHierarchy" => {
             let all: Vec<String> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).collect();
             app.select_names(&all, SelMode::Replace);

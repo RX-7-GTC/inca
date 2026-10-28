@@ -713,9 +713,6 @@ impl IncaApp {
             if mode == SelMode::Replace {
                 self.echo("select -cl;");
                 self.s.select(&[], SelMode::Replace);
-                if self.s.comp_mode.is_some() {
-                    self.s.comp.clear();
-                }
             }
             return;
         }

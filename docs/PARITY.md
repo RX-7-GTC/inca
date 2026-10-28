@@ -49,7 +49,7 @@ registry, menus, UI modules and a 0.1.12 screenshot.
 - [x] C2. Preferences persisted to a prefs file (JS stores menu set, workspace, HUD, shelves, hotkeys)
 - [x] C3. Viewport visuals: pre-selection highlight, component colours, wire colours, selected-face colour as in JS
 - [x] C4. Channel Box: MMB virtual slider in viewport, Ctrl/MMB drag in fields, expressions (`+=2`), int/enum stepping
-- [x] C5. Component selection: switching vertex/edge/face converts the selection with the JS `convertComp` fallbacks (lone vertex → incident edges / faces), and per-object component sets survive a trip through object mode (JS `Sel.setMode`)
+- [x] C5. Component selection: switching vertex/edge/face converts the selection with the JS `convertComp` fallbacks (lone vertex → incident edges / faces), and per-object component sets survive a trip through object mode (JS `Sel.setMode`); the component hilite is a separate list from the object selection (`App.hilite`), so object selection changes in component mode leave the edited objects alone, clicking another object hilites it and appends it to the selection, and leaving component mode keeps the hilited objects selected. Undo snapshots component mode, the hilite and the component sets (JS `Undo.snapshot`).
 
 ## Closed GitHub issues re-checked against the Rust version
 

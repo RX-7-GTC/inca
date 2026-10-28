@@ -255,7 +255,7 @@ pub enum CompMode {
     Face,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CompSel {
     pub v: BTreeSet<u32>,
     pub e: BTreeSet<(u32, u32)>,
@@ -342,6 +342,9 @@ pub struct Scene {
     pub time: TimeState,
     pub render: Params,
     pub sel: Vec<Id>,
+    /// Component-mode hilite objects (JS `App.hilite`): the objects whose components are shown
+    /// and edited. Kept separate from `sel` because the JS object selection does not change it.
+    pub hilite: Vec<Id>,
     pub comp_mode: Option<CompMode>,
     pub comp: HashMap<Id, CompSel>,
     pub id_counter: u64,
@@ -393,6 +396,7 @@ impl Scene {
             time: TimeState::default(),
             render: Params::new(),
             sel: vec![],
+            hilite: vec![],
             comp_mode: None,
             comp: HashMap::new(),
             id_counter: 1,
@@ -938,6 +942,7 @@ impl Scene {
             self.constraints.retain(|c| c.driven != *i && !c.targets.contains(i));
         }
         self.sel.retain(|s| !ids.contains(s));
+        self.hilite.retain(|h| !ids.contains(h));
         // booleans etc. that used a deleted mesh keep their current result
         let users: Vec<Id> = self
             .nodes
@@ -1577,26 +1582,72 @@ impl Scene {
         self.sel.last()
     }
 
-    /// Objects whose components are being edited (the selected meshes and curves in
-    /// component mode).
+    /// Objects whose components are being edited (the JS `App.hilite` list).
     pub fn hilite(&self) -> Vec<Id> {
         if self.comp_mode.is_none() {
             return vec![];
         }
-        self.sel.iter().filter(|i| self.nodes.get(*i).is_some_and(|n| n.mesh().is_some() || n.curve().is_some())).cloned().collect()
+        self.hilite.iter().filter(|i| self.nodes.get(*i).is_some_and(|n| n.mesh().is_some() || n.curve().is_some())).cloned().collect()
+    }
+
+    /// Replace the component-mode hilite with the given objects, filtering to meshes and curves
+    /// as the JS `Sel.hilite` does.
+    pub fn set_hilite(&mut self, ids: &[Id]) {
+        self.hilite.clear();
+        for id in ids {
+            if self.hilite.contains(id) {
+                continue;
+            }
+            if self.nodes.get(id).is_some_and(|n| n.mesh().is_some() || n.curve().is_some()) {
+                self.hilite.push(id.clone());
+            }
+        }
+    }
+
+    /// Add an object to the component-mode hilite (JS `Sel.selectComponents` line 55).
+    pub fn add_hilite(&mut self, id: &Id) {
+        if !self.hilite.contains(id) && self.nodes.get(id).is_some_and(|n| n.mesh().is_some() || n.curve().is_some()) {
+            self.hilite.push(id.clone());
+        }
     }
 
     pub fn set_comp_mode(&mut self, m: Option<CompMode>) {
-        // JS `Sel.setMode`: switching between component types converts the selection, and going
-        // back to object mode keeps the per-object component sets (they are hidden, not cleared)
-        if let (Some(prev), Some(to)) = (self.comp_mode, m) {
-            if prev != to {
+        match (self.comp_mode, m) {
+            // JS `Sel.setMode`: switching between component types converts the selection
+            (Some(prev), Some(to)) if prev != to => {
                 crate::selection::convert(self, to);
-                return;
+            }
+            (None, Some(to)) => {
+                // entering component mode: the selected meshes and curves become the hilite
+                let cand: Vec<Id> = self
+                    .sel
+                    .iter()
+                    .filter(|i| self.nodes.get(*i).is_some_and(|n| n.mesh().is_some() || n.curve().is_some()))
+                    .cloned()
+                    .collect();
+                if !cand.is_empty() {
+                    self.set_hilite(&cand);
+                }
+                self.hilite.retain(|i| self.nodes.contains_key(i));
+                self.comp_mode = Some(to);
+                self.rev += 1;
+            }
+            (Some(_), None) => {
+                // back to object mode: objects with components selected stay selected, at the
+                // end of the selection as in the JS (they become the lead)
+                let keep = std::mem::take(&mut self.hilite);
+                self.comp_mode = None;
+                for id in keep {
+                    self.sel.retain(|s| s != &id);
+                    self.sel.push(id);
+                }
+                self.rev += 1;
+            }
+            _ => {
+                self.comp_mode = m;
+                self.rev += 1;
             }
         }
-        self.comp_mode = m;
-        self.rev += 1;
     }
 
     pub fn comp_sel(&self, id: &str) -> CompSel {
@@ -1626,8 +1677,19 @@ impl Scene {
     }
 
     // ------------------------------------------------------------ undo
+    /// Snapshot data for undo: the scene plus the JS `Undo.snapshot` extras (component mode,
+    /// the hilite list and the component selections), so undoing an edit keeps component mode.
+    fn snapshot_data(&self) -> Value {
+        let mut d = self.serialize();
+        let o = d.as_object_mut().unwrap();
+        o.insert("compMode".into(), serde_json::to_value(self.comp_mode).unwrap());
+        o.insert("hilite".into(), json!(self.hilite));
+        let comp: serde_json::Map<String, Value> = self.comp.iter().map(|(id, c)| (id.clone(), json!({ "v": c.v, "e": c.e, "f": c.f }))).collect();
+        o.insert("compSel".into(), Value::Object(comp));
+        d
+    }
     pub fn checkpoint(&mut self, label: &str) {
-        let data = self.serialize();
+        let data = self.snapshot_data();
         self.undo_stack.push(Snapshot { label: label.into(), data });
         if self.undo_stack.len() > self.undo_limit {
             self.undo_stack.remove(0);
@@ -1636,14 +1698,14 @@ impl Scene {
     }
     pub fn undo(&mut self) -> Option<String> {
         let s = self.undo_stack.pop()?;
-        let cur = self.serialize();
+        let cur = self.snapshot_data();
         self.redo_stack.push(Snapshot { label: s.label.clone(), data: cur });
         self.restore(&s.data);
         Some(s.label)
     }
     pub fn redo(&mut self) -> Option<String> {
         let s = self.redo_stack.pop()?;
-        let cur = self.serialize();
+        let cur = self.snapshot_data();
         self.undo_stack.push(Snapshot { label: s.label.clone(), data: cur });
         self.restore(&s.data);
         Some(s.label)
@@ -1653,8 +1715,19 @@ impl Scene {
         let undo = std::mem::take(&mut self.undo_stack);
         let redo = std::mem::take(&mut self.redo_stack);
         let comp_mode = self.comp_mode;
+        let hilite = self.hilite.clone();
         let _ = self.load(d);
-        self.comp_mode = comp_mode;
+        // JS `Undo.restore`: component mode, the hilite and the component selections come back
+        self.comp_mode = d.get("compMode").and_then(|v| serde_json::from_value(v.clone()).ok()).flatten().or(comp_mode);
+        if let Some(h) = d.get("hilite").and_then(|v| v.as_array()) {
+            self.hilite = h.iter().filter_map(|v| v.as_str().map(String::from)).filter(|id| self.nodes.contains_key(id)).collect();
+        } else {
+            self.hilite = hilite.into_iter().filter(|id| self.nodes.contains_key(id)).collect();
+        }
+        if let Some(cs) = d.get("compSel") {
+            self.comp = serde_json::from_value::<HashMap<Id, CompSel>>(cs.clone()).unwrap_or_default();
+            self.comp.retain(|id, _| self.nodes.contains_key(id));
+        }
         self.undo_stack = undo;
         self.redo_stack = redo;
         self.file = file;
@@ -1828,6 +1901,7 @@ impl Scene {
         self.characters.clear();
         self.dynamics = Default::default();
         self.sel.clear();
+        self.hilite.clear();
         self.comp.clear();
         self.comp_mode = None;
         self.touch();
@@ -2180,5 +2254,45 @@ mod tests {
         s.set_key(&a, "tx", Some(11.0), Some(10.0));
         s.set_time(11.0);
         assert!((s.get_attr_f(&a, "tx") - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn component_hilite_is_separate_from_the_object_selection() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let b = s.create_mesh("polySphere", &Params::new(), None);
+        let l = s.create_locator("locator1");
+        s.select(std::slice::from_ref(&a), SelMode::Replace);
+        s.set_comp_mode(Some(CompMode::Vertex));
+        assert_eq!(s.hilite(), vec![a.clone()]);
+        // selecting another object (outliner / MEL) does not change the hilite, as in the JS
+        s.select(std::slice::from_ref(&l), SelMode::Replace);
+        assert_eq!(s.sel, vec![l.clone()]);
+        assert_eq!(s.hilite(), vec![a.clone()]);
+        // adding another mesh to the hilite keeps both; non-mesh kinds are filtered
+        s.set_hilite(&[b.clone(), l.clone()]);
+        assert_eq!(s.hilite(), vec![b.clone()]);
+        // leaving component mode keeps the hilited objects selected, at the end of the list
+        s.select(&[l.clone(), a.clone()], SelMode::Replace);
+        s.set_comp_mode(None);
+        assert!(s.hilite().is_empty());
+        assert_eq!(s.sel, vec![l, a, b]);
+    }
+
+    #[test]
+    fn undo_keeps_component_mode_and_selection() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.select(std::slice::from_ref(&a), SelMode::Replace);
+        s.set_comp_mode(Some(CompMode::Vertex));
+        s.comp.insert(a.clone(), CompSel { v: [0u32, 1].into_iter().collect(), ..Default::default() });
+        s.checkpoint("move components");
+        s.comp.insert(a.clone(), CompSel { v: [0u32, 1, 2].into_iter().collect(), ..Default::default() });
+        s.undo().unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Vertex));
+        assert_eq!(s.hilite(), vec![a.clone()]);
+        assert_eq!(s.comp_verts(&a), vec![0, 1]);
+        s.redo().unwrap();
+        assert_eq!(s.comp_verts(&a), vec![0, 1, 2]);
     }
 }
