@@ -745,7 +745,14 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "hudCameraNames" => app.hud.cam_names = !app.hud.cam_names,
         "hudViewAxis" => app.hud.view_axis = !app.hud.view_axis,
         "frameSelectedAll" | "frameAllAll" => {
-            let b = if id == "frameAllAll" || app.s.sel.is_empty() { viewport::scene_bbox(&app.s) } else { viewport::selection_bbox(&app.s) };
+            // JS `frameSelection`: frame the selected components/objects, and fall back to the
+            // whole scene when the selection box is empty (`frameSelection` -> `frameAll`)
+            let b = if id == "frameAllAll" {
+                viewport::scene_bbox(&app.s)
+            } else {
+                let sb = viewport::selection_bbox(&app.s);
+                if sb.is_empty() { viewport::scene_bbox(&app.s) } else { sb }
+            };
             for v in 0..app.vps.len() {
                 let r = app.vps[v].rect;
                 let aspect = if r.height() > 1.0 { (r.width() / r.height()) as f64 } else { 1.5 };
@@ -944,7 +951,14 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             v.isolate = if v.isolate.is_some() || app.s.sel.is_empty() { None } else { Some(app.s.sel.clone()) };
         }
         "frameSelected" | "frameAll" => {
-            let b = if id == "frameAll" || app.s.sel.is_empty() { viewport::scene_bbox(&app.s) } else { viewport::selection_bbox(&app.s) };
+            // JS `frameSelection` falls back to `frameAll` when the selection box is empty, and
+            // frames the selected components even when the object selection is empty
+            let b = if id == "frameAll" {
+                viewport::scene_bbox(&app.s)
+            } else {
+                let sb = viewport::selection_bbox(&app.s);
+                if sb.is_empty() { viewport::scene_bbox(&app.s) } else { sb }
+            };
             let r = app.vps[vp].rect;
             let aspect = if r.height() > 1.0 { (r.width() / r.height()) as f64 } else { 1.5 };
             let cam = app.vps[vp].camera.clone();

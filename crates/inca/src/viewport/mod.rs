@@ -354,20 +354,29 @@ pub fn draw_gate(s: &Scene, vp: &Viewport, painter: &egui::Painter) {
     painter.text(egui::pos2(g.min.x + 4.0, g.min.y - 3.0), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(11.0), Color32::from_gray(0xee));
 }
 
-/// Frame a world box (F / A).
+/// Frame a world box (F / A). An empty box frames the JS default ±6 box (`frame(box)`).
 pub fn frame_box(s: &mut Scene, cam: &str, b: &Aabb, aspect: f64) {
-    if b.is_empty() {
-        return;
-    }
+    // JS `Viewport.frame`: `if (!box || box.isEmpty()) box = new Box3((-6,-6,-6), (6,6,6))`
+    let default_box;
+    let b = if b.is_empty() {
+        default_box = Aabb { min: DVec3::splat(-6.0), max: DVec3::splat(6.0) };
+        &default_box
+    } else {
+        b
+    };
     let Some(id) = camera_id(s, cam) else { return };
     let Some(n) = s.nodes.get_mut(&id) else { return };
     let q = quat_from_euler_deg(n.xf.r, &n.xf.ro);
     let fwd = q * -DVec3::Z;
     let center = b.center();
-    let radius = (b.size().length() * 0.5).max(0.05);
+    let mut radius = b.size().length() * 0.5;
+    if radius < 0.01 {
+        radius = 1.0;
+    }
     if let Shape::Camera(c) = &mut n.shape {
         if c.ortho {
-            c.ortho_width = radius * 2.0 * 1.2 * aspect.max(1.0);
+            // JS: orthoWidth = radius * 2.4 * max(1, viewportAspect / 1.5)
+            c.ortho_width = radius * 2.4 * (aspect / 1.5).max(1.0);
             let d = c.coi;
             n.xf.t = (center - fwd * d).to_array();
         } else {
@@ -1041,7 +1050,9 @@ pub fn build_draws(
                 draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(icon_lines(s, &id, c)), u: DrawUniform::new(wm) });
             }
             Shape::Curve(_) => {
-                let c = if selected || is_affected { sel_col } else if template { C_TEMPLATE } else { C_CURVE };
+                // JS `prepareScene`: a hilited curve uses the hilite wire colour when it is not
+                // the selection lead/selected/affected (e.g. after selecting another object)
+                let c = if selected || is_affected { sel_col } else if template { C_TEMPLATE } else if hilite.contains(&id) { C_HILITE } else { C_CURVE };
                 draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(icon_lines(s, &id, c)), u: DrawUniform::new(wm) });
             }
             Shape::Locator => {
@@ -2134,6 +2145,32 @@ mod tests {
         // the ray through the projected point passes the point
         let t = (p - r.origin).dot(r.dir);
         assert!((r.at(t) - p).length() < 1e-6);
+    }
+
+    #[test]
+    fn empty_frame_uses_the_js_default_box() {
+        // JS `frame`: an empty box grows to (-6,-6,-6)..(6,6,6) instead of doing nothing
+        let mut s = Scene::new();
+        frame_box(&mut s, "persp", &Aabb::EMPTY, 1.5);
+        let id = camera_id(&s, "persp").unwrap();
+        let Shape::Camera(c) = &s.node(&id).unwrap().shape else { panic!("persp is not a camera") };
+        let radius = DVec3::splat(12.0).length() * 0.5;
+        let vf = c.fov_y(1.5);
+        let hf = 2.0 * ((vf / 2.0).tan() * 1.5).atan();
+        let d = radius / (vf.min(hf) / 2.0).sin() * 1.05;
+        assert!((c.coi - d).abs() < 1e-6, "coi {} != {d}", c.coi);
+    }
+
+    #[test]
+    fn ortho_frame_matches_the_js_aspect_factor() {
+        // JS `frame`: orthoWidth = radius * 2.4 * max(1, aspect / 1.5)
+        let mut s = Scene::new();
+        let b = Aabb { min: DVec3::splat(-1.0), max: DVec3::splat(1.0) };
+        frame_box(&mut s, "top", &b, 2.0);
+        let id = camera_id(&s, "top").unwrap();
+        let Shape::Camera(c) = &s.node(&id).unwrap().shape else { panic!("top is not a camera") };
+        let radius = DVec3::splat(2.0).length() * 0.5;
+        assert!((c.ortho_width - radius * 2.4 * (2.0f64 / 1.5)).abs() < 1e-9, "ortho width {}", c.ortho_width);
     }
 
     #[test]

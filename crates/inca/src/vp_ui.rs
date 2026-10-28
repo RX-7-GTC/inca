@@ -2241,7 +2241,8 @@ fn hud(app: &mut IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
     }
     let mut right = String::new();
     if h.frame {
-        right += &format!("Current Frame: {}\n", inca_core::math::fmt_num(app.s.time.current));
+        // JS `drawHud` uses `fmt(App.time.current, 2)` (two decimals, trailing zeros trimmed)
+        right += &format!("Current Frame: {}\n", inca_core::math::fmt_num(inca_core::math::round_to(app.s.time.current, 2)));
     }
     if h.fps {
         right += &format!("{:.1} fps\n", app.fps_measured);

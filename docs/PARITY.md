@@ -47,7 +47,7 @@ registry, menus, UI modules and a 0.1.12 screenshot.
 
 - [x] C1. Hotkeys: compare every JS hotkey (F2–F6 menu sets, Alt+B, Ctrl+Space, B, V, J, Shift+D, Ctrl+Shift+click to shelf, …)
 - [x] C2. Preferences persisted to a prefs file (JS stores menu set, workspace, HUD, shelves, hotkeys)
-- [x] C3. Viewport visuals: pre-selection highlight, component colours, wire colours, selected-face colour as in JS
+- [x] C3. Viewport visuals: pre-selection highlight, component colours, wire colours, selected-face colour as in JS; component-mode edges keep the JS hilite blue and a hilited-but-unselected curve uses the hilite wire colour; HUD frame shows two decimals (JS `fmt(frame, 2)`); resolution/film gate masks, borders and labels match `drawGate`; Frame Selection frames selected components and falls back to Frame All when its box is empty, and an empty frame uses the JS ±6 box and the JS orthographic aspect factor
 - [x] C4. Channel Box: MMB virtual slider in viewport, Ctrl/MMB drag in fields, expressions (`+=2`), int/enum stepping
 - [x] C5. Component selection: switching vertex/edge/face converts the selection with the JS `convertComp` fallbacks (lone vertex → incident edges / faces), and per-object component sets survive a trip through object mode (JS `Sel.setMode`); the component hilite is a separate list from the object selection (`App.hilite`), so object selection changes in component mode leave the edited objects alone, clicking another object hilites it and appends it to the selection, and leaving component mode keeps the hilited objects selected. Undo snapshots component mode, the hilite and the component sets (JS `Undo.snapshot`).
 
