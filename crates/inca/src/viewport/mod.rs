@@ -1537,11 +1537,9 @@ pub struct CompHit {
 pub fn pick_component_hit(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode: CompMode, pos: Pos2, mesh_cache: &mut MeshCache) -> Option<CompHit> {
     let n = s.node(id)?;
     let wm = s.world_matrix(id);
-    // a curve is a vertex cloud to the JS picker (`o.inca.curve.cvs`); there are no edges or faces
+    // a curve is a vertex cloud to the JS picker (`o.inca.curve.cvs`); JS picks its CVs in
+    // every component mode (the `o.inca.kind === 'curve'` branch of pickComponent)
     if let Some(c) = n.curve() {
-        if mode != CompMode::Vertex {
-            return None;
-        }
         let mut best: Option<CompHit> = None;
         for (i, p) in c.cvs.iter().enumerate() {
             let wp = wm.transform_point3(*p);
@@ -1671,11 +1669,8 @@ pub fn region_components(s: &Scene, vp: &Viewport, cv: &CamView, id: &str, mode:
     let Some(n) = s.node(id) else { return vec![] };
     let wm = s.world_matrix(id);
     let inside = |p: DVec3| cv.project(wm.transform_point3(p), vp.rect).is_some_and(region);
-    // curve CVs behave like vertices (and are never occluded)
+    // curve CVs behave like vertices (and are never occluded), in every component mode
     if let Some(c) = n.curve() {
-        if mode != CompMode::Vertex {
-            return vec![];
-        }
         return (0..c.cvs.len()).filter(|&i| inside(c.cvs[i])).map(|i| Comp::V(i as u32)).collect();
     }
     let Some(pm) = n.mesh().map(|m| &m.mesh) else { return vec![] };
@@ -2101,11 +2096,14 @@ mod tests {
         let (id, comp) = pick_best_component(&s, &vp, &cv, &[mesh, c.clone()], CompMode::Vertex, q, &mut cache).unwrap();
         assert_eq!(id, c);
         assert_eq!(comp, Comp::V(0));
-        // the marquee treats CVs like vertices
+        // the marquee treats CVs like vertices, in every component mode
         let inside = |r: Pos2| vp.rect.contains(r);
         assert_eq!(region_components(&s, &vp, &cv, &c, CompMode::Vertex, &inside, &mut cache), vec![Comp::V(0), Comp::V(1)]);
-        // curves have no edge or face components
-        assert!(region_components(&s, &vp, &cv, &c, CompMode::Edge, &inside, &mut cache).is_empty());
+        for mode in [CompMode::Edge, CompMode::Face] {
+            assert_eq!(region_components(&s, &vp, &cv, &c, mode, &inside, &mut cache), vec![Comp::V(0), Comp::V(1)]);
+            // JS pickComponent has a curve branch that picks CVs in edge and face mode too
+            assert_eq!(pick_component(&s, &vp, &cv, &c, mode, q, &mut cache), Some(Comp::V(0)));
+        }
     }
 
     #[test]
