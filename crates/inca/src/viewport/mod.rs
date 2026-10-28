@@ -1129,6 +1129,20 @@ pub fn pick_object(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_cache
                 }
             }
             Shape::Group => {}
+            // the JS pick intersects the sampled display line (`ud.line`, 16 per span) and only
+            // wins ties by 0.001: a mesh in front still takes the pick
+            Shape::Curve(c) => {
+                let pts: Vec<DVec3> = c.sample(16).iter().map(|p| wm.transform_point3(*p)).collect();
+                for seg in pts.windows(2) {
+                    let (dist, t) = ray_seg_closest(&ray, seg[0], seg[1]);
+                    if dist < 1.0 {
+                        let d = cv.depth(seg[0].lerp(seg[1], t)) - 0.001;
+                        if best.as_ref().is_none_or(|x| d < x.0) {
+                            best = Some((d, id.clone()));
+                        }
+                    }
+                }
+            }
             Shape::Camera(c) if c.startup => {}
             _ => {
                 // icon objects: screen distance to their lines
@@ -1159,6 +1173,22 @@ fn seg_closest(p: Pos2, a: Pos2, b: Pos2) -> (f32, f32) {
     ((a + ab * t).distance(p), t)
 }
 
+/// Closest distance between a ray and a segment (world space) and the segment parameter.
+fn ray_seg_closest(r: &Ray, a: DVec3, b: DVec3) -> (f64, f64) {
+    let u = b - a;
+    let w0 = r.origin - a;
+    let (uu, ud, uw, c) = (u.length_squared(), u.dot(r.dir), u.dot(w0), r.dir.dot(w0));
+    // s = ud*t - c along the ray, t along the segment (Ericson's segment/segment closest)
+    let mut t = if uu < 1e-12 { 0.0 } else { (ud * uw - c * uu) / (uu - ud * ud).max(1e-12) };
+    t = t.clamp(0.0, 1.0);
+    let mut ray_t = ud * t - c;
+    if ray_t < 0.0 {
+        // the closest point is behind the eye: clamp to the origin and reproject the segment
+        ray_t = 0.0;
+        t = if uu < 1e-12 { 0.0 } else { (uw / uu).clamp(0.0, 1.0) };
+    }
+    ((r.at(ray_t) - a.lerp(b, t)).length(), t)
+}
 pub fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     seg_closest(p, a, b).0
 }
@@ -2157,6 +2187,26 @@ mod tests {
         assert_ne!(k2, k3);
         // edge and face overlays have independent keys
         assert_ne!(cache.comp_key(&s, &id, CompMode::Edge).unwrap(), k3);
+    }
+
+    #[test]
+    fn curve_object_pick_competes_by_depth() {
+        // the JS intersects the sampled curve line at ray distance (-0.001): a mesh in front wins
+        let (mut s, vp, cv, mesh) = setup();
+        let front = cv.eye + (DVec3::ZERO - cv.eye).normalize() * (cv.eye.length() - 2.0);
+        let behind = cv.eye + (DVec3::ZERO - cv.eye).normalize() * (cv.eye.length() + 2.0);
+        let mk = |s: &mut Scene, at: DVec3| {
+            s.create_curve(
+                inca_core::curves::Curve::new(vec![at - cv.right * 0.3, at + cv.right * 0.3], 1, "open", "cv"),
+                "c1",
+            )
+        };
+        let c = mk(&mut s, front);
+        let p = cv.project(front, vp.rect).unwrap();
+        assert_eq!(pick_object(&s, &vp, &cv, p, &mut MeshCache::default()), Some(c.clone()));
+        // now behind the cube: the cube occludes the curve pick
+        s.set_world_matrix(&c, DMat4::from_translation(behind - front));
+        assert_eq!(pick_object(&s, &vp, &cv, p, &mut MeshCache::default()), Some(mesh));
     }
 
     #[test]
