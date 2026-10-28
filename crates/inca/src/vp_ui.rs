@@ -20,6 +20,18 @@ pub enum NavMode {
     Dolly,
 }
 
+/// A Shift+MMB / Shift+LMB drag waiting for enough movement to choose an axis (JS `middleDrag` auto mode).
+#[derive(Clone, Copy)]
+pub struct AutoDrag {
+    pub vp: usize,
+    pub button: egui::PointerButton,
+    /// press position; the axis is chosen from the drag since this point
+    pub origin: Pos2,
+    pub tool: Tool,
+    pub pivot: DVec3,
+    pub rot: DQuat,
+}
+
 pub struct VpState {
     pub gizmos: Vec<Gizmo>,
     pub drag: Option<GizmoDrag>,
@@ -31,10 +43,15 @@ pub struct VpState {
     pub snap_angle: f64,
     /// points placed by the curve / polygon creation tools
     pub tool_pts: Vec<DVec3>,
-    /// the manipulator's active handle (Maya: the last one dragged, Ctrl+click picks one); MMB drags it from anywhere
-    pub active_handle: Option<GizmoMode>,
-    /// an MMB manipulator drag is in progress
-    pub mmb: bool,
+    /// the manipulator's active handle per mode (move, rotate, scale), as JS `Manip.activeAxis`;
+    /// MMB drags it from anywhere and a click on a handle remembers it
+    pub active_handles: [Option<GizmoMode>; 3],
+    /// an MMB manipulator drag is in progress in this viewport
+    pub mmb: Option<usize>,
+    /// a forced handle drag in this viewport (Ctrl+LMB plane / auto axis) and the button driving it
+    pub force_handle: Option<(usize, GizmoMode, egui::PointerButton)>,
+    /// a Shift+drag waiting to choose the axis nearest the mouse direction
+    pub auto_drag: Option<AutoDrag>,
     /// the handle under the cursor when the button went down
     pub press_handle: Option<GizmoMode>,
     /// Three Point Arc editing: point being dragged (0-2, 3 = centre) and the last drag position
@@ -44,7 +61,41 @@ pub struct VpState {
 
 impl Default for VpState {
     fn default() -> Self {
-        VpState { gizmos: (0..4).map(|_| Gizmo::default()).collect(), drag: None, marquee: None, stroke: vec![], nav: None, snap_step: 1.0, snap_angle: 15.0, tool_pts: vec![], active_handle: None, mmb: false, press_handle: None, arc_drag: None, arc_anchor: None }
+        VpState {
+            gizmos: (0..4).map(|_| Gizmo::default()).collect(),
+            drag: None,
+            marquee: None,
+            stroke: vec![],
+            nav: None,
+            snap_step: 1.0,
+            snap_angle: 15.0,
+            tool_pts: vec![],
+            active_handles: [None; 3],
+            mmb: None,
+            force_handle: None,
+            auto_drag: None,
+            press_handle: None,
+            arc_drag: None,
+            arc_anchor: None,
+        }
+    }
+}
+
+/// Manipulator mode slot: move, rotate, scale (the JS `Manip.activeAxis` keys).
+pub fn mode_index(tool: Tool) -> usize {
+    match tool {
+        Tool::Rotate => 1,
+        Tool::Scale => 2,
+        _ => 0,
+    }
+}
+
+impl VpState {
+    pub fn active_handle(&self, tool: Tool) -> Option<GizmoMode> {
+        self.active_handles[mode_index(tool)]
+    }
+    pub fn reset_active_handle(&mut self, tool: Tool) {
+        self.active_handles[mode_index(tool)] = None;
     }
 }
 
@@ -961,6 +1012,61 @@ fn handle_at(config: &GizmoConfig, cursor: Pos2) -> Option<GizmoMode> {
     })
 }
 
+/// The central handle of a manipulator (JS `XYZ` / `E`).
+fn is_center_handle(m: GizmoMode) -> bool {
+    matches!(m, GizmoMode::TranslateView | GizmoMode::RotateView | GizmoMode::ScaleUniform | GizmoMode::Arcball)
+}
+
+/// Ctrl on an axis locks it: the drag happens in the plane of the other two (JS `PLANE_OF`).
+///
+/// transform-gizmo's plane modes are named after the corner their handle is drawn at, not after
+/// the axes they free: `TranslateXY` sits between +Y and +Z and its plane normal is X, so it
+/// keeps X fixed (the YZ plane); `TranslateYZ` keeps Z fixed (the XY plane). `XZ` is symmetric.
+/// The scale plane modes follow the same convention.
+fn plane_of(m: GizmoMode) -> GizmoMode {
+    match m {
+        GizmoMode::TranslateX => GizmoMode::TranslateXY,
+        GizmoMode::TranslateY => GizmoMode::TranslateXZ,
+        GizmoMode::TranslateZ => GizmoMode::TranslateYZ,
+        GizmoMode::ScaleX => GizmoMode::ScaleXY,
+        GizmoMode::ScaleY => GizmoMode::ScaleXZ,
+        GizmoMode::ScaleZ => GizmoMode::ScaleYZ,
+        _ => m,
+    }
+}
+
+/// The X / Y / Z handle for a translate or scale mode (JS auto-axis drag).
+fn axis_handle(tool: Tool, i: usize) -> GizmoMode {
+    if tool == Tool::Scale {
+        [GizmoMode::ScaleX, GizmoMode::ScaleY, GizmoMode::ScaleZ][i]
+    } else {
+        [GizmoMode::TranslateX, GizmoMode::TranslateY, GizmoMode::TranslateZ][i]
+    }
+}
+
+/// Shift+drag: the axis whose screen direction best matches the drag (JS `middleDrag` auto).
+fn auto_axis(tool: Tool, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, origin: Pos2, cursor: Pos2) -> GizmoMode {
+    let (dx, dy) = (cursor.x - origin.x, cursor.y - origin.y);
+    let mut best = axis_handle(tool, 0);
+    let mut bd = -1.0f32;
+    if let Some(a) = cv.project(pivot, rect) {
+        for (i, axis) in [DVec3::X, DVec3::Y, DVec3::Z].into_iter().enumerate() {
+            let Some(b) = cv.project(pivot + rot * axis, rect) else { continue };
+            let (sx, sy) = (b.x - a.x, b.y - a.y);
+            let l = (sx * sx + sy * sy).sqrt();
+            if l < 1e-6 {
+                continue;
+            }
+            let d = ((sx * dx + sy * dy) / l).abs();
+            if d > bd {
+                bd = d;
+                best = axis_handle(tool, i);
+            }
+        }
+    }
+    best
+}
+
 fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter) -> bool {
     let chan = channel_modes(app);
     if (!app.tool.is_manip() && chan.is_none()) || !app.vps[idx].show_manips {
@@ -1018,13 +1124,15 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         Tool::Rotate => GizmoMode::all_rotate(),
         _ => GizmoMode::all_scale(),
     };
-    // the active handle must be one of the shown handles
-    let default_handle = match tool {
+    // the active handle must be one of the shown handles (JS remembers one per mode)
+    let mode_tool = if pivot_mode { Tool::Move } else { tool };
+    let mi = mode_index(mode_tool);
+    let default_handle = match mode_tool {
         Tool::Rotate => GizmoMode::RotateView,
         Tool::Scale => GizmoMode::ScaleUniform,
         _ => GizmoMode::TranslateView,
     };
-    let active = app.vp_state.active_handle.filter(|m| modes.contains(*m)).or_else(|| modes.contains(default_handle).then_some(default_handle)).or_else(|| modes.iter().next());
+    let mut active = app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)).or_else(|| modes.contains(default_handle).then_some(default_handle)).or_else(|| modes.iter().next());
     let ppp = ui.ctx().pixels_per_point();
     let space_world = app.space_world(tool);
     let g = &mut app.vp_state.gizmos[idx];
@@ -1033,14 +1141,25 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     visuals.y_color = Color32::from_rgb(92, 214, 92);
     visuals.z_color = Color32::from_rgb(74, 132, 255);
     visuals.s_color = Color32::from_rgb(240, 225, 80);
-    g.update_config(GizmoConfig {
+    let pointer = ui.input(|i| i.pointer.clone());
+    let mods = ui.input(|i| i.modifiers);
+    let ctrl = mods.ctrl || mods.command;
+    let cursor = pointer.hover_pos().unwrap_or_default();
+    // a forced / MMB drag ends with its button
+    if app.vp_state.force_handle.is_some_and(|(v, _, b)| v == idx && !pointer.button_down(b)) {
+        app.vp_state.force_handle = None;
+    }
+    if app.vp_state.mmb == Some(idx) && !pointer.button_down(egui::PointerButton::Middle) {
+        app.vp_state.mmb = None;
+    }
+    let mut base = GizmoConfig {
         view_matrix: cv.view.into(),
         projection_matrix: cv.proj.into(),
         viewport: resp.rect,
         modes,
         orientation: if space_world && tool != Tool::Scale && app.s.comp_mode.is_none() { GizmoOrientation::Global } else { GizmoOrientation::Local },
-        // MMB: drag the active handle from anywhere in the view
-        mode_override: if app.vp_state.mmb { active } else { None },
+        // MMB: drag the active handle from anywhere in the view; Ctrl+LMB / auto-axis force a handle
+        mode_override: app.vp_state.force_handle.filter(|f| f.0 == idx).map(|f| f.1).or(if app.vp_state.mmb == Some(idx) { active } else { None }),
         // hold X: grid snap while moving; hold J: discrete rotate (Maya)
         snapping: app.snap_grid || ui.input(|i| (app.tool == Tool::Move && i.key_down(egui::Key::X)) || (app.tool == Tool::Rotate && i.key_down(egui::Key::J))),
         snap_distance: app.vp_state.snap_step as f32,
@@ -1049,55 +1168,119 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         visuals,
         pixels_per_point: ppp,
         ..Default::default()
-    });
+    };
+    g.update_config(base);
     let tf = Transform::from_scale_rotation_translation(DVec3::ONE, rot, pivot);
-    let pointer = ui.input(|i| i.pointer.clone());
-    let cursor = pointer.hover_pos().unwrap_or_default();
-    // Ctrl+click a handle: move/scale axis -> lock it (drag in the other two), plane -> that plane,
-    // centre -> back to the default; a plain click or drag on a handle makes it the active one
-    let mods = ui.input(|i| i.modifiers);
+    // A click / MMB press on a handle makes it the active one. Ctrl turns move/scale axes into
+    // their drag plane and starts that drag at once; Shift on the centre (or Shift+MMB away from
+    // a handle) picks the axis closest to the drag after 6 px, as the JS `middleDrag` does.
     let lmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Primary);
-    let probe = (lmb_pressed || (resp.hovered() && pointer.button_pressed(egui::PointerButton::Middle) && (mods.ctrl || mods.command))).then(|| handle_at(g.config(), cursor)).flatten();
-    if let Some(h) = probe {
-        let locked = if mods.ctrl || mods.command {
-            match h {
-                GizmoMode::TranslateX => Some(GizmoMode::TranslateYZ),
-                GizmoMode::TranslateY => Some(GizmoMode::TranslateXZ),
-                GizmoMode::TranslateZ => Some(GizmoMode::TranslateXY),
-                GizmoMode::ScaleX => Some(GizmoMode::ScaleYZ),
-                GizmoMode::ScaleY => Some(GizmoMode::ScaleXZ),
-                GizmoMode::ScaleZ => Some(GizmoMode::ScaleXY),
-                GizmoMode::TranslateView | GizmoMode::ScaleUniform | GizmoMode::RotateView => None,
-                m => Some(m),
+    let mmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Middle) && !mods.alt;
+    let mut consume_primary = false;
+    let mut start_mmb = false;
+    let mut start_auto = false;
+    let mut start_force: Option<GizmoMode> = None;
+    let mut press = None;
+    let hover = if lmb_pressed || mmb_pressed { handle_at(g.config(), cursor) } else { None };
+    if let Some(h) = hover {
+        let center = is_center_handle(h);
+        let mut set_active = Some(h);
+        let mut drive = h;
+        if mmb_pressed {
+            if ctrl && mode_tool != Tool::Rotate {
+                drive = plane_of(h);
+                set_active = Some(drive);
             }
+            start_mmb = true;
+            press = Some(drive);
+        } else if lmb_pressed {
+            if ctrl && !mods.shift && mode_tool != Tool::Rotate {
+                drive = plane_of(h);
+                set_active = Some(drive);
+                start_force = Some(drive);
+                press = Some(drive);
+                consume_primary = true;
+            } else if mods.shift && !ctrl && mode_tool != Tool::Rotate && center {
+                // JS remembers the centre ('XYZ') until the drag picks an axis
+                set_active = Some(h);
+                start_auto = true;
+                consume_primary = true;
+            } else {
+                press = Some(h);
+            }
+        }
+        app.vp_state.active_handles[mi] = set_active;
+    } else if mmb_pressed {
+        // MMB away from a handle: Shift picks an axis from the drag, otherwise the remembered one
+        if mods.shift && mode_tool != Tool::Rotate {
+            start_auto = true;
         } else {
-            Some(h)
-        };
-        app.vp_state.active_handle = locked;
-        if mods.ctrl || mods.command {
-            app.help = format!("Active handle: {}", locked.map(|m| format!("{m:?}")).unwrap_or("centre (default)".into()));
-            return true;
+            start_mmb = true;
         }
     }
-    // MMB press over the view (no Alt) starts dragging the active handle
-    if resp.hovered() && pointer.button_pressed(egui::PointerButton::Middle) && !mods.alt && !(mods.ctrl || mods.command) && active.is_some() {
-        app.vp_state.mmb = true;
+    if let Some(h) = start_force {
+        app.vp_state.force_handle = Some((idx, h, egui::PointerButton::Primary));
     }
-    if app.vp_state.mmb && !pointer.button_down(egui::PointerButton::Middle) {
-        app.vp_state.mmb = false;
+    if start_mmb {
+        app.vp_state.mmb = Some(idx);
     }
     if lmb_pressed {
-        app.vp_state.press_handle = probe;
+        app.vp_state.press_handle = press;
     }
-    let drag_handle = if app.vp_state.mmb { active } else { app.vp_state.press_handle };
+    if start_auto {
+        app.vp_state.auto_drag = Some(AutoDrag {
+            vp: idx,
+            button: if mmb_pressed { egui::PointerButton::Middle } else { egui::PointerButton::Primary },
+            origin: pointer.press_origin().unwrap_or(cursor),
+            tool: mode_tool,
+            pivot,
+            rot,
+        });
+    }
+    // resolve a pending auto-axis drag; consume the press until it has a direction
+    let mut auto_started = false;
+    let mut auto_pending = false;
+    let mut auto_cursor = cursor;
+    if let Some(a) = app.vp_state.auto_drag.filter(|a| a.vp == idx) {
+        if !pointer.button_down(a.button) {
+            app.vp_state.auto_drag = None;
+            auto_pending = true; // swallow the click release too
+        } else if (cursor - a.origin).length() >= 6.0 {
+            let h = auto_axis(a.tool, a.pivot, a.rot, cv, app.vps[idx].rect, a.origin, cursor);
+            app.vp_state.active_handles[mode_index(a.tool)] = Some(h);
+            app.vp_state.press_handle = Some(h);
+            if a.button == egui::PointerButton::Middle {
+                app.vp_state.mmb = Some(idx);
+            } else {
+                app.vp_state.force_handle = Some((idx, h, egui::PointerButton::Primary));
+            }
+            app.vp_state.auto_drag = None;
+            auto_started = true;
+            // start the drag at the press point, so the first threshold movement is not lost
+            auto_cursor = a.origin;
+        } else {
+            auto_pending = true;
+        }
+    }
+    active = app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)).or_else(|| modes.contains(default_handle).then_some(default_handle)).or_else(|| modes.iter().next());
+    let override_mode = app.vp_state.force_handle.filter(|f| f.0 == idx).map(|f| f.1).or(if app.vp_state.mmb == Some(idx) { active } else { None });
+    if override_mode != g.config().mode_override {
+        base.mode_override = override_mode;
+        g.update_config(base);
+    }
+    let drag_handle = app.vp_state.force_handle.filter(|f| f.0 == idx).map(|f| f.1).or(if app.vp_state.mmb == Some(idx) { active } else { app.vp_state.press_handle });
     let interaction = GizmoInteraction {
-        cursor_pos: (cursor.x, cursor.y),
-        hovered: resp.hovered() || app.vp_state.drag.is_some() || app.vp_state.mmb,
-        drag_started: lmb_pressed || (app.vp_state.mmb && pointer.button_pressed(egui::PointerButton::Middle)),
-        dragging: pointer.button_down(egui::PointerButton::Primary) || app.vp_state.mmb,
+        cursor_pos: if auto_started { (auto_cursor.x, auto_cursor.y) } else { (cursor.x, cursor.y) },
+        hovered: !auto_pending && (resp.hovered() || app.vp_state.drag.is_some() || app.vp_state.mmb == Some(idx) || app.vp_state.force_handle.is_some_and(|f| f.0 == idx)),
+        drag_started: !auto_pending && (lmb_pressed || (app.vp_state.mmb == Some(idx) && pointer.button_pressed(egui::PointerButton::Middle)) || auto_started),
+        dragging: !auto_pending && (pointer.button_down(egui::PointerButton::Primary) || app.vp_state.mmb == Some(idx)),
     };
     let focused_before = g.is_focused();
-    let result = g.update(interaction, &[tf]);
+    let mut result = g.update(interaction, &[tf]);
+    if auto_started {
+        // apply the movement already dragged past the 6 px threshold in this same frame
+        result = g.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), ..interaction }, &[tf]);
+    }
     let draw = g.draw();
     // manipulator guide: a faint line along the axis being dragged (Preferences can hide it)
     if app.prefs.manip_guides {
@@ -1299,6 +1482,9 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             true
         }
         None => {
+            if auto_pending || consume_primary {
+                return true;
+            }
             if let Some(d) = app.vp_state.drag.take() {
                 finish_drag(app, d);
                 return true;
@@ -1795,5 +1981,116 @@ fn mesh_overlays(app: &IncaApp, cv: &CamView, rect: Rect, p: &egui::Painter) {
                 line(wm.transform_point3(pm.v[a as usize]), wm.transform_point3(pm.v[b as usize]), Color32::from_rgb(0xff, 0x70, 0x30));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::vec2;
+    use inca_core::params::Params;
+    use inca_core::scene::Scene;
+
+    #[test]
+    fn active_handles_are_remembered_per_mode() {
+        let mut vp = VpState::default();
+        vp.active_handles[mode_index(Tool::Move)] = Some(GizmoMode::TranslateX);
+        vp.active_handles[mode_index(Tool::Rotate)] = Some(GizmoMode::RotateZ);
+        vp.active_handles[mode_index(Tool::Scale)] = Some(GizmoMode::ScaleUniform);
+        // the JS `Manip.activeAxis` reset only clears the current mode
+        vp.reset_active_handle(Tool::Rotate);
+        assert_eq!(vp.active_handle(Tool::Rotate), None);
+        assert_eq!(vp.active_handle(Tool::Move), Some(GizmoMode::TranslateX));
+        assert_eq!(vp.active_handle(Tool::Scale), Some(GizmoMode::ScaleUniform));
+        assert!(is_center_handle(GizmoMode::TranslateView));
+        assert!(is_center_handle(GizmoMode::RotateView));
+        assert!(is_center_handle(GizmoMode::ScaleUniform));
+        assert!(!is_center_handle(GizmoMode::TranslateX));
+    }
+
+    #[test]
+    fn ctrl_axis_locks_to_the_other_plane() {
+        // transform-gizmo names its plane handles after the corner they sit at: XY is the handle
+        // between +Y/+Z (normal X, locks X), YZ is the one between +X/+Y (normal Z, locks Z).
+        assert_eq!(plane_of(GizmoMode::TranslateX), GizmoMode::TranslateXY);
+        assert_eq!(plane_of(GizmoMode::TranslateY), GizmoMode::TranslateXZ);
+        assert_eq!(plane_of(GizmoMode::TranslateZ), GizmoMode::TranslateYZ);
+        assert_eq!(plane_of(GizmoMode::ScaleX), GizmoMode::ScaleXY);
+        assert_eq!(plane_of(GizmoMode::ScaleY), GizmoMode::ScaleXZ);
+        assert_eq!(plane_of(GizmoMode::ScaleZ), GizmoMode::ScaleYZ);
+        // planes stay planes, and the centre / rotate axes are untouched
+        assert_eq!(plane_of(GizmoMode::TranslateXY), GizmoMode::TranslateXY);
+        assert_eq!(plane_of(GizmoMode::TranslateXZ), GizmoMode::TranslateXZ);
+        assert_eq!(plane_of(GizmoMode::TranslateYZ), GizmoMode::TranslateYZ);
+        assert_eq!(plane_of(GizmoMode::TranslateView), GizmoMode::TranslateView);
+        assert_eq!(plane_of(GizmoMode::RotateX), GizmoMode::RotateX);
+        assert!(is_center_handle(GizmoMode::TranslateView));
+        assert!(!is_center_handle(GizmoMode::TranslateX));
+    }
+
+    /// Force a plane mode (as a Ctrl+click does) and drag from the pivot; returns the translation.
+    fn plane_drag(mode: GizmoMode) -> [f64; 3] {
+        let (cv, rect) = {
+            let mut s = Scene::new();
+            let id = s.create_mesh("polyCube", &Params::new(), None);
+            let mut vp = viewport::Viewport::new("persp");
+            vp.rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+            let b = s.world_bbox(&id);
+            viewport::frame_box(&mut s, "persp", &b, 800.0 / 600.0);
+            (viewport::cam_view(&s, "persp", [800.0, 600.0]), vp.rect)
+        };
+        let q = cv.project(DVec3::ZERO, rect).unwrap();
+        let tf = Transform::from_scale_rotation_translation(DVec3::ONE, DQuat::IDENTITY, DVec3::ZERO);
+        let mut g = Gizmo::default();
+        g.update_config(GizmoConfig {
+            view_matrix: cv.view.into(),
+            projection_matrix: cv.proj.into(),
+            viewport: rect,
+            modes: GizmoMode::all_translate(),
+            mode_override: Some(mode),
+            orientation: GizmoOrientation::Global,
+            ..Default::default()
+        });
+        assert!(g.update(GizmoInteraction { cursor_pos: (q.x, q.y), hovered: true, drag_started: true, dragging: true }, std::slice::from_ref(&tf)).is_some());
+        let (_, out) = g.update(GizmoInteraction { cursor_pos: (q.x + 40.0, q.y + 12.0), hovered: true, drag_started: false, dragging: true }, std::slice::from_ref(&tf)).unwrap();
+        let t = out[0].translation;
+        [t.x, t.y, t.z]
+    }
+
+    #[test]
+    fn forced_plane_override_drags_the_plane_not_the_handle_under_the_cursor() {
+        // Ctrl on X locks X: the forced drag must keep X fixed even though the press is elsewhere
+        for (mode, keep) in [
+            (plane_of(GizmoMode::TranslateX), 0),
+            (plane_of(GizmoMode::TranslateY), 1),
+            (plane_of(GizmoMode::TranslateZ), 2),
+        ] {
+            let t = plane_drag(mode);
+            assert!(t[keep].abs() < 1e-9, "{mode:?} must keep axis {keep} fixed: {t:?}");
+            assert!(t.iter().enumerate().any(|(i, v)| i != keep && v.abs() > 1e-6), "{mode:?} did not move: {t:?}");
+        }
+    }
+
+    #[test]
+    fn auto_axis_follows_the_drag_direction() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let mut vp = viewport::Viewport::new("persp");
+        vp.rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let b = s.world_bbox(&id);
+        viewport::frame_box(&mut s, "persp", &b, 800.0 / 600.0);
+        let cv = viewport::cam_view(&s, "persp", [800.0, 600.0]);
+        let pivot = DVec3::ZERO;
+        let origin = cv.project(pivot, vp.rect).unwrap();
+        for (axis, mode) in [(DVec3::X, GizmoMode::TranslateX), (DVec3::Y, GizmoMode::TranslateY), (DVec3::Z, GizmoMode::TranslateZ)] {
+            let tip = cv.project(pivot + axis, vp.rect).unwrap();
+            let drag = (tip - origin) * 4.0;
+            let got = auto_axis(Tool::Move, pivot, DQuat::IDENTITY, &cv, vp.rect, origin, origin + drag);
+            assert_eq!(got, mode, "drag along {axis:?}");
+        }
+        // the same drag with the scale tool picks the scale axis
+        let tip = cv.project(pivot + DVec3::Y, vp.rect).unwrap();
+        let drag = (tip - origin) * 4.0;
+        assert_eq!(auto_axis(Tool::Scale, pivot, DQuat::IDENTITY, &cv, vp.rect, origin, origin + drag), GizmoMode::ScaleY);
     }
 }

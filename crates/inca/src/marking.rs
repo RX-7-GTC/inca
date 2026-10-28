@@ -20,6 +20,7 @@ pub enum Act {
     Step(f64),
     Symmetry(usize),
     ToolSettings,
+    ResetActive,
     ResetTool,
     AssignExisting(String),
     History(String, usize),
@@ -186,7 +187,10 @@ pub fn open_tool(app: &mut IncaApp, idx: usize, tool: Tool, pos: Pos2, now: f64)
         ("W", sub("Step Size", steps.iter().map(|&v| checked(it(&format!("{}{unit}", inca_core::math::fmt_num(v)), Act::Step(v)), (step - v).abs() < 1e-9)).collect())),
         ("NW", sub("Symmetry", sym.iter().enumerate().map(|(i, l)| checked(it(l, Act::Symmetry(i)), app.symmetry == i)).collect())),
     ];
-    let list = vec![Some(disabled(cmd("Reset Active Handle", ""))), Some(it("Reset Tool", Act::ResetTool))];
+    let list = vec![
+        Some(if app.vp_state.active_handle(app.tool).is_some() { it("Reset Active Handle", Act::ResetActive) } else { disabled(it("Reset Active Handle", Act::ResetActive)) }),
+        Some(it("Reset Tool", Act::ResetTool)),
+    ];
     let title = crate::actions::label(match tool {
         Tool::Rotate => "rotateTool",
         Tool::Scale => "scaleTool",
@@ -244,6 +248,9 @@ fn run(app: &mut IncaApp, act: Act) {
             app.right_tab = crate::app::RightTab::ToolSettings;
             app.show_right = true;
         }
+        Act::ResetActive => {
+            app.vp_state.reset_active_handle(app.tool);
+        }
         Act::ResetTool => {
             // JS Reset Tool: move goes back to world, rotate and scale to object space
             app.set_space_world(app.tool, app.tool == Tool::Move);
@@ -251,6 +258,7 @@ fn run(app: &mut IncaApp, act: Act) {
             app.vp_state.snap_step = 1.0;
             app.vp_state.snap_angle = 15.0;
             app.pivot_mode = false;
+            app.vp_state.reset_active_handle(app.tool);
         }
         Act::AssignExisting(m) => {
             let _ = app.run_mel("assign material", &format!("hyperShade -assign {m};"));
