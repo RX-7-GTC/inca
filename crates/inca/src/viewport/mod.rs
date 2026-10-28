@@ -611,7 +611,8 @@ pub fn icon_lines(s: &Scene, id: &str, col: [f32; 4]) -> Vec<LineVertex> {
             }
         }
         Shape::Curve(c) => {
-            let pts = c.sample(12);
+            // the JS builds the curve line with `sample(16)`
+            let pts = c.sample(16);
             for w in pts.windows(2) {
                 push_line(&mut o, w[0], w[1], col);
             }
@@ -1112,13 +1113,15 @@ pub fn pick_object(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_cache
             Shape::Mesh(m) => {
                 let lr = ray.transformed(&wm.inverse());
                 let bb = m.mesh.bbox();
-                if inca_core::math::ray_aabb(&lr, &bb).is_none() {
-                    continue;
-                }
+                let bbox_hit = inca_core::math::ray_aabb(&lr, &bb).is_some();
                 // the cached BVH makes this a few microseconds even at 400k faces
-                let hit = match mesh_cache.bvh(s, &id) {
-                    Some(b) => b.raycast(&m.mesh, &lr, vp.backface),
-                    None => m.mesh.raycast(&lr, vp.backface),
+                let hit = if bbox_hit {
+                    match mesh_cache.bvh(s, &id) {
+                        Some(b) => b.raycast(&m.mesh, &lr, vp.backface),
+                        None => m.mesh.raycast(&lr, vp.backface),
+                    }
+                } else {
+                    None
                 };
                 if let Some((t, _)) = hit {
                     let wp = wm.transform_point3(lr.at(t));
@@ -1126,16 +1129,48 @@ pub fn pick_object(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_cache
                     if best.as_ref().is_none_or(|b| d < b.0) {
                         best = Some((d, id.clone()));
                     }
+                } else if vp.shade == ShadeMode::Wire {
+                    // the JS pickObjects falls back to the wire `LineSegments` when the
+                    // surface ray misses; three.js Line uses a 6-pixel world threshold
+                    // divided by the object's average scale to reach local space
+                    if let Some(topo) = mesh_cache.topo(s, &id) {
+                        let sc = wm.to_scale_rotation_translation().0.abs();
+                        let thresh = cv.units_per_px() * 6.0 / ((sc.x + sc.y + sc.z) / 3.0).max(1e-9);
+                        let tol = DVec3::splat(thresh);
+                        let ebb = Aabb { min: bb.min - tol, max: bb.max + tol };
+                        if inca_core::math::ray_aabb(&lr, &ebb).is_none() {
+                            continue;
+                        }
+                        let mut edge: Option<(f64, DVec3)> = None;
+                        for &(a, b) in &topo.edges {
+                            let (pa, pb) = (m.mesh.v[a as usize], m.mesh.v[b as usize]);
+                            let (dist, t) = ray_seg_closest(&lr, pa, pb);
+                            if dist < thresh {
+                                let wp = wm.transform_point3(pa.lerp(pb, t as f64));
+                                let d = cv.depth(wp);
+                                if edge.as_ref().is_none_or(|x| d < x.0) {
+                                    edge = Some((d, wp));
+                                }
+                            }
+                        }
+                        if let Some((d, _)) = edge {
+                            if best.as_ref().is_none_or(|x| d < x.0) {
+                                best = Some((d, id.clone()));
+                            }
+                        }
+                    }
                 }
             }
             Shape::Group => {}
             // the JS pick intersects the sampled display line (`ud.line`, 16 per span) and only
             // wins ties by 0.001: a mesh in front still takes the pick
             Shape::Curve(c) => {
+                // the JS raycaster uses a Line threshold of 6 screen pixels in world units
+                let thresh = cv.units_per_px() * 6.0;
                 let pts: Vec<DVec3> = c.sample(16).iter().map(|p| wm.transform_point3(*p)).collect();
                 for seg in pts.windows(2) {
                     let (dist, t) = ray_seg_closest(&ray, seg[0], seg[1]);
-                    if dist < 1.0 {
+                    if dist < thresh {
                         let d = cv.depth(seg[0].lerp(seg[1], t)) - 0.001;
                         if best.as_ref().is_none_or(|x| d < x.0) {
                             best = Some((d, id.clone()));
@@ -1145,18 +1180,30 @@ pub fn pick_object(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_cache
             }
             Shape::Camera(c) if c.startup => {}
             _ => {
-                // icon objects: screen distance to their lines
-                let lines = icon_lines(s, &id, [1.0; 4]);
-                for seg in lines.chunks(2) {
-                    let a = wm.transform_point3(DVec3::new(seg[0].pos[0] as f64, seg[0].pos[1] as f64, seg[0].pos[2] as f64));
-                    let b = wm.transform_point3(DVec3::new(seg[1].pos[0] as f64, seg[1].pos[1] as f64, seg[1].pos[2] as f64));
-                    if let (Some(pa), Some(pb)) = (cv.project(a, vp.rect), cv.project(b, vp.rect)) {
-                        if seg_dist(pos, pa, pb) < 6.0 {
-                            let d = cv.depth(a) - 1e6; // icons win over meshes behind them
-                            if best.as_ref().is_none_or(|x| d < x.0) {
-                                best = Some((d, id.clone()));
+                // the JS picker intersects the invisible `ud.pick` box/sphere of an icon
+                // object rather than its drawn lines (joints and lattices have a pick bias)
+                let lr = ray.transformed(&wm.inverse());
+                if let Some(t) = icon_pick_local(&n.shape, &n.kind, &lr) {
+                    let d = cv.depth(wm.transform_point3(lr.at(t))) - icon_pick_bias(&n.kind);
+                    if best.as_ref().is_none_or(|x| d < x.0) {
+                        best = Some((d, id.clone()));
+                    }
+                } else if n.kind != "constraint" {
+                    // kinds without a JS pick mesh (e.g. distance dimensions): fall back to
+                    // the drawn lines at their true depth
+                    let lines = icon_lines(s, &id, [1.0; 4]);
+                    for seg in lines.chunks(2) {
+                        let a = wm.transform_point3(DVec3::new(seg[0].pos[0] as f64, seg[0].pos[1] as f64, seg[0].pos[2] as f64));
+                        let b = wm.transform_point3(DVec3::new(seg[1].pos[0] as f64, seg[1].pos[1] as f64, seg[1].pos[2] as f64));
+                        if let (Some(pa), Some(pb)) = (cv.project(a, vp.rect), cv.project(b, vp.rect)) {
+                            let (dist, t) = seg_closest(pos, pa, pb);
+                            if dist < 6.0 {
+                                let d = cv.depth(a.lerp(b, t as f64)) - 0.001;
+                                if best.as_ref().is_none_or(|x| d < x.0) {
+                                    best = Some((d, id.clone()));
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
@@ -1173,13 +1220,71 @@ fn seg_closest(p: Pos2, a: Pos2, b: Pos2) -> (f32, f32) {
     ((a + ab * t).distance(p), t)
 }
 
+/// Invisible local-space pick volume of an icon object (the JS `addPick` geometry).
+fn icon_pick_local(shape: &Shape, kind: &str, r: &Ray) -> Option<f64> {
+    let bx = |h: DVec3| inca_core::math::ray_aabb(r, &Aabb { min: -h, max: h });
+    match (shape, kind) {
+        // joints use a SphereGeometry(0.5)
+        (Shape::Locator, "joint") => ray_sphere(r, DVec3::ZERO, 0.5),
+        // locators, emitters/fields, IK and cluster handles, lattices, deform handles
+        (Shape::Locator, "locator") => bx(DVec3::ONE),
+        (Shape::Locator, "emitter" | "field") => bx(DVec3::splat(0.6)),
+        (Shape::Locator, "ikHandle") => bx(DVec3::splat(0.3)),
+        (Shape::Locator, "clusterHandle") => bx(DVec3::splat(0.35)),
+        (Shape::Locator, "lattice") => bx(DVec3::splat(0.5)),
+        // nonlinear deformers: JS `deformHandle` (BoxGeometry(0.25, 2, 0.25))
+        (Shape::Locator, "deformer" | "deformHandle") => bx(DVec3::new(0.125, 1.0, 0.125)),
+        (Shape::Light(l), _) => bx(if matches!(l.ty.as_str(), "directionalLight" | "spotLight") { DVec3::new(0.6, 0.6, 1.0) } else { DVec3::splat(0.6) }),
+        (Shape::Camera(c), _) if !c.startup => bx(DVec3::new(0.5, 0.5, 0.8)),
+        _ => return None,
+    }
+}
+
+/// The JS `pickBias` of an icon object (subtracted from the ray distance).
+fn icon_pick_bias(kind: &str) -> f64 {
+    match kind {
+        "joint" => 1000.0,
+        // JS stores `userData.pickBias = -1e4` and subtracts it from the ray distance,
+        // so a lattice loses to every other object under the cursor
+        "lattice" => -1e4,
+        "deformer" | "deformHandle" => -0.5,
+        _ => 0.0,
+    }
+}
+
+fn ray_sphere(r: &Ray, c: DVec3, radius: f64) -> Option<f64> {
+    let oc = r.origin - c;
+    let b = oc.dot(r.dir);
+    let disc = b * b - (oc.length_squared() - radius * radius);
+    if disc < 0.0 {
+        return None;
+    }
+    let root = disc.sqrt();
+    let t = -b - root;
+    if t > 1e-9 {
+        Some(t)
+    } else {
+        let t2 = -b + root;
+        (t2 > 1e-9).then_some(t2)
+    }
+}
+
 /// Closest distance between a ray and a segment (world space) and the segment parameter.
 fn ray_seg_closest(r: &Ray, a: DVec3, b: DVec3) -> (f64, f64) {
     let u = b - a;
     let w0 = r.origin - a;
     let (uu, ud, uw, c) = (u.length_squared(), u.dot(r.dir), u.dot(w0), r.dir.dot(w0));
-    // s = ud*t - c along the ray, t along the segment (Ericson's segment/segment closest)
-    let mut t = if uu < 1e-12 { 0.0 } else { (ud * uw - c * uu) / (uu - ud * ud).max(1e-12) };
+    // minimizing |O + sD - (a + tU)|^2 gives t = (U.(O-a) - (D.(O-a))(U.D)) / (|U|^2 - (U.D)^2)
+    // and s = t(U.D) - D.(O-a). For a parallel segment any point gives the distance,
+    // so project the ray origin instead of dividing by ~0.
+    let denom = uu - ud * ud;
+    let mut t = if uu < 1e-12 {
+        0.0
+    } else if denom <= 1e-12 * uu {
+        uw / uu
+    } else {
+        (uw - c * ud) / denom
+    };
     t = t.clamp(0.0, 1.0);
     let mut ray_t = ud * t - c;
     if ray_t < 0.0 {
@@ -2193,11 +2298,69 @@ mod tests {
     }
 
     #[test]
+    fn icon_picks_use_js_boxes_and_bias() {
+        let (mut s, vp, cv, cube) = setup();
+        let q = cv.project(DVec3::ZERO, vp.rect).unwrap();
+        let d = cv.eye.length();
+        let behind = cv.eye + cv.fwd * (d + 3.0);
+        // `frame_box` puts the eye only ~2.5 units out, so stay well inside the frustum
+        let front = cv.eye + cv.fwd * (d * 0.5);
+        let l = s.create_locator("loc1");
+        // a locator behind the cube loses (pickBias 0)
+        s.set_world_matrix(&l, DMat4::from_translation(behind));
+        assert_eq!(pick_object(&s, &vp, &cv, q, &mut MeshCache::default()), Some(cube.clone()));
+        // its 2x2x2 box is pickable away from the drawn axis lines: local (0.9, 0.9, 0)
+        // is inside the box but 0.9 units from every axis
+        s.set_world_matrix(&l, DMat4::from_translation(front));
+        let p = cv.project(front + DVec3::new(0.9, 0.9, 0.0), vp.rect).unwrap();
+        assert_eq!(pick_object(&s, &vp, &cv, p, &mut MeshCache::default()), Some(l.clone()));
+        s.delete_node(&l);
+        // joints use a sphere and pickBias 1000: a joint behind the cube still wins
+        let j = s.create_handle("joint", "j1");
+        s.set_world_matrix(&j, DMat4::from_translation(behind));
+        assert_eq!(pick_object(&s, &vp, &cv, q, &mut MeshCache::default()), Some(j));
+    }
+
+    #[test]
+    fn wire_object_pick_falls_back_to_edges() {
+        let (s, mut vp, cv, cube) = setup();
+        vp.shade = ShadeMode::Wire;
+        let pm = &s.node(&cube).unwrap().mesh().unwrap().mesh;
+        // the projected vertex farthest from the silhouette centre is on the hull;
+        // 4 px further out the surface ray misses but the wire line is still in range
+        let pts: Vec<(Pos2, f32)> = pm.v.iter().filter_map(|v| cv.project(*v, vp.rect)).map(|p| (p, p.distance(vp.rect.center()))).collect();
+        let (corner, r) = pts.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        let q = corner + (corner - vp.rect.center()).normalized() * 4.0;
+        assert!(q.distance(vp.rect.center()) > r);
+        assert_eq!(pick_object(&s, &vp, &cv, q, &mut MeshCache::default()), Some(cube.clone()));
+        // without the wire fallback the same click hits nothing
+        vp.shade = ShadeMode::Shaded;
+        assert_eq!(pick_object(&s, &vp, &cv, q, &mut MeshCache::default()), None);
+    }
+
+    #[test]
+    fn ray_segment_closest_is_accurate() {
+        let r = Ray { origin: DVec3::new(0.0, 0.0, 5.0), dir: DVec3::new(0.0, 0.0, -1.0) };
+        // a segment crossing the ray at its middle
+        let (d, t) = ray_seg_closest(&r, DVec3::new(-0.3, 0.0, 0.0), DVec3::new(0.3, 0.0, 0.0));
+        assert!(d < 1e-9, "crossing distance {d}");
+        assert!((t - 0.5).abs() < 1e-9, "crossing t {t}");
+        // a segment off to the side: the nearest point is its start
+        let (d, t) = ray_seg_closest(&r, DVec3::new(0.4, 0.0, -1.0), DVec3::new(1.0, 0.0, -1.0));
+        assert!((d - 0.4).abs() < 1e-9, "side distance {d}");
+        assert!(t.abs() < 1e-9, "side t {t}");
+        // a segment parallel to the ray
+        let (d, t) = ray_seg_closest(&r, DVec3::new(0.2, 0.0, 1.0), DVec3::new(0.2, 0.0, -1.0));
+        assert!((d - 0.2).abs() < 1e-9, "parallel distance {d}");
+        assert!((0.0..=1.0).contains(&t), "parallel t {t}");
+    }
+
+    #[test]
     fn curve_object_pick_competes_by_depth() {
         // the JS intersects the sampled curve line at ray distance (-0.001): a mesh in front wins
         let (mut s, vp, cv, mesh) = setup();
-        let front = cv.eye + (DVec3::ZERO - cv.eye).normalize() * (cv.eye.length() - 2.0);
-        let behind = cv.eye + (DVec3::ZERO - cv.eye).normalize() * (cv.eye.length() + 2.0);
+        let front = cv.eye + cv.fwd * (cv.coi * 0.5);
+        let behind = cv.eye + cv.fwd * (cv.coi + 3.0);
         let mk = |s: &mut Scene, at: DVec3| {
             s.create_curve(
                 inca_core::curves::Curve::new(vec![at - cv.right * 0.3, at + cv.right * 0.3], 1, "open", "cv"),
