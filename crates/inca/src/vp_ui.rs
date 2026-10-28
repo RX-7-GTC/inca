@@ -122,6 +122,9 @@ pub struct GizmoDrag {
     pub extrude: Option<(String, usize, DVec3)>,
     /// the handle being dragged
     pub handle: Option<GizmoMode>,
+    /// press position of a JS-style drag (MMB / Shift auto-axis), where rotate and scale use
+    /// `middleDrag`'s dx maths rather than the TransformControls handle geometry
+    pub js_drag: Option<Pos2>,
 }
 
 impl VpState {
@@ -1044,6 +1047,171 @@ fn axis_handle(tool: Tool, i: usize) -> GizmoMode {
     }
 }
 
+/// Which local scale components a scale handle drives. The plane modes are named after the
+/// corner they sit at (the axis they keep fixed), while the JS names them after the axes they
+/// scale (`XY` scales X and Y), hence the swap.
+fn scale_axes(m: GizmoMode) -> [bool; 3] {
+    match m {
+        GizmoMode::ScaleX => [true, false, false],
+        GizmoMode::ScaleY => [false, true, false],
+        GizmoMode::ScaleZ => [false, false, true],
+        GizmoMode::ScaleXY => [false, true, true],
+        GizmoMode::ScaleXZ => [true, false, true],
+        GizmoMode::ScaleYZ => [true, true, false],
+        _ => [true, true, true],
+    }
+}
+
+/// JS `middleDrag` rotation: dx * 0.5 degrees about the active axis, applied in world space
+/// (`quaternion.copy(st.quat).premultiply(q)`), with the view handle turned the other way.
+fn js_rotate(start: DQuat, handle: GizmoMode, dx: f64, snap_deg: Option<f64>, view_fwd: DVec3) -> DQuat {
+    let mut deg = dx * 0.5;
+    if let Some(s) = snap_deg {
+        deg = (deg / s).round() * s;
+    }
+    let axis = match handle {
+        GizmoMode::RotateX => start * DVec3::X,
+        GizmoMode::RotateY => start * DVec3::Y,
+        GizmoMode::RotateZ => start * DVec3::Z,
+        _ => -view_fwd,
+    };
+    let ang = if handle == GizmoMode::RotateView { -deg } else { deg };
+    DQuat::from_axis_angle(axis, ang.to_radians()) * start
+}
+
+/// JS `middleDrag` scale: exp(dx * 0.01) on the handle's axes (`Math.max(s, snap(f, s))`).
+fn js_scale(handle: GizmoMode, dx: f64, snap: Option<f64>) -> DVec3 {
+    let mut f = (dx * 0.01).exp();
+    if let Some(s) = snap {
+        f = ((f / s).round() * s).max(s);
+    }
+    let ax = scale_axes(handle);
+    DVec3::new(if ax[0] { f } else { 1.0 }, if ax[1] { f } else { 1.0 }, if ax[2] { f } else { 1.0 })
+}
+
+/// The pivot and the screen-space unit directions of the manipulator's three axes.
+fn screen_axes(pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect) -> Option<(Pos2, [Option<egui::Vec2>; 3])> {
+    let p = cv.project(pivot, rect)?;
+    let mut dirs = [None; 3];
+    for (i, ax) in [DVec3::X, DVec3::Y, DVec3::Z].into_iter().enumerate() {
+        if let Some(q) = cv.project(pivot + rot * ax, rect) {
+            let d = q - p;
+            let l = d.length();
+            if l > 1e-3 {
+                dirs[i] = Some(d / l);
+            }
+        }
+    }
+    Some((p, dirs))
+}
+
+/// Distance from `p` to the segment `a..b`.
+fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let l2 = ab.length_sq();
+    let t = if l2 <= 1e-12 { 0.0 } else { ((p - a).dot(ab) / l2).clamp(0.0, 1.0) };
+    (p - (a + ab * t)).length()
+}
+
+/// The handle a click on a negative-axis arrow maps to, if the cursor is over one. The JS
+/// TransformControls pickers include those arrows; transform-gizmo only draws positive ones.
+fn negative_handle_at(tool: Tool, axes: &[bool; 3], pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, cursor: Pos2, size: f32) -> Option<GizmoMode> {
+    let (p, dirs) = screen_axes(pivot, rot, cv, rect)?;
+    for i in 0..3 {
+        if !axes[i] {
+            continue;
+        }
+        let Some(u) = dirs[i] else { continue };
+        let a = p - u * (size * 0.2);
+        let b = p - u * size;
+        if dist_to_segment(cursor, a, b) < 7.0 {
+            return Some(if tool == Tool::Scale { [GizmoMode::ScaleX, GizmoMode::ScaleY, GizmoMode::ScaleZ][i] } else { [GizmoMode::TranslateX, GizmoMode::TranslateY, GizmoMode::TranslateZ][i] });
+        }
+    }
+    None
+}
+
+/// Draw the negative-axis arrows (JS `manipNegativeHandles`, on by default).
+fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, cursor: Option<Pos2>, size: f32) {
+    let Some((p, dirs)) = screen_axes(pivot, rot, cv, rect) else { return };
+    let colors = [Color32::from_rgb(230, 57, 62), Color32::from_rgb(92, 214, 92), Color32::from_rgb(74, 132, 255)];
+    for i in 0..3 {
+        if !axes[i] {
+            continue;
+        }
+        let Some(u) = dirs[i] else { continue };
+        let a = p - u * (size * 0.2);
+        let b = p - u * size;
+        if (b - a).length() < 5.0 {
+            continue;
+        }
+        let hot = cursor.is_some_and(|c| dist_to_segment(c, a, b) < 7.0);
+        let mut color = colors[i];
+        if hot {
+            color = Color32::from_rgb(255, 235, 80);
+        }
+        painter.line_segment([a, b], Stroke::new(if hot { 4.0 } else { 2.5 }, color));
+        if tool == Tool::Scale {
+            painter.rect_filled(Rect::from_center_size(b, vec2(7.0, 7.0)), 0.0, color);
+        } else {
+            // arrow head pointing along -u
+            let base = b + u * 8.0;
+            let perp = vec2(-u.y, u.x) * 4.0;
+            painter.add(egui::Shape::convex_polygon(vec![b, base + perp, base - perp], color, Stroke::NONE));
+        }
+    }
+}
+
+/// The screen point that marks a handle, used for the JS `showActiveAxis` highlight.
+fn handle_anchor(handle: GizmoMode, p: Pos2, dirs: &[Option<egui::Vec2>; 3], size: f32) -> Option<Pos2> {
+    let d = |i: usize| dirs[i];
+    match handle {
+        GizmoMode::TranslateX | GizmoMode::ScaleX | GizmoMode::RotateX => d(0).map(|u| p + u * size * 0.9),
+        GizmoMode::TranslateY | GizmoMode::ScaleY | GizmoMode::RotateY => d(1).map(|u| p + u * size * 0.9),
+        GizmoMode::TranslateZ | GizmoMode::ScaleZ | GizmoMode::RotateZ => d(2).map(|u| p + u * size * 0.9),
+        // transform-gizmo's plane handles sit at the corner of the two axes they free
+        GizmoMode::TranslateXY | GizmoMode::ScaleXY => Some(p + (d(1)? + d(2)?) * size * 0.5),
+        GizmoMode::TranslateXZ | GizmoMode::ScaleXZ => Some(p + (d(0)? + d(2)?) * size * 0.5),
+        GizmoMode::TranslateYZ | GizmoMode::ScaleYZ => Some(p + (d(0)? + d(1)?) * size * 0.5),
+        _ => Some(p),
+    }
+}
+
+/// Keep the remembered active handle highlighted while the mouse is not over a handle
+/// (the JS `showActiveAxis`, which tints the active TransformControls handle yellow).
+fn draw_active_handle(painter: &egui::Painter, handle: GizmoMode, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, size: f32) {
+    let Some((p, dirs)) = screen_axes(pivot, rot, cv, rect) else { return };
+    let yellow = Color32::from_rgb(240, 225, 80);
+    match handle {
+        GizmoMode::RotateX | GizmoMode::RotateY | GizmoMode::RotateZ => {
+            let i = if handle == GizmoMode::RotateX { 0 } else if handle == GizmoMode::RotateY { 1 } else { 2 };
+            if let Some(u) = dirs[i] {
+                // the rotation ring is split per axis; mark where this axis crosses it
+                painter.circle_filled(p + u * size, 4.0, yellow);
+            }
+        }
+        GizmoMode::TranslateX | GizmoMode::ScaleX | GizmoMode::TranslateY | GizmoMode::ScaleY | GizmoMode::TranslateZ | GizmoMode::ScaleZ => {
+            let i = if matches!(handle, GizmoMode::TranslateX | GizmoMode::ScaleX) { 0 } else if matches!(handle, GizmoMode::TranslateY | GizmoMode::ScaleY) { 1 } else { 2 };
+            let Some(u) = dirs[i] else { return };
+            // tint the shaft of the handle
+            painter.line_segment([p + u * (size * 0.25), p + u * (size * 0.92)], Stroke::new(5.0, Color32::from_rgba_unmultiplied(240, 225, 80, 90)));
+            painter.circle_filled(p + u * (size * 0.92), 4.0, yellow);
+        }
+        GizmoMode::TranslateXY | GizmoMode::ScaleXY | GizmoMode::TranslateXZ | GizmoMode::ScaleXZ | GizmoMode::TranslateYZ | GizmoMode::ScaleYZ => {
+            if let Some(c) = handle_anchor(handle, p, &dirs, size) {
+                painter.circle_filled(c, 5.0, yellow);
+            }
+        }
+        GizmoMode::RotateView | GizmoMode::ScaleUniform => {
+            // the view / uniform circles sit at the gizmo's outer radius
+            painter.circle_stroke(p, size + 8.0, Stroke::new(2.0, yellow));
+        }
+        _ => {
+            painter.circle_stroke(p, 10.0, Stroke::new(2.0, yellow));
+        }
+    }
+}
+
 /// Shift+drag: the axis whose screen direction best matches the drag (JS `middleDrag` auto).
 fn auto_axis(tool: Tool, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, origin: Pos2, cursor: Pos2) -> GizmoMode {
     let (dx, dy) = (cursor.x - origin.x, cursor.y - origin.y);
@@ -1070,6 +1238,10 @@ fn auto_axis(tool: Tool, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, ori
 fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter) -> bool {
     let chan = channel_modes(app);
     if (!app.tool.is_manip() && chan.is_none()) || !app.vps[idx].show_manips {
+        return false;
+    }
+    // JS `manipActiveOnly`: other panes keep drawing the scene but hide their manipulators
+    if app.prefs.manip_active_only && app.active_vp != idx {
         return false;
     }
     if let Some(d) = &app.vp_state.drag {
@@ -1117,16 +1289,33 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         let rot = if app.space_world(tool) && tool != Tool::Scale { DQuat::IDENTITY } else { app.s.world_matrix(lead).to_scale_rotation_translation().1 };
         (app.s.world_pivot(lead), rot)
     };
-    let modes = match tool {
+    let mut modes = match tool {
         _ if pivot_mode => GizmoMode::all_translate(),
         _ if chan.is_some() => chan.unwrap().1,
         Tool::Move => GizmoMode::all_translate(),
         Tool::Rotate => GizmoMode::all_rotate(),
         _ => GizmoMode::all_scale(),
     };
+    // JS `manipPlaneHandles`; Edit Pivot also drops the plane handles (and the centre)
+    if pivot_mode || !app.prefs.manip_plane_handles {
+        for m in [GizmoMode::TranslateXY, GizmoMode::TranslateXZ, GizmoMode::TranslateYZ, GizmoMode::ScaleXY, GizmoMode::ScaleXZ, GizmoMode::ScaleYZ] {
+            modes.remove(m);
+        }
+    }
     // the active handle must be one of the shown handles (JS remembers one per mode)
     let mode_tool = if pivot_mode { Tool::Move } else { tool };
     let mi = mode_index(mode_tool);
+    let gizmo_size = 75.0 * app.manip_size;
+    // negative-axis arrows (`manipNegativeHandles`): translate and scale only, never in pivot mode
+    let neg_axes: [bool; 3] = if app.prefs.manip_negative_handles && !pivot_mode {
+        match mode_tool {
+            Tool::Scale => [modes.contains(GizmoMode::ScaleX), modes.contains(GizmoMode::ScaleY), modes.contains(GizmoMode::ScaleZ)],
+            Tool::Move => [modes.contains(GizmoMode::TranslateX), modes.contains(GizmoMode::TranslateY), modes.contains(GizmoMode::TranslateZ)],
+            _ => [false; 3],
+        }
+    } else {
+        [false; 3]
+    };
     let default_handle = match mode_tool {
         Tool::Rotate => GizmoMode::RotateView,
         Tool::Scale => GizmoMode::ScaleUniform,
@@ -1181,7 +1370,12 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     let mut start_auto = false;
     let mut start_force: Option<GizmoMode> = None;
     let mut press = None;
-    let hover = if lmb_pressed || mmb_pressed { handle_at(g.config(), cursor) } else { None };
+    let mut mmb_press = None;
+    let hover = if lmb_pressed || mmb_pressed {
+        handle_at(g.config(), cursor).or_else(|| negative_handle_at(mode_tool, &neg_axes, pivot, rot, cv, app.vps[idx].rect, cursor, gizmo_size))
+    } else {
+        None
+    };
     if let Some(h) = hover {
         let center = is_center_handle(h);
         let mut set_active = Some(h);
@@ -1223,6 +1417,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     }
     if start_mmb {
         app.vp_state.mmb = Some(idx);
+        mmb_press = Some(cursor);
     }
     if lmb_pressed {
         app.vp_state.press_handle = press;
@@ -1241,6 +1436,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     let mut auto_started = false;
     let mut auto_pending = false;
     let mut auto_cursor = cursor;
+    let mut auto_origin = None;
     if let Some(a) = app.vp_state.auto_drag.filter(|a| a.vp == idx) {
         if !pointer.button_down(a.button) {
             app.vp_state.auto_drag = None;
@@ -1256,6 +1452,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             }
             app.vp_state.auto_drag = None;
             auto_started = true;
+            auto_origin = Some(a.origin);
             // start the drag at the press point, so the first threshold movement is not lost
             auto_cursor = a.origin;
         } else {
@@ -1317,6 +1514,18 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         vertices: draw.vertices.into_iter().zip(draw.colors).map(|(p, [r, gg, b, a])| egui::epaint::Vertex { pos: p.into(), uv: Pos2::ZERO, color: egui::Rgba::from_rgba_premultiplied(r, gg, b, a).into() }).collect(),
         ..Default::default()
     });
+    let focused = g.is_focused();
+    // the negative-axis arrows transform-gizmo doesn't draw, and the remembered active handle
+    // kept tinted while the mouse is not over a handle (JS `showActiveAxis`)
+    let rect = app.vps[idx].rect;
+    if neg_axes.iter().any(|b| *b) && app.vp_state.drag.is_none() {
+        draw_negative_handles(painter, mode_tool, &neg_axes, pivot, rot, cv, rect, resp.hovered().then_some(cursor), gizmo_size);
+    }
+    if app.vp_state.drag.is_none() && !focused {
+        if let Some(h) = app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)) {
+            draw_active_handle(painter, h, pivot, rot, cv, rect, gizmo_size);
+        }
+    }
     match result {
         Some((_, new_tfs)) => {
             if app.vp_state.drag.is_none() {
@@ -1362,11 +1571,34 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     Some((id.clone(), i, DVec3::new(g("translateX"), g("translateY"), g("translateZ"))))
                 });
                 let (comps, weights, mirror) = if extrude.is_some() { (vec![], vec![], vec![]) } else { (comps, weights, mirror) };
-                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle });
+                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag: auto_origin.or(mmb_press) });
             }
             let d = app.vp_state.drag.as_mut().unwrap();
             if let Some(n) = new_tfs.first() {
                 d.cur = *n;
+            }
+            // JS `middleDrag` maths for MMB / Shift auto-axis drags: rotate by dx * 0.5 degrees
+            // around the active axis and scale by exp(dx * 0.01). Normal LMB handle drags keep
+            // TransformControls' tangential / radial behaviour.
+            if let (Some(origin), Some(handle)) = (d.js_drag, d.handle) {
+                let dx = (cursor.x - origin.x) as f64;
+                let snap_on = app.snap_grid || (app.tool == Tool::Rotate && ui.input(|i| i.key_down(egui::Key::J)));
+                match handle {
+                    GizmoMode::RotateX | GizmoMode::RotateY | GizmoMode::RotateZ | GizmoMode::RotateView => {
+                        let snap = snap_on.then_some(app.vp_state.snap_angle);
+                        d.cur.rotation = js_rotate(DQuat::from(d.start.rotation), handle, dx, snap, cv.fwd).into();
+                        d.cur.translation = d.start.translation;
+                        d.cur.scale = d.start.scale;
+                    }
+                    GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ | GizmoMode::ScaleXY | GizmoMode::ScaleXZ | GizmoMode::ScaleYZ | GizmoMode::ScaleUniform => {
+                        // the gizmo's scale snap step (JS `dragStep('scale')`, default 0.1)
+                        let m = js_scale(handle, dx, snap_on.then_some(0.1));
+                        d.cur.scale = (m * DVec3::from(d.start.scale)).into();
+                        d.cur.rotation = d.start.rotation;
+                        d.cur.translation = d.start.translation;
+                    }
+                    _ => {}
+                }
             }
             // centre handle with grid snap in a perspective view: slide on the ground plane through the
             // start point and snap X/Z to the grid (not every axis in 3D)
@@ -2006,6 +2238,59 @@ mod tests {
         assert!(is_center_handle(GizmoMode::RotateView));
         assert!(is_center_handle(GizmoMode::ScaleUniform));
         assert!(!is_center_handle(GizmoMode::TranslateX));
+    }
+
+    #[test]
+    fn negative_axis_arrows_are_pickable() {
+        let (cv, rect) = {
+            let mut s = Scene::new();
+            let id = s.create_mesh("polyCube", &Params::new(), None);
+            let mut vp = viewport::Viewport::new("persp");
+            vp.rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+            let b = s.world_bbox(&id);
+            viewport::frame_box(&mut s, "persp", &b, 800.0 / 600.0);
+            (viewport::cam_view(&s, "persp", [800.0, 600.0]), vp.rect)
+        };
+        let pivot = DVec3::ZERO;
+        let (p, dirs) = screen_axes(pivot, DQuat::IDENTITY, &cv, rect).unwrap();
+        let size = 75.0;
+        let mid = |i: usize| {
+            let u = dirs[i].unwrap();
+            p - u * (size * 0.6)
+        };
+        assert_eq!(negative_handle_at(Tool::Move, &[true, false, false], pivot, DQuat::IDENTITY, &cv, rect, mid(0), size), Some(GizmoMode::TranslateX));
+        assert_eq!(negative_handle_at(Tool::Scale, &[false, true, false], pivot, DQuat::IDENTITY, &cv, rect, mid(1), size), Some(GizmoMode::ScaleY));
+        // hidden handles are not pickable
+        assert_eq!(negative_handle_at(Tool::Move, &[false, false, false], pivot, DQuat::IDENTITY, &cv, rect, mid(0), size), None);
+        // nor is empty space on the positive side
+        let pos = p + dirs[0].unwrap() * (size * 0.6);
+        assert_eq!(negative_handle_at(Tool::Move, &[true, true, true], pivot, DQuat::IDENTITY, &cv, rect, pos, size), None);
+    }
+
+    #[test]
+    fn mmb_rotate_and_scale_use_middle_drag_math() {
+        let s2 = 0.5f64.sqrt();
+        // rotation: 90 px -> 45 degrees, premultiplied in world space (`quaternion.copy(st.quat).premultiply(q)`)
+        let q = js_rotate(DQuat::IDENTITY, GizmoMode::RotateY, 90.0, None, -DVec3::Z);
+        assert!((q * DVec3::X - DVec3::new(s2, 0.0, -s2)).length() < 1e-9);
+        // discrete 15 degree steps
+        let q = js_rotate(DQuat::IDENTITY, GizmoMode::RotateY, 20.0, Some(15.0), -DVec3::Z);
+        let a = 15f64.to_radians();
+        assert!((q * DVec3::X - DVec3::new(a.cos(), 0.0, -a.sin())).length() < 1e-9);
+        // the view handle turns the other way around the camera axis
+        let q = js_rotate(DQuat::IDENTITY, GizmoMode::RotateView, 90.0, None, -DVec3::Z);
+        assert!((q * DVec3::X - DVec3::new(s2, -s2, 0.0)).length() < 1e-9);
+        // scale: exp(dx * 0.01) on the freed axes (transform-gizmo's corner names are swapped)
+        let s = js_scale(GizmoMode::ScaleX, 100.0, None);
+        assert!((s - DVec3::new(std::f64::consts::E, 1.0, 1.0)).length() < 1e-9, "{s:?}");
+        let s = js_scale(GizmoMode::ScaleXY, 100.0, None);
+        assert!((s - DVec3::new(1.0, std::f64::consts::E, std::f64::consts::E)).length() < 1e-9, "{s:?}");
+        let s = js_scale(GizmoMode::ScaleYZ, 100.0, None);
+        assert!((s - DVec3::new(std::f64::consts::E, std::f64::consts::E, 1.0)).length() < 1e-9, "{s:?}");
+        // and the discrete scale step rounds up to at least the step itself
+        let dx = 100.0 * 1.24f64.ln();
+        assert!((js_scale(GizmoMode::ScaleUniform, dx, Some(0.1)) - DVec3::splat(1.2)).length() < 1e-9);
+        assert_eq!(js_scale(GizmoMode::ScaleUniform, -10_000.0, Some(0.1)), DVec3::splat(0.1));
     }
 
     #[test]

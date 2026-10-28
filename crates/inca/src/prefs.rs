@@ -31,11 +31,17 @@ pub struct Prefs {
     pub preselect: bool,
     /// faint guide line along the axis being dragged
     pub manip_guides: bool,
+    /// show the manipulator only in the active viewport (JS `manipActiveOnly`)
+    pub manip_active_only: bool,
+    /// show the move / scale plane handles (JS `manipPlaneHandles`)
+    pub manip_plane_handles: bool,
+    /// show the handles on the negative axes (JS `manipNegativeHandles`)
+    pub manip_negative_handles: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, preselect: true, manip_guides: true }
+        Prefs { ui_scale: 1.0, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true }
     }
 }
 
@@ -196,6 +202,15 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             });
             row(ui, "Show manipulator guides", |ui| {
                 ui.checkbox(&mut app.prefs.manip_guides, "");
+            });
+            row(ui, "Show manipulator in active view only", |ui| {
+                ui.checkbox(&mut app.prefs.manip_active_only, "");
+            });
+            row(ui, "Show plane handles", |ui| {
+                ui.checkbox(&mut app.prefs.manip_plane_handles, "");
+            });
+            row(ui, "Show negative axis handles", |ui| {
+                ui.checkbox(&mut app.prefs.manip_negative_handles, "");
             });
         }
         "Animation" => {
