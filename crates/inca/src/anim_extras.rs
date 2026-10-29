@@ -64,7 +64,7 @@ pub fn ghost(app: &mut IncaApp) {
                 for tr in pm.triangulate_face(fi) {
                     for &c in &tr {
                         let p = wm.transform_point3(pm.v[pm.f[fi][c] as usize]);
-                        tris.push(MeshVertex { pos: [p.x as f32, p.y as f32, p.z as f32], normal: [0.0, 1.0, 0.0], color: col });
+                        tris.push(MeshVertex { pos: [p.x as f32, p.y as f32, p.z as f32], normal: [0.0, 1.0, 0.0], color: col, ..Default::default() });
                     }
                 }
             }

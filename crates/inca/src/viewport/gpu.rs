@@ -9,13 +9,24 @@ pub const MSAA: u32 = 4;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const DRAW_SLOT: u64 = 256;
+/// Material textures live in one array; 64 layers of 256² RGBA is 16 MB.
+const TEX_LAYERS: u32 = 64;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct MeshVertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
+    pub uv: [f32; 2],
+    /// x = material texture layer (-1 = none), y = scalar tint multiplied with the sampled colour
+    pub tex: [f32; 2],
+}
+
+impl Default for MeshVertex {
+    fn default() -> Self {
+        MeshVertex { pos: [0.0; 3], normal: [0.0; 3], color: [0.0; 3], uv: [0.0; 2], tex: [-1.0, 1.0] }
+    }
 }
 
 /// One line endpoint. `normal`/`normal_b` are the normals of up to two faces sharing the edge
@@ -116,6 +127,11 @@ impl DrawUniform {
         self.params2[2] = if on { 1.0 } else { 0.0 };
         self
     }
+    /// Sample the material colour texture (JS Hardware Texturing).
+    pub fn textured(mut self, on: bool) -> Self {
+        self.params2[3] = if on { 1.0 } else { 0.0 };
+        self
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -211,6 +227,12 @@ pub struct Gpu {
     queue: wgpu::Queue,
     frame_bgl: wgpu::BindGroupLayout,
     draw_bgl: wgpu::BindGroupLayout,
+    tex_array: wgpu::Texture,
+    tex_bg: wgpu::BindGroup,
+    /// texture id -> array layer
+    tex_layers: HashMap<String, u32>,
+    /// texture id -> attributes hash of the pixels currently in the layer
+    tex_hashes: HashMap<String, u64>,
     bg_pipe: wgpu::RenderPipeline,
     mesh_pipe: wgpu::RenderPipeline,
     blend_pipe: wgpu::RenderPipeline,
@@ -251,8 +273,49 @@ impl Gpu {
                 count: None,
             }],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl)], immediate_size: 0 });
-        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
+        let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("textures"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let tex_array = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("material textures"),
+            size: wgpu::Extent3d { width: inca_core::materials::VIEW_TEX_SIZE, height: inca_core::materials::VIEW_TEX_SIZE, depth_or_array_layers: TEX_LAYERS },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let tex_view = tex_array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let tex_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("material sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("material textures"),
+            layout: &tex_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&tex_sampler) },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl), Some(&tex_bgl)], immediate_size: 0 });
+        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2];
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
         let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };
@@ -287,7 +350,27 @@ impl Gpu {
         let point_pipe = mk("points", "vs_point", "fs_point", &point_vbs, wgpu::PrimitiveTopology::TriangleList, depth(true, wgpu::CompareFunction::LessEqual), None);
         let draw_cap = 256;
         let (draw_buf, draw_bg) = Self::make_draw_buf(&device, &draw_bgl, draw_cap);
-        Gpu { device, queue, frame_bgl, draw_bgl, bg_pipe, mesh_pipe, blend_pipe, line_pipe, line_top_pipe, point_pipe, draw_buf, draw_cap, draw_bg, meshes: HashMap::new(), targets: HashMap::new() }
+        Gpu {
+            device,
+            queue,
+            frame_bgl,
+            draw_bgl,
+            tex_array,
+            tex_bg,
+            tex_layers: HashMap::new(),
+            tex_hashes: HashMap::new(),
+            bg_pipe,
+            mesh_pipe,
+            blend_pipe,
+            line_pipe,
+            line_top_pipe,
+            point_pipe,
+            draw_buf,
+            draw_cap,
+            draw_bg,
+            meshes: HashMap::new(),
+            targets: HashMap::new(),
+        }
     }
 
     fn make_draw_buf(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, cap: u64) -> (wgpu::Buffer, wgpu::BindGroup) {
@@ -309,6 +392,42 @@ impl Gpu {
         }
         use wgpu::util::DeviceExt;
         Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: data, usage: wgpu::BufferUsages::VERTEX }))
+    }
+
+    /// Layer of a material texture, uploading the pixels when they are new or `hash` changed.
+    /// Returns None when the array is full (the material then draws with its flat colour).
+    pub fn texture_layer(&mut self, key: &str, hash: u64, pixels: impl FnOnce() -> Option<Vec<u8>>) -> Option<u32> {
+        if let Some(&layer) = self.tex_layers.get(key) {
+            if self.tex_hashes.get(key) != Some(&hash) {
+                if let Some(px) = pixels() {
+                    self.write_texture_layer(layer, &px);
+                    self.tex_hashes.insert(key.to_string(), hash);
+                }
+            }
+            return Some(layer);
+        }
+        if self.tex_layers.len() as u32 >= TEX_LAYERS {
+            return None;
+        }
+        let px = pixels()?;
+        let layer = self.tex_layers.len() as u32;
+        self.tex_layers.insert(key.to_string(), layer);
+        self.tex_hashes.insert(key.to_string(), hash);
+        self.write_texture_layer(layer, &px);
+        Some(layer)
+    }
+
+    fn write_texture_layer(&self, layer: u32, px: &[u8]) {
+        let size = inca_core::materials::VIEW_TEX_SIZE;
+        if px.len() != (size * size * 4) as usize {
+            return;
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.tex_array, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
+            px,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
     }
 
     pub fn mesh_key(&self, name: &str) -> Option<u64> {
@@ -506,6 +625,7 @@ impl Gpu {
             });
             rp.set_bind_group(0, &t.frame_bg, &[]);
             rp.set_bind_group(1, &self.draw_bg, &[0]);
+            rp.set_bind_group(2, &self.tex_bg, &[]);
             rp.set_pipeline(&self.bg_pipe);
             rp.draw(0..3, 0..1);
             for pass in [Pass::LinesUnder, Pass::Mesh, Pass::Lines, Pass::Points, Pass::MeshBlend, Pass::LinesTop] {

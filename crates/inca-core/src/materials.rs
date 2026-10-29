@@ -231,6 +231,64 @@ impl Texture {
     }
 }
 
+/// Size of the viewport texture-array layers (one RGBA image per texture).
+pub const VIEW_TEX_SIZE: u32 = 256;
+
+fn srgb_byte(x: f32) -> u8 {
+    let x = x.clamp(0.0, 1.0);
+    let s = if x <= 0.0031308 { 12.92 * x } else { 1.055 * x.powf(1.0 / 2.4) - 0.055 };
+    (s * 255.0 + 0.5) as u8
+}
+
+/// RGBA8 sRGB pixels for the viewport: procedural textures rendered at `VIEW_TEX_SIZE²`
+/// (the JS `proceduralCanvas`), file textures resized to the same size. The image is flipped
+/// vertically so texture v=0 reads the bottom row like three.js `flipY`.
+pub fn viewport_texture_pixels(t: &Texture, project: Option<&str>) -> Option<Vec<u8>> {
+    let size = VIEW_TEX_SIZE;
+    if t.ty == "file" {
+        let name = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("");
+        let p = std::path::Path::new(name);
+        let path = if name.is_empty() {
+            None
+        } else if p.is_absolute() {
+            Some(p.to_path_buf())
+        } else {
+            Some(project.map(|pr| std::path::Path::new(pr).join(p)).unwrap_or_else(|| p.to_path_buf()))
+        };
+        let img = path.and_then(|p| image::open(p).ok());
+        return match img {
+            Some(img) => {
+                let img = img.to_rgba8();
+                let img = image::imageops::resize(&img, size, size, image::imageops::FilterType::Triangle);
+                Some(image::imageops::flip_vertical(&img).into_raw())
+            }
+            // JS `solidCanvas([0.5, 0.5, 0.5])` while a file texture is missing
+            None => {
+                let mut px = vec![255u8; (size * size * 4) as usize];
+                for c in px.chunks_mut(4) {
+                    c[0] = 128;
+                    c[1] = 128;
+                    c[2] = 128;
+                }
+                Some(px)
+            }
+        };
+    }
+    let mut out = vec![255u8; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let u = (x as f64 + 0.5) / size as f64;
+            let v = (y as f64 + 0.5) / size as f64;
+            let c = t.sample(u, v).unwrap_or([0.5, 0.5, 0.5]);
+            let k = ((y * size + x) * 4) as usize;
+            out[k] = srgb_byte(c[0]);
+            out[k + 1] = srgb_byte(c[1]);
+            out[k + 2] = srgb_byte(c[2]);
+        }
+    }
+    Some(out)
+}
+
 fn hash2(x: i64, y: i64) -> f64 {
     let mut h = (x.wrapping_mul(374761393) ^ y.wrapping_mul(668265263)) as u64;
     h = (h ^ (h >> 13)).wrapping_mul(1274126177);
@@ -304,4 +362,32 @@ pub fn texture_swatch(t: &Texture, size: usize) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_texture_pixels_render_procedural_patterns() {
+        let t = Texture { id: "t1".into(), name: "checker1".into(), ty: "checker".into(), attrs: tex_defaults_for("checker") };
+        let px = viewport_texture_pixels(&t, None).unwrap();
+        assert_eq!(px.len(), (VIEW_TEX_SIZE * VIEW_TEX_SIZE * 4) as usize);
+        let at = |x: u32, y: u32| {
+            let k = ((y * VIEW_TEX_SIZE + x) * 4) as usize;
+            [px[k], px[k + 1], px[k + 2]]
+        };
+        // the default checker has four tiles across and black/white squares
+        assert_ne!(at(10, 10), at(75, 10));
+        assert_eq!(at(10, 10), at(10, 140));
+    }
+
+    #[test]
+    fn missing_file_textures_fall_back_to_grey() {
+        let mut attrs = Params::new();
+        attrs.insert("fileTextureName".into(), serde_json::json!("definitely-missing.png"));
+        let t = Texture { id: "t2".into(), name: "file1".into(), ty: "file".into(), attrs };
+        let px = viewport_texture_pixels(&t, None).unwrap();
+        assert_eq!(&px[..4], &[128, 128, 128, 255]);
+    }
 }

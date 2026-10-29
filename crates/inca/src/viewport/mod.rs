@@ -3,7 +3,7 @@
 pub mod gpu;
 
 use egui::{Color32, Pos2, Rect, Stroke};
-use glam::{DMat4, DQuat, DVec3, Mat4};
+use glam::{DMat4, DQuat, DVec2, DVec3, Mat4};
 use gpu::*;
 use inca_core::math::{euler_deg_from_quat, quat_from_euler_deg, Aabb, Ray};
 use inca_core::mesh::{PolyMesh, Topo};
@@ -415,15 +415,21 @@ pub fn display_mesh(s: &Scene, id: &str, cache: &mut std::collections::HashMap<S
     Some(pm)
 }
 
-pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [f32; 3]) -> (Vec<MeshVertex>, Vec<LineVertex>) {
+pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [f32; 3], tex_of: &dyn Fn(Option<&String>) -> Option<TexRef>) -> (Vec<MeshVertex>, Vec<LineVertex>) {
     let normals = pm.corner_normals();
     let mut tris = Vec::with_capacity(pm.tri_count() * 3);
     for fi in 0..pm.f.len() {
         let f = &pm.f[fi];
         let col = color_of(pm.face_mat(fi));
+        let tex = tex_of(pm.face_mat(fi));
         for t in pm.triangulate_face(fi) {
             for &c in &t {
-                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col });
+                let uv = pm.face_uv(fi).and_then(|u| u.get(c)).copied().unwrap_or(DVec2::ZERO);
+                let (uv, texv) = match tex {
+                    Some(t) => (t.uv(uv), [t.layer as f32, t.tint]),
+                    None => ([uv.x as f32, uv.y as f32], [-1.0, 1.0]),
+                };
+                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col, uv, tex: texv });
             }
         }
     }
@@ -733,14 +739,7 @@ pub fn mat_color(s: &Scene, mid: &str) -> [f32; 3] {
     match s.mats.get(mid) {
         Some(m) => {
             let p = m.pbr();
-            // texture-mapped colour: show the texture's average tone
-            if let Some(tid) = m.maps.get(m.color_attr()).and_then(|v| v.as_str()) {
-                if let Some(t) = s.texs.get(tid) {
-                    if let Some(c) = t.sample(0.25, 0.25) {
-                        return c;
-                    }
-                }
-            }
+            // the flat colour (JS `matsU`); Hardware Texturing samples the map in the shader
             if p.unlit {
                 p.base
             } else {
@@ -749,6 +748,77 @@ pub fn mat_color(s: &Scene, mid: &str) -> [f32; 3] {
         }
         None => [0.4, 0.4, 0.4],
     }
+}
+
+/// Scalar the JS multiplies a colour map by (`applyAttrs`: white * base/diffuse).
+fn tex_tint(m: &inca_core::materials::Material) -> f32 {
+    let f = |k: &str, d: f64| m.attrs.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
+    match m.ty.as_str() {
+        "standardSurface" => f("base", 0.8),
+        "surfaceShader" => 1.0,
+        _ => f("diffuse", 0.8),
+    }
+}
+
+/// One face's colour texture: array layer, JS tint and file-texture UV transform.
+#[derive(Clone, Copy)]
+pub struct TexRef {
+    pub layer: u32,
+    pub tint: f32,
+    pub repeat: [f32; 2],
+    pub offset: [f32; 2],
+    /// radians
+    pub rot: f32,
+}
+
+impl TexRef {
+    pub fn uv(&self, uv: DVec2) -> [f32; 2] {
+        if self.rot == 0.0 && self.offset == [0.0; 2] && self.repeat == [1.0; 2] {
+            return [uv.x as f32, uv.y as f32];
+        }
+        let (s, c) = self.rot.sin_cos();
+        let x = uv.x as f32 * self.repeat[0];
+        let y = uv.y as f32 * self.repeat[1];
+        [c * x + s * y + self.offset[0], -s * x + c * y + self.offset[1]]
+    }
+}
+
+/// Make sure the colour texture of a material is in the GPU array; returns its layer.
+fn ensure_texture(g: &mut crate::viewport::gpu::Gpu, s: &Scene, t: &inca_core::materials::Texture) -> Option<u32> {
+    let mut h = DefaultHasher::new();
+    t.ty.hash(&mut h);
+    serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
+    let project = s.project.clone();
+    g.texture_layer(&t.id, h.finish(), || inca_core::materials::viewport_texture_pixels(t, project.as_deref()))
+}
+
+/// Colour texture of every material used by a mesh (None = no map).
+fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::scene::MeshShape) -> std::collections::HashMap<String, Option<TexRef>> {
+    let mut out = std::collections::HashMap::new();
+    let mut ids: Vec<&String> = vec![&m.material];
+    if let Some(fm) = &m.mesh.fm {
+        ids.extend(fm.iter().flatten());
+    }
+    for mid in ids {
+        if out.contains_key(mid) {
+            continue;
+        }
+        let r = s.mats.get(mid).and_then(|mat| {
+            let tid = mat.maps.get(mat.color_attr())?.as_str()?;
+            let t = s.texs.get(tid)?;
+            let layer = ensure_texture(g, s, t)?;
+            let (repeat, offset, rot) = if t.ty == "file" {
+                let a = &t.attrs;
+                let f = |k: &str, d: f64| a.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
+                ([f("repeatU", 1.0).max(0.0001), f("repeatV", 1.0).max(0.0001)], [f("offsetU", 0.0), f("offsetV", 0.0)], f("rotateUV", 0.0).to_radians())
+            } else {
+                ([1.0, 1.0], [0.0, 0.0], 0.0)
+            };
+            Some(TexRef { layer, tint: tex_tint(mat), repeat, offset, rot })
+        });
+        out.insert(mid.clone(), r);
+    }
+    out
 }
 
 /// Key for the GPU cache of a mesh node: geometry revision, smoothing and material colours.
@@ -769,6 +839,12 @@ pub fn mesh_key(s: &Scene, id: &str, divisions: u32) -> u64 {
         for mid in mats {
             for c in mat_color(s, mid) {
                 hash_f(&mut h, c);
+            }
+            // UV transforms are baked into the vertex buffer, so texture edits rebuild it
+            if let Some(t) = s.mats.get(mid.as_str()).and_then(|m| m.maps.get(m.color_attr())).and_then(|v| v.as_str()).and_then(|tid| s.texs.get(tid)) {
+                t.id.hash(&mut h);
+                t.ty.hash(&mut h);
+                serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
             }
         }
     }
@@ -1000,7 +1076,8 @@ pub fn build_draws(
                 let key = mesh_key(s, &id, smooth_divisions);
                 if g.mesh_key(&id) != Some(key) || live.contains(&id) {
                     if let Some(pm) = display_mesh(s, &id, smooth_cache, smooth_divisions) {
-                        let (t, mut w) = build_mesh_buffers(&pm, &|fm| mat_color(s, fm.map(|x| x.as_str()).unwrap_or(&m.material)));
+                        let texs = mesh_textures(g, s, m);
+                        let (t, mut w) = build_mesh_buffers(&pm, &|fm| mat_color(s, fm.map(|x| x.as_str()).unwrap_or(&m.material)), &|fm| texs.get(fm.map(|x| x.as_str()).unwrap_or(&m.material)).copied().flatten());
                         // the JS draws the base cage for levels 1 and 3 and the smooth mesh
                         // only for \"cage + smooth\" (level 2)
                         if m.smooth_level == 1 || m.smooth_level == 3 {
@@ -1013,7 +1090,7 @@ pub fn build_draws(
                 let in_comp = hilite.contains(&id) && !vp.beauty;
                 // templates draw as wireframe only, whatever the shading mode
                 if vp.shade != ShadeMode::Wire && !template {
-                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness);
+                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness).textured(vp.shade == ShadeMode::Textured);
                     if pbr.unlit {
                         u = u.unlit();
                     }
@@ -1082,7 +1159,7 @@ pub fn build_draws(
                                     let Some(f) = pm.f.get(fi) else { continue };
                                     for t in pm.triangulate_face(fi) {
                                         for &c in &t {
-                                            tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: [0.0, 1.0, 0.0], color: C_FACE_SEL });
+                                            tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: [0.0, 1.0, 0.0], color: C_FACE_SEL, ..Default::default() });
                                         }
                                     }
                                 }

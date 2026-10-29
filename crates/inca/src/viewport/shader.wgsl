@@ -80,16 +80,24 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
 }
 
 // ---------------------------------------------------------------- meshes
+@group(2) @binding(0) var tex_array: texture_2d_array<f32>;
+@group(2) @binding(1) var tex_samp: sampler;
+
 struct MeshIn {
     @location(0) pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
+    @location(3) uv: vec2<f32>,
+    /// x = texture layer (-1 = none), y = scalar tint
+    @location(4) tex: vec2<f32>,
 };
 struct MeshOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
+    @location(3) uv: vec2<f32>,
+    @location(4) tex: vec2<f32>,
 };
 
 @vertex
@@ -101,6 +109,8 @@ fn vs_mesh(v: MeshIn) -> MeshOut {
     o.clip.z = o.clip.z - draw.params.z * o.clip.w;
     o.normal = (draw.normal * vec4(v.normal, 0.0)).xyz;
     o.color = v.color;
+    o.uv = v.uv;
+    o.tex = v.tex;
     return o;
 }
 
@@ -187,7 +197,13 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
     if (frame.mode.w > 0.5 && !front) {
         discard;
     }
-    let base = mix(i.color, draw.tint.rgb, draw.tint.a);
+    var base = mix(i.color, draw.tint.rgb, draw.tint.a);
+    // Hardware Texturing: the map replaces the material colour, tinted by the JS scalar
+    // (`m.color = white * base/diffuse` in materials.js `applyAttrs`)
+    if (draw.params2.w > 0.5 && i.tex.x >= 0.0) {
+        let t = textureSampleLevel(tex_array, tex_samp, i.uv, i32(i.tex.x), 0.0).rgb;
+        base = t * i.tex.y;
+    }
     var c = base;
     if (draw.params.x < 0.5) {
         // lit surfaces: material colours are linear and the result is gamma-encoded once, as in the
