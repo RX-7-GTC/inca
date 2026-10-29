@@ -648,7 +648,7 @@ impl IncaApp {
             "RenderViewWindow" | "render" => {
                 self.win.render_view = true;
                 if cmd == "render" {
-                    self.windows_state.start_render(&self.s, &self.vps[self.active_vp].camera, 0);
+                    self.windows_state.start_render(&self.s, &self.vps[self.active_vp].camera, 0, self.prefs.smooth_divisions);
                 }
             }
             "OutlinerWindow" => self.show_outliner = true,

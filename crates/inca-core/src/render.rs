@@ -13,12 +13,14 @@ pub struct RenderSettings {
     pub samples: u32,
     pub bounces: u32,
     pub exposure: f32,
+    /// smooth mesh preview subdivision levels (a preference, not a render setting)
+    pub smooth_divisions: u32,
 }
 
 impl RenderSettings {
     pub fn from_scene(s: &Scene) -> Self {
         let g = |k: &str, d: f64| s.render.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
-        RenderSettings { width: g("width", 640.0) as u32, height: g("height", 480.0) as u32, samples: g("samples", 64.0) as u32, bounces: g("bounces", 4.0) as u32, exposure: g("exposure", 0.0) as f32 }
+        RenderSettings { width: g("width", 640.0) as u32, height: g("height", 480.0) as u32, samples: g("samples", 64.0) as u32, bounces: g("bounces", 4.0) as u32, exposure: g("exposure", 0.0) as f32, smooth_divisions: 2 }
     }
 }
 
@@ -142,7 +144,7 @@ impl RenderScene {
             let wm = s.world_matrix(&id);
             match &n.shape {
                 Shape::Mesh(m) => {
-                    let pm = if m.smooth_level > 0 { crate::mesh::subdivide(&m.mesh, m.smooth_level.min(3), true) } else { m.mesh.clone() };
+                    let pm = if m.smooth_level > 0 { crate::mesh::subdivide(&m.mesh, settings.smooth_divisions.clamp(1, 4), true) } else { m.mesh.clone() };
                     let nm = DMat4::from_mat3(glam::DMat3::from_mat4(wm).inverse().transpose());
                     let normals = pm.corner_normals();
                     let flip = wm.determinant() < 0.0;
@@ -534,7 +536,7 @@ mod tests {
         s.create_mesh("polyCube", &Params::new(), None);
         let cam = s.find("persp").unwrap();
         s.nodes.get_mut(&cam).unwrap().xf.t = [3.0, 2.25, 3.0];
-        let rs = RenderScene::build(&s, "persp", RenderSettings { width: 32, height: 24, samples: 1, bounces: 1, exposure: 0.0 });
+        let rs = RenderScene::build(&s, "persp", RenderSettings { width: 32, height: 24, samples: 1, bounces: 1, exposure: 0.0, smooth_divisions: 2 });
         assert_eq!(rs.triangle_count(), 12);
         let mut acc = vec![0.0; 32 * 24 * 3];
         rs.render_pass(&mut acc, 0);

@@ -40,11 +40,12 @@ pub struct WinState {
 }
 
 impl WinState {
-    pub fn start_render(&mut self, s: &Scene, camera: &str, _frame: u32) {
+    pub fn start_render(&mut self, s: &Scene, camera: &str, _frame: u32, smooth_divisions: u32) {
         if let Some(j) = &self.job {
             j.cancel.store(true, Ordering::Relaxed);
         }
-        let settings = RenderSettings::from_scene(s);
+        let mut settings = RenderSettings::from_scene(s);
+        settings.smooth_divisions = smooth_divisions.clamp(1, 4);
         let size = [settings.width.max(1), settings.height.max(1)];
         let total = settings.samples.max(1);
         let rs = Arc::new(RenderScene::build(s, camera, settings));

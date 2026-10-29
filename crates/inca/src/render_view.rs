@@ -66,7 +66,7 @@ pub fn render(app: &mut IncaApp) {
     if renderer(app) == "hardware" {
         hardware(app, &cam);
     } else {
-        app.windows_state.start_render(&app.s, &cam, 0);
+        app.windows_state.start_render(&app.s, &cam, 0, app.prefs.smooth_divisions);
     }
     let ipr = if app.windows_state.rv.ipr { " -ipr" } else { "" };
     app.echo(format!("render -camera {cam}{ipr};"));
@@ -74,7 +74,8 @@ pub fn render(app: &mut IncaApp) {
 
 /// Inca Hardware: the viewport rasterizer at render resolution, meshes only.
 fn hardware(app: &mut IncaApp, cam: &str) {
-    let settings = inca_core::render::RenderSettings::from_scene(&app.s);
+    let mut settings = inca_core::render::RenderSettings::from_scene(&app.s);
+    settings.smooth_divisions = app.prefs.smooth_divisions.clamp(1, 4);
     let size = [settings.width.max(1), settings.height.max(1)];
     let Some(gpu) = app.gpu.as_mut() else {
         app.s.msg(inca_core::scene::MsgKind::Warning, "// Warning: the hardware renderer needs a GPU viewport");
@@ -89,7 +90,7 @@ fn hardware(app: &mut IncaApp, cam: &str) {
     vp.lights = if lit { crate::viewport::LightMode::All } else { crate::viewport::LightMode::Default };
     vp.exposure = settings.exposure;
     let cv = crate::viewport::cam_view(&app.s, cam, [size[0] as f32, size[1] as f32]);
-    let draws = crate::viewport::build_draws(&app.s, &vp, &cv, gpu, &mut app.smooth_cache, &Default::default(), &mut app.mesh_cache, None);
+    let draws = crate::viewport::build_draws(&app.s, &vp, &cv, gpu, &mut app.smooth_cache, &Default::default(), &mut app.mesh_cache, None, app.prefs.smooth_divisions);
     let fu = crate::viewport::frame_uniform(&app.s, &vp, &cv, 1);
     let px = gpu.render_offscreen(size, &fu, &draws);
     if px.len() != (size[0] * size[1] * 4) as usize {

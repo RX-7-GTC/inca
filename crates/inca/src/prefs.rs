@@ -29,6 +29,8 @@ pub struct Prefs {
     pub recent_projects_count: usize,
     pub autosave_limit: usize,
     pub incremental_save: bool,
+    /// smooth mesh preview subdivision levels (JS `smoothDivisions`)
+    pub smooth_divisions: u32,
     /// red pre-selection highlight of the component under the cursor
     pub preselect: bool,
     /// faint guide line along the axis being dragged
@@ -43,7 +45,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true }
+        Prefs { ui_scale: 1.0, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true }
     }
 }
 
@@ -249,6 +251,11 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
         "Modeling" => {
+            theme::section_header(ui, "Smooth Mesh Preview");
+            ui.end_row();
+            row(ui, "Subdivision levels", |ui| {
+                ui.add(egui::DragValue::new(&mut app.prefs.smooth_divisions).range(1..=4));
+            });
             theme::section_header(ui, "Construction History");
             ui.end_row();
             row(ui, "Construction history on by default", |ui| {

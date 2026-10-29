@@ -1479,12 +1479,40 @@ fn shape_tab(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
     match &n.shape {
         Shape::Mesh(m) => {
             let (v, f, t) = (m.mesh.v.len(), m.mesh.f.len(), m.mesh.tri_count());
+            let uvs = m.mesh.uv.as_ref().map(|u| u.iter().flatten().map(|x| x.len()).sum::<usize>()).unwrap_or(0);
             let mat = m.material.clone();
-            if theme::fold(ui, "Mesh") {
-                ui.label(format!("{v} vertices, {f} faces, {t} triangles"));
-                channel_row(app, ui, std::slice::from_ref(&r), "smoothLevel", "Smooth Mesh Preview", ChanKind::Int, Some(0.0), Some(3.0));
+            if theme::fold(ui, "Mesh Info") {
+                ui.label(format!("{v} vertices, {f} faces, {t} triangles, {uvs} UVs"));
+            }
+            if theme::fold(ui, "Smooth Mesh") {
+                channel_row(app, ui, std::slice::from_ref(&r), "smoothLevel", "Display", ChanKind::Int, Some(0.0), Some(3.0));
+                // JS `smoothDivisions`: the assignment is global and cached previews are rebuilt
+                ui.horizontal(|ui| {
+                    ui.label("Preview Division Levels");
+                    let mut d = app.prefs.smooth_divisions.clamp(1, 4);
+                    if ui.add(egui::DragValue::new(&mut d).range(1..=4)).changed() {
+                        app.prefs.smooth_divisions = d;
+                        app.smooth_cache.clear();
+                    }
+                });
+            }
+            if theme::fold(ui, "Normals Display") {
+                channel_row(app, ui, std::slice::from_ref(&r), "softAngle", "Soft Edge Angle", ChanKind::Float, Some(0.0), Some(180.0));
             }
             if theme::fold(ui, "Render Stats") {
+                // stored like the JS `inc.extra` flags; shadow maps are still planned
+                for (key, label) in [("castShadows", "Casts Shadows"), ("receiveShadows", "Receive Shadows")] {
+                    let mut on = extra.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+                    if ui.checkbox(&mut on, label).changed() {
+                        app.s.checkpoint("render stats");
+                        if let Some(n) = app.s.nodes.get_mut(id) {
+                            if !n.extra.is_object() {
+                                n.extra = serde_json::json!({});
+                            }
+                            n.extra.as_object_mut().unwrap().insert(key.into(), serde_json::json!(on));
+                        }
+                    }
+                }
                 let mut on = xray;
                 if ui.checkbox(&mut on, "X-Ray (object)").changed() {
                     app.s.checkpoint("object x-ray");

@@ -396,19 +396,21 @@ fn hash_f(h: &mut DefaultHasher, x: f32) {
 }
 
 /// The mesh shown in the viewport (smooth mesh preview applied).
-pub fn display_mesh(s: &Scene, id: &str, cache: &mut std::collections::HashMap<String, (u64, PolyMesh)>) -> Option<PolyMesh> {
+pub fn display_mesh(s: &Scene, id: &str, cache: &mut std::collections::HashMap<String, (u64, PolyMesh)>, divisions: u32) -> Option<PolyMesh> {
     let n = s.node(id)?;
     let m = n.mesh()?;
     if m.smooth_level == 0 {
         return Some(m.mesh.clone());
     }
-    let key = n.rev * 4 + m.smooth_level as u64;
+    // the display level is just a flag in the JS; the subdivision count comes from the
+    // `smoothDivisions` preference
+    let key = (n.rev << 5) | ((m.smooth_level.min(3) as u64) << 2) | divisions.clamp(1, 4) as u64;
     if let Some((k, pm)) = cache.get(id) {
         if *k == key {
             return Some(pm.clone());
         }
     }
-    let pm = inca_core::mesh::subdivide(&m.mesh, m.smooth_level.min(3), true);
+    let pm = inca_core::mesh::subdivide(&m.mesh, divisions.clamp(1, 4), true);
     cache.insert(id.to_string(), (key, pm.clone()));
     Some(pm)
 }
@@ -425,6 +427,12 @@ pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [
             }
         }
     }
+    let wire = build_wire_lines(pm);
+    (tris, wire)
+}
+
+/// Edge list of a mesh, with the culling normals the JS wire shader uses.
+pub fn build_wire_lines(pm: &PolyMesh) -> Vec<LineVertex> {
     let mut wire = vec![];
     let col = [1.0, 1.0, 1.0, 1.0];
     match &pm.display_edges {
@@ -447,7 +455,7 @@ pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [
             }
         }
     }
-    (tris, wire)
+    wire
 }
 
 /// Grid on the ground plane (or facing an ortho camera).
@@ -744,12 +752,13 @@ pub fn mat_color(s: &Scene, mid: &str) -> [f32; 3] {
 }
 
 /// Key for the GPU cache of a mesh node: geometry revision, smoothing and material colours.
-pub fn mesh_key(s: &Scene, id: &str) -> u64 {
+pub fn mesh_key(s: &Scene, id: &str, divisions: u32) -> u64 {
     let mut h = DefaultHasher::new();
     let Some(n) = s.node(id) else { return 0 };
     n.rev.hash(&mut h);
     if let Some(m) = n.mesh() {
         m.smooth_level.hash(&mut h);
+        divisions.clamp(1, 4).hash(&mut h);
         m.material.hash(&mut h);
         let mut mats: Vec<&String> = vec![&m.material];
         if let Some(fm) = &m.mesh.fm {
@@ -956,6 +965,7 @@ pub fn build_draws(
     live: &std::collections::HashSet<String>,
     mesh_cache: &mut MeshCache,
     soft: Option<(f64, bool)>,
+    smooth_divisions: u32,
 ) -> Vec<DrawCmd> {
     let mut draws = vec![];
     if vp.grid {
@@ -987,10 +997,15 @@ pub fn build_draws(
         let sel_col = if template && selected { C_TEMPLATE_SEL } else if template { C_TEMPLATE } else if is_lead { C_LEAD } else if selected { C_SEL } else if is_affected { C_AFFECTED } else { C_WIRE };
         match &n.shape {
             Shape::Mesh(m) => {
-                let key = mesh_key(s, &id);
+                let key = mesh_key(s, &id, smooth_divisions);
                 if g.mesh_key(&id) != Some(key) || live.contains(&id) {
-                    if let Some(pm) = display_mesh(s, &id, smooth_cache) {
-                        let (t, w) = build_mesh_buffers(&pm, &|fm| mat_color(s, fm.map(|x| x.as_str()).unwrap_or(&m.material)));
+                    if let Some(pm) = display_mesh(s, &id, smooth_cache, smooth_divisions) {
+                        let (t, mut w) = build_mesh_buffers(&pm, &|fm| mat_color(s, fm.map(|x| x.as_str()).unwrap_or(&m.material)));
+                        // the JS draws the base cage for levels 1 and 3 and the smooth mesh
+                        // only for \"cage + smooth\" (level 2)
+                        if m.smooth_level == 1 || m.smooth_level == 3 {
+                            w = build_wire_lines(&m.mesh);
+                        }
                         g.upload_mesh(&id, if live.contains(&id) { 0 } else { key }, &t, &w);
                     }
                 }
@@ -2205,6 +2220,21 @@ mod tests {
         frame_box(&mut s, "persp", &b, 800.0 / 600.0);
         let cv = cam_view(&s, "persp", [800.0, 600.0]);
         (s, vp, cv, id)
+    }
+
+    #[test]
+    fn smooth_preview_uses_the_division_preference() {
+        let (mut s, _, _, id) = setup();
+        let r = inca_core::scene::NodeRef::Dag(id.clone());
+        s.set_attr(&r, "smoothLevel", serde_json::json!(1));
+        let mut cache = std::collections::HashMap::new();
+        let d1 = display_mesh(&s, &id, &mut cache, 1).unwrap();
+        let d2 = display_mesh(&s, &id, &mut cache, 2).unwrap();
+        assert!(d2.v.len() > d1.v.len(), "more divisions must add vertices");
+        // like the JS, levels 1 and 3 only change the cage; both show the same smooth mesh
+        s.set_attr(&r, "smoothLevel", serde_json::json!(3));
+        let d3 = display_mesh(&s, &id, &mut cache, 2).unwrap();
+        assert_eq!(d3.v.len(), d2.v.len());
     }
 
     #[test]

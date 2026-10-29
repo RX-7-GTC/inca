@@ -1244,6 +1244,7 @@ impl Scene {
                 match &n.shape {
                     Shape::Mesh(m) => match attr {
                         "smoothLevel" => Some(json!(m.smooth_level)),
+                        "softAngle" => Some(json!(m.mesh.soft_angle)),
                         "material" => Some(json!(self.mats.get(&m.material).map(|x| x.name.clone()))),
                         _ => None,
                     },
@@ -1308,6 +1309,10 @@ impl Scene {
                         _ => match &mut n.shape {
                             Shape::Mesh(m) if attr == "smoothLevel" => {
                                 m.smooth_level = f.unwrap_or(0.0).clamp(0.0, 3.0) as u32;
+                                n.rev += 1;
+                            }
+                            Shape::Mesh(m) if attr == "softAngle" => {
+                                m.mesh.soft_angle = f.unwrap_or(60.0).clamp(0.0, 180.0);
                                 n.rev += 1;
                             }
                             Shape::Light(l) => {
@@ -2215,6 +2220,20 @@ mod tests {
         s.set_attr_f(&a, "ry", 180.0);
         let after = s.world_matrix(&a).transform_point3(DVec3::ZERO);
         assert!((after - DVec3::new(4.0, 0.0, 0.0)).length() < 1e-6, "{after}");
+    }
+
+    #[test]
+    fn soft_angle_attr_round_trips() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let r = NodeRef::Dag(a.clone());
+        assert_eq!(s.get_attr(&r, "softAngle"), Some(json!(60.0)));
+        assert!(s.set_attr(&r, "softAngle", json!(15.0)));
+        assert_eq!(s.nodes[&a].mesh().unwrap().mesh.soft_angle, 15.0);
+        assert_eq!(s.get_attr(&r, "softAngle"), Some(json!(15.0)));
+        // clamped to the JS range
+        assert!(s.set_attr(&r, "softAngle", json!(500.0)));
+        assert_eq!(s.get_attr(&r, "softAngle"), Some(json!(180.0)));
     }
 
     #[test]

@@ -206,7 +206,7 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
         };
         let live = app.vp_state.live_meshes();
         let soft = app.soft.on.then_some((app.soft.radius, app.soft.linear));
-        let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.mesh_cache, soft);
+        let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.mesh_cache, soft, app.prefs.smooth_divisions);
         draws.extend(crate::anim_extras::draws(&app.viz));
         let fu = viewport::frame_uniform(&app.s, &app.vps[idx], &cv, app.bg_mode);
         gpu.render(idx, &fu, &draws);
