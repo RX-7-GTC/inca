@@ -877,30 +877,45 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
         LightMode::Flat => 2.0,
         LightMode::None => 3.0,
     };
+    // JS prepareScene: the last visible sky dome in "Use All Lights" becomes the scene
+    // environment; it is not fed to the punctual light loop (three.js intensity stays 0).
+    let mut sky = [0.0; 4];
+    let mut sky_col = [0.0, 0.0, 0.0, 1.0];
+    sky[2] = (cv.fov_y * 0.5).tan() as f32;
+    sky[3] = cv.size[0] / cv.size[1].max(1.0);
+    if vp.lights == LightMode::All {
+        for n in s.nodes.values() {
+            let Shape::Light(l) = &n.shape else { continue };
+            if l.ty != "skyDomeLight" || !s.is_visible(&n.id) {
+                continue;
+            }
+            let col = l.attrs.get("color").and_then(|c| c.as_array()).map(|a| [a[0].as_f64().unwrap_or(1.0).max(0.0), a[1].as_f64().unwrap_or(1.0).max(0.0), a[2].as_f64().unwrap_or(1.0).max(0.0)]).unwrap_or([1.0; 3]);
+            sky[0] = 1.0;
+            sky[1] = if l.attrs.get("showBackground").and_then(|v| v.as_bool()).unwrap_or(true) { 1.0 } else { 0.0 };
+            sky_col = [col[0] as f32, col[1] as f32, col[2] as f32, l.attrs.get("intensity").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32];
+        }
+    }
     if vp.lights == LightMode::All {
         for n in s.nodes.values() {
             if count >= 8 {
                 break;
             }
             let Shape::Light(l) = &n.shape else { continue };
-            if !s.is_visible(&n.id) {
+            if !s.is_visible(&n.id) || l.ty == "skyDomeLight" {
                 continue;
             }
             let wm = s.world_matrix(&n.id);
             let pos = wm.transform_point3(DVec3::ZERO);
             let dir = wm.transform_vector3(-DVec3::Z).normalize();
             let col = l.attrs.get("color").and_then(|c| c.as_array()).map(|a| [a[0].as_f64().unwrap_or(1.0), a[1].as_f64().unwrap_or(1.0), a[2].as_f64().unwrap_or(1.0)]).unwrap_or([1.0; 3]);
-            let mut i = l.attrs.get("intensity").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let i = l.attrs.get("intensity").and_then(|v| v.as_f64()).unwrap_or(1.0);
             let ty = match l.ty.as_str() {
                 "ambientLight" => 0.0,
                 "directionalLight" => 1.0,
                 "pointLight" => 2.0,
                 "spotLight" => 3.0,
                 "areaLight" => 4.0,
-                _ => {
-                    i *= 0.5;
-                    0.0
-                }
+                _ => 0.0,
             };
             let cone = l.attrs.get("coneAngle").and_then(|v| v.as_f64()).unwrap_or(40.0).to_radians() / 2.0;
             let pen = l.attrs.get("penumbraAngle").and_then(|v| v.as_f64()).unwrap_or(0.0).to_radians();
@@ -925,6 +940,8 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
         bg_bottom,
         mode: [light_mode, count as f32, if vp.xray { 1.0 } else { 0.0 }, if vp.backface { 1.0 } else { 0.0 }],
         post: [vp.exposure, vp.gamma.max(0.05), cv.size[0].max(1.0), cv.size[1].max(1.0)],
+        sky,
+        sky_col,
         lights,
     }
 }
@@ -947,6 +964,7 @@ pub fn build_draws(
     }
     let hilite = s.hilite();
     let lead = s.lead().cloned();
+    let active_cam = camera_id(s, &vp.camera);
     let affected = if vp.show_sel_highlight && !s.sel.is_empty() && !vp.beauty { s.affected_by(&s.sel) } else { Default::default() };
     for id in s.all_dag(false) {
         if !s.is_visible(&id) {
@@ -1089,6 +1107,10 @@ pub fn build_draws(
                 draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(icon_lines(s, &id, c)), u: DrawUniform::new(wm) });
             }
             Shape::Camera(_) => {
+                // JS prepareScene: the active panel camera never draws its own icon
+                if active_cam.as_ref() == Some(&id) {
+                    continue;
+                }
                 let c = if template || selected || is_affected { sel_col } else { C_ICON };
                 draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(icon_lines(s, &id, c)), u: DrawUniform::new(wm) });
             }
@@ -2183,6 +2205,28 @@ mod tests {
         frame_box(&mut s, "persp", &b, 800.0 / 600.0);
         let cv = cam_view(&s, "persp", [800.0, 600.0]);
         (s, vp, cv, id)
+    }
+
+    #[test]
+    fn sky_dome_is_the_environment_not_a_punctual_light() {
+        let (mut s, vp, cv, _) = setup();
+        s.create_light("skyDomeLight");
+        // the sky only joins "Use All Lights"
+        let fu = frame_uniform(&s, &vp, &cv, 0);
+        assert_eq!(fu.sky[0], 0.0);
+        let mut all = vp.clone();
+        all.lights = LightMode::All;
+        let fu = frame_uniform(&s, &all, &cv, 0);
+        assert_eq!(fu.sky[0], 1.0);
+        assert_eq!(fu.sky[1], 1.0);
+        assert_eq!(fu.mode[1], 0.0, "sky dome must not enter the punctual light list");
+        assert!((fu.sky_col[3] - 1.0).abs() < 1e-6);
+        // showBackground off keeps the environment but draws the normal viewport background
+        let id = s.find("skyDomeLight1").unwrap();
+        s.set_attr(&inca_core::scene::NodeRef::Dag(id), "showBackground", serde_json::json!(false));
+        let fu = frame_uniform(&s, &all, &cv, 0);
+        assert_eq!(fu.sky[0], 1.0);
+        assert_eq!(fu.sky[1], 0.0);
     }
 
     #[test]

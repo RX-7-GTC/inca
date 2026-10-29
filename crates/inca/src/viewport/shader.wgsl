@@ -16,6 +16,8 @@ struct Frame {
     bg_bottom: vec4<f32>,
     mode: vec4<f32>,     // x lighting (0 default, 1 all lights, 2 flat, 3 none), y light count, z xray, w backface culling
     post: vec4<f32>,     // x exposure (stops), y gamma
+    sky: vec4<f32>,      // x sky present, y show background, z tan(fov_y/2), w aspect
+    sky_col: vec4<f32>,  // sky dome colour (rgb), intensity (a)
     lights: array<Light, 8>,
 };
 
@@ -35,6 +37,7 @@ struct Draw {
 struct BgOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) t: f32,
+    @location(1) ndc: vec2<f32>,
 };
 
 @vertex
@@ -43,11 +46,36 @@ fn vs_bg(@builtin(vertex_index) i: u32) -> BgOut {
     var o: BgOut;
     o.pos = vec4(p[i], 0.0, 1.0);
     o.t = p[i].y * 0.5 + 0.5;
+    o.ndc = p[i];
     return o;
+}
+
+// The JS `proceduralSky` equirect (linear): zenith/horizon above, ground below. The
+// equirect row maps to direction.y, so the colour only depends on that.
+fn sky_color(s: f32) -> vec3<f32> {
+    let zen = vec3(0.30, 0.48, 0.85);
+    let hor = vec3(0.92, 0.95, 1.0);
+    let gnd = vec3(0.32, 0.29, 0.26);
+    let gh = vec3(0.55, 0.52, 0.48);
+    if (s >= 0.0) {
+        return mix(hor, zen, pow(s, 0.55));
+    }
+    return mix(gh, gnd, pow(-s, 0.35));
 }
 
 @fragment
 fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
+    if (frame.sky.x > 0.5 && frame.sky.y > 0.5) {
+        var dir = frame.cam_dir.xyz;
+        if (frame.cam_pos.w < 0.5) {
+            let right = normalize(vec3(frame.view[0][0], frame.view[1][0], frame.view[2][0]));
+            let up = normalize(vec3(frame.view[0][1], frame.view[1][1], frame.view[2][1]));
+            dir = normalize(dir + right * i.ndc.x * frame.sky.z * frame.sky.w + up * i.ndc.y * frame.sky.z);
+        }
+        var c = sky_color(clamp(dir.y, -1.0, 1.0)) * frame.sky_col.rgb;
+        c = pow(max(c * exp2(frame.post.x), vec3(0.0)), vec3(1.0 / frame.post.y));
+        return vec4(linear_to_srgb(c), 1.0);
+    }
     return vec4(mix(frame.bg_bottom.rgb, frame.bg_top.rgb, clamp(i.t, 0.0, 1.0)), 1.0);
 }
 
@@ -113,6 +141,10 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
         return base;
     }
     var c = vec3(0.0);
+    if (frame.sky.x > 0.5) {
+        // hemisphere approximation of the sky-dome environment (linear radiance * intensity)
+        c = c + base * sky_color(clamp(n.y, -1.0, 1.0)) * frame.sky_col.rgb * frame.sky_col.w;
+    }
     let count = i32(frame.mode.y);
     for (var i = 0; i < count; i = i + 1) {
         let L = frame.lights[i];

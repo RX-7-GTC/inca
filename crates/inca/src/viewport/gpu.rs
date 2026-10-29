@@ -60,6 +60,10 @@ pub struct FrameUniform {
     pub bg_bottom: [f32; 4],
     pub mode: [f32; 4],
     pub post: [f32; 4],
+    /// x = sky present (All lighting), y = show background, z = tan(fov_y/2), w = aspect
+    pub sky: [f32; 4],
+    /// sky dome colour (rgb) and intensity (a)
+    pub sky_col: [f32; 4],
     pub lights: [GpuLight; 8],
 }
 
