@@ -156,6 +156,8 @@ pub struct Node {
     pub visible: bool,
     pub layer: Option<Id>,
     pub template: bool,
+    /// can be picked and selected (Attribute Editor > Node Behavior)
+    pub selectable: bool,
     /// per-object x-ray (Attribute Editor > Render Stats)
     pub xray: bool,
     pub locks: Map<String, Value>,
@@ -563,6 +565,7 @@ impl Scene {
             visible: true,
             layer: None,
             template: false,
+            selectable: true,
             xray: false,
             locks: Map::new(),
             shape_name,
@@ -1566,6 +1569,9 @@ impl Scene {
 
     // ------------------------------------------------------------ selection
     pub fn select(&mut self, ids: &[Id], mode: SelMode) {
+        // JS `Sel.select`: templated and unselectable nodes never enter the selection
+        let ids: Vec<Id> = ids.iter().filter(|i| self.nodes.get(*i).is_some_and(|n| !n.template && n.selectable)).cloned().collect();
+        let ids = &ids[..];
         match mode {
             SelMode::Replace => self.sel = ids.to_vec(),
             SelMode::Add => {
@@ -1751,7 +1757,7 @@ impl Scene {
         let mut d = json!({
             "id": n.id, "name": n.name, "kind": n.kind, "parent": n.parent,
             "t": n.xf.t, "r": n.xf.r, "s": n.xf.s, "ro": n.xf.ro, "p": n.xf.p, "pt": n.xf.pt,
-            "visible": n.visible, "layer": n.layer, "template": n.template, "xray": n.xray, "locks": n.locks,
+            "visible": n.visible, "layer": n.layer, "template": n.template, "selectable": n.selectable, "xray": n.xray, "locks": n.locks,
             "shapeName": n.shape_name, "extra": n.extra,
         });
         let o = d.as_object_mut().unwrap();
@@ -1859,6 +1865,7 @@ impl Scene {
         n.visible = d["visible"].as_bool().unwrap_or(true);
         n.layer = d["layer"].as_str().map(String::from);
         n.template = d["template"].as_bool().unwrap_or(false);
+        n.selectable = d["selectable"].as_bool().unwrap_or(true);
         n.xray = d["xray"].as_bool().unwrap_or(false);
         n.locks = d["locks"].as_object().cloned().unwrap_or_default();
         n.extra = d["extra"].clone();
@@ -2234,6 +2241,28 @@ mod tests {
         // clamped to the JS range
         assert!(s.set_attr(&r, "softAngle", json!(500.0)));
         assert_eq!(s.get_attr(&r, "softAngle"), Some(json!(180.0)));
+    }
+
+    #[test]
+    fn unselectable_and_templated_nodes_never_enter_the_selection() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.nodes.get_mut(&a).unwrap().selectable = false;
+        s.select(std::slice::from_ref(&a), SelMode::Replace);
+        assert!(s.sel.is_empty());
+        s.nodes.get_mut(&a).unwrap().selectable = true;
+        s.select(std::slice::from_ref(&a), SelMode::Replace);
+        assert_eq!(s.sel, vec![a.clone()]);
+        s.nodes.get_mut(&a).unwrap().template = true;
+        s.select(std::slice::from_ref(&a), SelMode::Replace);
+        assert!(s.sel.is_empty());
+        // the flag round-trips (JS keeps it on the object only until the scene is saved)
+        s.nodes.get_mut(&a).unwrap().template = false;
+        s.nodes.get_mut(&a).unwrap().selectable = false;
+        let data = s.serialize();
+        let mut s2 = Scene::new();
+        s2.load(&data).unwrap();
+        assert!(!s2.node(&a).unwrap().selectable);
     }
 
     #[test]

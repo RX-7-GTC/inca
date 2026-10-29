@@ -1206,6 +1206,9 @@ pub fn pick_object_if(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_ca
             }
         }
         let n = s.node(&id).unwrap();
+        if !n.selectable {
+            continue;
+        }
         if !vp.shows(n) {
             continue;
         }
@@ -1446,7 +1449,7 @@ pub fn region_objects(s: &Scene, vp: &Viewport, cv: &CamView, inside: &dyn Fn(Po
             continue;
         }
         let n = s.node(&id).unwrap();
-        if !vp.shows(n) {
+        if !n.selectable || !vp.shows(n) {
             continue;
         }
         let wm = s.world_matrix(&id);
@@ -2689,7 +2692,7 @@ mod tests {
 
     #[test]
     fn pick_object_and_components() {
-        let (s, vp, cv, id) = setup();
+        let (mut s, vp, cv, id) = setup();
         let c = cv.project(DVec3::ZERO, vp.rect).unwrap();
         assert_eq!(pick_object(&s, &vp, &cv, c, &mut MeshCache::default()), Some(id.clone()));
         assert_eq!(pick_object(&s, &vp, &cv, Pos2::new(2.0, 2.0), &mut MeshCache::default()), None);
@@ -2710,6 +2713,10 @@ mod tests {
         assert_eq!(marquee_objects(&s, &vp, &cv, vp.rect), vec![id.clone()]);
         let vs = marquee_components(&s, &vp, &cv, &id, CompMode::Vertex, vp.rect);
         assert_eq!(vs.len(), 7);
+        // unselectable objects are invisible to both picking and the marquee (JS visibleNodes)
+        s.nodes.get_mut(&id).unwrap().selectable = false;
+        assert_eq!(pick_object(&s, &vp, &cv, c, &mut MeshCache::default()), None);
+        assert!(marquee_objects(&s, &vp, &cv, vp.rect).is_empty());
     }
 
     #[test]

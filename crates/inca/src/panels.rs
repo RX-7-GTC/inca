@@ -1421,6 +1421,33 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
             if theme::fold(ui, "Display") {
                 channel_row(app, ui, &targets, "visibility", "Visibility", ChanKind::Bool, None, None);
                 channel_row(app, ui, &targets, "template", "Template", ChanKind::Bool, None, None);
+                let layer = app.s.node(id).and_then(|n| n.layer.clone()).and_then(|l| app.s.layers.iter().find(|x| x.id == l).map(|x| x.name.clone())).unwrap_or_else(|| "defaultLayer".into());
+                ui.horizontal(|ui| {
+                    ui.label("Display Layer");
+                    ui.label(RichText::new(layer).color(theme::TEXT_DIM));
+                });
+            }
+            if theme::fold(ui, "Node Behavior") {
+                let mut on = app.s.node(id).map(|n| n.selectable).unwrap_or(true);
+                if ui.checkbox(&mut on, "Selectable").changed() {
+                    app.s.checkpoint("selectable");
+                    if let Some(n) = app.s.nodes.get_mut(id) {
+                        n.selectable = on;
+                    }
+                }
+            }
+            if theme::fold(ui, "Extra Attributes") {
+                ui.label(RichText::new("Notes:").color(theme::TEXT_DIM));
+                let mut notes = app.s.node(id).and_then(|n| n.extra.get("notes")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if ui.add(egui::TextEdit::multiline(&mut notes).desired_rows(2).desired_width(f32::INFINITY)).changed() {
+                    if let Some(n) = app.s.nodes.get_mut(id) {
+                        if !n.extra.is_object() {
+                            n.extra = serde_json::json!({});
+                        }
+                        n.extra.as_object_mut().unwrap().insert("notes".into(), serde_json::json!(notes));
+                        app.s.modified = true;
+                    }
+                }
             }
         }
         NodeRef::Dag(id) => shape_tab(app, ui, id),
@@ -1444,17 +1471,19 @@ fn shape_tab(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
     let Some(n) = app.s.node(id) else { return };
     let r = NodeRef::Dag(id.to_string());
     let (kind, extra) = (n.kind.clone(), n.extra.clone());
-    if let Some(e) = extra.as_object().filter(|e| !e.is_empty()) {
-        let title = match kind.as_str() {
-            "emitter" => "Emitter Attributes",
-            "field" => "Field Attributes",
-            "deformer" => "Deformer Handle",
-            _ if e.contains_key("rigidBody") => "Rigid Body Attributes",
-            _ => "Extra Attributes",
-        };
-        if theme::fold(ui, title) {
-            let keys: Vec<String> = e.keys().filter(|k| !matches!(k.as_str(), "source" | "affects" | "initial")).cloned().collect();
-            attr_map_editor(app, ui, &r, &keys);
+    if let Some(e) = extra.as_object() {
+        let keys: Vec<String> = e.keys().filter(|k| !matches!(k.as_str(), "source" | "affects" | "initial" | "notes")).cloned().collect();
+        if !keys.is_empty() {
+            let title = match kind.as_str() {
+                "emitter" => "Emitter Attributes",
+                "field" => "Field Attributes",
+                "deformer" => "Deformer Handle",
+                _ if e.contains_key("rigidBody") => "Rigid Body Attributes",
+                _ => "Extra Attributes",
+            };
+            if theme::fold(ui, title) {
+                attr_map_editor(app, ui, &r, &keys);
+            }
         }
     }
     if kind == "field" && theme::fold(ui, "Connections") {
