@@ -2201,9 +2201,15 @@ pub fn selected_objects_bbox(s: &Scene) -> Aabb {
 pub fn scene_bbox(s: &Scene) -> Aabb {
     let mut b = Aabb::EMPTY;
     for id in s.all_dag(false) {
-        if s.is_visible(&id) && s.node(&id).is_some_and(|n| !matches!(n.shape, Shape::Group)) {
-            b.union(&s.local_bbox(&id).transformed(&s.world_matrix(&id)));
+        let Some(n) = s.node(&id) else { continue };
+        // JS `frameAll`: visible objects of these kinds, never the startup cameras
+        if !s.is_visible(&id) || n.startup() {
+            continue;
         }
+        if !matches!(n.kind.as_str(), "mesh" | "curve" | "light" | "locator" | "camera") {
+            continue;
+        }
+        b.union(&s.local_bbox(&id).transformed(&s.world_matrix(&id)));
     }
     b
 }
@@ -2223,6 +2229,21 @@ mod tests {
         frame_box(&mut s, "persp", &b, 800.0 / 600.0);
         let cv = cam_view(&s, "persp", [800.0, 600.0]);
         (s, vp, cv, id)
+    }
+
+    #[test]
+    fn frame_all_ignores_startup_cameras() {
+        let (mut s, _, _, id) = setup();
+        let cam = s.find("persp").unwrap();
+        s.nodes.get_mut(&cam).unwrap().xf.t = [1000.0, 0.0, 0.0];
+        let mesh_box = s.world_bbox(&id);
+        let b = scene_bbox(&s);
+        assert!((b.center() - mesh_box.center()).length() < 1e-9, "startup camera must not widen the box");
+        // user cameras do count (JS frameAll includes kind camera)
+        let c = s.create_camera("shotCam", inca_core::scene::CamShape::default(), false);
+        s.nodes.get_mut(&c).unwrap().xf.t = [0.0, 10.0, 0.0];
+        let b = scene_bbox(&s);
+        assert!(b.max.y > mesh_box.max.y, "the user camera must be included");
     }
 
     #[test]
