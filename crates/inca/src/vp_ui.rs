@@ -284,6 +284,9 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
                 v.film_gate = !v.film_gate;
                 v.res_gate = false;
             }
+            if check(ui, app.prefs.ortho_tumble, "Orthographic Tumble").clicked() {
+                app.prefs.ortho_tumble = !app.prefs.ortho_tumble;
+            }
         });
         if ui.button("Camera Attribute Editor...").clicked() {
             select_camera(app, idx);
@@ -431,7 +434,7 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         }
         ui.separator();
         ui.menu_button("Panel", |ui| {
-            for (l, a) in [("Outliner", "outlinerWindow"), ("Graph Editor", "graphEditor"), ("Dope Sheet", "dopeSheet"), ("Hypershade", "hypershade"), ("Render View", "renderView")] {
+            for (l, a) in [("Outliner", "outlinerWindow"), ("Graph Editor", "graphEditor"), ("Dope Sheet", "dopeSheet"), ("Hypershade", "hypershade"), ("Hypergraph Hierarchy", "hypergraph"), ("Render View", "renderView")] {
                 if ui.button(l).clicked() {
                     app.action(a);
                     ui.close();
