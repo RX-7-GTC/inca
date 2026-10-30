@@ -332,7 +332,10 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         ui.radio_value(&mut v.lights, LightMode::Flat, "Use Flat Lighting");
         ui.radio_value(&mut v.lights, LightMode::None, "Use No Lights");
         ui.separator();
-        ui.add_enabled(false, egui::Button::new("Shadows (planned)"));
+        ui.checkbox(&mut v.shadows, "Shadows");
+        if v.shadows && v.lights != LightMode::All {
+            ui.label(egui::RichText::new("Shadows need \"Use All Lights\" (7)").color(theme::TEXT_DIM));
+        }
     });
     ui.menu_button(small("Show"), |ui| {
         ui.menu_button("Isolate Select", |ui| {
@@ -509,7 +512,13 @@ fn panel_toolbar(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
     if ib(ui, "useLights", "Use all lights (7)", v.lights == LightMode::All) {
         v.lights = if v.lights == LightMode::All { LightMode::Default } else { LightMode::All };
     }
-    icons::button_ex(ui, "shadows", "Shadows (planned)", false, 20.0, 16.0, false);
+    if ib(ui, "shadows", "Shadows", v.shadows) {
+        v.shadows = !v.shadows;
+        // the JS toolbar also switches to Use All Lights, unlike the menu item
+        if v.shadows && v.lights != LightMode::All {
+            v.lights = LightMode::All;
+        }
+    }
     separator(ui);
     let iso = v.isolate.is_some();
     if ib(ui, "isolate", "Isolate select", iso) {

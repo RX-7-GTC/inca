@@ -164,6 +164,7 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("toggleHud", "Heads Up Display", ""),
     ("toggleWireOnShaded", "Wireframe on Shaded", ""),
     ("toggleXray", "X-Ray", "Alt+A"),
+    ("toggleShadows", "Shadows", ""),
     ("toggleBackface", "Backface Culling", ""),
     ("shadeWire", "Wireframe", "4"),
     ("shadeSmooth", "Smooth Shade All", "5"),
@@ -927,6 +928,12 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "toggleHud" => app.vps[vp].hud = !app.vps[vp].hud,
         "toggleWireOnShaded" => app.vps[vp].wire_on_shaded = !app.vps[vp].wire_on_shaded,
         "toggleXray" => app.vps[vp].xray = !app.vps[vp].xray,
+        "toggleShadows" => {
+            app.vps[vp].shadows = !app.vps[vp].shadows;
+            if app.vps[vp].shadows {
+                app.vps[vp].lights = LightMode::All;
+            }
+        }
         "toggleBackface" => app.set_backface(!app.backface),
         "shadeWire" => app.vps[vp].shade = ShadeMode::Wire,
         "shadeSmooth" => app.vps[vp].shade = ShadeMode::Shaded,

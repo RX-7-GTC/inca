@@ -1529,9 +1529,9 @@ fn shape_tab(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
                 channel_row(app, ui, std::slice::from_ref(&r), "softAngle", "Soft Edge Angle", ChanKind::Float, Some(0.0), Some(180.0));
             }
             if theme::fold(ui, "Render Stats") {
-                // stored like the JS `inc.extra` flags; shadow maps are still planned
+                // stored like the JS `inc.extra` flags; meshes cast and receive by default
                 for (key, label) in [("castShadows", "Casts Shadows"), ("receiveShadows", "Receive Shadows")] {
-                    let mut on = extra.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+                    let mut on = extra.get(key).and_then(|v| v.as_bool()).unwrap_or(true);
                     if ui.checkbox(&mut on, label).changed() {
                         app.s.checkpoint("render stats");
                         if let Some(n) = app.s.nodes.get_mut(id) {
@@ -1565,9 +1565,26 @@ fn shape_tab(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
             }
         }
         Shape::Light(l) => {
-            if theme::fold(ui, &format!("{} Attributes", crate::actions::label(&l.ty))) {
-                let keys: Vec<String> = l.attrs.keys().cloned().collect();
+            // shadows live in their own section like the JS Attribute Editor
+            let ty = l.ty.clone();
+            let keys: Vec<String> = l.attrs.keys().filter(|k| !matches!(k.as_str(), "shadows" | "shadowRadius")).cloned().collect();
+            let mut shadows = l.attrs.get("shadows").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut radius = l.attrs.get("shadowRadius").and_then(|v| v.as_f64()).unwrap_or(2.0) as f32;
+            if theme::fold(ui, &format!("{} Attributes", crate::actions::label(&ty))) {
                 attr_map_editor(app, ui, &r, &keys);
+            }
+            if ty != "ambientLight" && ty != "skyDomeLight" && theme::fold(ui, "Shadows") {
+                if ui.checkbox(&mut shadows, "Use Depth Map / Ray Trace Shadows").changed() {
+                    app.s.checkpoint("light shadows");
+                    app.s.set_attr(&r, "shadows", json!(shadows));
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Shadow Softness");
+                    if ui.add(egui::DragValue::new(&mut radius).range(0.0..=10.0).speed(0.01)).changed() {
+                        app.s.set_attr(&r, "shadowRadius", json!(radius));
+                    }
+                });
+                ui.label(RichText::new("Tip: press 7 in a viewport to see lights; turn on Lighting > Shadows for shadows.").color(theme::TEXT_DIM));
             }
         }
         Shape::Camera(_) => {

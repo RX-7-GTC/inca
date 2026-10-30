@@ -88,6 +88,8 @@ fn hardware(app: &mut IncaApp, cam: &str) {
     // like Maya: scene lights, or the default light when there are none
     let lit = app.s.nodes.values().any(|n| matches!(n.shape, inca_core::scene::Shape::Light(_)) && app.s.is_visible(&n.id));
     vp.lights = if lit { crate::viewport::LightMode::All } else { crate::viewport::LightMode::Default };
+    // the JS hardware renderer always enables the shadow map; per-light `shadows` decides
+    vp.shadows = true;
     vp.exposure = settings.exposure;
     let cv = crate::viewport::cam_view(&app.s, cam, [size[0] as f32, size[1] as f32]);
     let draws = crate::viewport::build_draws(&app.s, &vp, &cv, gpu, &mut app.smooth_cache, &Default::default(), &mut app.mesh_cache, None, app.prefs.smooth_divisions);

@@ -19,6 +19,8 @@ struct Frame {
     sky: vec4<f32>,      // x sky present, y show background, z tan(fov_y/2), w aspect
     sky_col: vec4<f32>,  // sky dome colour (rgb), intensity (a)
     lights: array<Light, 8>,
+    shadow_mats: array<mat4x4<f32>, 8>, // first face of each shadowing light
+    shadow_info: array<vec4<f32>, 8>,   // x layer (-1 none), y type (1 ortho, 2 spot, 3 point), z radius
 };
 
 struct Draw {
@@ -27,7 +29,8 @@ struct Draw {
     mvp: mat4x4<f32>,    // view_proj * model, filled per viewport
     tint: vec4<f32>,     // rgb, a = mix amount
     params: vec4<f32>,   // x unlit, y alpha, z depth bias, w specular
-    params2: vec4<f32>,  // x roughness, y dot half-size, z cull wires/dots
+    params2: vec4<f32>,  // x roughness, y dot half-size, z cull wires/dots, w textured
+    shadow: vec4<f32>,   // x receives shadows, y casts shadows
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -82,6 +85,14 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
 // ---------------------------------------------------------------- meshes
 @group(2) @binding(0) var tex_array: texture_2d_array<f32>;
 @group(2) @binding(1) var tex_samp: sampler;
+@group(3) @binding(0) var shadow_map: texture_depth_2d_array;
+@group(3) @binding(1) var shadow_samp: sampler_comparison;
+
+const SHADOW_SIZE: f32 = 512.0;
+const SHADOW_NEAR: f32 = 0.5;
+const SHADOW_FAR: f32 = 500.0;
+const SHADOW_BIAS: f32 = -0.0005;
+const SHADOW_NORMAL_BIAS: f32 = 0.02;
 
 struct MeshIn {
     @location(0) pos: vec3<f32>,
@@ -118,6 +129,85 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     let lo = c * 12.92;
     let hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
     return select(hi, lo, c <= vec3(0.0031308));
+}
+
+// three.js PCFShadowMap: a small comparison-filtered kernel scaled by `shadow.radius`.
+fn shadow_pcf(base: i32, uv: vec2<f32>, depth: f32, radius: f32) -> f32 {
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return 1.0;
+    }
+    // The JS renders 2048² maps; scale its `shadowRadius` (in JS texels) into our 512²
+    // map so the world-space PCF footprint stays the same. Never go below half a texel.
+    const JS_SHADOW_SIZE: f32 = 2048.0;
+    let texel = max(radius * (SHADOW_SIZE / JS_SHADOW_SIZE), 0.5) / SHADOW_SIZE;
+    var sum = 0.0;
+    for (var y = -1; y <= 1; y = y + 1) {
+        for (var x = -1; x <= 1; x = x + 1) {
+            sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + vec2<f32>(f32(x), f32(y)) * texel, base, depth);
+        }
+    }
+    return sum / 9.0;
+}
+
+// 1 = lit, 0 = fully shadowed. `n` is the two-sided normal used for shading.
+fn shadow_factor(world: vec3<f32>, n: vec3<f32>, pos: vec3<f32>, info: vec4<f32>, m: mat4x4<f32>) -> f32 {
+    if (info.x < 0.0) {
+        return 1.0;
+    }
+    let base = i32(info.x);
+    let radius = max(info.z, 1.0);
+    let biased = world + n * SHADOW_NORMAL_BIAS;
+    if (info.y < 2.5) {
+        // directional (orthographic) or spot (perspective)
+        let p = m * vec4<f32>(biased, 1.0);
+        if (p.w <= 0.0) {
+            return 1.0;
+        }
+        let ndc = p.xyz / p.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        return shadow_pcf(base, uv, ndc.z + SHADOW_BIAS, radius);
+    }
+    // point light: pick the cube face whose axis is largest and look it up like the
+    // six 90-degree depth maps rendered by `prepare_shadow_faces`
+    let d = biased - pos;
+    let ax = abs(d.x);
+    let ay = abs(d.y);
+    let az = abs(d.z);
+    var face = 0;
+    var uv2 = vec2<f32>(0.0);
+    if (ax >= ay && ax >= az) {
+        if (d.x > 0.0) {
+            face = 0;
+            uv2 = vec2<f32>(-d.z, -d.y) / ax;
+        } else {
+            face = 1;
+            uv2 = vec2<f32>(d.z, -d.y) / ax;
+        }
+    } else if (ay >= az) {
+        if (d.y > 0.0) {
+            face = 2;
+            uv2 = vec2<f32>(d.x, d.z) / ay;
+        } else {
+            face = 3;
+            uv2 = vec2<f32>(d.x, -d.z) / ay;
+        }
+    } else {
+        if (d.z > 0.0) {
+            face = 4;
+            uv2 = vec2<f32>(d.x, -d.y) / az;
+        } else {
+            face = 5;
+            uv2 = vec2<f32>(-d.x, -d.y) / az;
+        }
+    }
+    let dist = length(d);
+    if (dist <= SHADOW_NEAR || dist >= SHADOW_FAR) {
+        return 1.0;
+    }
+    let uv = vec2<f32>(uv2.x * 0.5 + 0.5, 0.5 - uv2.y * 0.5);
+    // wgpu's 0..1 perspective depth (glam `perspective_rh`)
+    let depth = SHADOW_FAR * (dist - SHADOW_NEAR) / (dist * (SHADOW_FAR - SHADOW_NEAR));
+    return shadow_pcf(base + face, uv, depth + SHADOW_BIAS, radius);
 }
 
 fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec3<f32> {
@@ -185,7 +275,11 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
         let d = max(dot(n, l), 0.0);
         let h = normalize(l + v);
         let s = spec_k * pow(max(dot(n, h), 0.0), max(shin, 1.0)) * 0.5;
-        c = c + (base * d + vec3(s) * step(0.0001, d)) * L.color.rgb * att;
+        var shadow = 1.0;
+        if (draw.shadow.x > 0.5) {
+            shadow = shadow_factor(world, n, L.pos.xyz, frame.shadow_info[i], frame.shadow_mats[i]);
+        }
+        c = c + (base * d + vec3(s) * step(0.0001, d)) * L.color.rgb * att * shadow;
     }
     return c;
 }

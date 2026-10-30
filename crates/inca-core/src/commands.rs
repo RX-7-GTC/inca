@@ -2733,6 +2733,20 @@ mod tests {
     }
 
     #[test]
+    fn set_attr_boolean_literals_match_mel() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n c; setAttr c.visibility false; setAttr c.template true;").unwrap();
+        let id = s.find("c").unwrap();
+        let n = s.node(&id).unwrap();
+        assert!(!n.visible);
+        assert!(n.template);
+        // light flags must be stored as real booleans for the viewport shadow path
+        let l = s.create_light("directionalLight");
+        mel(&mut s, "setAttr directionalLight1.shadows true;").unwrap();
+        assert_eq!(s.get_attr(&NodeRef::Dag(l), "shadows"), Some(json!(true)));
+    }
+
+    #[test]
     fn camera_command_matches_the_js_default_placement() {
         let mut s = Scene::new();
         mel(&mut s, "select -cl; camera -n camA;").unwrap();

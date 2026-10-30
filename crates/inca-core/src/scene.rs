@@ -626,11 +626,9 @@ impl Scene {
             _ => Map::new(),
         };
         let id = self.make_dag("light", &format!("{ty}1"), None, Shape::Light(LightShape { ty: ty.into(), attrs }), false, None);
-        if ty == "directionalLight" || ty == "spotLight" || ty == "areaLight" {
-            let n = self.nodes.get_mut(&id).unwrap();
-            if ty == "directionalLight" {
-                n.xf.r = [-45.0, 30.0, 0.0];
-            }
+        if ty == "directionalLight" || ty == "spotLight" {
+            // JS `commands.js`: directional/spot lights start at [-45, 45, 0]
+            self.nodes.get_mut(&id).unwrap().xf.r = [-45.0, 45.0, 0.0];
         }
         id
     }
@@ -2205,6 +2203,19 @@ mod tests {
         assert_eq!(s.name_of(&b), "pCube2");
         assert_eq!(s.nodes[&a].shape_name.as_deref(), Some("pCubeShape1"));
         assert_eq!(s.nodes[&a].mesh().unwrap().history[0].name, "polyCube1");
+    }
+
+    #[test]
+    fn light_defaults_match_js() {
+        let mut s = Scene::new();
+        let d = s.create_light("directionalLight");
+        let p = s.create_light("pointLight");
+        let sp = s.create_light("spotLight");
+        assert_eq!(s.nodes[&d].xf.r, [-45.0, 45.0, 0.0]);
+        assert_eq!(s.nodes[&p].xf.r, [0.0, 0.0, 0.0]);
+        assert_eq!(s.nodes[&sp].xf.r, [-45.0, 45.0, 0.0]);
+        assert_eq!(s.get_attr(&NodeRef::Dag(d), "shadowRadius"), Some(json!(2)));
+        assert_eq!(s.get_attr(&NodeRef::Dag(sp), "shadowRadius"), Some(json!(2)));
     }
 
     #[test]
