@@ -200,13 +200,15 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>, pos: vec3<f32>, info: vec4<f32>
             uv2 = vec2<f32>(-d.x, -d.y) / az;
         }
     }
-    let dist = length(d);
-    if (dist <= SHADOW_NEAR || dist >= SHADOW_FAR) {
+    // A cube face's projection depth uses the view-space z (the dominant axis), not the
+    // Euclidean distance; using `length(d)` would self-shadow every off-axis fragment.
+    let z = max(ax, max(ay, az));
+    if (z <= SHADOW_NEAR || z >= SHADOW_FAR) {
         return 1.0;
     }
     let uv = vec2<f32>(uv2.x * 0.5 + 0.5, 0.5 - uv2.y * 0.5);
     // wgpu's 0..1 perspective depth (glam `perspective_rh`)
-    let depth = SHADOW_FAR * (dist - SHADOW_NEAR) / (dist * (SHADOW_FAR - SHADOW_NEAR));
+    let depth = SHADOW_FAR * (z - SHADOW_NEAR) / (z * (SHADOW_FAR - SHADOW_NEAR));
     return shadow_pcf(base + face, uv, depth + SHADOW_BIAS, radius);
 }
 
