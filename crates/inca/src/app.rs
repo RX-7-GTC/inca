@@ -283,6 +283,10 @@ pub struct IncaApp {
     /// Space: tap toggles the layout, hold shows the hotbox
     pub space_down: Option<f64>,
     pub hotbox: Option<egui::Pos2>,
+    /// top-level menu currently open (main menu bar or hotbox)
+    pub open_menu: Option<crate::menus::OpenMenu>,
+    /// screen rect of the open menu popup (tells hotbox menu clicks from outside clicks)
+    pub menu_popup_rect: Option<egui::Rect>,
 }
 
 /// Soft Selection settings (JS Manip.soft).
@@ -461,6 +465,8 @@ impl IncaApp {
             last_dup: None,
             bg_mode: cc.storage.and_then(|s| eframe::get_value(s, "bgMode")).unwrap_or(0),
             hotbox: None,
+            open_menu: None,
+            menu_popup_rect: None,
         };
         app.panels.ol = cc.storage.and_then(|s| eframe::get_value(s, "outliner")).unwrap_or_default();
         if app.test.is_none() {
@@ -770,6 +776,7 @@ impl IncaApp {
 
     /// Run a named action (menus, shelves, hotkeys all go through here).
     pub fn action(&mut self, id: &str) {
+        self.open_menu = None;
         self.hotbox = None;
         if crate::actions::repeatable(id) {
             self.last_action = Some(id.to_string());
@@ -819,6 +826,7 @@ impl IncaApp {
         if let Some(t0) = self.space_down {
             if now - t0 >= 0.25 && self.hotbox.is_none() {
                 self.hotbox = ctx.input(|i| i.pointer.hover_pos()).or(Some(ctx.content_rect().center()));
+                self.open_menu = None;
             }
             ctx.request_repaint();
         }

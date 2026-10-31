@@ -5,6 +5,43 @@ use crate::app::{IncaApp, MenuSet};
 use inca_core::primitives::GEN_INFO;
 use inca_core::scene::LIGHT_TYPES;
 
+/// Which menu bar an open menu belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MenuSource {
+    Main,
+    Hotbox,
+}
+
+impl MenuSource {
+    fn with(self, title: &'static str) -> OpenMenu {
+        match self {
+            Self::Main => OpenMenu::Main(title),
+            Self::Hotbox => OpenMenu::Hotbox(title),
+        }
+    }
+}
+
+/// The top-level menu that is currently open (Maya keeps exactly one open at a time).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenMenu {
+    Main(&'static str),
+    Hotbox(&'static str),
+}
+
+impl OpenMenu {
+    fn source(self) -> MenuSource {
+        match self {
+            Self::Main(_) => MenuSource::Main,
+            Self::Hotbox(_) => MenuSource::Hotbox,
+        }
+    }
+    fn title(self) -> &'static str {
+        match self {
+            Self::Main(t) | Self::Hotbox(t) => t,
+        }
+    }
+}
+
 pub enum M {
     A(&'static str),
     Sub(&'static str, Vec<M>),
@@ -216,21 +253,27 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                     let mut opened = false;
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        if ui.add(b).clicked() {
+                        let main = ui.add(b);
+                        if main.clicked() || released_here(ui, &main) {
                             menu_pick(app, ui, id);
                             ui.close();
                         }
-                        if crate::icons::button_ex(ui, "optionBox", "Options", false, 16.0, 12.0, true).clicked() {
+                        let opt = crate::icons::button_ex(ui, "optionBox", "Options", false, 16.0, 12.0, true);
+                        if opt.clicked() || released_here(ui, &opt) {
                             opened = true;
                         }
                     });
                     if opened {
                         crate::options::open(app, id);
+                        app.open_menu = None;
                         ui.close();
                     }
-                } else if ui.add(b).clicked() {
-                    menu_pick(app, ui, id);
-                    ui.close();
+                } else {
+                    let r = ui.add(b);
+                    if r.clicked() || released_here(ui, &r) {
+                        menu_pick(app, ui, id);
+                        ui.close();
+                    }
                 }
             }
             Sub(l, v) => {
@@ -252,12 +295,14 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                             ui.add_enabled(false, egui::Button::new("(none)"));
                         }
                         for r in list {
-                            if ui.button(&r).clicked() {
+                            let resp = ui.button(&r);
+                            if resp.clicked() || released_here(ui, &resp) {
                                 if files {
                                     app.open_path(std::path::Path::new(&r));
                                 } else {
                                     crate::project::set_project(app, &r, false);
                                 }
+                                app.open_menu = None;
                                 ui.close();
                             }
                         }
@@ -265,8 +310,10 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                     "Assign Existing Material" => {
                         let mats: Vec<(String, String)> = app.s.mats.values().map(|m| (m.id.clone(), m.name.clone())).collect();
                         for (_, name) in mats {
-                            if ui.button(&name).clicked() {
+                            let resp = ui.button(&name);
+                            if resp.clicked() || released_here(ui, &resp) {
                                 let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
+                                app.open_menu = None;
                                 ui.close();
                             }
                         }
@@ -278,8 +325,15 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
     }
 }
 
+/// True when the primary button was released over this item. The JS menus run items on
+/// `mouseup`, so holding the button after opening a menu and releasing over an item runs it.
+pub fn released_here(ui: &egui::Ui, r: &egui::Response) -> bool {
+    r.contains_pointer() && ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
+}
+
 /// A menu item click: runs the command, or with Ctrl+Shift adds it to the current shelf (as in Maya).
 fn menu_pick(app: &mut IncaApp, ui: &egui::Ui, id: &str) {
+    app.open_menu = None;
     let m = ui.input(|i| i.modifiers);
     if (m.ctrl || m.command) && m.shift {
         crate::toolbar::add_to_shelf(app, id);
@@ -313,21 +367,103 @@ pub fn toggle_state(app: &IncaApp, id: &str) -> Option<bool> {
 }
 
 pub fn menu_bar(app: &mut IncaApp, ui: &mut egui::Ui) {
+    let mut titles: Vec<(&'static str, egui::Response)> = Vec::new();
+    let mut entries: Vec<(&'static str, Vec<M>)> = Vec::new();
+    let open = open_title(app.open_menu, MenuSource::Main);
     egui::MenuBar::new().ui(ui, |ui| {
         for name in ["File", "Edit", "Create", "Select", "Modify", "Display", "Windows"] {
             let list = common(name);
-            ui.menu_button(name, |ui| {
-                items(app, ui, &list);
-            });
+            titles.push((name, title_button(ui, name, open == Some(name))));
+            entries.push((name, list));
         }
         ui.separator();
         for (name, list) in set_menus(app.menu_set) {
-            ui.menu_button(name, |ui| items(app, ui, &list));
+            titles.push((name, title_button(ui, name, open == Some(name))));
+            entries.push((name, list));
         }
         let help = common("Help");
-        ui.menu_button("Help", |ui| items(app, ui, &help));
+        titles.push(("Help", title_button(ui, "Help", open == Some("Help"))));
+        entries.push(("Help", help));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| crate::workspace::selector(app, ui));
     });
+
+    update_open_menu(ui.ctx(), app, &titles, MenuSource::Main, true);
+    if let Some(OpenMenu::Main(name)) = app.open_menu {
+        if let Some((_, resp)) = titles.iter().find(|(n, _)| *n == name) {
+            if let Some((_, list)) = entries.iter().find(|(n, _)| *n == name) {
+                let suppress = released_on_title(ui.ctx(), &titles);
+                app.menu_popup_rect = show_menu_popup(app, resp, list, suppress);
+                return;
+            }
+        }
+        // the menu set changed; the open title no longer exists
+        app.open_menu = None;
+    }
+    app.menu_popup_rect = None;
+}
+
+fn open_title(open: Option<OpenMenu>, source: MenuSource) -> Option<&'static str> {
+    open.filter(|m| m.source() == source).map(|m| m.title())
+}
+
+fn title_button(ui: &mut egui::Ui, name: &str, open: bool) -> egui::Response {
+    ui.add(egui::Button::new(name).selected(open))
+}
+
+/// Maya/JS top-level menu behaviour: press a title to open it, press it again to close, and
+/// while it is open just hovering another title switches menus.
+fn next_open(
+    source: MenuSource,
+    current: Option<OpenMenu>,
+    pressed_at: Option<egui::Pos2>,
+    hover_at: Option<egui::Pos2>,
+    titles: &[(&'static str, egui::Rect)],
+    hover_switch: bool,
+) -> Option<OpenMenu> {
+    let cur = open_title(current, source);
+    if let Some(pos) = pressed_at {
+        if let Some((name, _)) = titles.iter().find(|(_, r)| r.contains(pos)) {
+            return if cur == Some(*name) { None } else { Some(source.with(name)) };
+        }
+    }
+    if hover_switch {
+        if let (Some(cur), Some(pos)) = (cur, hover_at) {
+            if let Some((name, _)) = titles.iter().find(|(_, r)| r.contains(pos)) {
+                if *name != cur {
+                    return Some(source.with(name));
+                }
+            }
+        }
+    }
+    current
+}
+
+fn update_open_menu(ctx: &egui::Context, app: &mut IncaApp, titles: &[(&'static str, egui::Response)], source: MenuSource, hover_switch: bool) {
+    let rects: Vec<(&'static str, egui::Rect)> = titles.iter().map(|(name, r)| (*name, r.rect)).collect();
+    let (pressed_at, hover_at) = ctx.input(|i| {
+        let pressed = i.pointer.button_pressed(egui::PointerButton::Primary);
+        (if pressed { i.pointer.interact_pos() } else { None }, i.pointer.hover_pos())
+    });
+    app.open_menu = next_open(source, app.open_menu, pressed_at, hover_at, &rects, hover_switch);
+}
+
+fn released_on_title(ctx: &egui::Context, titles: &[(&'static str, egui::Response)]) -> bool {
+    ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
+        && ctx.input(|i| i.pointer.interact_pos()).is_some_and(|pos| titles.iter().any(|(_, r)| r.rect.contains(pos)))
+}
+
+/// Draw the open menu below its title. `open_bool` gives us egui's click-outside and Escape
+/// handling; the title-release case is suppressed because opening on press means the release
+/// of that same click would otherwise close the new menu immediately.
+fn show_menu_popup(app: &mut IncaApp, response: &egui::Response, list: &[M], suppress_close: bool) -> Option<egui::Rect> {
+    let mut open = true;
+    let popup = egui::Popup::menu(response).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    let popup = if suppress_close { popup.open(true) } else { popup.open_bool(&mut open) };
+    let shown = popup.show(|ui| items(app, ui, list));
+    if !open {
+        app.open_menu = None;
+    }
+    shown.map(|r| r.response.rect)
 }
 
 /// Maya's hotbox: every menu around the cursor while Space is held (stays until a click outside or Esc).
@@ -335,8 +471,12 @@ pub fn hotbox(app: &mut IncaApp, ctx: &egui::Context) {
     let Some(pos) = app.hotbox else { return };
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.hotbox = None;
+        app.open_menu = None;
         return;
     }
+    let mut titles: Vec<(&'static str, egui::Response)> = Vec::new();
+    let mut entries: Vec<(&'static str, Vec<M>)> = Vec::new();
+    let open = open_title(app.open_menu, MenuSource::Hotbox);
     let r = egui::Area::new(egui::Id::new("hotbox")).fixed_pos(pos - egui::vec2(260.0, 70.0)).order(egui::Order::Foreground).show(ctx, |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -351,18 +491,97 @@ pub fn hotbox(app: &mut IncaApp, ctx: &egui::Context) {
                 ui.set_max_width(520.0);
                 for name in ["File", "Edit", "Create", "Select", "Modify", "Display", "Windows"] {
                     let list = common(name);
-                    ui.menu_button(name, |ui| items(app, ui, &list));
+                    titles.push((name, title_button(ui, name, open == Some(name))));
+                    entries.push((name, list));
                 }
                 for (name, list) in set_menus(app.menu_set) {
-                    ui.menu_button(name, |ui| items(app, ui, &list));
+                    titles.push((name, title_button(ui, name, open == Some(name))));
+                    entries.push((name, list));
                 }
                 let help = common("Help");
-                ui.menu_button("Help", |ui| items(app, ui, &help));
+                titles.push(("Help", title_button(ui, "Help", open == Some("Help"))));
+                entries.push(("Help", help));
             });
         });
     });
-    let clicked_outside = ctx.input(|i| i.pointer.any_click()) && !r.response.contains_pointer() && !ctx.any_popup_open();
+
+    // The JS hotbox opens menus on press but (unlike the main menu bar) does not switch on hover.
+    update_open_menu(ctx, app, &titles, MenuSource::Hotbox, false);
+    if let Some(OpenMenu::Hotbox(name)) = app.open_menu {
+        if let Some((_, resp)) = titles.iter().find(|(n, _)| *n == name) {
+            if let Some((_, list)) = entries.iter().find(|(n, _)| *n == name) {
+                let suppress = released_on_title(ctx, &titles);
+                app.menu_popup_rect = show_menu_popup(app, resp, list, suppress);
+            } else {
+                app.open_menu = None;
+            }
+        } else {
+            app.open_menu = None;
+        }
+    }
+    let pointer = ctx.input(|i| i.pointer.interact_pos());
+    let in_menu = app.menu_popup_rect.is_some_and(|rect| pointer.is_some_and(|p| rect.contains(p)));
+    let clicked_outside = ctx.input(|i| i.pointer.any_click()) && !r.response.contains_pointer() && !in_menu && !ctx.any_popup_open();
     if clicked_outside && app.space_down.is_none() {
         app.hotbox = None;
+        if matches!(app.open_menu, Some(OpenMenu::Hotbox(_))) {
+            app.open_menu = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{pos2, vec2, Rect};
+
+    fn titles() -> Vec<(&'static str, Rect)> {
+        ["File", "Edit", "Create"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| (n, Rect::from_min_size(pos2(i as f32 * 30.0, 0.0), vec2(30.0, 20.0))))
+            .collect()
+    }
+
+    #[test]
+    fn hover_switches_an_open_menu() {
+        let r = titles();
+        let open = next_open(MenuSource::Main, Some(OpenMenu::Main("File")), None, Some(pos2(40.0, 10.0)), &r, true);
+        assert_eq!(open, Some(OpenMenu::Main("Edit")));
+    }
+
+    #[test]
+    fn pressing_the_open_title_closes_it() {
+        let r = titles();
+        let open = next_open(MenuSource::Main, Some(OpenMenu::Main("File")), Some(pos2(10.0, 10.0)), None, &r, true);
+        assert_eq!(open, None);
+    }
+
+    #[test]
+    fn pressing_another_title_switches_without_hover() {
+        let r = titles();
+        let open = next_open(MenuSource::Main, Some(OpenMenu::Main("File")), Some(pos2(70.0, 10.0)), None, &r, true);
+        assert_eq!(open, Some(OpenMenu::Main("Create")));
+    }
+
+    #[test]
+    fn hovering_does_not_open_a_menu_by_itself() {
+        let r = titles();
+        let open = next_open(MenuSource::Main, None, None, Some(pos2(40.0, 10.0)), &r, true);
+        assert_eq!(open, None);
+    }
+
+    #[test]
+    fn the_hotbox_does_not_switch_on_hover() {
+        let r = titles();
+        let open = next_open(MenuSource::Hotbox, Some(OpenMenu::Hotbox("File")), None, Some(pos2(40.0, 10.0)), &r, false);
+        assert_eq!(open, Some(OpenMenu::Hotbox("File")));
+    }
+
+    #[test]
+    fn pressing_outside_keeps_the_open_menu() {
+        let r = titles();
+        let open = next_open(MenuSource::Main, Some(OpenMenu::Main("File")), Some(pos2(200.0, 200.0)), None, &r, true);
+        assert_eq!(open, Some(OpenMenu::Main("File")));
     }
 }

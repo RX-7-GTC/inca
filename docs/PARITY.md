@@ -73,7 +73,7 @@ registry, menus, UI modules and a 0.1.12 screenshot.
 | #10 face highlight follows pointer | ok |
 | #11 In-View Editor movable | fixed: drag its title |
 | #12 one value into several picked channels | fixed |
-| #13 hotbox menus open on hover | ok |
+| #13 hotbox menus open on hover | ok: hotbox menus open on press, toggle on a second press, and run the item under the cursor on release like JS 0.1.12 (which does not hover-switch) |
 | #14 / #15 status line and shelf icons | ok |
 | #16 Channel Box channels drive the manipulator | fixed: picked transform channels show their axes, MMB drags them |
 | #17 W/E/R + LMB marking menu | ok |
