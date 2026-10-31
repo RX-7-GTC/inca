@@ -208,8 +208,25 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
         let soft = app.soft.on.then_some((app.soft.radius, app.soft.linear));
         let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.mesh_cache, soft, app.prefs.smooth_divisions);
         draws.extend(crate::anim_extras::draws(&app.viz));
-        let fu = viewport::frame_uniform(&app.s, &app.vps[idx], &cv, app.bg_mode);
+        let mut fu = viewport::frame_uniform(&app.s, &app.vps[idx], &cv, app.bg_mode);
+        let mut sky_warning = None;
+        if fu.sky[0] > 1.5 {
+            match viewport::sky_texture_file(&app.s, &app.vps[idx]) {
+                Some(file) => match gpu.prepare_sky(app.s.project.as_deref(), &file) {
+                    viewport::gpu::SkyLoad::Ready => {}
+                    viewport::gpu::SkyLoad::Failed(e) => {
+                        fu.sky[0] = 1.0;
+                        sky_warning = Some(format!("Sky dome texture could not be loaded: {file} ({e})"));
+                    }
+                    viewport::gpu::SkyLoad::Unavailable => fu.sky[0] = 1.0,
+                },
+                None => fu.sky[0] = 1.0,
+            }
+        }
         gpu.render(idx, &fu, &draws);
+        if let Some(w) = sky_warning {
+            app.warn(w);
+        }
         ui.painter().image(tex, img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
     } else {
         ui.painter().rect_filled(img_rect, 0.0, Color32::from_rgb(60, 64, 70));

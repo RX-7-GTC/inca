@@ -183,6 +183,17 @@ pub enum Geo {
     TransientLines(Vec<LineVertex>),
 }
 
+/// Result of asking the GPU for a sky-dome `textureFile`.
+#[derive(Clone, Debug)]
+pub enum SkyLoad {
+    /// The equirect texture is uploaded and bound.
+    Ready,
+    /// The first load failed; the caller should warn and use the procedural fallback.
+    Failed(String),
+    /// A previous load of the same file failed; stay on the procedural fallback silently.
+    Unavailable,
+}
+
 pub struct DrawCmd {
     pub pass: Pass,
     pub geo: Geo,
@@ -245,7 +256,10 @@ pub struct Gpu {
     queue: wgpu::Queue,
     frame_bgl: wgpu::BindGroupLayout,
     draw_bgl: wgpu::BindGroupLayout,
+    tex_bgl: wgpu::BindGroupLayout,
     tex_array: wgpu::Texture,
+    tex_view: wgpu::TextureView,
+    tex_sampler: wgpu::Sampler,
     tex_bg: wgpu::BindGroup,
     /// texture id -> array layer
     tex_layers: HashMap<String, u32>,
@@ -256,6 +270,11 @@ pub struct Gpu {
     shadow_buf: wgpu::Buffer,
     shadow_ubg: wgpu::BindGroup,
     shadow_pipe: wgpu::RenderPipeline,
+    /// group 2 binding 4: sky sampler
+    sky_samp: wgpu::Sampler,
+    /// resolved path of the loaded sky file, and whether it loaded
+    sky_key: Option<String>,
+    sky_ok: bool,
     bg_pipe: wgpu::RenderPipeline,
     mesh_pipe: wgpu::RenderPipeline,
     blend_pipe: wgpu::RenderPipeline,
@@ -296,6 +315,8 @@ impl Gpu {
                 count: None,
             }],
         });
+        // group 2: material texture array + the sky dome equirect/irradiance. max_bind_groups is
+        // 4, so the sky lives here rather than in a group of its own.
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("textures"),
             entries: &[
@@ -306,6 +327,19 @@ impl Gpu {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ],
         });
         let tex_array = device.create_texture(&wgpu::TextureDescriptor {
@@ -329,12 +363,43 @@ impl Gpu {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
+        let sky_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("sky sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let sky_white = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sky fallback"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let white = [half::f16::from_f32(1.0).to_bits(); 4];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &sky_white, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&white),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let sky_white_view = sky_white.create_view(&Default::default());
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("material textures"),
             layout: &tex_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&tex_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&sky_white_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&sky_white_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&sky_samp) },
             ],
         });
         // group 3: the shadow depth array sampled by the mesh shader
@@ -463,7 +528,10 @@ impl Gpu {
             queue,
             frame_bgl,
             draw_bgl,
+            tex_bgl,
             tex_array,
+            tex_view,
+            tex_sampler,
             tex_bg,
             tex_layers: HashMap::new(),
             tex_hashes: HashMap::new(),
@@ -472,6 +540,9 @@ impl Gpu {
             shadow_buf,
             shadow_ubg,
             shadow_pipe,
+            sky_samp,
+            sky_key: None,
+            sky_ok: false,
             bg_pipe,
             mesh_pipe,
             blend_pipe,
@@ -541,6 +612,85 @@ impl Gpu {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
             wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
         );
+    }
+
+    /// Decode and upload a sky dome `textureFile` when it changed. Synchronous: the first
+    /// frame after picking a file may pause while the image is decoded and prefiltered.
+    pub fn prepare_sky(&mut self, project: Option<&str>, file: &str) -> SkyLoad {
+        let path = inca_core::sky::resolve_path(project, file);
+        let key = path.to_string_lossy().to_string();
+        if self.sky_key.as_deref() == Some(key.as_str()) {
+            return if self.sky_ok { SkyLoad::Ready } else { SkyLoad::Unavailable };
+        }
+        self.sky_key = Some(key);
+        match inca_core::sky::load(&path) {
+            Ok(img) => {
+                self.upload_sky(&img);
+                self.sky_ok = true;
+                SkyLoad::Ready
+            }
+            Err(e) => {
+                self.sky_ok = false;
+                SkyLoad::Failed(e)
+            }
+        }
+    }
+
+    fn upload_sky(&mut self, img: &inca_core::sky::SkyImage) {
+        let levels = inca_core::sky::mip_chain(img);
+        let (w, h) = (levels[0].0, levels[0].1);
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sky equirect"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: levels.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (i, (lw, lh, px)) in levels.iter().enumerate() {
+            let half_px: Vec<u16> = px.iter().map(|v| half::f16::from_f32(*v).to_bits()).collect();
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: i as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                bytemuck::cast_slice(&half_px),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(lw * 8), rows_per_image: Some(*lh) },
+                wgpu::Extent3d { width: *lw, height: *lh, depth_or_array_layers: 1 },
+            );
+        }
+        let (iw, ih) = (64u32, 32u32);
+        let irr = inca_core::sky::irradiance(img, iw as usize, ih as usize);
+        let irr_half: Vec<u16> = irr.iter().map(|v| half::f16::from_f32(*v).to_bits()).collect();
+        let irr_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("sky irradiance"),
+            size: wgpu::Extent3d { width: iw, height: ih, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &irr_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&irr_half),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(iw * 8), rows_per_image: Some(ih) },
+            wgpu::Extent3d { width: iw, height: ih, depth_or_array_layers: 1 },
+        );
+        let view = tex.create_view(&Default::default());
+        let irr_view = irr_tex.create_view(&Default::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("material textures"),
+            layout: &self.tex_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.tex_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.tex_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&irr_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sky_samp) },
+            ],
+        });
+        self.tex_bg = bg;
     }
 
     pub fn mesh_key(&self, name: &str) -> Option<u64> {

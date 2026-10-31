@@ -66,6 +66,32 @@ fn sky_color(s: f32) -> vec3<f32> {
     return mix(gh, gnd, pow(-s, 0.35));
 }
 
+// three.js `equirectUv`: u from atan2(z, x), v from asin(y). The texture's row 0 is the
+// nadir, matching the JS DataTexture (`v = 0` at the bottom).
+fn equirect_uv(d: vec3<f32>) -> vec2<f32> {
+    let u = atan2(d.z, d.x) * (1.0 / 6.28318530718) + 0.5;
+    let v = asin(clamp(d.y, -1.0, 1.0)) * (1.0 / 3.14159265359) + 0.5;
+    return vec2<f32>(u, v);
+}
+
+fn sky_radiance(d: vec3<f32>) -> vec3<f32> {
+    if (frame.sky.x > 1.5) {
+        // trilinear from the CPU-built mip chain (the JS linear-filters the base level only,
+        // but the mips avoid shimmering on large HDRIs)
+        return textureSample(sky_tex, sky_samp, equirect_uv(d)).rgb;
+    }
+    return sky_color(clamp(d.y, -1.0, 1.0));
+}
+
+// Normalised cosine-weighted environment average (the PMREM roughness-1 irradiance the JS
+// `scene.environment` feeds to diffuse shading).
+fn sky_irradiance(n: vec3<f32>) -> vec3<f32> {
+    if (frame.sky.x > 1.5) {
+        return textureSampleLevel(sky_irr, sky_samp, equirect_uv(n), 0.0).rgb;
+    }
+    return sky_color(clamp(n.y, -1.0, 1.0));
+}
+
 @fragment
 fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
     if (frame.sky.x > 0.5 && frame.sky.y > 0.5) {
@@ -75,7 +101,7 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
             let up = normalize(vec3(frame.view[0][1], frame.view[1][1], frame.view[2][1]));
             dir = normalize(dir + right * i.ndc.x * frame.sky.z * frame.sky.w + up * i.ndc.y * frame.sky.z);
         }
-        var c = sky_color(clamp(dir.y, -1.0, 1.0)) * frame.sky_col.rgb;
+        var c = sky_radiance(dir) * frame.sky_col.rgb;
         c = pow(max(c * exp2(frame.post.x), vec3(0.0)), vec3(1.0 / frame.post.y));
         return vec4(linear_to_srgb(c), 1.0);
     }
@@ -85,6 +111,11 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
 // ---------------------------------------------------------------- meshes
 @group(2) @binding(0) var tex_array: texture_2d_array<f32>;
 @group(2) @binding(1) var tex_samp: sampler;
+// sky dome equirect (mip 0 = background, mips are unused for now), its diffuse irradiance,
+// and a repeat-u/clamp-v linear sampler
+@group(2) @binding(2) var sky_tex: texture_2d<f32>;
+@group(2) @binding(3) var sky_irr: texture_2d<f32>;
+@group(2) @binding(4) var sky_samp: sampler;
 @group(3) @binding(0) var shadow_map: texture_depth_2d_array;
 @group(3) @binding(1) var shadow_samp: sampler_comparison;
 
@@ -244,8 +275,8 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
     }
     var c = vec3(0.0);
     if (frame.sky.x > 0.5) {
-        // hemisphere approximation of the sky-dome environment (linear radiance * intensity)
-        c = c + base * sky_color(clamp(n.y, -1.0, 1.0)) * frame.sky_col.rgb * frame.sky_col.w;
+        // sky-dome environment (procedural hemisphere or prefiltered HDRI irradiance)
+        c = c + base * sky_irradiance(n) * frame.sky_col.rgb * frame.sky_col.w;
     }
     let count = i32(frame.mode.y);
     for (var i = 0; i < count; i = i + 1) {

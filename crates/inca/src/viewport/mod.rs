@@ -954,6 +954,47 @@ pub fn background(mode: usize) -> ([f32; 4], [f32; 4]) {
     }
 }
 
+/// The sky dome light that supplies the viewport environment, mirroring the JS
+/// `Viewport.prepareScene`: the last visible sky dome in "Use All Lights".
+#[derive(Clone, Debug)]
+pub struct SkyLight {
+    pub file: String,
+    pub color: [f64; 3],
+    pub intensity: f64,
+    pub show_background: bool,
+}
+
+pub fn sky_light(s: &Scene, vp: &Viewport) -> Option<SkyLight> {
+    if vp.lights != LightMode::All {
+        return None;
+    }
+    let mut found = None;
+    for n in s.nodes.values() {
+        let Shape::Light(l) = &n.shape else { continue };
+        if l.ty != "skyDomeLight" || !s.is_visible(&n.id) {
+            continue;
+        }
+        let color = l
+            .attrs
+            .get("color")
+            .and_then(|c| c.as_array())
+            .map(|a| [a[0].as_f64().unwrap_or(1.0).max(0.0), a[1].as_f64().unwrap_or(1.0).max(0.0), a[2].as_f64().unwrap_or(1.0).max(0.0)])
+            .unwrap_or([1.0; 3]);
+        found = Some(SkyLight {
+            file: l.attrs.get("textureFile").and_then(|v| v.as_str()).unwrap_or("").trim().to_string(),
+            color,
+            intensity: l.attrs.get("intensity").and_then(|v| v.as_f64()).unwrap_or(1.0),
+            show_background: l.attrs.get("showBackground").and_then(|v| v.as_bool()).unwrap_or(true),
+        });
+    }
+    found
+}
+
+/// Resolved `textureFile` of the active sky dome, for `Gpu::prepare_sky`.
+pub fn sky_texture_file(s: &Scene, vp: &Viewport) -> Option<String> {
+    sky_light(s, vp).and_then(|l| (!l.file.is_empty()).then_some(l.file))
+}
+
 pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> FrameUniform {
     let (bg_top, bg_bottom) = background(bg_mode);
     let m4 = |m: DMat4| m.as_mat4().to_cols_array_2d();
@@ -971,21 +1012,16 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
     };
     // JS prepareScene: the last visible sky dome in "Use All Lights" becomes the scene
     // environment; it is not fed to the punctual light loop (three.js intensity stays 0).
+    // sky.x = 0 none, 1 procedural fallback, 2 equirect texture (patched back to 1 by the
+    // renderer when the file fails to load).
     let mut sky = [0.0; 4];
     let mut sky_col = [0.0, 0.0, 0.0, 1.0];
     sky[2] = (cv.fov_y * 0.5).tan() as f32;
     sky[3] = cv.size[0] / cv.size[1].max(1.0);
-    if vp.lights == LightMode::All {
-        for n in s.nodes.values() {
-            let Shape::Light(l) = &n.shape else { continue };
-            if l.ty != "skyDomeLight" || !s.is_visible(&n.id) {
-                continue;
-            }
-            let col = l.attrs.get("color").and_then(|c| c.as_array()).map(|a| [a[0].as_f64().unwrap_or(1.0).max(0.0), a[1].as_f64().unwrap_or(1.0).max(0.0), a[2].as_f64().unwrap_or(1.0).max(0.0)]).unwrap_or([1.0; 3]);
-            sky[0] = 1.0;
-            sky[1] = if l.attrs.get("showBackground").and_then(|v| v.as_bool()).unwrap_or(true) { 1.0 } else { 0.0 };
-            sky_col = [col[0] as f32, col[1] as f32, col[2] as f32, l.attrs.get("intensity").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32];
-        }
+    if let Some(l) = sky_light(s, vp) {
+        sky[0] = if l.file.is_empty() { 1.0 } else { 2.0 };
+        sky[1] = if l.show_background { 1.0 } else { 0.0 };
+        sky_col = [l.color[0] as f32, l.color[1] as f32, l.color[2] as f32, l.intensity as f32];
     }
     if vp.lights == LightMode::All {
         for n in s.nodes.values() {
@@ -2395,8 +2431,15 @@ mod tests {
         assert_eq!(fu.sky[1], 1.0);
         assert_eq!(fu.mode[1], 0.0, "sky dome must not enter the punctual light list");
         assert!((fu.sky_col[3] - 1.0).abs() < 1e-6);
-        // showBackground off keeps the environment but draws the normal viewport background
+        // a textureFile switches the shader to the equirect texture (2), and the renderer
+        // falls back to 1 when the file cannot be loaded
         let id = s.find("skyDomeLight1").unwrap();
+        s.set_attr(&inca_core::scene::NodeRef::Dag(id.clone()), "textureFile", serde_json::json!("sky.hdr"));
+        let fu = frame_uniform(&s, &all, &cv, 0);
+        assert_eq!(fu.sky[0], 2.0);
+        assert_eq!(sky_texture_file(&s, &all).as_deref(), Some("sky.hdr"));
+        s.set_attr(&inca_core::scene::NodeRef::Dag(id.clone()), "textureFile", serde_json::json!(""));
+        // showBackground off keeps the environment but draws the normal viewport background
         s.set_attr(&inca_core::scene::NodeRef::Dag(id), "showBackground", serde_json::json!(false));
         let fu = frame_uniform(&s, &all, &cv, 0);
         assert_eq!(fu.sky[0], 1.0);

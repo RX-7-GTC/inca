@@ -93,8 +93,25 @@ fn hardware(app: &mut IncaApp, cam: &str) {
     vp.exposure = settings.exposure;
     let cv = crate::viewport::cam_view(&app.s, cam, [size[0] as f32, size[1] as f32]);
     let draws = crate::viewport::build_draws(&app.s, &vp, &cv, gpu, &mut app.smooth_cache, &Default::default(), &mut app.mesh_cache, None, app.prefs.smooth_divisions);
-    let fu = crate::viewport::frame_uniform(&app.s, &vp, &cv, 1);
+    let mut fu = crate::viewport::frame_uniform(&app.s, &vp, &cv, 1);
+    let mut sky_warning = None;
+    if fu.sky[0] > 1.5 {
+        match crate::viewport::sky_texture_file(&app.s, &vp) {
+            Some(file) => match gpu.prepare_sky(app.s.project.as_deref(), &file) {
+                crate::viewport::gpu::SkyLoad::Ready => {}
+                crate::viewport::gpu::SkyLoad::Failed(e) => {
+                    fu.sky[0] = 1.0;
+                    sky_warning = Some(format!("Sky dome texture could not be loaded: {file} ({e})"));
+                }
+                crate::viewport::gpu::SkyLoad::Unavailable => fu.sky[0] = 1.0,
+            },
+            None => fu.sky[0] = 1.0,
+        }
+    }
     let px = gpu.render_offscreen(size, &fu, &draws);
+    if let Some(w) = sky_warning {
+        app.warn(w);
+    }
     if px.len() != (size[0] * size[1] * 4) as usize {
         return;
     }

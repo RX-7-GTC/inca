@@ -624,6 +624,16 @@ impl IncaApp {
         self.script_log.push((MsgKind::Echo, line.into()));
     }
 
+    /// Print a warning in the Script Editor immediately. Paint-time warnings cannot wait for
+    /// the next MEL command to flush `Scene::msgs`.
+    pub fn warn(&mut self, msg: impl Into<String>) {
+        // file/OS errors can carry line breaks; the Script Editor shows one line per message
+        let msg = msg.into().split_whitespace().collect::<Vec<_>>().join(" ");
+        let m = format!("// Warning: {msg}");
+        self.last_result = m.clone();
+        self.script_log.push((MsgKind::Warning, m));
+    }
+
     fn ui_command(&mut self, cmd: &str, args: &[Val]) {
         match cmd {
             "setToolTo" => {

@@ -11,6 +11,7 @@ pub mod params;
 pub mod primitives;
 pub mod anim;
 pub mod materials;
+pub mod sky;
 pub mod scene;
 pub mod io;
 pub mod commands;

@@ -1171,8 +1171,38 @@ pub fn attr_map_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, keys: 
                     }
                 }
                 Value::String(mut s) => {
-                    let resp = ui.text_edit_singleline(&mut s);
-                    if resp.changed() {
+                    // JS file fields (`textureFile`, `fileTextureName`) get a browse button.
+                    let file_field = matches!(k.as_str(), "textureFile" | "fileTextureName");
+                    let mut edited = false;
+                    ui.horizontal(|ui| {
+                        edited = ui.text_edit_singleline(&mut s).changed();
+                        if file_field && ui.small_button("...").on_hover_text("Browse").clicked() {
+                            let filters: &[&str] = if k == "textureFile" {
+                                &["hdr", "exr", "png", "jpg", "jpeg"]
+                            } else {
+                                &["png", "jpg", "jpeg", "bmp", "tga", "tif", "tiff", "exr", "hdr", "webp", "gif"]
+                            };
+                            let mut dlg = rfd::FileDialog::new().add_filter("HDR / Images", filters);
+                            if let Some(proj) = app.s.project.as_deref() {
+                                // the JS file field starts in <project>/sourceimages
+                                let src = std::path::Path::new(proj).join("sourceimages");
+                                dlg = dlg.set_directory(if src.is_dir() { src } else { std::path::PathBuf::from(proj) });
+                            }
+                            if let Some(p) = dlg.pick_file() {
+                                let mut v = p.to_string_lossy().replace('\\', "/");
+                                if let Some(proj) = app.s.project.as_deref() {
+                                    let pr = proj.replace('\\', "/");
+                                    if let Some(rest) = v.strip_prefix(&(pr + "/")) {
+                                        v = rest.to_string();
+                                    }
+                                }
+                                app.s.checkpoint(&format!("set {k}"));
+                                app.s.set_attr(r, k, json!(v.clone()));
+                                s = v;
+                            }
+                        }
+                    });
+                    if edited {
                         app.s.set_attr(r, k, json!(s));
                     }
                 }
