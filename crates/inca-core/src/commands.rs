@@ -172,6 +172,21 @@ pub fn parse_component(s: &Scene, txt: &str) -> Option<(Id, CompMode, Vec<usize>
     Some((id, mode, idx.into_iter().filter(|&i| i < count).collect()))
 }
 
+/// Parse a component argument for `select`, which looks edge indices up in the topology and
+/// ignores out-of-range ones. Avoids building the topology just to bound-check a single
+/// `.e[i]`: a marquee emits one argument per selected edge.
+fn parse_select_component(s: &Scene, txt: &str) -> Option<(Id, CompMode, Vec<usize>)> {
+    let (obj, rest) = txt.split_once('.')?;
+    let (kind, range) = rest.split_once('[')?;
+    let range = range.trim_end_matches(']');
+    if kind != "e" || range == "*" || range.contains(':') {
+        return parse_component(s, txt);
+    }
+    let id = s.find(obj)?;
+    s.node(&id)?.mesh()?;
+    Some((id, CompMode::Edge, vec![range.parse().ok()?]))
+}
+
 /// Component selection as strings (for `ls -sl`).
 pub fn component_names(s: &Scene, id: &str) -> Vec<String> {
     let Some(n) = s.node(id) else { return vec![] };
@@ -2443,7 +2458,7 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
     let mut objs = vec![];
     let mut comps: Vec<(Id, CompMode, Vec<usize>)> = vec![];
     for t in a.strings() {
-        if let Some(c) = parse_component(s, &t) {
+        if let Some(c) = parse_select_component(s, &t) {
             comps.push(c);
             continue;
         }
@@ -2481,11 +2496,19 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
                 }
             }
         }
+        // Edge indices need the topology, but building it once per component turned a
+        // marquee over a 400k-vertex mesh into hundreds of thousands of rebuilds (the
+        // subdivision hang). Cache it per object, and skip it entirely for vertices/faces.
+        let mut topo_cache: std::collections::HashMap<Id, Option<crate::mesh::Topo>> = std::collections::HashMap::new();
         for (id, m, idx) in comps {
             // JS `Sel.selectComponents` hilites every object whose components are selected
             s.add_hilite(&id);
             // curves have no edges/faces; `parse_component` already restricts them to CVs
-            let topo = s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.topo());
+            let topo = if m == CompMode::Edge {
+                topo_cache.entry(id.clone()).or_insert_with(|| s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.topo())).as_ref()
+            } else {
+                None
+            };
             let c = s.comp.entry(id.clone()).or_default();
             for i in idx {
                 match (m, mode) {
@@ -2730,6 +2753,42 @@ mod tests {
         mel(&mut s, "setAttr polyExtrudeFace1.localTranslateZ 4;").unwrap();
         let b = s.world_bbox(&id);
         assert!((b.max.y - 4.5).abs() < 1e-9, "{:?}", b);
+    }
+
+    #[test]
+    fn selecting_many_components_does_not_rebuild_topology() {
+        // A marquee on a subdivided cube used to spend one full `topo()` build per component
+        // argument because `select` and `parse_component` computed the edge topology for
+        // every name. At 400k vertices that turned a selection into an apparent hang.
+        use std::fmt::Write;
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n c; polySmooth -dv 6 -ch 0; selectMode -component;").unwrap();
+        let id = s.find("c").unwrap();
+        let (n, edges) = {
+            let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
+            (pm.v.len(), pm.topo().edges.len())
+        };
+        let mut src = String::from("select -r ");
+        for i in 0..n {
+            let _ = write!(src, "c.vtx[{i}] ");
+        }
+        src.push(';');
+        let t = std::time::Instant::now();
+        mel(&mut s, &src).unwrap();
+        let dt = t.elapsed();
+        assert_eq!(s.comp_sel(&id).v.len(), n);
+        assert!(dt < std::time::Duration::from_secs(10), "selecting {n} vertices took {dt:?}; topology may be rebuilt per component");
+
+        let mut src = String::from("select -r ");
+        for i in 0..edges {
+            let _ = write!(src, "c.e[{i}] ");
+        }
+        src.push(';');
+        let t = std::time::Instant::now();
+        mel(&mut s, &src).unwrap();
+        let dt = t.elapsed();
+        assert_eq!(s.comp_sel(&id).e.len(), edges);
+        assert!(dt < std::time::Duration::from_secs(10), "selecting {edges} edges took {dt:?}; topology may be rebuilt per component");
     }
 
     #[test]
