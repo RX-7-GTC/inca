@@ -93,8 +93,9 @@ impl Default for OutlinerOpts {
 // ------------------------------------------------------------------ outliner
 
 pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
-    egui::MenuBar::new().ui(ui, |ui| {
-        ui.menu_button("Edit", |ui| {
+    use crate::menus::{activated, menu_check, menu_item, panel_bar, MenuSource};
+    panel_bar(app, ui, MenuSource::Outliner, &["Edit", "Display", "Show", "Help"], false, |app, ui, title| match title {
+        "Edit" => {
             for (l, a) in [("Rename", "renameSel"), ("Select Hierarchy", "selectHierarchy")] {
                 outliner_cmd(app, ui, l, a);
             }
@@ -103,26 +104,35 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
                 outliner_cmd(app, ui, l, a);
             }
             ui.separator();
-            if ui.button("Expand All").clicked() {
+            let r = ui.button("Expand All");
+            if activated(app, ui, &r) {
                 app.panels.expanded = app.s.all_dag(true).into_iter().collect();
-                ui.close();
             }
-            if ui.button("Collapse All").clicked() {
+            let r = ui.button("Collapse All");
+            if activated(app, ui, &r) {
                 app.panels.expanded.clear();
-                ui.close();
             }
-        });
-        ui.menu_button("Display", |ui| {
-            let o = &mut app.panels.ol;
-            ui.checkbox(&mut o.dag_only, "DAG Objects Only");
-            ui.checkbox(&mut o.shapes, "Shapes");
-            ui.checkbox(&mut o.sets, "Sets");
-            ui.checkbox(&mut o.materials, "Materials");
+        }
+        "Display" => {
+            let mut o = app.panels.ol;
+            for (value, label) in [
+                (&mut o.dag_only, "DAG Objects Only"),
+                (&mut o.shapes, "Shapes"),
+                (&mut o.sets, "Sets"),
+                (&mut o.materials, "Materials"),
+            ] {
+                if menu_check(app, ui, *value, label) {
+                    *value = !*value;
+                }
+            }
             ui.separator();
-            ui.checkbox(&mut o.sort_alpha, "Sort Alphabetical");
-        });
-        ui.menu_button("Show", |ui| {
-            if ui.button("Show Selected").clicked() {
+            if menu_check(app, ui, o.sort_alpha, "Sort Alphabetical") {
+                o.sort_alpha = !o.sort_alpha;
+            }
+            app.panels.ol = o;
+        }
+        "Show" => {
+            if menu_item(app, ui, "Show Selected") {
                 for id in app.s.sel.clone() {
                     let mut p = app.s.node(&id).and_then(|n| n.parent.clone());
                     while let Some(x) = p {
@@ -131,16 +141,14 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                 }
                 app.panels.ol_scroll = true;
-                ui.close();
             }
             outliner_cmd(app, ui, "Frame Selection", "frameSelected");
-        });
-        ui.menu_button("Help", |ui| {
-            if ui.button("Help on Outliner").clicked() {
+        }
+        _ => {
+            if menu_item(app, ui, "Help on Outliner") {
                 app.help = "Click to select, Ctrl to toggle, Shift for range. Drag onto another item to parent; drop on empty space to unparent. Double-click to rename.".into();
-                ui.close();
             }
-        });
+        }
     });
     ui.add(egui::TextEdit::singleline(&mut app.panels.outliner_filter).hint_text("Search...").desired_width(f32::INFINITY));
     let filter = app.panels.outliner_filter.trim().to_lowercase().replace('*', "");
@@ -211,9 +219,9 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
 }
 
 fn outliner_cmd(app: &mut IncaApp, ui: &mut egui::Ui, label: &str, action: &str) {
-    if ui.button(label).clicked() {
+    let r = ui.button(label);
+    if crate::menus::activated(app, ui, &r) {
         app.action(action);
-        ui.close();
     }
 }
 
@@ -1270,49 +1278,48 @@ fn ae_target(app: &mut IncaApp) -> Option<String> {
 }
 
 pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
+    use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
     let target = ae_target(app);
-    egui::MenuBar::new().ui(ui, |ui| {
-        ui.menu_button("List", |ui| {
+    let titles = ["List", "Selected", "Focus", "Attributes", "Show", "Help"];
+    panel_bar(app, ui, MenuSource::AttrEditor, &titles, false, |app, ui, title| match title {
+        "List" => {
             let mut auto = app.panels.ae_locked.is_none();
-            if ui.checkbox(&mut auto, "Auto Load Selected Attributes").clicked() {
+            if menu_check(app, ui, auto, "Auto Load Selected Attributes") {
+                auto = !auto;
                 app.panels.ae_locked = if auto { None } else { target.clone() };
             }
-            if ui.button("Load Selected Attributes").clicked() {
+            if menu_item(app, ui, "Load Selected Attributes") {
                 app.panels.ae_locked = None;
-                ui.close();
             }
-        });
-        ui.menu_button("Selected", |ui| {
-            if ui.button("Select Node").clicked() {
+        }
+        "Selected" => {
+            if menu_item(app, ui, "Select Node") {
                 if let Some(t) = &target {
                     app.select_names(std::slice::from_ref(t), SelMode::Replace);
                 }
-                ui.close();
             }
-        });
-        ui.menu_button("Focus", |ui| {
+        }
+        "Focus" => {
             for id in app.s.sel.clone() {
-                if ui.button(app.s.name_of(&id)).clicked() {
+                let name = app.s.name_of(&id);
+                if menu_item(app, ui, &name) {
                     app.panels.ae_locked = Some(id);
-                    ui.close();
                 }
             }
-        });
-        ui.menu_button("Attributes", |ui| {
+        }
+        "Attributes" => {
             ui.add_enabled(false, egui::Button::new("Add Attribute..."));
-        });
-        ui.menu_button("Show", |ui| {
-            if ui.button("Show Notes").clicked() {
+        }
+        "Show" => {
+            if menu_item(app, ui, "Show Notes") {
                 app.help = "Notes are under Extra Attributes on the transform tab".into();
-                ui.close();
             }
-        });
-        ui.menu_button("Help", |ui| {
-            if ui.button("Help on Attribute Editor").clicked() {
+        }
+        _ => {
+            if menu_item(app, ui, "Help on Attribute Editor") {
                 app.help = "The Attribute Editor shows every attribute of the selected node; tabs list connected nodes (shape, history, material).".into();
-                ui.close();
             }
-        });
+        }
     });
     let Some(id) = target else {
         ui.label(RichText::new("Select an object to see its attributes.").color(theme::TEXT_DIM));

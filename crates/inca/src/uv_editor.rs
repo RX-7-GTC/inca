@@ -274,81 +274,85 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
 }
 
 fn menus(app: &mut IncaApp, ui: &mut egui::Ui) {
-    egui::MenuBar::new().ui(ui, |ui| {
-        let item = |ui: &mut egui::Ui, l: &str| {
-            let c = ui.button(l).clicked();
-            if c {
-                ui.close();
-            }
-            c
-        };
-        ui.menu_button("Edit", |ui| {
-            if item(ui, "Undo") {
+    use crate::menus::{menu_check, menu_item, menu_radio, panel_bar, MenuSource};
+    panel_bar(app, ui, MenuSource::UvEditor, &["Edit", "Select", "Create", "Modify", "Tool", "View", "Help"], false, |app, ui, title| match title {
+        "Edit" => {
+            if menu_item(app, ui, "Undo") {
                 app.action("undo");
             }
-            if item(ui, "Redo") {
+            if menu_item(app, ui, "Redo") {
                 app.action("redo");
             }
-        });
-        ui.menu_button("Select", |ui| {
-            if item(ui, "Select All UVs") {
+        }
+        "Select" => {
+            if menu_item(app, ui, "Select All UVs") {
                 select_all(app);
             }
-            if item(ui, "Select Shell") {
+            if menu_item(app, ui, "Select Shell") {
                 select_shell(app);
             }
-            if item(ui, "Convert Scene Selection to UVs") {
+            if menu_item(app, ui, "Convert Scene Selection to UVs") {
                 from_scene(app);
             }
-            if item(ui, "Clear Selection") {
+            if menu_item(app, ui, "Clear Selection") {
                 app.uv_editor.sel.clear();
             }
-        });
-        ui.menu_button("Create", |ui| {
+        }
+        "Create" => {
             for (l, a) in [("Planar", "planarMap"), ("Cylindrical", "cylindricalMap"), ("Spherical", "sphericalMap"), ("Automatic", "automaticMap")] {
-                if item(ui, l) {
+                if menu_item(app, ui, l) {
                     project(app, a);
                 }
             }
-        });
-        ui.menu_button("Modify", |ui| {
+        }
+        "Modify" => {
             for (l, k) in [("Flip U", "flipU"), ("Flip V", "flipV"), ("Rotate 90° CCW", "rot90"), ("Rotate 90° CW", "rot-90")] {
-                if item(ui, l) {
+                if menu_item(app, ui, l) {
                     op(app, k);
                 }
             }
             ui.separator();
             for (l, k) in [("Normalize", "normalize"), ("Layout", "layout"), ("Unfold (Relax)", "relax")] {
-                if item(ui, l) {
+                if menu_item(app, ui, l) {
                     op(app, k);
                 }
             }
-        });
-        ui.menu_button("Tool", |ui| {
+        }
+        "Tool" => {
             for (l, t) in [("Select Tool  Q", UvTool::Select), ("Move Tool  W", UvTool::Move), ("Rotate Tool  E", UvTool::Rotate), ("Scale Tool  R", UvTool::Scale)] {
-                if ui.radio(app.uv_editor.tool == t, l).clicked() {
+                if menu_radio(app, ui, app.uv_editor.tool == t, l) {
                     app.uv_editor.tool = t;
-                    ui.close();
                 }
             }
-        });
-        ui.menu_button("View", |ui| {
-            if item(ui, "Frame All  A") {
+        }
+        "View" => {
+            if menu_item(app, ui, "Frame All  A") {
                 app.uv_editor.framed = false;
             }
             ui.separator();
-            let e = &mut app.uv_editor;
-            ui.checkbox(&mut e.grid, "Grid");
-            ui.checkbox(&mut e.checker, "Checker Map");
-            ui.checkbox(&mut e.image, "Display Image");
-            ui.checkbox(&mut e.shade, "Shade UVs");
-            ui.checkbox(&mut e.points, "UV Points");
-        });
-        ui.menu_button("Help", |ui| {
-            if item(ui, "Help on UV Editor") {
+            for (on, label) in [
+                (app.uv_editor.grid, "Grid"),
+                (app.uv_editor.checker, "Checker Map"),
+                (app.uv_editor.image, "Display Image"),
+                (app.uv_editor.shade, "Shade UVs"),
+                (app.uv_editor.points, "UV Points"),
+            ] {
+                if menu_check(app, ui, on, label) {
+                    match label {
+                        "Grid" => app.uv_editor.grid = !app.uv_editor.grid,
+                        "Checker Map" => app.uv_editor.checker = !app.uv_editor.checker,
+                        "Display Image" => app.uv_editor.image = !app.uv_editor.image,
+                        "Shade UVs" => app.uv_editor.shade = !app.uv_editor.shade,
+                        _ => app.uv_editor.points = !app.uv_editor.points,
+                    }
+                }
+            }
+        }
+        _ => {
+            if menu_item(app, ui, "Help on UV Editor") {
                 app.help = "UV Editor: click/marquee UVs (Shift toggle, Ctrl deselect, Ctrl+Shift add) · W/E/R + LMB drag on the selection (or MMB anywhere) to move/rotate/scale · Shift constrains, Ctrl snaps · Alt+MMB pan · wheel zoom".into();
             }
-        });
+        }
     });
 }
 

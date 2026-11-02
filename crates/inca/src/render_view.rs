@@ -334,60 +334,51 @@ pub fn toggle_ipr(app: &mut IncaApp) {
 // ---------------------------------------------------------------- window
 
 pub fn render_view(app: &mut IncaApp, ui: &mut egui::Ui) {
-    egui::MenuBar::new().ui(ui, |ui| {
-        ui.menu_button("File", |ui| {
-            if ui.button("Save Image...").clicked() {
+    use crate::menus::{menu_item, menu_radio, panel_bar, MenuSource};
+    panel_bar(app, ui, MenuSource::RenderView, &["File", "Display", "Render"], false, |app, ui, title| match title {
+        "File" => {
+            if menu_item(app, ui, "Save Image...") {
                 save_image(app);
-                ui.close();
             }
-            if ui.button("Keep Image").clicked() {
+            if menu_item(app, ui, "Keep Image") {
                 keep_image(app);
-                ui.close();
             }
-            if ui.button("Remove Image").clicked() {
+            if menu_item(app, ui, "Remove Image") {
                 remove_image(app);
-                ui.close();
             }
-        });
-        ui.menu_button("Display", |ui| {
-            if ui.radio(!app.windows_state.rv.show_alpha, "Display RGB Channels").clicked() {
+        }
+        "Display" => {
+            if menu_radio(app, ui, !app.windows_state.rv.show_alpha, "Display RGB Channels") {
                 app.windows_state.rv.show_alpha = false;
                 app.windows_state.rv.dirty = true;
-                ui.close();
             }
-            if ui.radio(app.windows_state.rv.show_alpha, "Display Alpha Channel").clicked() {
+            if menu_radio(app, ui, app.windows_state.rv.show_alpha, "Display Alpha Channel") {
                 app.windows_state.rv.show_alpha = true;
                 app.windows_state.rv.dirty = true;
-                ui.close();
             }
-            if ui.button("Reset Exposure / Gamma").clicked() {
+            if menu_item(app, ui, "Reset Exposure / Gamma") {
                 app.windows_state.rv.exposure = 0.0;
                 app.windows_state.rv.gamma = 1.0;
                 app.windows_state.rv.dirty = true;
-                ui.close();
             }
-        });
-        ui.menu_button("Render", |ui| {
-            if ui.button("Render Current Frame").clicked() {
+        }
+        _ => {
+            if menu_item(app, ui, "Render Current Frame") {
                 render(app);
-                ui.close();
             }
-            if ui.radio(app.windows_state.rv.ipr, "IPR").clicked() {
+            if menu_radio(app, ui, app.windows_state.rv.ipr, "IPR") {
                 toggle_ipr(app);
-                ui.close();
             }
-            if ui.button("Render Sequence").clicked() {
+            if menu_item(app, ui, "Render Sequence") {
                 render_sequence(app);
-                ui.close();
             }
             ui.separator();
             for (k, l) in RENDERERS {
-                if ui.radio(renderer(app) == k, l).clicked() {
+                if menu_radio(app, ui, renderer(app) == k, l) {
                     app.s.render.insert("renderer".into(), serde_json::json!(k));
-                    ui.close();
                 }
             }
-        });
+        }
     });
     ui.horizontal(|ui| {
         if crate::icons::button(ui, "renderFrame", "Render the current frame", false, 22.0).clicked() {

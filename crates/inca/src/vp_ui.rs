@@ -259,112 +259,124 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
 }
 
 fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
+    use crate::menus::{activated, menu_check, menu_item, menu_radio, menu_selectable, panel_bar, MenuSource};
     ui.spacing_mut().button_padding = vec2(4.0, 0.0);
-    let small = |t: &str| RichText::new(t).size(11.5);
     let cam = app.vps[idx].camera.clone();
-    let check = |ui: &mut egui::Ui, on: bool, label: &str| ui.add(egui::Button::new(format!("{} {label}", if on { "✔" } else { "  " })));
-    ui.menu_button(small("View"), |ui| {
-        if ui.button("Select Camera").clicked() {
+    let titles = ["View", "Shading", "Lighting", "Show", "Renderer", "Panels"];
+    panel_bar(app, ui, MenuSource::Panel(idx), &titles, true, |app, ui, title| match title {
+        "View" => {
+        if menu_item(app, ui, "Select Camera") {
             select_camera(app, idx);
-            ui.close();
         }
-        if ui.button("Default View").clicked() {
+        if menu_item(app, ui, "Default View") {
             viewport::default_view(&mut app.s, &cam);
-            ui.close();
         }
-        if ui.button("Look at Selection").clicked() {
+        if menu_item(app, ui, "Look at Selection") {
             // JS `lookAtSelection` unions the selected objects' bounding boxes, not components
             let b = viewport::selected_objects_bbox(&app.s);
             if !b.is_empty() {
                 viewport::look_at(&mut app.s, &cam, b.center());
             }
-            ui.close();
         }
-        if ui.add(egui::Button::new("Frame All").shortcut_text("A")).clicked() {
+        let r = ui.add(egui::Button::new("Frame All").shortcut_text("A"));
+        if activated(app, ui, &r) {
             app.active_vp = idx;
             app.action("frameAll");
-            ui.close();
         }
-        if ui.add(egui::Button::new("Frame Selection").shortcut_text("F")).clicked() {
+        let r = ui.add(egui::Button::new("Frame Selection").shortcut_text("F"));
+        if activated(app, ui, &r) {
             app.active_vp = idx;
             app.action("frameSelected");
-            ui.close();
         }
         ui.separator();
         ui.menu_button("Camera Settings", |ui| {
-            let v = &mut app.vps[idx];
-            if check(ui, v.res_gate, "Resolution Gate").clicked() {
-                v.res_gate = !v.res_gate;
-                v.film_gate = false;
+            if menu_check(app, ui, app.vps[idx].res_gate, "Resolution Gate") {
+                app.vps[idx].res_gate = !app.vps[idx].res_gate;
+                app.vps[idx].film_gate = false;
             }
-            if check(ui, v.film_gate, "Film Gate").clicked() {
-                v.film_gate = !v.film_gate;
-                v.res_gate = false;
+            if menu_check(app, ui, app.vps[idx].film_gate, "Film Gate") {
+                app.vps[idx].film_gate = !app.vps[idx].film_gate;
+                app.vps[idx].res_gate = false;
             }
-            if check(ui, app.prefs.ortho_tumble, "Orthographic Tumble").clicked() {
+            if menu_check(app, ui, app.prefs.ortho_tumble, "Orthographic Tumble") {
                 app.prefs.ortho_tumble = !app.prefs.ortho_tumble;
             }
         });
-        if ui.button("Camera Attribute Editor...").clicked() {
+        if menu_item(app, ui, "Camera Attribute Editor...") {
             select_camera(app, idx);
             app.action("attributeEditor");
-            ui.close();
         }
         ui.separator();
         ui.menu_button("Predefined Bookmarks", |ui| {
             for (l, t, r) in BOOKMARKS {
-                if ui.button(*l).clicked() {
+                if menu_item(app, ui, l) {
                     let ortho = viewport::camera_id(&app.s, &cam).and_then(|id| app.s.node(&id)).is_some_and(|n| matches!(&n.shape, Shape::Camera(c) if c.ortho));
                     if !ortho {
                         viewport::set_view(&mut app.s, &cam, *t, *r, Some((t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()));
                     }
-                    ui.close();
                 }
             }
         });
-    });
-    let mut backface = app.backface;
-    ui.menu_button(small("Shading"), |ui| {
-        let v = &mut app.vps[idx];
-        ui.radio_value(&mut v.shade, ShadeMode::Wire, "Wireframe  4");
-        ui.radio_value(&mut v.shade, ShadeMode::Shaded, "Smooth Shade All  5");
+        }
+        "Shading" => {
+        let mut backface = app.backface;
+        if menu_radio(app, ui, app.vps[idx].shade == ShadeMode::Wire, "Wireframe  4") {
+            app.vps[idx].shade = ShadeMode::Wire;
+        }
+        if menu_radio(app, ui, app.vps[idx].shade == ShadeMode::Shaded, "Smooth Shade All  5") {
+            app.vps[idx].shade = ShadeMode::Shaded;
+        }
         // JS "Bounding Box" also switches to wireframe in this release
-        if ui.selectable_label(false, "Bounding Box").clicked() {
-            v.shade = ShadeMode::Wire;
+        if menu_selectable(app, ui, false, "Bounding Box") {
+            app.vps[idx].shade = ShadeMode::Wire;
         }
         ui.separator();
-        ui.checkbox(&mut v.wire_on_shaded, "Wireframe on Shaded");
-        ui.checkbox(&mut v.xray, "X-Ray  Alt+A");
-        ui.checkbox(&mut backface, "Backface Culling");
-        ui.separator();
-        let mut tex = v.shade == ShadeMode::Textured;
-        if ui.checkbox(&mut tex, "Hardware Texturing  6").clicked() {
-            v.shade = if tex { ShadeMode::Textured } else { ShadeMode::Shaded };
+        if menu_check(app, ui, app.vps[idx].wire_on_shaded, "Wireframe on Shaded") {
+            app.vps[idx].wire_on_shaded = !app.vps[idx].wire_on_shaded;
         }
-    });
-    if backface != app.backface {
-        app.set_backface(backface);
-    }
-    ui.menu_button(small("Lighting"), |ui| {
-        let v = &mut app.vps[idx];
-        ui.radio_value(&mut v.lights, LightMode::Default, "Use Default Lighting");
-        ui.radio_value(&mut v.lights, LightMode::All, "Use All Lights  7");
-        ui.radio_value(&mut v.lights, LightMode::Flat, "Use Flat Lighting");
-        ui.radio_value(&mut v.lights, LightMode::None, "Use No Lights");
+        if menu_check(app, ui, app.vps[idx].xray, "X-Ray  Alt+A") {
+            app.vps[idx].xray = !app.vps[idx].xray;
+        }
+        if menu_check(app, ui, backface, "Backface Culling") {
+            backface = !backface;
+        }
         ui.separator();
-        ui.checkbox(&mut v.shadows, "Shadows");
-        if v.shadows && v.lights != LightMode::All {
+        let tex = app.vps[idx].shade == ShadeMode::Textured;
+        if menu_check(app, ui, tex, "Hardware Texturing  6") {
+            app.vps[idx].shade = if !tex { ShadeMode::Textured } else { ShadeMode::Shaded };
+        }
+        if backface != app.backface {
+            app.set_backface(backface);
+        }
+        }
+        "Lighting" => {
+        if menu_radio(app, ui, app.vps[idx].lights == LightMode::Default, "Use Default Lighting") {
+            app.vps[idx].lights = LightMode::Default;
+        }
+        if menu_radio(app, ui, app.vps[idx].lights == LightMode::All, "Use All Lights  7") {
+            app.vps[idx].lights = LightMode::All;
+        }
+        if menu_radio(app, ui, app.vps[idx].lights == LightMode::Flat, "Use Flat Lighting") {
+            app.vps[idx].lights = LightMode::Flat;
+        }
+        if menu_radio(app, ui, app.vps[idx].lights == LightMode::None, "Use No Lights") {
+            app.vps[idx].lights = LightMode::None;
+        }
+        ui.separator();
+        if menu_check(app, ui, app.vps[idx].shadows, "Shadows") {
+            app.vps[idx].shadows = !app.vps[idx].shadows;
+        }
+        if app.vps[idx].shadows && app.vps[idx].lights != LightMode::All {
             ui.label(egui::RichText::new("Shadows need \"Use All Lights\" (7)").color(theme::TEXT_DIM));
         }
-    });
-    ui.menu_button(small("Show"), |ui| {
+        }
+        "Show" => {
         ui.menu_button("Isolate Select", |ui| {
-            if check(ui, app.vps[idx].isolate.is_some(), "View Selected").clicked() {
+            if menu_check(app, ui, app.vps[idx].isolate.is_some(), "View Selected") {
                 app.active_vp = idx;
                 app.action("isolateSelect");
-                ui.close();
             }
-            if ui.button("Add Selected Objects").clicked() {
+            if menu_item(app, ui, "Add Selected Objects") {
                 let sel = app.s.sel.clone();
                 let iso = app.vps[idx].isolate.get_or_insert_with(Vec::new);
                 for id in sel {
@@ -372,101 +384,114 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
                         iso.push(id);
                     }
                 }
-                ui.close();
             }
-            if ui.button("Remove Selected Objects").clicked() {
+            if menu_item(app, ui, "Remove Selected Objects") {
                 let sel = app.s.sel.clone();
                 if let Some(iso) = app.vps[idx].isolate.as_mut() {
                     iso.retain(|i| !sel.contains(i));
                 }
-                ui.close();
             }
         });
         ui.separator();
-        let v = &mut app.vps[idx];
-        if ui.button("All").clicked() {
+        if menu_item(app, ui, "All") {
+            let v = &mut app.vps[idx];
             v.show_all(true);
             v.hud = true;
             v.show_manips = true;
         }
-        if ui.button("None").clicked() {
-            v.show_all(false);
+        if menu_item(app, ui, "None") {
+            app.vps[idx].show_all(false);
         }
         ui.separator();
-        ui.checkbox(&mut v.show_curves, "NURBS Curves");
-        ui.checkbox(&mut v.show_nurbs, "NURBS Surfaces");
-        ui.checkbox(&mut v.show_meshes, "Polygons");
-        ui.checkbox(&mut v.show_lights, "Lights");
-        ui.checkbox(&mut v.show_cameras, "Cameras");
-        ui.checkbox(&mut v.show_locators, "Locators");
+        if menu_check(app, ui, app.vps[idx].show_curves, "NURBS Curves") {
+            app.vps[idx].show_curves = !app.vps[idx].show_curves;
+        }
+        if menu_check(app, ui, app.vps[idx].show_nurbs, "NURBS Surfaces") {
+            app.vps[idx].show_nurbs = !app.vps[idx].show_nurbs;
+        }
+        if menu_check(app, ui, app.vps[idx].show_meshes, "Polygons") {
+            app.vps[idx].show_meshes = !app.vps[idx].show_meshes;
+        }
+        if menu_check(app, ui, app.vps[idx].show_lights, "Lights") {
+            app.vps[idx].show_lights = !app.vps[idx].show_lights;
+        }
+        if menu_check(app, ui, app.vps[idx].show_cameras, "Cameras") {
+            app.vps[idx].show_cameras = !app.vps[idx].show_cameras;
+        }
+        if menu_check(app, ui, app.vps[idx].show_locators, "Locators") {
+            app.vps[idx].show_locators = !app.vps[idx].show_locators;
+        }
         ui.separator();
-        ui.checkbox(&mut v.grid, "Grid");
-        ui.checkbox(&mut v.show_manips, "Manipulators");
-        ui.checkbox(&mut v.show_sel_highlight, "Selection Highlighting");
-        ui.checkbox(&mut v.hud, "HUD");
-    });
-    ui.menu_button(small("Renderer"), |ui| {
-        check(ui, true, "Viewport 2.0 (Inca wgpu)");
-        if ui.button("   Inca Path Tracer (Render View)").clicked() {
+        if menu_check(app, ui, app.vps[idx].grid, "Grid") {
+            app.vps[idx].grid = !app.vps[idx].grid;
+        }
+        if menu_check(app, ui, app.vps[idx].show_manips, "Manipulators") {
+            app.vps[idx].show_manips = !app.vps[idx].show_manips;
+        }
+        if menu_check(app, ui, app.vps[idx].show_sel_highlight, "Selection Highlighting") {
+            app.vps[idx].show_sel_highlight = !app.vps[idx].show_sel_highlight;
+        }
+        if menu_check(app, ui, app.vps[idx].hud, "HUD") {
+            app.vps[idx].hud = !app.vps[idx].hud;
+        }
+        }
+        "Renderer" => {
+        let _ = menu_radio(app, ui, true, "Viewport 2.0 (Inca wgpu)");
+        if menu_item(app, ui, "   Inca Path Tracer (Render View)") {
             app.action("renderView");
-            ui.close();
         }
-    });
-    ui.menu_button(small("Panels"), |ui| {
+        }
+        "Panels" => {
         let cams: Vec<(String, bool)> = app.s.all_dag(true).into_iter().filter_map(|id| app.s.node(&id)).filter_map(|n| match &n.shape {
             Shape::Camera(c) => Some((n.name.clone(), c.ortho)),
             _ => None,
         }).collect();
         ui.menu_button("Perspective", |ui| {
             for (c, _) in cams.iter().filter(|c| !c.1) {
-                if check(ui, app.vps[idx].camera == *c, c).clicked() {
+                if menu_check(app, ui, app.vps[idx].camera == *c, c) {
                     app.vps[idx].camera = c.clone();
-                    ui.close();
                 }
             }
             ui.separator();
-            if ui.button("New").clicked() {
+            if menu_item(app, ui, "New") {
                 let before: HashSet<String> = app.s.nodes.keys().cloned().collect();
                 app.action("createCamera");
                 if let Some(n) = app.s.nodes.values().find(|n| !before.contains(&n.id) && matches!(n.shape, Shape::Camera(_))) {
                     app.vps[idx].camera = n.name.clone();
                 }
-                ui.close();
             }
         });
         ui.menu_button("Orthographic", |ui| {
             for (c, _) in cams.iter().filter(|c| c.1) {
-                if check(ui, app.vps[idx].camera == *c, c).clicked() {
+                if menu_check(app, ui, app.vps[idx].camera == *c, c) {
                     app.vps[idx].camera = c.clone();
-                    ui.close();
                 }
             }
         });
-        if ui.button("Look Through Selected").clicked() {
+        if menu_item(app, ui, "Look Through Selected") {
             match app.s.sel.iter().find(|i| matches!(app.s.node(i).map(|n| &n.shape), Some(Shape::Camera(_)))).cloned() {
                 Some(c) => app.vps[idx].camera = app.s.name_of(&c),
                 None => app.last_result = "Warning: Select a camera".into(),
             }
-            ui.close();
         }
         ui.separator();
         ui.menu_button("Panel", |ui| {
             for (l, a) in [("Outliner", "outlinerWindow"), ("Graph Editor", "graphEditor"), ("Dope Sheet", "dopeSheet"), ("Hypershade", "hypershade"), ("Hypergraph Hierarchy", "hypergraph"), ("Render View", "renderView")] {
-                if ui.button(l).clicked() {
+                if menu_item(app, ui, l) {
                     app.action(a);
-                    ui.close();
                 }
             }
         });
         ui.menu_button("Layouts", |ui| {
             for (l, lay) in [("Single Pane", Layout::Single), ("Two Panes Side by Side", Layout::TwoSide), ("Two Panes Stacked", Layout::TwoStack), ("Three Panes Split Left", Layout::Three), ("Four Panes", Layout::Four)] {
-                if check(ui, app.layout == lay, l).clicked() {
+                if menu_check(app, ui, app.layout == lay, l) {
                     app.active_vp = idx;
                     app.layout = lay;
-                    ui.close();
                 }
             }
         });
+        }
+        _ => {}
     });
 }
 
