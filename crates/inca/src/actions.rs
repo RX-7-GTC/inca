@@ -190,6 +190,7 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("untemplateAll", "Untemplate All", ""),
     ("toggleNormals", "Face Normals", ""),
     ("toggleBorderEdges", "Border Edges", ""),
+    ("faceCenters", "Face Centers", ""),
     ("frameSelectedAll", "Frame Selection in All Views", "Shift+F"),
     ("frameAllAll", "Frame All in All Views", "Shift+A"),
     ("hudPolyCount", "Poly Count", ""),
@@ -927,6 +928,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "toggleGrid" => app.vps[vp].grid = !app.vps[vp].grid,
         "toggleHud" => app.vps[vp].hud = !app.vps[vp].hud,
         "toggleWireOnShaded" => app.vps[vp].wire_on_shaded = !app.vps[vp].wire_on_shaded,
+        "faceCenters" => app.vps[vp].face_centers = !app.vps[vp].face_centers,
         "toggleXray" => app.vps[vp].xray = !app.vps[vp].xray,
         "toggleShadows" => {
             app.vps[vp].shadows = !app.vps[vp].shadows;

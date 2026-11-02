@@ -171,6 +171,8 @@ pub enum Geo {
     MeshWire(String),
     /// cached component dots by key
     MeshPoints(String),
+    /// cached face-centre dots by key (Display > Polygons > Face Centers)
+    MeshFacePoints(String),
     /// cached selected-edge overlay by key
     CompLines(String),
     /// cached selected-face overlay by key
@@ -205,6 +207,10 @@ pub struct GpuMesh {
     points: Option<wgpu::Buffer>,
     point_count: u32,
     points_key: Option<u64>,
+    /// face-centre dots (Display > Polygons > Face Centers), separate from component dots
+    face_points: Option<wgpu::Buffer>,
+    face_point_count: u32,
+    face_points_key: Option<u64>,
     /// selected-edge overlay (object space), cached by selection key
     comp_lines: Option<wgpu::Buffer>,
     comp_line_count: u32,
@@ -226,6 +232,9 @@ impl Default for GpuMesh {
             points: None,
             point_count: 0,
             points_key: None,
+            face_points: None,
+            face_point_count: 0,
+            face_points_key: None,
             comp_lines: None,
             comp_line_count: 0,
             comp_line_key: None,
@@ -703,6 +712,10 @@ impl Gpu {
         self.meshes.get(name).and_then(|m| m.points_key)
     }
 
+    pub fn face_point_key(&self, name: &str) -> Option<u64> {
+        self.meshes.get(name).and_then(|m| m.face_points_key)
+    }
+
     pub fn comp_line_key(&self, name: &str) -> Option<u64> {
         self.meshes.get(name).and_then(|m| m.comp_line_key)
     }
@@ -724,6 +737,15 @@ impl Gpu {
         m.points = buf;
         m.point_count = points.len() as u32;
         m.points_key = Some(key);
+    }
+
+    /// Upload the face-centre dots; skipped while `key` is unchanged.
+    pub fn upload_face_points(&mut self, name: &str, key: u64, points: &[PointVertex]) {
+        let buf = self.vbuf(bytemuck::cast_slice(points));
+        let m = self.meshes.entry(name.to_string()).or_default();
+        m.face_points = buf;
+        m.face_point_count = points.len() as u32;
+        m.face_points_key = Some(key);
     }
 
     /// Upload the selected-edge overlay; skipped while `key` is unchanged.
@@ -1000,6 +1022,10 @@ impl Gpu {
                         },
                         Geo::MeshPoints(k) => match self.meshes.get(k) {
                             Some(GpuMesh { points: Some(b), point_count, .. }) => (b, 0, *point_count),
+                            _ => continue,
+                        },
+                        Geo::MeshFacePoints(k) => match self.meshes.get(k) {
+                            Some(GpuMesh { face_points: Some(b), face_point_count, .. }) => (b, 0, *face_point_count),
                             _ => continue,
                         },
                         Geo::CompLines(k) => match self.meshes.get(k) {

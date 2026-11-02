@@ -50,6 +50,8 @@ pub struct Viewport {
     /// JS `opts.shadows`: depth-map shadows, only with Use All Lights
     pub shadows: bool,
     pub wire_on_shaded: bool,
+    /// Display > Polygons > Face Centers (Maya default: off)
+    pub face_centers: bool,
     pub xray: bool,
     pub backface: bool,
     pub grid: bool,
@@ -106,6 +108,7 @@ impl Viewport {
             lights: LightMode::Default,
             shadows: false,
             wire_on_shaded: false,
+            face_centers: false,
             xray: false,
             backface: false,
             grid: true,
@@ -884,6 +887,25 @@ fn points_key(s: &Scene, id: &str, mode: CompMode, soft: Option<(f64, bool)>) ->
     h.finish()
 }
 
+/// Cache key for the Display > Polygons > Face Centers dots. Selected faces only change the
+/// colour in face component mode, so the component mode is part of the key along with the
+/// geometry revision and, in face mode, the face selection.
+fn face_centers_key(s: &Scene, id: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    if let Some(n) = s.node(id) {
+        n.rev.hash(&mut h);
+    }
+    s.comp_mode.hash(&mut h);
+    if s.comp_mode == Some(CompMode::Face) {
+        let cs = s.comp_sel(id);
+        cs.f.len().hash(&mut h);
+        for f in &cs.f {
+            f.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 /// One dot per vertex face corner, coloured like the JS overlay (selected, soft falloff,
 /// plain). Duplicating the dot per adjacent face normal lets backface culling hide a dot
 /// only when every adjacent face is turned away, which one dot per vertex cannot express.
@@ -923,7 +945,9 @@ fn component_points(s: &Scene, id: &str, soft: Option<(f64, bool)>, mesh_cache: 
 /// One dot per face centre, as the JS face-mode overlay: selected faces orange, the rest blue.
 /// The face normal lets the shader cull dots of back-facing faces.
 fn face_center_points(s: &Scene, id: &str, geo: &FaceGeo) -> Vec<PointVertex> {
-    let cs = s.comp_sel(id);
+    // only highlight selected faces while face components are being edited; the stored
+    // component sets survive object mode, but the dots are plain then
+    let cs = if s.comp_mode == Some(CompMode::Face) { s.comp_sel(id) } else { Default::default() };
     let mut pts = Vec::with_capacity(geo.centers.len());
     for (fi, (&c, &n)) in geo.centers.iter().zip(&geo.normals).enumerate() {
         let color = if cs.f.contains(&fi) {
@@ -1199,6 +1223,19 @@ pub fn build_draws(
                         u: DrawUniform::new(wm).tint([c[0], c[1], c[2]], 1.0).cull_wire(vp.backface),
                     });
                 }
+                // Display > Polygons > Face Centers (off by default, like Maya). The dots are
+                // independent of component mode and use their own buffer so face mode and
+                // vertex mode can both be displayed.
+                if vp.face_centers && !vp.beauty && !template && !m.nurbs {
+                    if let Some(geo) = mesh_cache.faces(s, &id) {
+                        let key = face_centers_key(s, &id);
+                        if g.face_point_key(&id) != Some(key) {
+                            let pts = face_center_points(s, &id, &geo);
+                            g.upload_face_points(&id, key, &pts);
+                        }
+                        draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshFacePoints(id.clone()), u: DrawUniform::new(wm).point_size(2.0).cull_wire(vp.backface) });
+                    }
+                }
                 if in_comp {
                     match s.comp_mode {
                         Some(CompMode::Vertex) => {
@@ -1210,17 +1247,6 @@ pub fn build_draws(
                                 g.upload_points(&id, key, &pts);
                             }
                             draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(3.0).cull_wire(vp.backface) });
-                        }
-                        Some(CompMode::Face) => {
-                            // the JS face mode shows a dot on every face centre, not just the selection
-                            if let Some(geo) = mesh_cache.faces(s, &id) {
-                                let key = points_key(s, &id, CompMode::Face, soft);
-                                if g.point_key(&id) != Some(key) {
-                                    let pts = face_center_points(s, &id, &geo);
-                                    g.upload_points(&id, key, &pts);
-                                }
-                                draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(2.0).cull_wire(vp.backface) });
-                            }
                         }
                         _ => {}
                     }
@@ -2767,8 +2793,12 @@ mod tests {
             // face normals drive the shader's backface culling of the dots
             assert!(p.normal.iter().any(|x| *x != 0.0));
         }
-        // selecting a face turns only its dot orange
+        // selecting a face turns only its dot orange while face components are shown
         s.comp.entry(id.clone()).or_default().f.insert(0);
+        // the component set survives object mode, but the dots stay plain there
+        let pts = face_center_points(&s, &id, &geo);
+        assert_eq!(pts[0].color, [C_DOT[0], C_DOT[1], C_DOT[2], 1.0]);
+        s.comp_mode = Some(CompMode::Face);
         let pts = face_center_points(&s, &id, &geo);
         assert_eq!(pts[0].color, [C_FACE_SEL[0], C_FACE_SEL[1], C_FACE_SEL[2], 1.0]);
         assert_eq!(pts[1].color, [C_DOT[0], C_DOT[1], C_DOT[2], 1.0]);
