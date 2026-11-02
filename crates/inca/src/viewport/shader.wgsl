@@ -16,6 +16,7 @@ struct Frame {
     bg_bottom: vec4<f32>,
     mode: vec4<f32>,     // x lighting (0 default, 1 all lights, 2 flat, 3 none), y light count, z xray, w backface culling
     post: vec4<f32>,     // x exposure (stops), y gamma
+    render: vec4<f32>,   // x tone mapping (0 none, 1 ACES, 2 AgX, 3 Neutral, 4 Linear), y transparent bg
     sky: vec4<f32>,      // x sky present, y show background, z tan(fov_y/2), w aspect
     sky_col: vec4<f32>,  // sky dome colour (rgb), intensity (a)
     lights: array<Light, 8>,
@@ -94,6 +95,10 @@ fn sky_irradiance(n: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
+    // Render Settings > Transparent Background: leave the clear alpha at zero
+    if (frame.render.y > 0.5) {
+        return vec4(0.0);
+    }
     if (frame.sky.x > 0.5 && frame.sky.y > 0.5) {
         var dir = frame.cam_dir.xyz;
         if (frame.cam_pos.w < 0.5) {
@@ -102,7 +107,8 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
             dir = normalize(dir + right * i.ndc.x * frame.sky.z * frame.sky.w + up * i.ndc.y * frame.sky.z);
         }
         var c = sky_radiance(dir) * frame.sky_col.rgb;
-        c = pow(max(c * exp2(frame.post.x), vec3(0.0)), vec3(1.0 / frame.post.y));
+        c = tone_map(max(c * exp2(frame.post.x), vec3(0.0)));
+        c = pow(max(c, vec3(0.0)), vec3(1.0 / frame.post.y));
         return vec4(linear_to_srgb(c), 1.0);
     }
     return vec4(mix(frame.bg_bottom.rgb, frame.bg_top.rgb, clamp(i.t, 0.0, 1.0)), 1.0);
@@ -132,6 +138,8 @@ struct MeshIn {
     @location(3) uv: vec2<f32>,
     /// x = texture layer (-1 = none), y = scalar tint
     @location(4) tex: vec2<f32>,
+    /// additive emissive colour (JS `emissive` / `incandescence`)
+    @location(5) emission: vec3<f32>,
 };
 struct MeshOut {
     @builtin(position) clip: vec4<f32>,
@@ -140,6 +148,7 @@ struct MeshOut {
     @location(2) color: vec3<f32>,
     @location(3) uv: vec2<f32>,
     @location(4) tex: vec2<f32>,
+    @location(5) emission: vec3<f32>,
 };
 
 @vertex
@@ -152,6 +161,7 @@ fn vs_mesh(v: MeshIn) -> MeshOut {
     o.color = v.color;
     o.uv = v.uv;
     o.tex = v.tex;
+    o.emission = v.emission;
     return o;
 }
 
@@ -159,6 +169,67 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     let lo = c * 12.92;
     let hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
     return select(hi, lo, c <= vec3(0.0031308));
+}
+
+// ---------------------------------------------------------------- tone mapping
+// The five mappings exposed by Render Settings (three.js `ACESFilmicToneMapping`,
+// `AgXToneMapping`, `NeutralToneMapping`, `LinearToneMapping`, `NoToneMapping`).
+fn tone_aces(x: vec3<f32>) -> vec3<f32> {
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3(0.0), vec3(1.0));
+}
+
+fn tone_agx(c: vec3<f32>) -> vec3<f32> {
+    // inset (columns as in the three.js mat3 constructor)
+    var color = vec3<f32>(
+        dot(c, vec3<f32>(0.856627153315983, 0.137318972929847, 0.11189821299995)),
+        dot(c, vec3<f32>(0.0951212405381588, 0.761241990602591, 0.0767994186031903)),
+        dot(c, vec3<f32>(0.0482516061458583, 0.101439036467562, 0.811302368396859)),
+    );
+    color = max(color, vec3(1e-10));
+    color = log2(color);
+    color = clamp((color + 12.47393) / (4.026069 + 12.47393), vec3(0.0), vec3(1.0));
+    // AgXDefaultContrastApprox
+    let x2 = color * color;
+    let x4 = x2 * x2;
+    color = 15.5 * x4 * x2 - 40.14 * x4 * color + 31.96 * x4 - 6.868 * x2 * color + 0.4298 * x2 + 0.1191 * color - 0.00232;
+    // outset
+    color = vec3<f32>(
+        dot(color, vec3<f32>(1.1271005818144368, -0.11060664309660323, -0.016493938717834573)),
+        dot(color, vec3<f32>(-0.1413297634984383, 1.157823702216272, -0.016493938717834257)),
+        dot(color, vec3<f32>(-0.14132976349843826, -0.11060664309660294, 1.2519364065950405)),
+    );
+    return pow(max(color, vec3(0.0)), vec3(2.2));
+}
+
+fn tone_neutral(c0: vec3<f32>) -> vec3<f32> {
+    let start = 0.8 - 0.04;
+    let desat = 0.15;
+    let x = min(min(c0.r, c0.g), c0.b);
+    let offset = select(0.04, x - 6.25 * x * x, x < 0.08);
+    var c = c0 - offset;
+    let peak = max(max(c.r, c.g), c.b);
+    if (peak < start) {
+        return c;
+    }
+    let d = 1.0 - start;
+    let new_peak = 1.0 - d * d / (peak + d - start);
+    c = c * new_peak / peak;
+    let g = 1.0 - 1.0 / (desat * (peak - new_peak) + 1.0);
+    return c * (1.0 - g) + new_peak * g;
+}
+
+fn tone_map(c: vec3<f32>) -> vec3<f32> {
+    let m = frame.render.x;
+    if (m < 0.5) {
+        return c;
+    } else if (m < 1.5) {
+        return tone_aces(c);
+    } else if (m < 2.5) {
+        return tone_agx(c);
+    } else if (m < 3.5) {
+        return tone_neutral(c);
+    }
+    return c;
 }
 
 // three.js PCFShadowMap: a small comparison-filtered kernel scaled by `shadow.radius`.
@@ -333,9 +404,11 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
     var c = base;
     if (draw.params.x < 0.5) {
         // lit surfaces: material colours are linear and the result is gamma-encoded once, as in the
-        // JS (three.js sRGB output); the egui texture path shows these values as they are
-        c = shade(i.normal, i.world, base, front);
-        c = pow(max(c * exp2(frame.post.x), vec3(0.0)), vec3(1.0 / frame.post.y));
+        // JS (three.js sRGB output); the egui texture path shows these values as they are.
+        // Emissive is additive and unlit, like three.js `totalEmissiveRadiance`.
+        c = shade(i.normal, i.world, base, front) + i.emission;
+        c = tone_map(max(c * exp2(frame.post.x), vec3(0.0)));
+        c = pow(max(c, vec3(0.0)), vec3(1.0 / frame.post.y));
         c = linear_to_srgb(c);
     } else {
         c = pow(max(c * exp2(frame.post.x), vec3(0.0)), vec3(1.0 / frame.post.y));

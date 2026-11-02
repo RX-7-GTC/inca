@@ -27,11 +27,13 @@ pub struct MeshVertex {
     pub uv: [f32; 2],
     /// x = material texture layer (-1 = none), y = scalar tint multiplied with the sampled colour
     pub tex: [f32; 2],
+    /// additive emissive colour (JS `emissive` / `incandescence`), applied after lighting
+    pub emission: [f32; 3],
 }
 
 impl Default for MeshVertex {
     fn default() -> Self {
-        MeshVertex { pos: [0.0; 3], normal: [0.0; 3], color: [0.0; 3], uv: [0.0; 2], tex: [-1.0, 1.0] }
+        MeshVertex { pos: [0.0; 3], normal: [0.0; 3], color: [0.0; 3], uv: [0.0; 2], tex: [-1.0, 1.0], emission: [0.0; 3] }
     }
 }
 
@@ -77,6 +79,8 @@ pub struct FrameUniform {
     pub bg_bottom: [f32; 4],
     pub mode: [f32; 4],
     pub post: [f32; 4],
+    /// x = tone mapping (0 none, 1 ACES, 2 AgX, 3 Neutral, 4 Linear), y = transparent background
+    pub render: [f32; 4],
     /// x = sky present (All lighting), y = show background, z = tan(fov_y/2), w = aspect
     pub sky: [f32; 4],
     /// sky dome colour (rgb) and intensity (a)
@@ -493,7 +497,7 @@ impl Gpu {
             cache: None,
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl), Some(&tex_bgl), Some(&shadow_bgl)], immediate_size: 0 });
-        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2];
+        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2, 5 => Float32x3];
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
         let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };
@@ -944,6 +948,8 @@ impl Gpu {
         let tri_buf = self.vbuf(bytemuck::cast_slice(&ttris));
         let line_buf = self.vbuf(bytemuck::cast_slice(&tlines));
         let shadow_faces = self.prepare_shadow_faces(frame);
+        // transparent renders keep a zero clear alpha so the saved PNG shows the background
+        let clear = if frame.render[1] > 0.5 { wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } } else { wgpu::Color::BLACK };
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
         for (layer, _) in &shadow_faces {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -981,7 +987,7 @@ impl Gpu {
                     view: &t.msaa_view,
                     depth_slice: None,
                     resolve_target: Some(&t.color_view),
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Discard },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth_view,

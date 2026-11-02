@@ -657,9 +657,21 @@ fn dope_sheet(app: &mut IncaApp, ui: &mut egui::Ui) {
 // ------------------------------------------------------------------ rendering
 
 fn render_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
+    let d = inca_core::render::RenderSettings::default();
     let r = &mut app.s.render;
     let get = |k: &str, d: f64| r.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
-    let (mut w, mut h, mut spp, mut b, mut ex) = (get("width", 640.0), get("height", 480.0), get("samples", 64.0), get("bounces", 4.0), get("exposure", 0.0));
+    let gets = |k: &str, d: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or(d).to_string();
+    let getb = |k: &str, d: bool| r.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
+    let (mut w, mut h, mut spp, mut b, mut ex) = (get("width", d.width as f64), get("height", d.height as f64), get("samples", d.samples as f64), get("bounces", d.bounces as f64), get("exposure", d.exposure as f64));
+    let mut pixel_aspect = get("pixelAspect", d.pixel_aspect as f64);
+    let mut tone = gets("toneMapping", "aces");
+    let mut hw_tone = gets("hwToneMapping", &tone);
+    let mut bg: [f32; 3] = r.get("background").and_then(|v| v.as_array()).map(|a| [a.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32, a.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32, a.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32]).unwrap_or(d.background);
+    let mut transparent = getb("transparentBg", d.transparent);
+    let mut hw_aa = gets("hwAA", "high");
+    let mut all_shadows = getb("hwAllShadows", d.hw_all_shadows);
+    let mut format = gets("format", "png");
+    let mut jpg_quality = get("jpgQuality", 0.92);
     let cams: Vec<String> = app.s.nodes.values().filter(|n| matches!(n.shape, inca_core::scene::Shape::Camera(_))).map(|n| n.name.clone()).collect();
     let r = &mut app.s.render;
     let mut renderer = r.get("renderer").and_then(|v| v.as_str()).unwrap_or("path").to_string();
@@ -700,10 +712,12 @@ fn render_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
         r.insert(k.into(), json!(v));
     }
     ui.separator();
+    const TONES: [(&str, &str); 5] = [("aces", "ACES Filmic"), ("agx", "AgX"), ("neutral", "Khronos Neutral"), ("linear", "Linear"), ("none", "None")];
+    const AA: [(&str, &str); 5] = [("off", "Off"), ("low", "Low"), ("medium", "Medium"), ("high", "High"), ("ultra", "Ultra")];
     egui::Grid::new("rs").num_columns(2).show(ui, |ui| {
         ui.label("Presets");
         ui.horizontal(|ui| {
-            for (l, pw, ph) in [("320x240", 320.0, 240.0), ("640x480", 640.0, 480.0), ("HD 720", 1280.0, 720.0), ("HD 1080", 1920.0, 1080.0)] {
+            for (l, pw, ph) in [("HD 540", 960.0, 540.0), ("HD 720", 1280.0, 720.0), ("HD 1080", 1920.0, 1080.0), ("640x480", 640.0, 480.0), ("2K Sq", 2048.0, 2048.0), ("4K UHD", 3840.0, 2160.0)] {
                 if ui.small_button(l).clicked() {
                     w = pw;
                     h = ph;
@@ -717,6 +731,9 @@ fn render_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.label("Height");
         ui.add(egui::DragValue::new(&mut h).range(16.0..=8192.0));
         ui.end_row();
+        ui.label("Pixel aspect");
+        ui.add(egui::DragValue::new(&mut pixel_aspect).speed(0.01).range(0.1..=10.0));
+        ui.end_row();
         ui.label("Samples");
         ui.add(egui::DragValue::new(&mut spp).range(1.0..=10000.0));
         ui.end_row();
@@ -726,9 +743,55 @@ fn render_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.label("Exposure");
         ui.add(egui::DragValue::new(&mut ex).speed(0.05).range(-10.0..=10.0));
         ui.end_row();
+        ui.label("Tone mapping");
+        egui::ComboBox::from_id_salt("rsTone").selected_text(TONES.iter().find(|x| x.0 == tone).map(|x| x.1).unwrap_or("ACES Filmic")).show_ui(ui, |ui| {
+            for (k, l) in TONES {
+                ui.selectable_value(&mut tone, k.to_string(), l);
+            }
+        });
+        ui.end_row();
+        ui.label("Hardware tone");
+        egui::ComboBox::from_id_salt("rsHwTone").selected_text(TONES.iter().find(|x| x.0 == hw_tone).map(|x| x.1).unwrap_or("ACES Filmic")).show_ui(ui, |ui| {
+            for (k, l) in TONES {
+                ui.selectable_value(&mut hw_tone, k.to_string(), l);
+            }
+        });
+        ui.end_row();
+        ui.label("Background");
+        ui.color_edit_button_rgb(&mut bg);
+        ui.end_row();
+        ui.label("Transparent background");
+        ui.checkbox(&mut transparent, "");
+        ui.end_row();
+        ui.label("Hardware anti-aliasing");
+        egui::ComboBox::from_id_salt("rsAA").selected_text(AA.iter().find(|x| x.0 == hw_aa).map(|x| x.1).unwrap_or("High")).show_ui(ui, |ui| {
+            for (k, l) in AA {
+                ui.selectable_value(&mut hw_aa, k.to_string(), l);
+            }
+        });
+        ui.end_row();
+        ui.label("All lights cast shadows");
+        ui.checkbox(&mut all_shadows, "");
+        ui.end_row();
+        ui.label("Image format");
+        egui::ComboBox::from_id_salt("rsFmt").selected_text(if format == "jpg" { "JPEG" } else { "PNG" }).show_ui(ui, |ui| {
+            ui.selectable_value(&mut format, "png".to_string(), "PNG");
+            ui.selectable_value(&mut format, "jpg".to_string(), "JPEG");
+        });
+        ui.end_row();
+        ui.label("JPEG quality");
+        ui.add(egui::DragValue::new(&mut jpg_quality).speed(0.01).range(0.01..=1.0));
+        ui.end_row();
     });
-    for (k, v) in [("width", w), ("height", h), ("samples", spp), ("bounces", b), ("exposure", ex)] {
+    for (k, v) in [("width", w), ("height", h), ("samples", spp), ("bounces", b), ("exposure", ex), ("pixelAspect", pixel_aspect), ("jpgQuality", jpg_quality)] {
         r.insert(k.into(), json!(v));
     }
+    r.insert("toneMapping".into(), json!(tone));
+    r.insert("hwToneMapping".into(), json!(hw_tone));
+    r.insert("background".into(), json!(bg));
+    r.insert("transparentBg".into(), json!(transparent));
+    r.insert("hwAA".into(), json!(hw_aa));
+    r.insert("hwAllShadows".into(), json!(all_shadows));
+    r.insert("format".into(), json!(format));
 }
 

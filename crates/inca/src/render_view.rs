@@ -72,11 +72,57 @@ pub fn render(app: &mut IncaApp) {
     app.echo(format!("render -camera {cam}{ipr};"));
 }
 
+fn tone_id(t: inca_core::render::ToneMap) -> f32 {
+    use inca_core::render::ToneMap;
+    match t {
+        ToneMap::None => 0.0,
+        ToneMap::Aces => 1.0,
+        ToneMap::AgX => 2.0,
+        ToneMap::Neutral => 3.0,
+        ToneMap::Linear => 4.0,
+    }
+}
+
+/// Box-filter a supersampled RGBA image down to `size` (JS `copyOut`).
+fn downsample(px: &[u8], src: [u32; 2], size: [u32; 2]) -> Vec<u8> {
+    let (sw, sh) = (src[0].max(1) as usize, src[1].max(1) as usize);
+    let (w, h) = (size[0].max(1) as usize, size[1].max(1) as usize);
+    if sw == w && sh == h {
+        return px.to_vec();
+    }
+    let mut out = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        let y0 = y * sh / h;
+        let y1 = (((y + 1) * sh + h - 1) / h).max(y0 + 1).min(sh);
+        for x in 0..w {
+            let x0 = x * sw / w;
+            let x1 = (((x + 1) * sw + w - 1) / w).max(x0 + 1).min(sw);
+            let mut c = [0u32; 4];
+            let mut n = 0u32;
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let i = (sy * sw + sx) * 4;
+                    for k in 0..4 {
+                        c[k] += px[i + k] as u32;
+                    }
+                    n += 1;
+                }
+            }
+            for k in 0..4 {
+                out.push(((c[k] + n / 2) / n.max(1)) as u8);
+            }
+        }
+    }
+    out
+}
+
 /// Inca Hardware: the viewport rasterizer at render resolution, meshes only.
 fn hardware(app: &mut IncaApp, cam: &str) {
     let mut settings = inca_core::render::RenderSettings::from_scene(&app.s);
     settings.smooth_divisions = app.prefs.smooth_divisions.clamp(1, 4);
     let size = [settings.width.max(1), settings.height.max(1)];
+    // JS renderRaster: ss = min(hwAA, floor(maxTextureSize / max(W, H)))
+    let ss = settings.hw_aa.max(1).min((8192 / size[0].max(size[1])).max(1));
     let Some(gpu) = app.gpu.as_mut() else {
         app.s.msg(inca_core::scene::MsgKind::Warning, "// Warning: the hardware renderer needs a GPU viewport");
         return;
@@ -88,12 +134,26 @@ fn hardware(app: &mut IncaApp, cam: &str) {
     // like Maya: scene lights, or the default light when there are none
     let lit = app.s.nodes.values().any(|n| matches!(n.shape, inca_core::scene::Shape::Light(_)) && app.s.is_visible(&n.id));
     vp.lights = if lit { crate::viewport::LightMode::All } else { crate::viewport::LightMode::Default };
-    // the JS hardware renderer always enables the shadow map; per-light `shadows` decides
+    // the JS hardware renderer always enables the shadow map; hwAllShadows or the
+    // per-light `shadows` flag decides which lights cast
     vp.shadows = true;
+    vp.all_shadows = settings.hw_all_shadows;
     vp.exposure = settings.exposure;
-    let cv = crate::viewport::cam_view(&app.s, cam, [size[0] as f32, size[1] as f32]);
+    // JS makeRenderCamera: aspect = W * pixelAspect / H
+    let aspect_w = size[0] as f32 * settings.pixel_aspect.max(1e-3);
+    let cv = crate::viewport::cam_view(&app.s, cam, [aspect_w, size[1] as f32]);
     let draws = crate::viewport::build_draws(&app.s, &vp, &cv, gpu, &mut app.smooth_cache, &Default::default(), &mut app.mesh_cache, None, app.prefs.smooth_divisions);
     let mut fu = crate::viewport::frame_uniform(&app.s, &vp, &cv, 1);
+    fu.render[0] = tone_id(settings.hw_tone);
+    fu.render[1] = if settings.transparent { 1.0 } else { 0.0 };
+    // the JS hardware renderer uses the configured background colour (not the viewport gradient);
+    // `fs_bg` outputs display values directly, so encode the linear Render Settings colour
+    let srgb = |c: f32| if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    fu.bg_top = [srgb(settings.background[0]), srgb(settings.background[1]), srgb(settings.background[2]), 1.0];
+    fu.bg_bottom = fu.bg_top;
+    if settings.transparent {
+        fu.sky[1] = 0.0;
+    }
     let mut sky_warning = None;
     if fu.sky[0] > 1.5 {
         match crate::viewport::sky_texture_file(&app.s, &vp) {
@@ -108,15 +168,17 @@ fn hardware(app: &mut IncaApp, cam: &str) {
             None => fu.sky[0] = 1.0,
         }
     }
-    let px = gpu.render_offscreen(size, &fu, &draws);
+    let render_size = [size[0] * ss, size[1] * ss];
+    let px = gpu.render_offscreen(render_size, &fu, &draws);
     if let Some(w) = sky_warning {
         app.warn(w);
     }
-    if px.len() != (size[0] * size[1] * 4) as usize {
+    if px.len() != (render_size[0] * render_size[1] * 4) as usize {
         return;
     }
+    let px = downsample(&px, render_size, size);
+    let alpha: Vec<u8> = px.chunks(4).map(|c| c[3]).collect();
     let rs = inca_core::render::RenderScene::build(&app.s, cam, settings);
-    let alpha = rs.coverage();
     let tris = rs.triangle_count();
     app.windows_state.set_image(px, alpha, size, cam, tris);
 }
@@ -226,6 +288,38 @@ fn remove_image(app: &mut IncaApp) {
     rv.dirty = true;
 }
 
+/// JS `extOf` / `format`: `jpg`/`jpeg` write JPEG, everything else PNG.
+fn output_format(app: &IncaApp) -> &'static str {
+    match app.s.render.get("format").and_then(|v| v.as_str()).unwrap_or("png") {
+        "jpg" | "jpeg" => "jpg",
+        _ => "png",
+    }
+}
+
+fn jpg_quality(app: &IncaApp) -> u8 {
+    let q = app.s.render.get("jpgQuality").and_then(|v| v.as_f64()).unwrap_or(0.92);
+    (q.clamp(0.01, 1.0) * 100.0).round() as u8
+}
+
+/// Save RGBA pixels as PNG (alpha preserved) or JPEG (composited over black, like
+/// `canvasBlob` in the JS).
+fn save_pixels(px: &[u8], size: [u32; 2], path: &std::path::Path, fmt: &str, quality: u8) -> Result<(), String> {
+    if fmt == "jpg" {
+        let mut rgb = Vec::with_capacity(px.len() / 4 * 3);
+        for c in px.chunks(4) {
+            let a = c[3] as f32 / 255.0;
+            rgb.push((c[0] as f32 * a + 0.5) as u8);
+            rgb.push((c[1] as f32 * a + 0.5) as u8);
+            rgb.push((c[2] as f32 * a + 0.5) as u8);
+        }
+        let f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(f, quality);
+        enc.encode(&rgb, size[0], size[1], image::ExtendedColorType::Rgb8).map_err(|e| e.to_string())
+    } else {
+        image::save_buffer(path, px, size[0], size[1], image::ColorType::Rgba8).map_err(|e| e.to_string())
+    }
+}
+
 fn save_image(app: &mut IncaApp) {
     let ws = &app.windows_state;
     let (px, size) = match ws.rv.viewing.and_then(|i| ws.rv.kept.get(i)) {
@@ -236,10 +330,12 @@ fn save_image(app: &mut IncaApp) {
         },
     };
     let name = app.s.render.get("filename").and_then(|v| v.as_str()).unwrap_or("image").to_string();
+    let fmt = output_format(app);
     let dir = crate::project::default_dir(app, "images");
     let _ = std::fs::create_dir_all(&dir);
-    if let Some(p) = rfd::FileDialog::new().add_filter("PNG Image", &["png"]).set_directory(&dir).set_file_name(format!("{name}.png")).save_file() {
-        match image::save_buffer(&p, &px, size[0], size[1], image::ColorType::Rgba8) {
+    let filter = if fmt == "jpg" { ("JPEG Image", "jpg") } else { ("PNG Image", "png") };
+    if let Some(p) = rfd::FileDialog::new().add_filter(filter.0, &[filter.1]).set_directory(&dir).set_file_name(format!("{name}.{fmt}")).save_file() {
+        match save_pixels(&px, size, &p, fmt, jpg_quality(app)) {
             Ok(_) => app.last_result = format!("// Result: {}", p.display()),
             Err(e) => app.s.msg(inca_core::scene::MsgKind::Error, format!("// Error: Could not save image: {e}")),
         }
@@ -281,11 +377,13 @@ fn batch_tick(app: &mut IncaApp) {
         if !job_done(app) {
             return;
         }
+        let fmt = output_format(app);
+        let quality = jpg_quality(app);
         let b = app.windows_state.rv.batch.as_mut().unwrap();
         let f = b.frames[b.next];
         if let Some((px, size)) = &app.windows_state.pixels {
-            let p = b.dir.join(format!("{}.{f:04}.png", b.name));
-            if image::save_buffer(&p, px, size[0], size[1], image::ColorType::Rgba8).is_ok() {
+            let p = b.dir.join(format!("{}.{f:04}.{fmt}", b.name));
+            if save_pixels(px, *size, &p, fmt, quality).is_ok() {
                 b.saved += 1;
             }
         }
@@ -468,5 +566,48 @@ pub fn render_view(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.centered_and_justified(|ui| ui.image((t.id(), size * k)));
     } else {
         ui.label(RichText::new(format!("{} — press Render", RENDERERS.iter().find(|r| r.0 == renderer(app)).map(|r| r.1).unwrap_or(""))).color(theme::TEXT_DIM));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downsample_averages_source_blocks() {
+        // 4x2 source: two 2x1 blocks per output pixel
+        let mut px = vec![0u8; 4 * 2 * 4];
+        for x in 0..4 {
+            for y in 0..2 {
+                let i = (y * 4 + x) * 4;
+                px[i] = if x < 2 { 10 } else { 30 };
+                px[i + 1] = 20;
+                px[i + 2] = 40;
+                px[i + 3] = 255;
+            }
+        }
+        let out = downsample(&px, [4, 2], [2, 2]);
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert_eq!(&out[0..4], &[10, 20, 40, 255]);
+        assert_eq!(&out[4..8], &[30, 20, 40, 255]);
+    }
+
+    #[test]
+    fn save_pixels_writes_png_with_alpha_and_jpeg_over_black() {
+        let px = vec![255, 0, 0, 0, 0, 255, 0, 255, 0, 0, 255, 128, 255, 255, 255, 255];
+        let dir = std::env::temp_dir();
+        let png = dir.join(format!("inca_render_test_{}.png", std::process::id()));
+        save_pixels(&px, [2, 2], &png, "png", 92).unwrap();
+        let img = image::open(&png).unwrap().to_rgba8();
+        assert_eq!(img.dimensions(), (2, 2));
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 0]);
+        let jpg = dir.join(format!("inca_render_test_{}.jpg", std::process::id()));
+        save_pixels(&px, [2, 2], &jpg, "jpg", 92).unwrap();
+        let img = image::open(&jpg).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (2, 2));
+        // fully transparent pixels composite over black, not red
+        assert!(img.get_pixel(0, 0).0[0] < 16, "{:?}", img.get_pixel(0, 0));
+        let _ = std::fs::remove_file(png);
+        let _ = std::fs::remove_file(jpg);
     }
 }

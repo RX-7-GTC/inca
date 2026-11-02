@@ -49,6 +49,8 @@ pub struct Viewport {
     pub lights: LightMode,
     /// JS `opts.shadows`: depth-map shadows, only with Use All Lights
     pub shadows: bool,
+    /// hardware renderer: every light casts (JS `hwAllShadows`)
+    pub all_shadows: bool,
     pub wire_on_shaded: bool,
     /// Display > Polygons > Face Centers (Maya default: off)
     pub face_centers: bool,
@@ -107,6 +109,7 @@ impl Viewport {
             shade: ShadeMode::Shaded,
             lights: LightMode::Default,
             shadows: false,
+            all_shadows: false,
             wire_on_shaded: false,
             face_centers: false,
             xray: false,
@@ -421,13 +424,14 @@ pub fn display_mesh(s: &Scene, id: &str, cache: &mut std::collections::HashMap<S
     Some(pm)
 }
 
-pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [f32; 3], tex_of: &dyn Fn(Option<&String>) -> Option<TexRef>) -> (Vec<MeshVertex>, Vec<LineVertex>) {
+pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [f32; 3], tex_of: &dyn Fn(Option<&String>) -> Option<TexRef>, emit_of: &dyn Fn(Option<&String>) -> [f32; 3]) -> (Vec<MeshVertex>, Vec<LineVertex>) {
     let normals = pm.corner_normals();
     let mut tris = Vec::with_capacity(pm.tri_count() * 3);
     for fi in 0..pm.f.len() {
         let f = &pm.f[fi];
         let col = color_of(pm.face_mat(fi));
         let tex = tex_of(pm.face_mat(fi));
+        let emission = emit_of(pm.face_mat(fi));
         for t in pm.triangulate_face(fi) {
             for &c in &t {
                 let uv = pm.face_uv(fi).and_then(|u| u.get(c)).copied().unwrap_or(DVec2::ZERO);
@@ -435,7 +439,7 @@ pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [
                     Some(t) => (t.uv(uv), [t.layer as f32, t.tint]),
                     None => ([uv.x as f32, uv.y as f32], [-1.0, 1.0]),
                 };
-                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col, uv, tex: texv });
+                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col, uv, tex: texv, emission });
             }
         }
     }
@@ -743,16 +747,22 @@ pub fn icon_lines(s: &Scene, id: &str, col: [f32; 4]) -> Vec<LineVertex> {
 
 pub fn mat_color(s: &Scene, mid: &str) -> [f32; 3] {
     match s.mats.get(mid) {
+        // the flat colour (JS `matsU`); Hardware Texturing samples the map in the shader.
+        // Emission is a separate additive vertex attribute, like three.js `emissive`.
+        Some(m) => m.pbr().base,
+        None => [0.4, 0.4, 0.4],
+    }
+}
+
+/// Additive emission of a material (JS `emissive` / `incandescence`).
+pub fn mat_emission(s: &Scene, mid: &str) -> [f32; 3] {
+    match s.mats.get(mid) {
+        // surfaceShader is unlit: its outColor is the vertex base, not an added emission
         Some(m) => {
             let p = m.pbr();
-            // the flat colour (JS `matsU`); Hardware Texturing samples the map in the shader
-            if p.unlit {
-                p.base
-            } else {
-                [p.base[0].max(p.emission[0]), p.base[1].max(p.emission[1]), p.base[2].max(p.emission[2])]
-            }
+            if p.unlit { [0.0; 3] } else { p.emission }
         }
-        None => [0.4, 0.4, 0.4],
+        None => [0.0; 3],
     }
 }
 
@@ -844,6 +854,9 @@ pub fn mesh_key(s: &Scene, id: &str, divisions: u32) -> u64 {
         mats.dedup();
         for mid in mats {
             for c in mat_color(s, mid) {
+                hash_f(&mut h, c);
+            }
+            for c in mat_emission(s, mid) {
                 hash_f(&mut h, c);
             }
             // UV transforms are baked into the vertex buffer, so texture edits rebuild it
@@ -1076,7 +1089,7 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
             let decay = l.attrs.get("decayRate").and_then(|v| v.as_f64()).unwrap_or(0.0);
             // JS `syncLight`: L.castShadow = !!a.shadows, L.shadow.radius = a.shadowRadius || 1;
             // three.js only renders maps while `shadowMap.enabled`, which needs Use All Lights.
-            if shadows_on && l.attrs.get("shadows").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if shadows_on && (vp.all_shadows || l.attrs.get("shadows").and_then(|v| v.as_bool()).unwrap_or(false)) {
                 let radius = l.attrs.get("shadowRadius").and_then(|v| v.as_f64()).unwrap_or(2.0).max(0.0) as f32;
                 let radius = if radius > 0.0 { radius } else { 1.0 };
                 let up = if dir.dot(DVec3::Y).abs() > 0.999 { DVec3::Z } else { DVec3::Y };
@@ -1123,6 +1136,7 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
         bg_bottom,
         mode: [light_mode, count as f32, if vp.xray { 1.0 } else { 0.0 }, if vp.backface { 1.0 } else { 0.0 }],
         post: [vp.exposure, vp.gamma.max(0.05), cv.size[0].max(1.0), cv.size[1].max(1.0)],
+        render: [0.0; 4],
         sky,
         sky_col,
         lights,
@@ -1144,6 +1158,8 @@ pub fn build_draws(
     smooth_divisions: u32,
 ) -> Vec<DrawCmd> {
     let mut draws = vec![];
+    // transparent meshes, sorted back-to-front like three.js's transparent pass
+    let mut blend_draws: Vec<(f32, DrawCmd)> = vec![];
     if vp.grid {
         // drawn first without depth so any geometry (e.g. a ground plane) covers it
         draws.push(DrawCmd { pass: Pass::LinesUnder, geo: Geo::TransientLines(grid_lines(cv, vp.grid_cfg)), u: DrawUniform::new(Mat4::IDENTITY) });
@@ -1177,7 +1193,12 @@ pub fn build_draws(
                 if g.mesh_key(&id) != Some(key) || live.contains(&id) {
                     if let Some(pm) = display_mesh(s, &id, smooth_cache, smooth_divisions) {
                         let texs = mesh_textures(g, s, m);
-                        let (t, mut w) = build_mesh_buffers(&pm, &|fm| mat_color(s, fm.map(|x| x.as_str()).unwrap_or(&m.material)), &|fm| texs.get(fm.map(|x| x.as_str()).unwrap_or(&m.material)).copied().flatten());
+                        let (t, mut w) = build_mesh_buffers(
+                            &pm,
+                            &|fm| mat_color(s, fm.map(|x| x.as_str()).unwrap_or(&m.material)),
+                            &|fm| texs.get(fm.map(|x| x.as_str()).unwrap_or(&m.material)).copied().flatten(),
+                            &|fm| mat_emission(s, fm.map(|x| x.as_str()).unwrap_or(&m.material)),
+                        );
                         // the JS draws the base cage for levels 1 and 3 and the smooth mesh
                         // only for \"cage + smooth\" (level 2)
                         if m.smooth_level == 1 || m.smooth_level == 3 {
@@ -1199,9 +1220,12 @@ pub fn build_draws(
                     }
                     let xray = vp.xray || n.xray;
                     if xray || pbr.opacity < 0.99 {
-                        // JS: opacity = min(material opacity, 0.5), depth write off
-                        let a = if xray { pbr.opacity.min(0.5) } else { pbr.opacity.max(0.1) };
-                        draws.push(DrawCmd { pass: Pass::MeshBlend, geo: Geo::MeshTris(id.clone()), u: u.alpha(a) });
+                        // JS: opacity = min(material opacity, 0.5), depth write off. Unlike the old
+                        // viewport, opacity 0 stays fully transparent (the JS clamps to [0, 1]).
+                        let a = if xray { pbr.opacity.min(0.5) } else { pbr.opacity };
+                        // three.js sorts the transparent pass back-to-front by world position
+                        let wp = DVec3::new(wm.w_axis.x as f64, wm.w_axis.y as f64, wm.w_axis.z as f64);
+                        blend_draws.push(((wp - cv.eye).dot(cv.fwd) as f32, DrawCmd { pass: Pass::MeshBlend, geo: Geo::MeshTris(id.clone()), u: u.alpha(a) }));
                     } else {
                         draws.push(DrawCmd { pass: Pass::Mesh, geo: Geo::MeshTris(id.clone()), u });
                     }
@@ -1213,7 +1237,8 @@ pub fn build_draws(
                     } else if vp.shade == ShadeMode::Wire || selected || template || is_affected {
                         sel_col
                     } else {
-                        [0.0, 0.0, 0.0, 1.0]
+                        // JS `WIRE_MATS.wire` = 0x10106e (wireframe on shaded, unselected)
+                        [0.0627451, 0.0627451, 0.43137255, 1.0]
                     };
                     // wires of back-facing faces are culled in the shader from the cached
                     // per-edge normals (the JS `cullable`), so no per-frame Edge rebuild
@@ -1358,6 +1383,13 @@ pub fn build_draws(
             }
             _ => {}
         }
+    }
+    // back-to-front, like three.js's transparent pass; kept before the selected-face
+    // overlay so an alpha-blended mesh does not dim the orange face highlight
+    blend_draws.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let insert_at = draws.iter().position(|d| d.pass == Pass::MeshBlend).unwrap_or(draws.len());
+    for (i, (_, d)) in blend_draws.into_iter().enumerate() {
+        draws.insert(insert_at + i, d);
     }
     draws
 }
@@ -2500,6 +2532,26 @@ mod tests {
         let fu = frame_uniform(&s, &vp, &cv, 0);
         assert_eq!(fu.shadow_info[0][0], -1.0);
         assert_eq!(fu.shadow_info[1][0], -1.0);
+    }
+
+    #[test]
+    fn emission_is_additive_and_unlit_shaders_stay_flat() {
+        let (mut s, _, _, _) = setup();
+        // standardSurface: base and emission travel separately so the shader can add the
+        // emission after lighting, like three.js `totalEmissiveRadiance`
+        let mid = s.create_material("standardSurface", Some("emissiveMat"));
+        let m = s.mats.get_mut(&mid).unwrap();
+        m.attrs.insert("base".into(), serde_json::json!(1.0));
+        m.attrs.insert("baseColor".into(), serde_json::json!([0.0, 0.0, 1.0]));
+        m.attrs.insert("emission".into(), serde_json::json!(2.0));
+        m.attrs.insert("emissionColor".into(), serde_json::json!([1.0, 0.0, 0.0]));
+        assert_eq!(mat_color(&s, &mid), [0.0, 0.0, 1.0]);
+        assert_eq!(mat_emission(&s, &mid), [2.0, 0.0, 0.0]);
+        // surfaceShader outColor is the unlit base itself, not an added emission
+        let sid = s.create_material("surfaceShader", Some("flatMat"));
+        s.mats.get_mut(&sid).unwrap().attrs.insert("outColor".into(), serde_json::json!([0.25, 0.5, 0.75]));
+        assert_eq!(mat_color(&s, &sid), [0.25, 0.5, 0.75]);
+        assert_eq!(mat_emission(&s, &sid), [0.0; 3]);
     }
 
     #[test]

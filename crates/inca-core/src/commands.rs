@@ -796,11 +796,28 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let (obj, attr) = target.split_once('.').ok_or("setAttr: expected node.attribute")?;
             let vals: Vec<&Val> = a.pos.iter().skip(1).collect();
             if matches!(obj, "defaultResolution" | "defaultRenderGlobals") {
-                // render settings (Render Settings window)
-                let v = match vals.first() {
-                    Some(Val::Str(st)) if st.parse::<f64>().is_err() => json!(st),
-                    Some(v) => v.to_json(),
-                    None => return Err("setAttr: no value".into()),
+                // render settings (Render Settings window); vector attributes such as
+                // `background 0.1 0.2 0.3` arrive as several positional values
+                let v = if a.has(&["type"]) && a.s(&["type"]).as_deref() == Some("string") {
+                    json!(vals.first().map(|v| v.str()).unwrap_or_default())
+                } else if vals.len() >= 3 {
+                    json!([vals[0].num(), vals[1].num(), vals[2].num()])
+                } else {
+                    match vals.first() {
+                        Some(Val::Str(st)) if st.parse::<f64>().is_err() => json!(st),
+                        Some(v) => v.to_json(),
+                        None => return Err("setAttr: no value".into()),
+                    }
+                };
+                // MEL booleans arrive as 1/0; the Render Settings UI and `from_scene`
+                // expect real booleans for the checkbox attributes
+                let v = if matches!(attr, "transparentBg" | "hwAllShadows" | "caustics" | "animation" | "keepRatio" | "autoResize") {
+                    match v.as_f64() {
+                        Some(n) => json!(n != 0.0),
+                        None => v,
+                    }
+                } else {
+                    v
                 };
                 s.render.insert(attr.to_string(), v);
                 return Ok(Val::None);
@@ -2803,6 +2820,17 @@ mod tests {
         let l = s.create_light("directionalLight");
         mel(&mut s, "setAttr directionalLight1.shadows true;").unwrap();
         assert_eq!(s.get_attr(&NodeRef::Dag(l), "shadows"), Some(json!(true)));
+    }
+
+    #[test]
+    fn render_global_set_attr_accepts_vectors() {
+        let mut s = Scene::new();
+        mel(&mut s, "setAttr defaultRenderGlobals.background 0.1 0.2 0.3;").unwrap();
+        assert_eq!(s.render.get("background"), Some(&json!([0.1, 0.2, 0.3])));
+        // scalars and booleans keep their type
+        mel(&mut s, "setAttr defaultRenderGlobals.width 640; setAttr defaultRenderGlobals.transparentBg true;").unwrap();
+        assert_eq!(s.render.get("width"), Some(&json!(640)));
+        assert_eq!(s.render.get("transparentBg"), Some(&json!(true)));
     }
 
     #[test]

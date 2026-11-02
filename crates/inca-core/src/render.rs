@@ -6,6 +6,94 @@ use crate::scene::{Scene, Shape};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+/// JS `TM`: the tone mappings exposed by Render Settings (three.js names).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToneMap {
+    Aces,
+    AgX,
+    Neutral,
+    Linear,
+    None,
+}
+
+impl ToneMap {
+    pub fn from_name(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "agx" => ToneMap::AgX,
+            "neutral" => ToneMap::Neutral,
+            "linear" => ToneMap::Linear,
+            "none" => ToneMap::None,
+            _ => ToneMap::Aces,
+        }
+    }
+    /// three.js `ACESFilmicToneMapping`.
+    fn aces(x: f32) -> f32 {
+        (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
+    }
+    /// three.js `AgXToneMapping` (inset/log/contrast/outset).
+    fn agx(v: [f32; 3]) -> [f32; 3] {
+        // row-major form of the three.js column-major mat3 constants
+        let inset = [[0.856627153315983, 0.0951212405381588, 0.0482516061458583], [0.137318972929847, 0.761241990602591, 0.101439036467562], [0.11189821299995, 0.0767994186031903, 0.811302368396859]];
+        let outset = [[1.1271005818144368, -0.11060664309660323, -0.016493938717834573], [-0.1413297634984383, 1.157823702216272, -0.016493938717834257], [-0.14132976349843826, -0.11060664309660294, 1.2519364065950405]];
+        let mul = |m: [[f32; 3]; 3], c: [f32; 3]| [m[0][0] * c[0] + m[0][1] * c[1] + m[0][2] * c[2], m[1][0] * c[0] + m[1][1] * c[1] + m[1][2] * c[2], m[2][0] * c[0] + m[2][1] * c[1] + m[2][2] * c[2]];
+        let c = mul(inset, v);
+        let c = c.map(|x| {
+            let x = x.max(1e-10).log2();
+            let x = ((x + 12.47393) / (4.026069 + 12.47393)).clamp(0.0, 1.0);
+            // three.js `AgXDefaultContrastApprox`
+            let x2 = x * x;
+            let x4 = x2 * x2;
+            15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232
+        });
+        mul(outset, c).map(|x| x.max(0.0).powf(2.2))
+    }
+    /// Khronos PBR Neutral (`THREE.NeutralToneMapping`).
+    fn neutral(mut c: [f32; 3]) -> [f32; 3] {
+        let start = 0.8 - 0.04;
+        let desat = 0.15;
+        let x = c[0].min(c[1]).min(c[2]);
+        let offset = if x < 0.08 { x - 6.25 * x * x } else { 0.04 };
+        for v in &mut c {
+            *v -= offset;
+        }
+        let peak = c[0].max(c[1]).max(c[2]);
+        if peak < start {
+            return c;
+        }
+        let d = 1.0 - start;
+        let new_peak = 1.0 - d * d / (peak + d - start);
+        for v in &mut c {
+            *v *= new_peak / peak;
+        }
+        let g = 1.0 - 1.0 / (desat * (peak - new_peak) + 1.0);
+        c.map(|v| v * (1.0 - g) + new_peak * g)
+    }
+    pub fn apply(self, c: [f32; 3]) -> [f32; 3] {
+        let c = match self {
+            ToneMap::Aces => c.map(Self::aces),
+            ToneMap::AgX => Self::agx(c),
+            ToneMap::Neutral => Self::neutral(c),
+            ToneMap::Linear | ToneMap::None => c,
+        };
+        c.map(|v| v.clamp(0.0, 1.0))
+    }
+}
+
+impl Default for ToneMap {
+    fn default() -> Self {
+        ToneMap::Aces
+    }
+}
+
+fn aa_scale(name: &str) -> u32 {
+    match name {
+        "off" | "low" => 1,
+        "medium" => 2,
+        "ultra" => 4,
+        _ => 3,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderSettings {
     pub width: u32,
@@ -15,12 +103,70 @@ pub struct RenderSettings {
     pub exposure: f32,
     /// smooth mesh preview subdivision levels (a preference, not a render setting)
     pub smooth_divisions: u32,
+    /// path tracer tone mapping (JS `toneMapping`)
+    pub tone: ToneMap,
+    /// hardware renderer tone mapping (JS `hwToneMapping`, falls back to `toneMapping`)
+    pub hw_tone: ToneMap,
+    pub pixel_aspect: f32,
+    pub background: [f32; 3],
+    pub transparent: bool,
+    /// hardware supersampling factor (JS `hwAA`)
+    pub hw_aa: u32,
+    /// hardware renderer forces every light to cast (JS `hwAllShadows`, default true)
+    pub hw_all_shadows: bool,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        RenderSettings {
+            width: 960,
+            height: 540,
+            samples: 128,
+            bounces: 5,
+            exposure: 0.0,
+            smooth_divisions: 2,
+            tone: ToneMap::Aces,
+            hw_tone: ToneMap::Aces,
+            pixel_aspect: 1.0,
+            background: [0.0; 3],
+            transparent: false,
+            hw_aa: 3,
+            hw_all_shadows: true,
+        }
+    }
 }
 
 impl RenderSettings {
     pub fn from_scene(s: &Scene) -> Self {
         let g = |k: &str, d: f64| s.render.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
-        RenderSettings { width: g("width", 640.0) as u32, height: g("height", 480.0) as u32, samples: g("samples", 64.0) as u32, bounces: g("bounces", 4.0) as u32, exposure: g("exposure", 0.0) as f32, smooth_divisions: 2 }
+        let st = |k: &str, d: &str| s.render.get(k).and_then(|v| v.as_str()).unwrap_or(d).to_string();
+        let b = |k: &str, d: bool| {
+            s.render.get(k).and_then(|v| match v {
+                serde_json::Value::Bool(b) => Some(*b),
+                serde_json::Value::Number(n) => Some(n.as_f64().unwrap_or(0.0) != 0.0),
+                serde_json::Value::String(s) => Some(matches!(s.as_str(), "true" | "on" | "yes" | "1")),
+                _ => None,
+            }).unwrap_or(d)
+        };
+        let d = Self::default();
+        let tone = ToneMap::from_name(&st("toneMapping", "aces"));
+        let hw_tone = ToneMap::from_name(&st("hwToneMapping", &st("toneMapping", "aces")));
+        let bg = s.render.get("background").and_then(|v| v.as_array()).map(|a| [a.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32, a.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32, a.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32]).unwrap_or(d.background);
+        RenderSettings {
+            width: g("width", d.width as f64) as u32,
+            height: g("height", d.height as f64) as u32,
+            samples: g("samples", d.samples as f64) as u32,
+            bounces: g("bounces", d.bounces as f64) as u32,
+            exposure: g("exposure", d.exposure as f64) as f32,
+            smooth_divisions: 2,
+            tone,
+            hw_tone,
+            pixel_aspect: g("pixelAspect", d.pixel_aspect as f64) as f32,
+            background: bg,
+            transparent: b("transparentBg", d.transparent),
+            hw_aa: aa_scale(&st("hwAA", "high")),
+            hw_all_shadows: b("hwAllShadows", d.hw_all_shadows),
+        }
     }
 }
 
@@ -204,8 +350,17 @@ impl RenderScene {
             lights.push(Light { kind: LightKind::Ambient, pos: DVec3::ZERO, color: DVec3::splat(0.12), decay: 0.0, shadows: false });
         }
         let has_sky = lights.iter().any(|l| matches!(l.kind, LightKind::Sky));
-        let background = if has_sky { lights.iter().find(|l| matches!(l.kind, LightKind::Sky)).unwrap().color } else { DVec3::ZERO };
-        let aspect = settings.width as f64 / settings.height.max(1) as f64;
+        // JS prepareScene: a sky dome supplies the environment, otherwise Render Settings'
+        // background colour clears the frame (transparent backgrounds stay black behind objects)
+        let background = if has_sky {
+            lights.iter().find(|l| matches!(l.kind, LightKind::Sky)).unwrap().color
+        } else if settings.transparent {
+            DVec3::ZERO
+        } else {
+            DVec3::new(settings.background[0] as f64, settings.background[1] as f64, settings.background[2] as f64)
+        };
+        // pixel aspect stretches the frame horizontally, as in the JS camera film gate
+        let aspect = settings.width as f64 * settings.pixel_aspect.max(1e-3) as f64 / settings.height.max(1) as f64;
         let mut rs = RenderScene { tris, nodes: vec![], mats, lights, cam, fov_y: cshape.fov_y(aspect), ortho: cshape.ortho.then_some(cshape.ortho_width), settings, background };
         rs.build_bvh();
         rs
@@ -315,7 +470,7 @@ impl RenderScene {
         let (w, h) = (self.settings.width as f64, self.settings.height as f64);
         let nx = (x / w) * 2.0 - 1.0;
         let ny = 1.0 - (y / h) * 2.0;
-        let aspect = w / h;
+        let aspect = w * self.settings.pixel_aspect.max(1e-3) as f64 / h;
         match self.ortho {
             Some(ow) => {
                 let o = self.cam.transform_point3(DVec3::new(nx * ow / 2.0, ny * ow / 2.0 / aspect, 0.0));
@@ -489,9 +644,9 @@ impl RenderScene {
         let k = 2f32.powf(self.settings.exposure) / passes.max(1) as f32;
         let mut out = Vec::with_capacity(accum.len() / 3 * 4);
         for c in accum.chunks(3) {
-            for &x in c {
-                let v = x * k;
-                let v = v / (1.0 + v * 0.15); // gentle shoulder
+            // tone map in linear space, then sRGB-encode, matching three.js output
+            let mapped = self.settings.tone.apply([c[0] * k, c[1] * k, c[2] * k]);
+            for v in mapped {
                 let s = if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
                 out.push((s.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
             }
@@ -536,7 +691,7 @@ mod tests {
         s.create_mesh("polyCube", &Params::new(), None);
         let cam = s.find("persp").unwrap();
         s.nodes.get_mut(&cam).unwrap().xf.t = [3.0, 2.25, 3.0];
-        let rs = RenderScene::build(&s, "persp", RenderSettings { width: 32, height: 24, samples: 1, bounces: 1, exposure: 0.0, smooth_divisions: 2 });
+        let rs = RenderScene::build(&s, "persp", RenderSettings { width: 32, height: 24, samples: 1, bounces: 1, ..Default::default() });
         assert_eq!(rs.triangle_count(), 12);
         let mut acc = vec![0.0; 32 * 24 * 3];
         rs.render_pass(&mut acc, 0);
@@ -547,5 +702,78 @@ mod tests {
         assert_eq!(acc[0], 0.0);
         let px = rs.resolve(&acc, 1);
         assert_eq!(px.len(), 32 * 24 * 4);
+    }
+
+    #[test]
+    fn render_settings_defaults_match_the_js() {
+        let s = Scene::new();
+        let d = RenderSettings::from_scene(&s);
+        assert_eq!((d.width, d.height, d.samples, d.bounces), (960, 540, 128, 5));
+        assert_eq!(d.tone, ToneMap::Aces);
+        assert_eq!(d.hw_tone, ToneMap::Aces);
+        assert_eq!(d.pixel_aspect, 1.0);
+        assert!(!d.transparent);
+        assert_eq!(d.hw_aa, 3);
+        assert!(d.hw_all_shadows);
+    }
+
+    #[test]
+    fn render_settings_parse_tone_mapping_and_hardware_options() {
+        let mut s = Scene::new();
+        s.render.insert("toneMapping".into(), serde_json::json!("agx"));
+        s.render.insert("hwToneMapping".into(), serde_json::json!("neutral"));
+        s.render.insert("hwAA".into(), serde_json::json!("ultra"));
+        s.render.insert("transparentBg".into(), serde_json::json!(true));
+        s.render.insert("background".into(), serde_json::json!([0.1, 0.2, 0.3]));
+        s.render.insert("pixelAspect".into(), serde_json::json!(2.0));
+        let d = RenderSettings::from_scene(&s);
+        assert_eq!(d.tone, ToneMap::AgX);
+        assert_eq!(d.hw_tone, ToneMap::Neutral);
+        assert_eq!(d.hw_aa, 4);
+        assert!(d.transparent);
+        assert_eq!(d.pixel_aspect, 2.0);
+        assert!((d.background[2] - 0.3).abs() < 1e-6);
+        // hwToneMapping falls back to toneMapping when unset
+        s.render.remove("hwToneMapping");
+        assert_eq!(RenderSettings::from_scene(&s).hw_tone, ToneMap::AgX);
+    }
+
+    #[test]
+    fn path_tracer_uses_the_render_background_colour() {
+        let mut s = Scene::new();
+        s.render.insert("background".into(), serde_json::json!([0.1, 0.2, 0.3]));
+        s.render.insert("toneMapping".into(), serde_json::json!("none"));
+        s.render.insert("width".into(), serde_json::json!(8));
+        s.render.insert("height".into(), serde_json::json!(8));
+        s.render.insert("samples".into(), serde_json::json!(1));
+        s.render.insert("bounces".into(), serde_json::json!(0));
+        let rs = RenderScene::build(&s, "persp", RenderSettings::from_scene(&s));
+        let mut acc = vec![0.0; 8 * 8 * 3];
+        rs.render_pass(&mut acc, 0);
+        let px = rs.resolve(&acc, 1);
+        assert!(px[0] > 0 && px[1] > px[0] && px[2] > px[1], "{:?}", &px[0..4]);
+        // transparent backgrounds render black behind objects
+        s.render.insert("transparentBg".into(), serde_json::json!(true));
+        let rs = RenderScene::build(&s, "persp", RenderSettings::from_scene(&s));
+        let mut acc = vec![0.0; 8 * 8 * 3];
+        rs.render_pass(&mut acc, 0);
+        assert_eq!(rs.resolve(&acc, 1)[0], 0);
+    }
+
+    #[test]
+    fn aces_tone_mapping_matches_three_js() {
+        let high = ToneMap::Aces.apply([1.0, 1.0, 1.0]);
+        let mid = ToneMap::Aces.apply([0.5, 0.5, 0.5]);
+        assert!((high[0] - 2.54 / 3.16).abs() < 1e-6, "{high:?}");
+        assert!((mid[0] - 0.6425 / 1.0425).abs() < 1e-6, "{mid:?}");
+        // none/linear leave values unchanged (then clamp)
+        assert_eq!(ToneMap::None.apply([0.25, 0.5, 2.0]), [0.25, 0.5, 1.0]);
+        assert_eq!(ToneMap::Linear.apply([0.25, 0.5, 2.0]), [0.25, 0.5, 1.0]);
+        // AgX and Neutral stay in range and darken highlights
+        let agx = ToneMap::AgX.apply([4.0, 2.0, 1.0]);
+        assert!(agx.iter().all(|v| (0.0..=1.0).contains(v)), "{agx:?}");
+        let neu = ToneMap::Neutral.apply([4.0, 2.0, 1.0]);
+        assert!(neu.iter().all(|v| (0.0..=1.0).contains(v)), "{neu:?}");
+        assert!(neu[0] > 0.9, "{neu:?}");
     }
 }
