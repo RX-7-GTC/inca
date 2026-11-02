@@ -1196,7 +1196,7 @@ pub fn build_draws(
                     draws.push(DrawCmd {
                         pass: Pass::Lines,
                         geo: Geo::MeshWire(id.clone()),
-                        u: DrawUniform::new(wm).tint([c[0], c[1], c[2]], 1.0).bias(0.00012).cull_wire(vp.backface),
+                        u: DrawUniform::new(wm).tint([c[0], c[1], c[2]], 1.0).cull_wire(vp.backface),
                     });
                 }
                 if in_comp {
@@ -1209,7 +1209,7 @@ pub fn build_draws(
                                 let pts = component_points(s, &id, soft, mesh_cache);
                                 g.upload_points(&id, key, &pts);
                             }
-                            draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(3.0).bias(0.0003).cull_wire(vp.backface) });
+                            draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(3.0).cull_wire(vp.backface) });
                         }
                         Some(CompMode::Face) => {
                             // the JS face mode shows a dot on every face centre, not just the selection
@@ -1219,7 +1219,7 @@ pub fn build_draws(
                                     let pts = face_center_points(s, &id, &geo);
                                     g.upload_points(&id, key, &pts);
                                 }
-                                draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(2.0).bias(0.0003).cull_wire(vp.backface) });
+                                draws.push(DrawCmd { pass: Pass::Points, geo: Geo::MeshPoints(id.clone()), u: DrawUniform::new(wm).point_size(2.0).cull_wire(vp.backface) });
                             }
                         }
                         _ => {}
@@ -1244,7 +1244,7 @@ pub fn build_draws(
                                 }
                                 g.upload_comp_tris(&id, key, &tris);
                             }
-                            draws.push(DrawCmd { pass: Pass::MeshBlend, geo: Geo::CompTris(id.clone()), u: DrawUniform::new(wm).unlit().alpha(0.45).bias(0.0002) });
+                            draws.push(DrawCmd { pass: Pass::MeshBlend, geo: Geo::CompTris(id.clone()), u: DrawUniform::new(wm).unlit().alpha(0.45) });
                         }
                     }
                 }
@@ -1266,7 +1266,7 @@ pub fn build_draws(
                                 }
                                 g.upload_comp_lines(&id, key, &l);
                             }
-                            draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::CompLines(id.clone()), u: DrawUniform::new(wm).bias(0.0004).cull_wire(vp.backface) });
+                            draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::CompLines(id.clone()), u: DrawUniform::new(wm).cull_wire(vp.backface) });
                         }
                     }
                 }

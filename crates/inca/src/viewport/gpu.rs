@@ -121,10 +121,6 @@ impl DrawUniform {
         self.params[1] = a;
         self
     }
-    pub fn bias(mut self, b: f32) -> Self {
-        self.params[2] = b;
-        self
-    }
     pub fn spec(mut self, s: f32, rough: f32) -> Self {
         self.params[3] = s;
         self.params2[0] = rough;
@@ -492,9 +488,15 @@ impl Gpu {
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
         let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };
-        let depth = |write: bool, compare: wgpu::CompareFunction| {
-            Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(write), depth_compare: Some(compare), stencil: Default::default(), bias: Default::default() })
+        let depth = |write: bool, compare: wgpu::CompareFunction, bias: wgpu::DepthBiasState| {
+            Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(write), depth_compare: Some(compare), stencil: Default::default(), bias })
         };
+        // JS `applyAttrs` sets polygonOffset(1, 1) on every shaded material, pushing the
+        // surface back so depth-tested wires on its edges stay visible. A fixed clip-space
+        // wire bias cannot do this: at the default camera distance it is larger than the
+        // whole depth range of a small object and hidden back edges bleed through.
+        let no_bias = wgpu::DepthBiasState::default();
+        let mesh_bias = wgpu::DepthBiasState { constant: 1, slope_scale: 1.0, clamp: 0.0 };
         let target = |blend: Option<wgpu::BlendState>| [Some(wgpu::ColorTargetState { format: COLOR_FORMAT, blend, write_mask: wgpu::ColorWrites::ALL })];
         let alpha = Some(wgpu::BlendState::ALPHA_BLENDING);
         let mk = |label: &str, vs: &str, fs: &str, buffers: &[Option<wgpu::VertexBufferLayout>], topo: wgpu::PrimitiveTopology, ds: Option<wgpu::DepthStencilState>, blend: Option<wgpu::BlendState>| {
@@ -515,12 +517,12 @@ impl Gpu {
         let mut point_vb = vb_layout(std::mem::size_of::<PointVertex>() as u64, &point_attrs);
         point_vb.step_mode = wgpu::VertexStepMode::Instance;
         let point_vbs = [Some(point_vb)];
-        let bg_pipe = mk("bg", "vs_bg", "fs_bg", &[], wgpu::PrimitiveTopology::TriangleList, depth(false, wgpu::CompareFunction::Always), None);
-        let mesh_pipe = mk("mesh", "vs_mesh", "fs_mesh", &mesh_vb, wgpu::PrimitiveTopology::TriangleList, depth(true, wgpu::CompareFunction::LessEqual), None);
-        let blend_pipe = mk("blend", "vs_mesh", "fs_mesh", &mesh_vb, wgpu::PrimitiveTopology::TriangleList, depth(false, wgpu::CompareFunction::LessEqual), alpha);
-        let line_pipe = mk("line", "vs_line", "fs_line", &line_vb, wgpu::PrimitiveTopology::LineList, depth(true, wgpu::CompareFunction::LessEqual), alpha);
-        let line_top_pipe = mk("line top", "vs_line", "fs_line", &line_vb, wgpu::PrimitiveTopology::LineList, depth(false, wgpu::CompareFunction::Always), alpha);
-        let point_pipe = mk("points", "vs_point", "fs_point", &point_vbs, wgpu::PrimitiveTopology::TriangleList, depth(true, wgpu::CompareFunction::LessEqual), None);
+        let bg_pipe = mk("bg", "vs_bg", "fs_bg", &[], wgpu::PrimitiveTopology::TriangleList, depth(false, wgpu::CompareFunction::Always, no_bias), None);
+        let mesh_pipe = mk("mesh", "vs_mesh", "fs_mesh", &mesh_vb, wgpu::PrimitiveTopology::TriangleList, depth(true, wgpu::CompareFunction::LessEqual, mesh_bias), None);
+        let blend_pipe = mk("blend", "vs_mesh", "fs_mesh", &mesh_vb, wgpu::PrimitiveTopology::TriangleList, depth(false, wgpu::CompareFunction::LessEqual, no_bias), alpha);
+        let line_pipe = mk("line", "vs_line", "fs_line", &line_vb, wgpu::PrimitiveTopology::LineList, depth(true, wgpu::CompareFunction::LessEqual, no_bias), alpha);
+        let line_top_pipe = mk("line top", "vs_line", "fs_line", &line_vb, wgpu::PrimitiveTopology::LineList, depth(false, wgpu::CompareFunction::Always, no_bias), alpha);
+        let point_pipe = mk("points", "vs_point", "fs_point", &point_vbs, wgpu::PrimitiveTopology::TriangleList, depth(true, wgpu::CompareFunction::LessEqual, no_bias), None);
         let draw_cap = 256;
         let (draw_buf, draw_bg) = Self::make_draw_buf(&device, &draw_bgl, draw_cap);
         Gpu {

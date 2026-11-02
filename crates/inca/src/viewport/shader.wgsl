@@ -28,7 +28,7 @@ struct Draw {
     normal: mat4x4<f32>,
     mvp: mat4x4<f32>,    // view_proj * model, filled per viewport
     tint: vec4<f32>,     // rgb, a = mix amount
-    params: vec4<f32>,   // x unlit, y alpha, z depth bias, w specular
+    params: vec4<f32>,   // x unlit, y alpha, z unused, w specular
     params2: vec4<f32>,  // x roughness, y dot half-size, z cull wires/dots, w textured
     shadow: vec4<f32>,   // x receives shadows, y casts shadows
 };
@@ -148,7 +148,6 @@ fn vs_mesh(v: MeshIn) -> MeshOut {
     let w = draw.model * vec4(v.pos, 1.0);
     o.world = w.xyz;
     o.clip = frame.view_proj * w;
-    o.clip.z = o.clip.z - draw.params.z * o.clip.w;
     o.normal = (draw.normal * vec4(v.normal, 0.0)).xyz;
     o.color = v.color;
     o.uv = v.uv;
@@ -378,7 +377,6 @@ fn vs_point(v: PointIn, @builtin(vertex_index) vi: u32) -> PointOut {
     let size = max(frame.post.zw, vec2(1.0));
     let off = corner[vi] * vec2(draw.params2.y * 2.0 / size.x, draw.params2.y * 2.0 / size.y) * clip.w;
     clip = clip + vec4(off, 0.0, 0.0);
-    clip.z = clip.z - draw.params.z * clip.w;
     o.clip = clip;
     return o;
 }
@@ -413,7 +411,6 @@ fn vs_line(v: LineIn) -> LineOut {
             clip = vec4(0.0, 0.0, 2.0, 1.0);
         }
     }
-    clip.z = clip.z - draw.params.z * clip.w;
     o.clip = clip;
     o.color = mix(v.color, vec4(draw.tint.rgb, v.color.a), draw.tint.a);
     return o;
