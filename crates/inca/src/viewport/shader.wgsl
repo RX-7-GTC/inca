@@ -33,8 +33,9 @@ struct Draw {
     tint: vec4<f32>,     // rgb, a = mix amount
     params: vec4<f32>,   // x unlit, y alpha, z specular IOR, w specular intensity
     params2: vec4<f32>,  // x roughness, y dot half-size, z cull wires/dots, w textured
-    shadow: vec4<f32>,   // x receives shadows, y casts shadows
+    shadow: vec4<f32>,   // x receives shadows, y casts shadows, z coat, w coat roughness
     spec: vec4<f32>,     // rgb specular tint (JS specularColor), a metalness
+    sheen: vec4<f32>,    // rgb sheenColor * sheen (three.js uniform), a sheen amount
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -351,6 +352,34 @@ fn v_smith(ndv: f32, ndl: f32, rough: f32) -> f32 {
     return gv * gl / max(4.0 * ndv, 1e-4);
 }
 
+fn max3(c: vec3<f32>) -> f32 {
+    return max(c.x, max(c.y, c.z));
+}
+
+// three.js `D_Charlie` (Production Friendly Microfacet Sheen BRDF).
+fn d_charlie(rough: f32, ndh: f32) -> f32 {
+    let alpha = rough * rough;
+    let inv_alpha = 1.0 / max(alpha, 1e-5);
+    let cos2h = ndh * ndh;
+    let sin2h = max(1.0 - cos2h, 0.0078125);
+    return (2.0 + inv_alpha) * pow(sin2h, inv_alpha * 0.5) / (2.0 * PI);
+}
+
+// three.js `V_Neubelt`: the sheen visibility term includes no NdotL factor.
+fn v_neubelt(ndv: f32, ndl: f32) -> f32 {
+    return clamp(1.0 / max(4.0 * (ndl + ndv - ndl * ndv), 1e-5), 0.0, 1.0);
+}
+
+// three.js `IBLSheenBRDF`: curve fit for the hemisphere-integrated Charlie lobe.
+fn ibl_sheen_brdf(n: vec3<f32>, v: vec3<f32>, rough: f32) -> f32 {
+    let ndv = clamp(dot(n, v), 0.0, 1.0);
+    let r2 = rough * rough;
+    let r_inv = 1.0 / (rough + 0.1);
+    let a = -1.9362 + 1.0678 * rough + 0.4573 * r2 - 0.8469 * r_inv;
+    let b = -0.6014 + 0.5538 * rough - 0.4670 * r2 - 0.1255 * r_inv;
+    return clamp(exp(a * ndv + b), 0.0, 1.0);
+}
+
 // three.js `bumpmap_pars_fragment`: perturb the normal from the screen-space derivative of the
 // height map. Explicit LOD sampling keeps this valid when only some faces have a bump map.
 fn bump_normal(n_in: vec3<f32>, world: vec3<f32>, uv: vec2<f32>, layer: i32, scale: f32) -> vec3<f32> {
@@ -371,7 +400,16 @@ fn bump_normal(n_in: vec3<f32>, world: vec3<f32>, uv: vec2<f32>, layer: i32, sca
     return normalize(abs(det) * n - grad);
 }
 
-fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_in: f32, metal_in: f32, tint_in: vec3<f32>) -> vec3<f32> {
+fn env_radiance(r: vec3<f32>, n: vec3<f32>, rough: f32) -> vec3<f32> {
+    var env = sky_color(clamp(r.y, -1.0, 1.0));
+    if (frame.sky.x > 1.5) {
+        let max_lod = max(f32(textureNumLevels(sky_tex) - 1), 0.0);
+        env = textureSampleLevel(sky_tex, sky_samp, equirect_uv(r), clamp(rough * max_lod, 0.0, max_lod)).rgb;
+    }
+    return mix(env, sky_irradiance(n), rough) * frame.sky_col.rgb * frame.sky_col.w;
+}
+
+fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_in: f32, metal_in: f32, tint_in: vec3<f32>, emission: vec3<f32>) -> vec3<f32> {
     var n = normalize(n_in);
     var v = normalize(frame.cam_pos.xyz - world);
     if (frame.cam_pos.w > 0.5) {
@@ -393,6 +431,15 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_
     let f90 = mix(vec3<f32>(spec_k), vec3<f32>(1.0), metal);
     let ndv = max(dot(n, v), 1e-4);
     let diffuse = base * (1.0 - metal);
+    // Standard Surface coat/sheen. The JS leaves `sheenRoughness` at the three.js default
+    // (1.0) and the sheen colour is premultiplied by the amount in `build_draws`.
+    let coat = clamp(draw.shadow.z, 0.0, 1.0);
+    let coat_rough = clamp(draw.shadow.w, 0.0525, 1.0);
+    let sheen_col = draw.sheen.rgb;
+    let sheen_rough = 1.0;
+    let cc_f0 = vec3<f32>(0.04);
+    let cc_f90 = vec3<f32>(1.0);
+    let fcc = fresnel_schlick(ndv, cc_f0, cc_f90);
     if (frame.mode.x < 0.5) {
         // JS `prepareScene`: the default light sits at camera + (-0.15, 0.2, 0) in camera
         // space and aims down the view axis, so the surface-to-light vector is constant
@@ -401,37 +448,42 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_
         let l = normalize(-0.15 * right + 0.2 * up - frame.cam_dir.xyz);
         let ndl = max(dot(n, l), 0.0);
         let h = normalize(l + v);
+        let ndh = max(dot(n, h), 0.0);
         let f = fresnel_schlick(max(dot(v, h), 0.0), f0, f90);
         // the default directional light is white*PI in the JS
-        let spec = f * d_ggx(max(dot(n, h), 0.0), rough) * v_smith(ndv, ndl, rough) * PI;
-        return diffuse * ndl + spec;
+        let spec = f * d_ggx(ndh, rough) * v_smith(ndv, ndl, rough) * PI;
+        let sheen_energy = 1.0 - max3(sheen_col) * max(ibl_sheen_brdf(n, v, sheen_rough), ibl_sheen_brdf(n, l, sheen_rough));
+        let sheen_direct = sheen_col * d_charlie(sheen_rough, ndh) * v_neubelt(ndv, ndl) * ndl * PI;
+        let cc_spec = fresnel_schlick(max(dot(v, h), 0.0), cc_f0, cc_f90) * d_ggx(ndh, coat_rough) * v_smith(ndv, ndl, coat_rough) * PI * step(0.0001, ndl);
+        let lit = (diffuse * ndl + spec) * sheen_energy + sheen_direct;
+        return (lit + emission) * (1.0 - coat * fcc) + cc_spec * coat;
     }
     if (frame.mode.x > 2.5) {
-        return base * 0.06;
+        return base * 0.06 + emission;
     }
     if (frame.mode.x > 1.5) {
-        return base;
+        return base + emission;
     }
     var c = vec3(0.0);
+    var cc = vec3(0.0);
     if (frame.sky.x > 0.5) {
         // sky-dome environment: diffuse irradiance plus a roughness-mip specular reflection
         let irr = sky_irradiance(n) * frame.sky_col.rgb * frame.sky_col.w;
-        c = c + diffuse * irr;
         let r = reflect(-v, n);
-        var env = sky_color(clamp(r.y, -1.0, 1.0));
-        if (frame.sky.x > 1.5) {
-            let max_lod = max(f32(textureNumLevels(sky_tex) - 1), 0.0);
-            env = textureSampleLevel(sky_tex, sky_samp, equirect_uv(r), clamp(rough * max_lod, 0.0, max_lod)).rgb;
-        }
-        env = mix(env, sky_irradiance(n), rough) * frame.sky_col.rgb * frame.sky_col.w;
-        c = c + env * fresnel_schlick(ndv, f0, f90);
+        let sheen_albedo = ibl_sheen_brdf(n, v, sheen_rough);
+        let sheen_energy = 1.0 - max3(sheen_col) * sheen_albedo;
+        let env = env_radiance(r, n, rough);
+        c = (diffuse * irr + env * fresnel_schlick(ndv, f0, f90)) * sheen_energy + irr * sheen_col * sheen_albedo;
+        // three.js samples the environment again at the clearcoat roughness
+        cc = env_radiance(r, n, coat_rough) * fcc;
     }
     let count = i32(frame.mode.y);
     for (var i = 0; i < count; i = i + 1) {
         let L = frame.lights[i];
         let ty = L.pos.w;
         if (ty < 0.5) {
-            c = c + diffuse * L.color.rgb;
+            let sheen_energy = 1.0 - max3(sheen_col) * ibl_sheen_brdf(n, v, sheen_rough);
+            c = c + diffuse * L.color.rgb * sheen_energy;
             continue;
         }
         var l: vec3<f32>;
@@ -471,15 +523,27 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_
         }
         let ndl = max(dot(n, l), 0.0);
         let h = normalize(l + v);
+        let ndh = max(dot(n, h), 0.0);
         let f = fresnel_schlick(max(dot(v, h), 0.0), f0, f90);
-        let spec = f * d_ggx(max(dot(n, h), 0.0), rough) * v_smith(ndv, ndl, rough) * PI;
+        let spec = f * d_ggx(ndh, rough) * v_smith(ndv, ndl, rough) * PI;
+        // three.js applies sheen to punctual lights but not RectAreaLight; clearcoat gets its
+        // own GGX lobe (F0 = 0.04) on every light type.
+        var sheen_direct = vec3<f32>(0.0);
+        var sheen_energy = 1.0;
+        if (ty < 3.5) {
+            sheen_direct = sheen_col * d_charlie(sheen_rough, ndh) * v_neubelt(ndv, ndl) * ndl * PI;
+            sheen_energy = 1.0 - max3(sheen_col) * max(ibl_sheen_brdf(n, v, sheen_rough), ibl_sheen_brdf(n, l, sheen_rough));
+        }
+        let cc_spec = fresnel_schlick(max(dot(v, h), 0.0), cc_f0, cc_f90) * d_ggx(ndh, coat_rough) * v_smith(ndv, ndl, coat_rough) * PI * step(0.0001, ndl);
         var shadow = 1.0;
         if (draw.shadow.x > 0.5) {
             shadow = shadow_factor(world, n, L.pos.xyz, frame.shadow_info[i], frame.shadow_mats[i]);
         }
-        c = c + (diffuse * ndl + spec * step(0.0001, ndl)) * L.color.rgb * att * shadow;
+        let radiance = L.color.rgb * att * shadow;
+        c = c + ((diffuse * ndl + spec * step(0.0001, ndl)) * sheen_energy + sheen_direct) * radiance;
+        cc = cc + cc_spec * radiance;
     }
-    return c;
+    return (c + emission) * (1.0 - coat * fcc) + cc * coat;
 }
 
 @fragment
@@ -536,7 +600,7 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
         // lit surfaces: material colours are linear and the result is gamma-encoded once, as in the
         // JS (three.js sRGB output); the egui texture path shows these values as they are.
         // Emissive is additive and unlit, like three.js `totalEmissiveRadiance`.
-        c = shade(n, i.world, base, front, rough, metal, tint) + emission;
+        c = shade(n, i.world, base, front, rough, metal, tint, emission);
         c = tone_map(max(c * exp2(frame.post.x), vec3(0.0)));
         c = pow(max(c, vec3(0.0)), vec3(1.0 / frame.post.y));
         c = linear_to_srgb(c);

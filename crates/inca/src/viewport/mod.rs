@@ -1318,7 +1318,7 @@ pub fn build_draws(
                 let receive_shadows = n.extra.get("receiveShadows").and_then(|v| v.as_bool()).unwrap_or(true);
                 // templates draw as wireframe only, whatever the shading mode
                 if vp.shade != ShadeMode::Wire && !template {
-                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness).spec_tint(pbr.spec_color, pbr.metalness).ior(pbr.ior as f32).textured(vp.shade == ShadeMode::Textured).shadows(cast_shadows, receive_shadows);
+                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness).spec_tint(pbr.spec_color, pbr.metalness).ior(pbr.ior as f32).textured(vp.shade == ShadeMode::Textured).shadows(cast_shadows, receive_shadows).coat(pbr.coat, pbr.coat_roughness).sheen(pbr.sheen_color, pbr.sheen);
                     if pbr.unlit {
                         u = u.unlit();
                     }
@@ -2739,6 +2739,13 @@ mod tests {
         assert_eq!(u.shadow, [1.0, 0.0, 0.0, 0.0], "x receives, y casts");
         let u = DrawUniform::new(Mat4::IDENTITY).shadows(true, false);
         assert_eq!(u.shadow, [0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn coat_and_sheen_pack_into_the_draw_uniform() {
+        let u = DrawUniform::new(Mat4::IDENTITY).shadows(true, true).coat(0.7, 0.05).sheen([0.2, 0.4, 0.6], 0.5);
+        assert_eq!(u.shadow, [1.0, 1.0, 0.7, 0.05], "coat amount/roughness share the shadow vector");
+        assert_eq!(u.sheen, [0.1, 0.2, 0.3, 0.5], "three.js premultiplies the sheen colour");
     }
 
     #[test]

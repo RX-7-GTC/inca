@@ -114,16 +114,19 @@ pub struct DrawUniform {
     pub tint: [f32; 4],
     pub params: [f32; 4],
     pub params2: [f32; 4],
-    /// x = receives shadows, y = casts shadows (Render Stats; the shadow pass reads y)
+    /// x = receives shadows, y = casts shadows (Render Stats; the shadow pass reads y),
+    /// z = clearcoat amount, w = clearcoat roughness
     pub shadow: [f32; 4],
     /// rgb = specular tint (JS `specularColor`), a = metalness
     pub spec: [f32; 4],
+    /// rgb = sheen colour pre-multiplied by the sheen amount (the JS three.js uniform), a = amount
+    pub sheen: [f32; 4],
 }
 
 impl DrawUniform {
     pub fn new(model: glam::Mat4) -> Self {
         let n = model.inverse().transpose();
-        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), mvp: model.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 1.5, 0.0], params2: [0.5, 0.0, 0.0, 0.0], shadow: [1.0, 1.0, 0.0, 0.0], spec: [1.0, 1.0, 1.0, 0.0] }
+        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), mvp: model.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 1.5, 0.0], params2: [0.5, 0.0, 0.0, 0.0], shadow: [1.0, 1.0, 0.0, 0.0], spec: [1.0, 1.0, 1.0, 0.0], sheen: [0.0; 4] }
     }
     pub fn tint(mut self, c: [f32; 3], a: f32) -> Self {
         self.tint = [c[0], c[1], c[2], a];
@@ -169,7 +172,19 @@ impl DrawUniform {
     }
     /// Render Stats shadow flags: cast into light depth maps and/or receive shadows.
     pub fn shadows(mut self, cast: bool, receive: bool) -> Self {
-        self.shadow = [if receive { 1.0 } else { 0.0 }, if cast { 1.0 } else { 0.0 }, 0.0, 0.0];
+        self.shadow[0] = if receive { 1.0 } else { 0.0 };
+        self.shadow[1] = if cast { 1.0 } else { 0.0 };
+        self
+    }
+    /// Standard Surface clearcoat (JS `coat` / `coatRoughness`).
+    pub fn coat(mut self, amount: f32, rough: f32) -> Self {
+        self.shadow[2] = amount;
+        self.shadow[3] = rough;
+        self
+    }
+    /// Standard Surface sheen; three.js premultiplies the colour by the amount.
+    pub fn sheen(mut self, c: [f32; 3], amount: f32) -> Self {
+        self.sheen = [c[0] * amount, c[1] * amount, c[2] * amount, amount];
         self
     }
 }
