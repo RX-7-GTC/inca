@@ -563,9 +563,13 @@ impl RenderScene {
             let metal = m.pbr.metalness as f64;
             let rough = (m.pbr.roughness as f64).clamp(0.03, 1.0);
             let sc = DVec3::new(m.pbr.spec_color[0] as f64, m.pbr.spec_color[1] as f64, m.pbr.spec_color[2] as f64);
-            let dielectric = sc * (m.pbr.specular as f64 * 0.04);
+            // three.js: F0 = min(((ior - 1) / (ior + 1))² * specularColor, 1) * specularIntensity;
+            // metals blend straight to the base colour, ignoring the dielectric tint/intensity.
+            let ior = (m.pbr.ior as f64).max(1.0);
+            let f0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
+            let dielectric = sc * (m.pbr.specular as f64 * f0);
             let diffuse = base * (1.0 - metal);
-            let spec_col = dielectric.lerp(base * sc, metal);
+            let spec_col = dielectric.lerp(base, metal);
             let v_dir = -ray.dir;
             // direct light
             for l in &self.lights {

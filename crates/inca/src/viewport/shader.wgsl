@@ -5,6 +5,8 @@ struct Light {
     dir: vec4<f32>,    // xyz direction the light points to
     color: vec4<f32>,  // rgb * intensity
     params: vec4<f32>, // x cos(outer), y cos(inner), z decay rate
+    half_u: vec4<f32>, // area light half-width axis (xyz); zero for other types
+    half_v: vec4<f32>, // area light half-height axis (xyz); zero for other types
 };
 
 struct Frame {
@@ -19,9 +21,9 @@ struct Frame {
     render: vec4<f32>,   // x tone mapping (0 none, 1 ACES, 2 AgX, 3 Neutral, 4 Linear), y transparent bg
     sky: vec4<f32>,      // x sky present, y show background, z tan(fov_y/2), w aspect
     sky_col: vec4<f32>,  // sky dome colour (rgb), intensity (a)
-    lights: array<Light, 8>,
-    shadow_mats: array<mat4x4<f32>, 8>, // first face of each shadowing light
-    shadow_info: array<vec4<f32>, 8>,   // x layer (-1 none), y type (1 ortho, 2 spot, 3 point), z radius
+    lights: array<Light, 32>,
+    shadow_mats: array<mat4x4<f32>, 32>, // first face of each shadowing light
+    shadow_info: array<vec4<f32>, 32>,   // x layer (-1 none), y type (1 ortho, 2 spot, 3 point), z radius
 };
 
 struct Draw {
@@ -29,7 +31,7 @@ struct Draw {
     normal: mat4x4<f32>,
     mvp: mat4x4<f32>,    // view_proj * model, filled per viewport
     tint: vec4<f32>,     // rgb, a = mix amount
-    params: vec4<f32>,   // x unlit, y alpha, z unused, w specular intensity
+    params: vec4<f32>,   // x unlit, y alpha, z specular IOR, w specular intensity
     params2: vec4<f32>,  // x roughness, y dot half-size, z cull wires/dots, w textured
     shadow: vec4<f32>,   // x receives shadows, y casts shadows
     spec: vec4<f32>,     // rgb specular tint (JS specularColor), a metalness
@@ -141,6 +143,10 @@ struct MeshIn {
     @location(4) tex: vec2<f32>,
     /// additive emissive colour (JS `emissive` / `incandescence`)
     @location(5) emission: vec3<f32>,
+    /// x = roughness map, y = metalness map, z = emission map, w = alpha map (-1 = none)
+    @location(6) aux: vec4<f32>,
+    /// x = specular colour map, y = bump map (-1 = none); z/w = emissive/bump scale
+    @location(7) extra: vec4<f32>,
 };
 struct MeshOut {
     @builtin(position) clip: vec4<f32>,
@@ -150,6 +156,8 @@ struct MeshOut {
     @location(3) uv: vec2<f32>,
     @location(4) tex: vec2<f32>,
     @location(5) emission: vec3<f32>,
+    @location(6) aux: vec4<f32>,
+    @location(7) extra: vec4<f32>,
 };
 
 @vertex
@@ -163,6 +171,8 @@ fn vs_mesh(v: MeshIn) -> MeshOut {
     o.uv = v.uv;
     o.tex = v.tex;
     o.emission = v.emission;
+    o.aux = v.aux;
+    o.extra = v.extra;
     return o;
 }
 
@@ -341,7 +351,27 @@ fn v_smith(ndv: f32, ndl: f32, rough: f32) -> f32 {
     return gv * gl / max(4.0 * ndv, 1e-4);
 }
 
-fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec3<f32> {
+// three.js `bumpmap_pars_fragment`: perturb the normal from the screen-space derivative of the
+// height map. Explicit LOD sampling keeps this valid when only some faces have a bump map.
+fn bump_normal(n_in: vec3<f32>, world: vec3<f32>, uv: vec2<f32>, layer: i32, scale: f32) -> vec3<f32> {
+    let n = normalize(n_in);
+    let dx = dpdx(uv);
+    let dy = dpdy(uv);
+    let h = textureSampleLevel(tex_array, tex_samp, uv, layer, 0.0).r;
+    let hx = textureSampleLevel(tex_array, tex_samp, uv + dx, layer, 0.0).r;
+    let hy = textureSampleLevel(tex_array, tex_samp, uv + dy, layer, 0.0).r;
+    let dhdx = (hx - h) * scale;
+    let dhdy = (hy - h) * scale;
+    let sx = dpdx(world);
+    let sy = dpdy(world);
+    let r1 = cross(sy, n);
+    let r2 = cross(n, sx);
+    let det = dot(sx, r1);
+    let grad = sign(det) * (dhdx * r1 + dhdy * r2);
+    return normalize(abs(det) * n - grad);
+}
+
+fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_in: f32, metal_in: f32, tint_in: vec3<f32>) -> vec3<f32> {
     var n = normalize(n_in);
     var v = normalize(frame.cam_pos.xyz - world);
     if (frame.cam_pos.w > 0.5) {
@@ -352,11 +382,14 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
         n = -n;
     }
     let spec_k = clamp(draw.params.w, 0.0, 1.0);
-    let metal = clamp(draw.spec.a, 0.0, 1.0);
-    let rough = clamp(draw.params2.x, 0.03, 1.0);
-    let tint = draw.spec.rgb;
-    // JS physical material: F0 = mix(0.04, base, metalness) * specularIntensity * specularColor
-    let f0 = mix(vec3<f32>(0.04) * spec_k * tint, base * spec_k * tint, metal);
+    let metal = clamp(metal_in, 0.0, 1.0);
+    let rough = clamp(rough_in, 0.03, 1.0);
+    let tint = tint_in;
+    // three.js physical material: F0 = min(((ior - 1)/(ior + 1))² * specularColor, 1) *
+    // specularIntensity for dielectrics; metals blend straight to the base colour.
+    let ior = max(draw.params.z, 1.0);
+    let dielectric_f0 = (ior - 1.0) / (ior + 1.0);
+    let f0 = mix(min(vec3<f32>(dielectric_f0 * dielectric_f0) * tint, vec3<f32>(1.0)) * spec_k, base, metal);
     let f90 = mix(vec3<f32>(spec_k), vec3<f32>(1.0), metal);
     let ndv = max(dot(n, v), 1e-4);
     let diffuse = base * (1.0 - metal);
@@ -405,6 +438,25 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
         var att = 1.0;
         if (ty < 1.5) {
             l = -normalize(L.dir.xyz);
+        } else if (ty > 3.5) {
+            // RectAreaLight: representative point clamped to the rectangle. The JS uses LTC;
+            // this reproduces its constant radiance and the inverse-square plus projected-area
+            // falloff (`A * cos(light) / r²`) without the LTC tables.
+            let rel = world - L.pos.xyz;
+            let u = L.half_u.xyz;
+            let v = L.half_v.xyz;
+            let closest = L.pos.xyz
+                + clamp(dot(rel, u) / max(dot(u, u), 1e-8), -1.0, 1.0) * u
+                + clamp(dot(rel, v) / max(dot(v, v), 1e-8), -1.0, 1.0) * v;
+            let d = closest - world;
+            let dist2 = dot(d, d);
+            let area = 4.0 * length(u) * length(v);
+            // clamp the near field to the light's equivalent radius so a shading point on the
+            // surface cannot divide by zero
+            let near_r = max(0.5 * sqrt(area / PI), 1e-3);
+            l = normalize(d);
+            let cos_light = max(dot(-l, normalize(L.dir.xyz)), 0.0);
+            att = area * cos_light / max(dist2, near_r * near_r);
         } else {
             let d = L.pos.xyz - world;
             let dist = length(d);
@@ -415,9 +467,6 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
             if (ty > 2.5 && ty < 3.5) {
                 let cd = dot(-l, normalize(L.dir.xyz));
                 att = att * smoothstep(L.params.x, L.params.y, cd);
-            }
-            if (ty > 3.5) {
-                att = att * max(dot(-l, normalize(L.dir.xyz)), 0.0);
             }
         }
         let ndl = max(dot(n, l), 0.0);
@@ -441,26 +490,60 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
         discard;
     }
     var base = mix(i.color, draw.tint.rgb, draw.tint.a);
-    // Hardware Texturing: the map replaces the material colour, tinted by the JS scalar
-    // (`m.color = white * base/diffuse` in materials.js `applyAttrs`).
-    // Sample before the branch so implicit derivatives (mip selection) are in uniform control flow.
-    let texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.tex.x, 0.0))).rgb;
-    if (draw.params2.w > 0.5 && i.tex.x >= 0.0) {
-        base = texel * i.tex.y;
+    var emission = i.emission;
+    var rough = clamp(draw.params2.x, 0.03, 1.0);
+    var metal = clamp(draw.spec.a, 0.0, 1.0);
+    var tint = draw.spec.rgb;
+    var alpha = draw.params.y;
+    var n = i.normal;
+    // Hardware Texturing: every channel `applyAttrs` assigns to the textured material. The branch
+    // is uniform per draw, so implicit derivatives (mip selection, bump) are well defined.
+    if (draw.params2.w > 0.5) {
+        let color_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.tex.x, 0.0))).rgb;
+        let rough_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.aux.x, 0.0))).g;
+        let metal_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.aux.y, 0.0))).b;
+        let emission_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.aux.z, 0.0))).rgb;
+        let alpha_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.aux.w, 0.0))).g;
+        let spec_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.extra.x, 0.0))).rgb;
+        if (i.tex.x >= 0.0) {
+            // `m.color = white * base/diffuse`, so the map is tinted by the material scalar
+            base = color_texel * i.tex.y;
+        }
+        if (i.aux.x >= 0.0) {
+            // three.js roughnessMap reads G and multiplies the material roughness
+            rough = clamp(rough * rough_texel, 0.03, 1.0);
+        }
+        if (i.aux.y >= 0.0) {
+            // three.js metalnessMap reads B
+            metal = clamp(metal * metal_texel, 0.0, 1.0);
+        }
+        if (i.aux.z >= 0.0) {
+            emission = emission * emission_texel;
+        }
+        if (i.aux.w >= 0.0) {
+            // three.js alphaMap reads G and multiplies the material opacity
+            alpha = alpha * alpha_texel;
+        }
+        if (i.extra.x >= 0.0) {
+            tint = tint * spec_texel;
+        }
+        if (i.extra.y >= 0.0) {
+            n = bump_normal(n, i.world, i.uv, i32(i.extra.y), i.extra.w);
+        }
     }
     var c = base;
     if (draw.params.x < 0.5) {
         // lit surfaces: material colours are linear and the result is gamma-encoded once, as in the
         // JS (three.js sRGB output); the egui texture path shows these values as they are.
         // Emissive is additive and unlit, like three.js `totalEmissiveRadiance`.
-        c = shade(i.normal, i.world, base, front) + i.emission;
+        c = shade(n, i.world, base, front, rough, metal, tint) + emission;
         c = tone_map(max(c * exp2(frame.post.x), vec3(0.0)));
         c = pow(max(c, vec3(0.0)), vec3(1.0 / frame.post.y));
         c = linear_to_srgb(c);
     } else {
         c = pow(max(c * exp2(frame.post.x), vec3(0.0)), vec3(1.0 / frame.post.y));
     }
-    return vec4(c, draw.params.y);
+    return vec4(c, alpha);
 }
 
 // ---------------------------------------------------------------- component dots

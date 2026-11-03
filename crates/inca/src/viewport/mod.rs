@@ -424,22 +424,34 @@ pub fn display_mesh(s: &Scene, id: &str, cache: &mut std::collections::HashMap<S
     Some(pm)
 }
 
-pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [f32; 3], tex_of: &dyn Fn(Option<&String>) -> Option<TexRef>, emit_of: &dyn Fn(Option<&String>) -> [f32; 3]) -> (Vec<MeshVertex>, Vec<LineVertex>) {
+pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [f32; 3], tex_of: &dyn Fn(Option<&String>) -> Option<MatTex>, emit_of: &dyn Fn(Option<&String>) -> [f32; 3]) -> (Vec<MeshVertex>, Vec<LineVertex>) {
     let normals = pm.corner_normals();
     let mut tris = Vec::with_capacity(pm.tri_count() * 3);
     for fi in 0..pm.f.len() {
         let f = &pm.f[fi];
         let col = color_of(pm.face_mat(fi));
         let tex = tex_of(pm.face_mat(fi));
-        let emission = emit_of(pm.face_mat(fi));
+        let mut emission = emit_of(pm.face_mat(fi));
+        let layer = |l: Option<u32>| l.map(|x| x as f32).unwrap_or(-1.0);
+        let (texv, aux, extra) = match tex {
+            Some(t) => {
+                // With an emissive map three.js replaces the flat emissive colour by white (or
+                // the Standard Surface emission factor) and lets the map supply the colour.
+                if t.emission.is_some() {
+                    emission = [t.emission_scale; 3];
+                }
+                ([layer(t.color), t.tint], [layer(t.roughness), layer(t.metalness), layer(t.emission), layer(t.alpha)], [layer(t.specular), layer(t.bump), t.emission_scale, t.bump_scale])
+            }
+            None => ([-1.0, 1.0], [-1.0; 4], [-1.0, -1.0, 1.0, 1.0]),
+        };
         for t in pm.triangulate_face(fi) {
             for &c in &t {
                 let uv = pm.face_uv(fi).and_then(|u| u.get(c)).copied().unwrap_or(DVec2::ZERO);
-                let (uv, texv) = match tex {
-                    Some(t) => (t.uv(uv), [t.layer as f32, t.tint]),
-                    None => ([uv.x as f32, uv.y as f32], [-1.0, 1.0]),
+                let uv = match tex {
+                    Some(t) => t.uv(uv),
+                    None => [uv.x as f32, uv.y as f32],
                 };
-                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col, uv, tex: texv, emission });
+                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col, uv, tex: texv, emission, aux, extra });
             }
         }
     }
@@ -776,18 +788,35 @@ fn tex_tint(m: &inca_core::materials::Material) -> f32 {
     }
 }
 
-/// One face's colour texture: array layer, JS tint and file-texture UV transform.
+/// Material maps for one face material: array layers, JS tint and the UV transform the maps
+/// share. three.js keeps a separate transform per texture; the Rust viewport uses the first
+/// assigned map's transform for all channels.
 #[derive(Clone, Copy)]
-pub struct TexRef {
-    pub layer: u32,
+pub struct MatTex {
+    pub color: Option<u32>,
+    pub roughness: Option<u32>,
+    pub metalness: Option<u32>,
+    pub emission: Option<u32>,
+    pub alpha: Option<u32>,
+    pub specular: Option<u32>,
+    pub bump: Option<u32>,
     pub tint: f32,
+    /// JS `max(a.emission, 0.0001)` for a Standard Surface emission map (1 otherwise).
+    pub emission_scale: f32,
+    pub bump_scale: f32,
     pub repeat: [f32; 2],
     pub offset: [f32; 2],
     /// radians
     pub rot: f32,
 }
 
-impl TexRef {
+impl Default for MatTex {
+    fn default() -> Self {
+        MatTex { color: None, roughness: None, metalness: None, emission: None, alpha: None, specular: None, bump: None, tint: 1.0, emission_scale: 1.0, bump_scale: 1.0, repeat: [1.0; 2], offset: [0.0; 2], rot: 0.0 }
+    }
+}
+
+impl MatTex {
     pub fn uv(&self, uv: DVec2) -> [f32; 2] {
         if self.rot == 0.0 && self.offset == [0.0; 2] && self.repeat == [1.0; 2] {
             return [uv.x as f32, uv.y as f32];
@@ -799,7 +828,7 @@ impl TexRef {
     }
 }
 
-/// Make sure the colour texture of a material is in the GPU array; returns its layer.
+/// Make sure a texture is in the GPU array; returns its layer.
 fn ensure_texture(g: &mut crate::viewport::gpu::Gpu, s: &Scene, t: &inca_core::materials::Texture) -> Option<u32> {
     let mut h = DefaultHasher::new();
     t.ty.hash(&mut h);
@@ -808,8 +837,15 @@ fn ensure_texture(g: &mut crate::viewport::gpu::Gpu, s: &Scene, t: &inca_core::m
     g.texture_layer(&t.id, h.finish(), || inca_core::materials::viewport_texture_pixels(t, project.as_deref()))
 }
 
-/// Colour texture of every material used by a mesh (None = no map).
-fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::scene::MeshShape) -> std::collections::HashMap<String, Option<TexRef>> {
+fn texture_slot<'a>(g: &mut crate::viewport::gpu::Gpu, s: &'a Scene, mat: &inca_core::materials::Material, slot: &str) -> Option<(&'a inca_core::materials::Texture, u32)> {
+    let tid = mat.maps.get(slot)?.as_str()?;
+    let t = s.texs.get(tid)?;
+    let layer = ensure_texture(g, s, t)?;
+    Some((t, layer))
+}
+
+/// Map layers of every material used by a mesh (empty = no maps).
+fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::scene::MeshShape) -> std::collections::HashMap<String, MatTex> {
     let mut out = std::collections::HashMap::new();
     let mut ids: Vec<&String> = vec![&m.material];
     if let Some(fm) = &m.mesh.fm {
@@ -819,22 +855,73 @@ fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::sc
         if out.contains_key(mid) {
             continue;
         }
-        let r = s.mats.get(mid).and_then(|mat| {
-            let tid = mat.maps.get(mat.color_attr())?.as_str()?;
-            let t = s.texs.get(tid)?;
-            let layer = ensure_texture(g, s, t)?;
-            let (repeat, offset, rot) = if t.ty == "file" {
+        let Some(mat) = s.mats.get(mid) else { continue };
+        let color = texture_slot(g, s, mat, mat.color_attr());
+        let (rough, metal, emission_slot, alpha, spec, bump) = match mat.ty.as_str() {
+            "standardSurface" => (
+                texture_slot(g, s, mat, "specularRoughness"),
+                texture_slot(g, s, mat, "metalness"),
+                texture_slot(g, s, mat, "emissionColor"),
+                texture_slot(g, s, mat, "opacity"),
+                None,
+                texture_slot(g, s, mat, "bump"),
+            ),
+            "surfaceShader" => (None, None, None, None, None, None),
+            ty => (
+                None,
+                None,
+                texture_slot(g, s, mat, "incandescence"),
+                texture_slot(g, s, mat, "transparency"),
+                if ty == "lambert" { None } else { texture_slot(g, s, mat, "specularColor") },
+                texture_slot(g, s, mat, "bump"),
+            ),
+        };
+        let first = [color, rough, metal, emission_slot, alpha, spec, bump].into_iter().flatten().next();
+        let mut mt = MatTex::default();
+        mt.color = color.map(|(_, l)| l);
+        mt.roughness = rough.map(|(_, l)| l);
+        mt.metalness = metal.map(|(_, l)| l);
+        mt.emission = emission_slot.map(|(_, l)| l);
+        mt.alpha = alpha.map(|(_, l)| l);
+        mt.specular = spec.map(|(_, l)| l);
+        mt.bump = bump.map(|(_, l)| l);
+        mt.tint = tex_tint(mat);
+        if mat.ty == "standardSurface" {
+            mt.emission_scale = mat.attrs.get("emission").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0001) as f32;
+        }
+        let bump_amount = mat.attrs.get("bump").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        mt.bump_scale = if bump_amount == 0.0 { 1.0 } else { bump_amount as f32 };
+        if let Some((t, _)) = first {
+            if t.ty == "file" {
                 let a = &t.attrs;
                 let f = |k: &str, d: f64| a.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
-                ([f("repeatU", 1.0).max(0.0001), f("repeatV", 1.0).max(0.0001)], [f("offsetU", 0.0), f("offsetV", 0.0)], f("rotateUV", 0.0).to_radians())
-            } else {
-                ([1.0, 1.0], [0.0, 0.0], 0.0)
-            };
-            Some(TexRef { layer, tint: tex_tint(mat), repeat, offset, rot })
-        });
-        out.insert(mid.clone(), r);
+                mt.repeat = [f("repeatU", 1.0).max(0.0001), f("repeatV", 1.0).max(0.0001)];
+                mt.offset = [f("offsetU", 0.0), f("offsetV", 0.0)];
+                mt.rot = f("rotateUV", 0.0).to_radians();
+            }
+        }
+        out.insert(mid.clone(), mt);
     }
     out
+}
+
+/// JS `applyAttrs` alpha map slot: Standard Surface uses `opacity`, the classic materials use
+/// `transparency`; a Surface Shader has none.
+fn mat_has_alpha_map(m: &inca_core::materials::Material) -> bool {
+    let slot = match m.ty.as_str() {
+        "standardSurface" => "opacity",
+        "surfaceShader" => return false,
+        _ => "transparency",
+    };
+    m.maps.get(slot).and_then(|v| v.as_str()).is_some()
+}
+
+fn mesh_has_alpha_map(s: &Scene, m: &inca_core::scene::MeshShape) -> bool {
+    let mut ids: Vec<&String> = vec![&m.material];
+    if let Some(fm) = &m.mesh.fm {
+        ids.extend(fm.iter().flatten());
+    }
+    ids.into_iter().any(|mid| s.mats.get(mid).is_some_and(mat_has_alpha_map))
 }
 
 /// Key for the GPU cache of a mesh node: geometry revision, smoothing and material colours.
@@ -859,11 +946,17 @@ pub fn mesh_key(s: &Scene, id: &str, divisions: u32) -> u64 {
             for c in mat_emission(s, mid) {
                 hash_f(&mut h, c);
             }
-            // UV transforms are baked into the vertex buffer, so texture edits rebuild it
-            if let Some(t) = s.mats.get(mid.as_str()).and_then(|m| m.maps.get(m.color_attr())).and_then(|v| v.as_str()).and_then(|tid| s.texs.get(tid)) {
-                t.id.hash(&mut h);
-                t.ty.hash(&mut h);
-                serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
+            // UV transforms and map layers are baked into the vertex buffer, so texture edits
+            // (and the bump strength) rebuild it.
+            if let Some(mat) = s.mats.get(mid.as_str()) {
+                mat.attrs.get("bump").and_then(|v| v.as_f64()).map(|v| v.to_bits()).hash(&mut h);
+                for slot in inca_core::materials::mat_type(&mat.ty).mappable {
+                    if let Some(t) = mat.maps.get(*slot).and_then(|v| v.as_str()).and_then(|tid| s.texs.get(tid)) {
+                        t.id.hash(&mut h);
+                        t.ty.hash(&mut h);
+                        serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
+                    }
+                }
             }
         }
     }
@@ -1035,9 +1128,9 @@ pub fn sky_texture_file(s: &Scene, vp: &Viewport) -> Option<String> {
 pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> FrameUniform {
     let (bg_top, bg_bottom) = background(bg_mode);
     let m4 = |m: DMat4| m.as_mat4().to_cols_array_2d();
-    let mut lights = [GpuLight { pos: [0.0; 4], dir: [0.0; 4], color: [0.0; 4], params: [0.0; 4] }; 8];
-    let mut shadow_mats = [[[0.0; 4]; 4]; 8];
-    let mut shadow_info = [[-1.0, 0.0, 0.0, 0.0]; 8];
+    let mut lights = [GpuLight { pos: [0.0; 4], dir: [0.0; 4], color: [0.0; 4], params: [0.0; 4], half_u: [0.0; 4], half_v: [0.0; 4] }; MAX_LIGHTS];
+    let mut shadow_mats = [[[0.0; 4]; 4]; MAX_LIGHTS];
+    let mut shadow_info = [[-1.0, 0.0, 0.0, 0.0]; MAX_LIGHTS];
     let mut shadow_layer = 0u32;
     let shadows_on = vp.shadows && vp.lights == LightMode::All;
     let mut count = 0;
@@ -1062,7 +1155,7 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
     }
     if vp.lights == LightMode::All {
         for n in s.nodes.values() {
-            if count >= 8 {
+            if count >= MAX_LIGHTS {
                 break;
             }
             let Shape::Light(l) = &n.shape else { continue };
@@ -1072,6 +1165,15 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
             let wm = s.world_matrix(&n.id);
             let pos = wm.transform_point3(DVec3::ZERO);
             let dir = wm.transform_vector3(-DVec3::Z).normalize();
+            // JS `syncLight`: RectAreaLight width/height = 2 * |scale.x| / 2 * |scale.y|, i.e.
+            // the local axes scaled by the object. These are half-axis vectors for the shader.
+            let (half_u, half_v) = if l.ty == "areaLight" {
+                let u = wm.transform_vector3(DVec3::X);
+                let v = wm.transform_vector3(DVec3::Y);
+                ([u.x as f32, u.y as f32, u.z as f32, 0.0], [v.x as f32, v.y as f32, v.z as f32, 0.0])
+            } else {
+                ([0.0; 4], [0.0; 4])
+            };
             let col = l.attrs.get("color").and_then(|c| c.as_array()).map(|a| [a[0].as_f64().unwrap_or(1.0), a[1].as_f64().unwrap_or(1.0), a[2].as_f64().unwrap_or(1.0)]).unwrap_or([1.0; 3]);
             let i = l.attrs.get("intensity").and_then(|v| v.as_f64()).unwrap_or(1.0);
             let ty = match l.ty.as_str() {
@@ -1123,6 +1225,8 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
                 dir: [dir.x as f32, dir.y as f32, dir.z as f32, 0.0],
                 color: [(col[0] * i) as f32, (col[1] * i) as f32, (col[2] * i) as f32, 1.0],
                 params: [outer as f32, inner as f32, decay as f32, 0.0],
+                half_u,
+                half_v,
             };
             count += 1;
         }
@@ -1196,7 +1300,7 @@ pub fn build_draws(
                         let (t, mut w) = build_mesh_buffers(
                             &pm,
                             &|fm| mat_color(s, fm.map(|x| x.as_str()).unwrap_or(&m.material)),
-                            &|fm| texs.get(fm.map(|x| x.as_str()).unwrap_or(&m.material)).copied().flatten(),
+                            &|fm| texs.get(fm.map(|x| x.as_str()).unwrap_or(&m.material)).copied(),
                             &|fm| mat_emission(s, fm.map(|x| x.as_str()).unwrap_or(&m.material)),
                         );
                         // the JS draws the base cage for levels 1 and 3 and the smooth mesh
@@ -1214,12 +1318,15 @@ pub fn build_draws(
                 let receive_shadows = n.extra.get("receiveShadows").and_then(|v| v.as_bool()).unwrap_or(true);
                 // templates draw as wireframe only, whatever the shading mode
                 if vp.shade != ShadeMode::Wire && !template {
-                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness).spec_tint(pbr.spec_color, pbr.metalness).textured(vp.shade == ShadeMode::Textured).shadows(cast_shadows, receive_shadows);
+                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness).spec_tint(pbr.spec_color, pbr.metalness).ior(pbr.ior as f32).textured(vp.shade == ShadeMode::Textured).shadows(cast_shadows, receive_shadows);
                     if pbr.unlit {
                         u = u.unlit();
                     }
                     let xray = vp.xray || n.xray;
-                    if xray || pbr.opacity < 0.99 {
+                    // three.js sets `material.transparent` when an alpha map is assigned, even
+                    // with opacity 1, so those meshes use the sorted transparent pass.
+                    let alpha_map = !xray && vp.shade == ShadeMode::Textured && mesh_has_alpha_map(s, m);
+                    if xray || pbr.opacity < 0.99 || alpha_map {
                         // JS: opacity = min(material opacity, 0.5), depth write off. Unlike the old
                         // viewport, opacity 0 stays fully transparent (the JS clamps to [0, 1]).
                         let a = if xray { pbr.opacity.min(0.5) } else { pbr.opacity };
@@ -2535,6 +2642,32 @@ mod tests {
     }
 
     #[test]
+    fn area_lights_carry_rectangle_axes_and_more_than_eight_lights_reach_the_gpu() {
+        let (mut s, mut vp, cv, _) = setup();
+        let a = s.create_light("areaLight");
+        s.nodes.get_mut(&a).unwrap().xf.s = [3.0, 2.0, 1.0];
+        for _ in 0..10 {
+            s.create_light("pointLight");
+        }
+        vp.lights = LightMode::All;
+        let fu = frame_uniform(&s, &vp, &cv, 0);
+        assert_eq!(fu.mode[1], 11.0, "the old eight-light cap must be gone");
+        let area = (0..11).find(|&i| fu.lights[i].pos[3] == 4.0).expect("area light in the list");
+        let au = fu.lights[area].half_u;
+        let av = fu.lights[area].half_v;
+        let u = glam::Vec3::new(au[0], au[1], au[2]);
+        let v = glam::Vec3::new(av[0], av[1], av[2]);
+        assert!((u.length() - 3.0).abs() < 1e-5, "JS width = 2 * scale.x, half axis = 3");
+        assert!((v.length() - 2.0).abs() < 1e-5, "JS height = 2 * scale.y, half axis = 2");
+        // the frame array still has a finite size, but far beyond the old cap
+        for _ in 0..(MAX_LIGHTS as usize + 4) {
+            s.create_light("pointLight");
+        }
+        let fu = frame_uniform(&s, &vp, &cv, 0);
+        assert_eq!(fu.mode[1], MAX_LIGHTS as f32);
+    }
+
+    #[test]
     fn emission_is_additive_and_unlit_shaders_stay_flat() {
         let (mut s, _, _, _) = setup();
         // standardSurface: base and emission travel separately so the shader can add the
@@ -2552,6 +2685,52 @@ mod tests {
         s.mats.get_mut(&sid).unwrap().attrs.insert("outColor".into(), serde_json::json!([0.25, 0.5, 0.75]));
         assert_eq!(mat_color(&s, &sid), [0.25, 0.5, 0.75]);
         assert_eq!(mat_emission(&s, &sid), [0.0; 3]);
+    }
+
+    #[test]
+    fn non_colour_maps_fill_the_vertex_channels() {
+        let (s, _, _, id) = setup();
+        let pm = s.node(&id).unwrap().mesh().unwrap().mesh.clone();
+        let mt = MatTex {
+            color: Some(2),
+            roughness: Some(3),
+            metalness: Some(4),
+            emission: Some(5),
+            alpha: Some(6),
+            specular: Some(7),
+            bump: Some(8),
+            tint: 0.5,
+            emission_scale: 0.3,
+            bump_scale: 0.35,
+            ..Default::default()
+        };
+        let (tris, _) = build_mesh_buffers(&pm, &|_| [0.4; 3], &|_| Some(mt), &|_| [1.0, 0.0, 0.0]);
+        assert!(!tris.is_empty());
+        let v = tris[0];
+        assert_eq!(v.tex, [2.0, 0.5]);
+        assert_eq!(v.aux, [3.0, 4.0, 5.0, 6.0], "roughness, metalness, emission and alpha layers");
+        assert_eq!(v.extra, [7.0, 8.0, 0.3, 0.35], "specular, bump, scales");
+        assert_eq!(v.emission, [0.3; 3], "an emissive map replaces the flat emission");
+    }
+
+    #[test]
+    fn alpha_maps_use_the_transparent_pass_and_invalidate_mesh_buffers() {
+        let (mut s, _, _, id) = setup();
+        let mid = s.create_material("standardSurface", Some("alphaMat"));
+        s.assign_material(&id, &mid, None);
+        let tid = s.create_texture("checker", Some("alphaTex"));
+        let mesh = s.node(&id).unwrap().mesh().unwrap().clone();
+        assert!(!mesh_has_alpha_map(&s, &mesh), "no alpha map yet");
+        let before = mesh_key(&s, &id, 1);
+        s.mats.get_mut(&mid).unwrap().maps.insert("opacity".into(), serde_json::json!(tid));
+        assert!(mesh_has_alpha_map(&s, &mesh));
+        assert_ne!(mesh_key(&s, &id, 1), before, "map edits must rebuild the vertex buffer");
+        // Surface Shader ignores an opacity map (applyAttrs leaves alphaMap null).
+        let sid = s.create_material("surfaceShader", Some("flatMat"));
+        s.mats.get_mut(&sid).unwrap().maps.insert("opacity".into(), serde_json::json!(tid));
+        let mut flat = mesh;
+        flat.material = sid;
+        assert!(!mesh_has_alpha_map(&s, &flat));
     }
 
     #[test]

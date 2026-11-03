@@ -9,6 +9,9 @@ pub const MSAA: u32 = 4;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const DRAW_SLOT: u64 = 512;
+/// Punctual lights per frame. The JS has no fixed limit; this keeps the frame uniform small
+/// while covering scenes far beyond the old eight-light cap.
+pub const MAX_LIGHTS: usize = 32;
 /// Material textures live in one array; 64 layers of 256² RGBA is 16 MB.
 const TEX_LAYERS: u32 = 64;
 /// Shadow depth maps: 512² per face, 48 layers (eight point lights, or fewer mixed lights).
@@ -29,11 +32,15 @@ pub struct MeshVertex {
     pub tex: [f32; 2],
     /// additive emissive colour (JS `emissive` / `incandescence`), applied after lighting
     pub emission: [f32; 3],
+    /// Material map layers: x = roughness, y = metalness, z = emission, w = alpha (-1 = none).
+    pub aux: [f32; 4],
+    /// x = specular colour map, y = bump map (-1 = none); z = emissive scale, w = bump scale.
+    pub extra: [f32; 4],
 }
 
 impl Default for MeshVertex {
     fn default() -> Self {
-        MeshVertex { pos: [0.0; 3], normal: [0.0; 3], color: [0.0; 3], uv: [0.0; 2], tex: [-1.0, 1.0], emission: [0.0; 3] }
+        MeshVertex { pos: [0.0; 3], normal: [0.0; 3], color: [0.0; 3], uv: [0.0; 2], tex: [-1.0, 1.0], emission: [0.0; 3], aux: [-1.0; 4], extra: [-1.0, -1.0, 1.0, 1.0] }
     }
 }
 
@@ -66,6 +73,9 @@ pub struct GpuLight {
     pub dir: [f32; 4],
     pub color: [f32; 4],
     pub params: [f32; 4],
+    /// Half-width and half-height axes of an area light (xyz, w = 0); zero for other types.
+    pub half_u: [f32; 4],
+    pub half_v: [f32; 4],
 }
 
 #[repr(C)]
@@ -85,12 +95,12 @@ pub struct FrameUniform {
     pub sky: [f32; 4],
     /// sky dome colour (rgb) and intensity (a)
     pub sky_col: [f32; 4],
-    pub lights: [GpuLight; 8],
+    pub lights: [GpuLight; MAX_LIGHTS],
     /// light view-projection for the first face of a shadowing light
-    pub shadow_mats: [[[f32; 4]; 4]; 8],
+    pub shadow_mats: [[[f32; 4]; 4]; MAX_LIGHTS],
     /// x = first depth-array layer (-1 = no shadows), y = type (1 ortho, 2 spot, 3 point),
     /// z = PCF softness (JS `shadowRadius`)
-    pub shadow_info: [[f32; 4]; 8],
+    pub shadow_info: [[f32; 4]; MAX_LIGHTS],
 }
 
 #[repr(C)]
@@ -113,7 +123,7 @@ pub struct DrawUniform {
 impl DrawUniform {
     pub fn new(model: glam::Mat4) -> Self {
         let n = model.inverse().transpose();
-        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), mvp: model.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 0.0, 0.0], params2: [0.5, 0.0, 0.0, 0.0], shadow: [1.0, 1.0, 0.0, 0.0], spec: [1.0, 1.0, 1.0, 0.0] }
+        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), mvp: model.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 1.5, 0.0], params2: [0.5, 0.0, 0.0, 0.0], shadow: [1.0, 1.0, 0.0, 0.0], spec: [1.0, 1.0, 1.0, 0.0] }
     }
     pub fn tint(mut self, c: [f32; 3], a: f32) -> Self {
         self.tint = [c[0], c[1], c[2], a];
@@ -135,6 +145,11 @@ impl DrawUniform {
     /// Specular tint and metalness (JS `specularColor`, `metalness`).
     pub fn spec_tint(mut self, c: [f32; 3], metal: f32) -> Self {
         self.spec = [c[0], c[1], c[2], metal];
+        self
+    }
+    /// Specular IOR (JS Standard Surface `specularIOR`), used for the dielectric F0.
+    pub fn ior(mut self, ior: f32) -> Self {
+        self.params[2] = ior.max(1.0);
         self
     }
     /// Half-size in pixels of component dots (see `vs_point`).
@@ -504,7 +519,7 @@ impl Gpu {
             cache: None,
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl), Some(&tex_bgl), Some(&shadow_bgl)], immediate_size: 0 });
-        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2, 5 => Float32x3];
+        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2, 5 => Float32x3, 6 => Float32x4, 7 => Float32x4];
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
         let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };
@@ -917,7 +932,7 @@ impl Gpu {
     fn prepare_shadow_faces(&self, frame: &FrameUniform) -> Vec<(u32, glam::Mat4)> {
         let mut slots = vec![0u8; (SHADOW_LAYERS as u64 * SHADOW_SLOT) as usize];
         let mut faces = vec![];
-        for i in 0..8 {
+        for i in 0..MAX_LIGHTS {
             let info = frame.shadow_info[i];
             if info[0] < 0.0 {
                 continue;
