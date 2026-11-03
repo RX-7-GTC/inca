@@ -92,6 +92,11 @@ fn rgb(v: Option<&Value>) -> Option<[f32; 3]> {
 fn f(v: Option<&Value>) -> Option<f32> {
     v?.as_f64().map(|x| x as f32)
 }
+/// JS `col(specularColor, 1 / lum(specularColor))`: keep the hue but average to 1.
+fn normalise_rgb(c: [f32; 3]) -> [f32; 3] {
+    let l = ((c[0] + c[1] + c[2]) / 3.0).max(0.01);
+    [c[0] / l, c[1] / l, c[2] / l]
+}
 
 /// Simplified physically based view of any material, used by the viewport and the path tracer.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,6 +105,8 @@ pub struct Pbr {
     pub roughness: f32,
     pub metalness: f32,
     pub specular: f32,
+    /// Specular tint (Blinn/Phong normalise it to an average of 1, like the JS).
+    pub spec_color: [f32; 3],
     pub emission: [f32; 3],
     pub opacity: f32,
     pub transmission: f32,
@@ -109,7 +116,7 @@ pub struct Pbr {
 
 impl Default for Pbr {
     fn default() -> Self {
-        Pbr { base: [0.4, 0.4, 0.4], roughness: 0.6, metalness: 0.0, specular: 0.0, emission: [0.0; 3], opacity: 1.0, transmission: 0.0, ior: 1.5, unlit: false }
+        Pbr { base: [0.4, 0.4, 0.4], roughness: 0.6, metalness: 0.0, specular: 0.0, spec_color: [1.0; 3], emission: [0.0; 3], opacity: 1.0, transmission: 0.0, ior: 1.5, unlit: false }
     }
 }
 
@@ -129,6 +136,7 @@ impl Material {
                 p.roughness = f(a.get("specularRoughness")).unwrap_or(0.2);
                 p.metalness = f(a.get("metalness")).unwrap_or(0.0);
                 p.specular = f(a.get("specular")).unwrap_or(1.0);
+                p.spec_color = rgb(a.get("specularColor")).unwrap_or([1.0; 3]);
                 let e = f(a.get("emission")).unwrap_or(0.0);
                 let ec = rgb(a.get("emissionColor")).unwrap_or([1.0; 3]);
                 p.emission = [ec[0] * e, ec[1] * e, ec[2] * e];
@@ -150,13 +158,21 @@ impl Material {
                 p.opacity = 1.0 - rgb(a.get("transparency")).map(|o| (o[0] + o[1] + o[2]) / 3.0).unwrap_or(0.0);
                 match ty {
                     "blinn" => {
-                        p.roughness = f(a.get("eccentricity")).unwrap_or(0.3).clamp(0.02, 1.0);
-                        p.specular = rgb(a.get("specularColor")).map(|s| (s[0] + s[1] + s[2]) / 3.0).unwrap_or(0.5);
+                        // JS applyAttrs: roughness = sqrt(eccentricity), specularIntensity =
+                        // min(1, lum(specularColor) * 2 * specularRollOff), colour normalised
+                        // to an average of 1.
+                        p.roughness = f(a.get("eccentricity")).unwrap_or(0.3).max(0.0).sqrt().clamp(0.05, 1.0);
+                        let sc = rgb(a.get("specularColor")).unwrap_or([0.5; 3]);
+                        let roll = f(a.get("specularRollOff")).unwrap_or(0.7);
+                        p.specular = (((sc[0] + sc[1] + sc[2]) / 3.0) * 2.0 * roll).clamp(0.0, 1.0);
+                        p.spec_color = normalise_rgb(sc);
                     }
                     "phong" => {
                         let cp = f(a.get("cosinePower")).unwrap_or(20.0).max(2.0);
-                        p.roughness = (2.0 / (cp + 2.0)).sqrt();
-                        p.specular = rgb(a.get("specularColor")).map(|s| (s[0] + s[1] + s[2]) / 3.0).unwrap_or(0.5);
+                        p.roughness = ((2.0 / (cp + 2.0)).sqrt() * 1.2).clamp(0.04, 1.0);
+                        let sc = rgb(a.get("specularColor")).unwrap_or([0.5; 3]);
+                        p.specular = (((sc[0] + sc[1] + sc[2]) / 3.0) * 2.0).clamp(0.0, 1.0);
+                        p.spec_color = normalise_rgb(sc);
                     }
                     _ => {
                         p.roughness = 1.0;
@@ -378,6 +394,30 @@ pub fn texture_swatch(t: &Texture, size: usize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blinn_and_phong_pbr_match_js_apply_attrs() {
+        // JS: roughness sqrt(eccentricity), intensity lum(specularColor)*2*rollOff
+        let mut blinn = Material::new("m1".into(), "blinn1".into(), "blinn");
+        let p = blinn.pbr();
+        assert!((p.roughness - 0.3f32.sqrt()).abs() < 1e-5);
+        assert!((p.specular - 0.7).abs() < 1e-5);
+        assert_eq!(p.spec_color, [1.0; 3]);
+        // a tinted specular colour is normalised to an average of 1
+        blinn.attrs.insert("specularColor".into(), serde_json::json!([1.0, 0.5, 0.0]));
+        let p = blinn.pbr();
+        assert!((p.specular - 0.7).abs() < 1e-5);
+        assert_eq!(p.spec_color, [2.0, 1.0, 0.0]);
+        // JS: roughness sqrt(2/(cosinePower+2))*1.2, intensity lum(specularColor)*2
+        let phong = Material::new("m2".into(), "phong1".into(), "phong");
+        let p = phong.pbr();
+        assert!((p.roughness - ((2.0f32 / 22.0).sqrt() * 1.2)).abs() < 1e-5);
+        assert!((p.specular - 1.0).abs() < 1e-5);
+        // Standard Surface keeps the authored specular colour (no normalisation)
+        let mut ss = Material::new("m3".into(), "standardSurface1".into(), "standardSurface");
+        ss.attrs.insert("specularColor".into(), serde_json::json!([0.5, 0.25, 0.1]));
+        assert_eq!(ss.pbr().spec_color, [0.5, 0.25, 0.1]);
+    }
 
     #[test]
     fn viewport_texture_pixels_render_procedural_patterns() {

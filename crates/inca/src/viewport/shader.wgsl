@@ -29,9 +29,10 @@ struct Draw {
     normal: mat4x4<f32>,
     mvp: mat4x4<f32>,    // view_proj * model, filled per viewport
     tint: vec4<f32>,     // rgb, a = mix amount
-    params: vec4<f32>,   // x unlit, y alpha, z unused, w specular
+    params: vec4<f32>,   // x unlit, y alpha, z unused, w specular intensity
     params2: vec4<f32>,  // x roughness, y dot half-size, z cull wires/dots, w textured
     shadow: vec4<f32>,   // x receives shadows, y casts shadows
+    spec: vec4<f32>,     // rgb specular tint (JS specularColor), a metalness
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -313,6 +314,33 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>, pos: vec3<f32>, info: vec4<f32>
     return shadow_pcf(base + face, uv, depth + SHADOW_BIAS, radius);
 }
 
+const PI: f32 = 3.14159265359;
+
+// Fresnel with separate F0 and grazing F90, like three.js `specularF90`
+// (`mix(specularIntensity, 1, metalness)`).
+fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>, f90: vec3<f32>) -> vec3<f32> {
+    let t = pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+    return f0 + (f90 - f0) * t;
+}
+
+// GGX/Trowbridge-Reitz normal distribution.
+fn d_ggx(ndh: f32, rough: f32) -> f32 {
+    let a = rough * rough;
+    let a2 = a * a;
+    let d = ndh * ndh * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-7);
+}
+
+// Smith height-correlated visibility, with the NdotL factor already cancelled out
+// (the caller feeds the light radiance directly, as three.js does).
+fn v_smith(ndv: f32, ndl: f32, rough: f32) -> f32 {
+    let a = rough * rough;
+    let k = a * 0.5;
+    let gv = ndv / (ndv * (1.0 - k) + k);
+    let gl = ndl / (ndl * (1.0 - k) + k);
+    return gv * gl / max(4.0 * ndv, 1e-4);
+}
+
 fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec3<f32> {
     var n = normalize(n_in);
     var v = normalize(frame.cam_pos.xyz - world);
@@ -323,19 +351,27 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
     if (dot(n, v) < 0.0) {
         n = -n;
     }
-    let spec_k = draw.params.w;
-    let rough = max(draw.params2.x, 0.03);
-    let shin = 2.0 / (rough * rough) - 2.0;
+    let spec_k = clamp(draw.params.w, 0.0, 1.0);
+    let metal = clamp(draw.spec.a, 0.0, 1.0);
+    let rough = clamp(draw.params2.x, 0.03, 1.0);
+    let tint = draw.spec.rgb;
+    // JS physical material: F0 = mix(0.04, base, metalness) * specularIntensity * specularColor
+    let f0 = mix(vec3<f32>(0.04) * spec_k * tint, base * spec_k * tint, metal);
+    let f90 = mix(vec3<f32>(spec_k), vec3<f32>(1.0), metal);
+    let ndv = max(dot(n, v), 1e-4);
+    let diffuse = base * (1.0 - metal);
     if (frame.mode.x < 0.5) {
         // JS `prepareScene`: the default light sits at camera + (-0.15, 0.2, 0) in camera
         // space and aims down the view axis, so the surface-to-light vector is constant
         let right = normalize(vec3(frame.view[0][0], frame.view[1][0], frame.view[2][0]));
         let up = normalize(vec3(frame.view[0][1], frame.view[1][1], frame.view[2][1]));
         let l = normalize(-0.15 * right + 0.2 * up - frame.cam_dir.xyz);
-        let d = max(dot(n, l), 0.0);
+        let ndl = max(dot(n, l), 0.0);
         let h = normalize(l + v);
-        let s = spec_k * pow(max(dot(n, h), 0.0), max(shin, 1.0)) * 0.5;
-        return base * d + vec3(s);
+        let f = fresnel_schlick(max(dot(v, h), 0.0), f0, f90);
+        // the default directional light is white*PI in the JS
+        let spec = f * d_ggx(max(dot(n, h), 0.0), rough) * v_smith(ndv, ndl, rough) * PI;
+        return diffuse * ndl + spec;
     }
     if (frame.mode.x > 2.5) {
         return base * 0.06;
@@ -345,15 +381,24 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
     }
     var c = vec3(0.0);
     if (frame.sky.x > 0.5) {
-        // sky-dome environment (procedural hemisphere or prefiltered HDRI irradiance)
-        c = c + base * sky_irradiance(n) * frame.sky_col.rgb * frame.sky_col.w;
+        // sky-dome environment: diffuse irradiance plus a roughness-mip specular reflection
+        let irr = sky_irradiance(n) * frame.sky_col.rgb * frame.sky_col.w;
+        c = c + diffuse * irr;
+        let r = reflect(-v, n);
+        var env = sky_color(clamp(r.y, -1.0, 1.0));
+        if (frame.sky.x > 1.5) {
+            let max_lod = max(f32(textureNumLevels(sky_tex) - 1), 0.0);
+            env = textureSampleLevel(sky_tex, sky_samp, equirect_uv(r), clamp(rough * max_lod, 0.0, max_lod)).rgb;
+        }
+        env = mix(env, sky_irradiance(n), rough) * frame.sky_col.rgb * frame.sky_col.w;
+        c = c + env * fresnel_schlick(ndv, f0, f90);
     }
     let count = i32(frame.mode.y);
     for (var i = 0; i < count; i = i + 1) {
         let L = frame.lights[i];
         let ty = L.pos.w;
         if (ty < 0.5) {
-            c = c + base * L.color.rgb;
+            c = c + diffuse * L.color.rgb;
             continue;
         }
         var l: vec3<f32>;
@@ -375,14 +420,15 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool) -> vec
                 att = att * max(dot(-l, normalize(L.dir.xyz)), 0.0);
             }
         }
-        let d = max(dot(n, l), 0.0);
+        let ndl = max(dot(n, l), 0.0);
         let h = normalize(l + v);
-        let s = spec_k * pow(max(dot(n, h), 0.0), max(shin, 1.0)) * 0.5;
+        let f = fresnel_schlick(max(dot(v, h), 0.0), f0, f90);
+        let spec = f * d_ggx(max(dot(n, h), 0.0), rough) * v_smith(ndv, ndl, rough) * PI;
         var shadow = 1.0;
         if (draw.shadow.x > 0.5) {
             shadow = shadow_factor(world, n, L.pos.xyz, frame.shadow_info[i], frame.shadow_mats[i]);
         }
-        c = c + (base * d + vec3(s) * step(0.0001, d)) * L.color.rgb * att * shadow;
+        c = c + (diffuse * ndl + spec * step(0.0001, ndl)) * L.color.rgb * att * shadow;
     }
     return c;
 }

@@ -1214,7 +1214,7 @@ pub fn build_draws(
                 let receive_shadows = n.extra.get("receiveShadows").and_then(|v| v.as_bool()).unwrap_or(true);
                 // templates draw as wireframe only, whatever the shading mode
                 if vp.shade != ShadeMode::Wire && !template {
-                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness).textured(vp.shade == ShadeMode::Textured).shadows(cast_shadows, receive_shadows);
+                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness).spec_tint(pbr.spec_color, pbr.metalness).textured(vp.shade == ShadeMode::Textured).shadows(cast_shadows, receive_shadows);
                     if pbr.unlit {
                         u = u.unlit();
                     }

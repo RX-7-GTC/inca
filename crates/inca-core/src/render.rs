@@ -562,9 +562,10 @@ impl RenderScene {
             }
             let metal = m.pbr.metalness as f64;
             let rough = (m.pbr.roughness as f64).clamp(0.03, 1.0);
-            let spec_k = (m.pbr.specular as f64 * 0.04 * (1.0 - metal) + metal).clamp(0.0, 1.0);
+            let sc = DVec3::new(m.pbr.spec_color[0] as f64, m.pbr.spec_color[1] as f64, m.pbr.spec_color[2] as f64);
+            let dielectric = sc * (m.pbr.specular as f64 * 0.04);
             let diffuse = base * (1.0 - metal);
-            let spec_col = DVec3::splat(spec_k).lerp(base, metal);
+            let spec_col = dielectric.lerp(base * sc, metal);
             let v_dir = -ray.dir;
             // direct light
             for l in &self.lights {

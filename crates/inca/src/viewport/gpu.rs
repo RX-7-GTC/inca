@@ -106,12 +106,14 @@ pub struct DrawUniform {
     pub params2: [f32; 4],
     /// x = receives shadows, y = casts shadows (Render Stats; the shadow pass reads y)
     pub shadow: [f32; 4],
+    /// rgb = specular tint (JS `specularColor`), a = metalness
+    pub spec: [f32; 4],
 }
 
 impl DrawUniform {
     pub fn new(model: glam::Mat4) -> Self {
         let n = model.inverse().transpose();
-        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), mvp: model.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 0.0, 0.0], params2: [0.5, 0.0, 0.0, 0.0], shadow: [1.0, 1.0, 0.0, 0.0] }
+        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), mvp: model.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 0.0, 0.0], params2: [0.5, 0.0, 0.0, 0.0], shadow: [1.0, 1.0, 0.0, 0.0], spec: [1.0, 1.0, 1.0, 0.0] }
     }
     pub fn tint(mut self, c: [f32; 3], a: f32) -> Self {
         self.tint = [c[0], c[1], c[2], a];
@@ -128,6 +130,11 @@ impl DrawUniform {
     pub fn spec(mut self, s: f32, rough: f32) -> Self {
         self.params[3] = s;
         self.params2[0] = rough;
+        self
+    }
+    /// Specular tint and metalness (JS `specularColor`, `metalness`).
+    pub fn spec_tint(mut self, c: [f32; 3], metal: f32) -> Self {
+        self.spec = [c[0], c[1], c[2], metal];
         self
     }
     /// Half-size in pixels of component dots (see `vs_point`).
