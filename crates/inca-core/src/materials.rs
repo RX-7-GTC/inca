@@ -259,7 +259,18 @@ pub fn viewport_texture_pixels(t: &Texture, project: Option<&str>) -> Option<Vec
         return match img {
             Some(img) => {
                 let img = img.to_rgba8();
-                let img = image::imageops::resize(&img, size, size, image::imageops::FilterType::Triangle);
+                let mut img = image::imageops::resize(&img, size, size, image::imageops::FilterType::Triangle);
+                // `colorSpace: Raw` (JS `THREE.NoColorSpace`): the stored bytes are linear,
+                // but the texture array is sRGB, so pre-encode them to keep the sampled
+                // values linear.
+                if t.attrs.get("colorSpace").and_then(|v| v.as_str()) == Some("Raw") {
+                    for c in img.chunks_mut(4) {
+                        for b in &mut c[..3] {
+                            let v = *b as f32 / 255.0;
+                            *b = srgb_byte(v);
+                        }
+                    }
+                }
                 Some(image::imageops::flip_vertical(&img).into_raw())
             }
             // JS `solidCanvas([0.5, 0.5, 0.5])` while a file texture is missing
@@ -380,6 +391,26 @@ mod tests {
         // the default checker has four tiles across and black/white squares
         assert_ne!(at(10, 10), at(75, 10));
         assert_eq!(at(10, 10), at(10, 140));
+    }
+
+    #[test]
+    fn raw_file_textures_keep_linear_values_in_the_srgb_array() {
+        let path = std::env::temp_dir().join(format!("inca_raw_tex_{}.png", std::process::id()));
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([128, 64, 32, 255]));
+        img.save(&path).unwrap();
+        let mut attrs = tex_defaults_for("file");
+        attrs.insert("fileTextureName".into(), serde_json::json!(path.display().to_string()));
+        attrs.insert("colorSpace".into(), serde_json::json!("sRGB"));
+        let srgb = Texture { id: "t3".into(), name: "file1".into(), ty: "file".into(), attrs: attrs.clone() };
+        let px = viewport_texture_pixels(&srgb, None).unwrap();
+        assert_eq!(&px[..3], &[128, 64, 32], "sRGB bytes pass through unchanged");
+        attrs.insert("colorSpace".into(), serde_json::json!("Raw"));
+        let raw = Texture { id: "t4".into(), name: "file1".into(), ty: "file".into(), attrs };
+        let px = viewport_texture_pixels(&raw, None).unwrap();
+        // the raw byte 128 must sample as linear 128/255 after the GPU's sRGB decode
+        assert_eq!(px[0], srgb_byte(128.0 / 255.0));
+        assert_eq!(px[1], srgb_byte(64.0 / 255.0));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

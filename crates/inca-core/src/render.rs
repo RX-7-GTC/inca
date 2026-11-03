@@ -187,16 +187,22 @@ struct Mat {
 #[derive(Clone)]
 enum TexSampler {
     Proc(crate::materials::Texture),
-    Image { w: u32, h: u32, px: std::sync::Arc<Vec<[f32; 3]>>, repeat: (f64, f64) },
+    Image { w: u32, h: u32, px: std::sync::Arc<Vec<[f32; 3]>>, repeat: (f64, f64), offset: (f64, f64), rot: f64 },
 }
 
 impl TexSampler {
     fn sample(&self, uv: DVec2) -> Option<[f32; 3]> {
         match self {
             TexSampler::Proc(t) => t.sample(uv.x, uv.y),
-            TexSampler::Image { w, h, px, repeat } => {
-                let u = (uv.x * repeat.0).rem_euclid(1.0);
-                let v = (1.0 - (uv.y * repeat.1).rem_euclid(1.0)).clamp(0.0, 0.9999);
+            TexSampler::Image { w, h, px, repeat, offset, rot } => {
+                // the same repeat / offset / rotateUV transform as the viewport `TexRef`
+                let (s, c) = rot.sin_cos();
+                let x = uv.x * repeat.0;
+                let y = uv.y * repeat.1;
+                let tu = c * x + s * y + offset.0;
+                let tv = -s * x + c * y + offset.1;
+                let u = tu.rem_euclid(1.0);
+                let v = (1.0 - tv.rem_euclid(1.0)).clamp(0.0, 0.9999);
                 let x = ((u * *w as f64) as u32).min(w - 1);
                 let y = ((v * *h as f64) as u32).min(h - 1);
                 px.get((y * w + x) as usize).copied()
@@ -261,15 +267,38 @@ impl RenderScene {
             let tex = m.and_then(|m| m.maps.get(m.color_attr()).and_then(|t| t.as_str()).and_then(|t| s.texs.get(t))).and_then(|t| {
                 if t.ty == "file" {
                     let path = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if let Some(c) = image_cache.get(&path) {
+                    let raw = t.attrs.get("colorSpace").and_then(|v| v.as_str()) == Some("Raw");
+                    let r = (t.attrs.get("repeatU").and_then(|v| v.as_f64()).unwrap_or(1.0), t.attrs.get("repeatV").and_then(|v| v.as_f64()).unwrap_or(1.0));
+                    let o = (t.attrs.get("offsetU").and_then(|v| v.as_f64()).unwrap_or(0.0), t.attrs.get("offsetV").and_then(|v| v.as_f64()).unwrap_or(0.0));
+                    let rot = t.attrs.get("rotateUV").and_then(|v| v.as_f64()).unwrap_or(0.0).to_radians();
+                    let key = format!("{path}|{raw}|{r:?}|{o:?}|{rot}");
+                    if let Some(c) = image_cache.get(&key) {
                         return Some(c.clone());
                     }
-                    let img = image::open(&path).ok()?.to_rgb32f();
+                    // relative texture names resolve inside the project, like the viewport
+                    let full = if std::path::Path::new(&path).is_absolute() {
+                        std::path::PathBuf::from(&path)
+                    } else if let Some(pr) = &s.project {
+                        std::path::Path::new(pr).join(&path)
+                    } else {
+                        std::path::PathBuf::from(&path)
+                    };
+                    let img = image::open(full).ok()?.to_rgb32f();
                     let (w, h) = img.dimensions();
-                    let px: Vec<[f32; 3]> = img.pixels().map(|p| [p[0].powf(2.2), p[1].powf(2.2), p[2].powf(2.2)]).collect();
-                    let r = (t.attrs.get("repeatU").and_then(|v| v.as_f64()).unwrap_or(1.0), t.attrs.get("repeatV").and_then(|v| v.as_f64()).unwrap_or(1.0));
-                    let ts = TexSampler::Image { w, h, px: std::sync::Arc::new(px), repeat: r };
-                    image_cache.insert(path, ts.clone());
+                    // file pixels are sRGB unless `colorSpace: Raw`; three.js decodes them
+                    // to linear before the path tracer shades them
+                    let decode = |v: f32| {
+                        if raw {
+                            v
+                        } else if v <= 0.04045 {
+                            v / 12.92
+                        } else {
+                            ((v + 0.055) / 1.055).powf(2.4)
+                        }
+                    };
+                    let px: Vec<[f32; 3]> = img.pixels().map(|p| [decode(p[0]), decode(p[1]), decode(p[2])]).collect();
+                    let ts = TexSampler::Image { w, h, px: std::sync::Arc::new(px), repeat: r, offset: o, rot };
+                    image_cache.insert(key, ts.clone());
                     Some(ts)
                 } else {
                     Some(TexSampler::Proc(t.clone()))

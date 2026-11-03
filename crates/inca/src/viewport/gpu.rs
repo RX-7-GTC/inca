@@ -354,7 +354,7 @@ impl Gpu {
         let tex_array = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("material textures"),
             size: wgpu::Extent3d { width: inca_core::materials::VIEW_TEX_SIZE, height: inca_core::materials::VIEW_TEX_SIZE, depth_or_array_layers: TEX_LAYERS },
-            mip_level_count: 1,
+            mip_level_count: inca_core::materials::VIEW_TEX_SIZE.ilog2() + 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -369,7 +369,7 @@ impl Gpu {
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let sky_samp = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -621,12 +621,42 @@ impl Gpu {
         if px.len() != (size * size * 4) as usize {
             return;
         }
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &self.tex_array, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
-            px,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
-            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-        );
+        // Three.js generates mipmaps for material textures; box-filter the chain here so
+        // minified surfaces don't shimmer and small textures keep their average colour.
+        let mut w = size;
+        let mut data = px.to_vec();
+        let mut mip = 0u32;
+        loop {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.tex_array, mip_level: mip, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
+                &data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(w) },
+                wgpu::Extent3d { width: w, height: w, depth_or_array_layers: 1 },
+            );
+            if w == 1 {
+                break;
+            }
+            let n = (w / 2).max(1);
+            let mut next = vec![0u8; (n * n * 4) as usize];
+            for y in 0..n {
+                for x in 0..n {
+                    for k in 0..4 {
+                        let mut sum = 0u32;
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let sx = (x * 2 + dx).min(w - 1);
+                                let sy = (y * 2 + dy).min(w - 1);
+                                sum += data[((sy * w + sx) * 4 + k) as usize] as u32;
+                            }
+                        }
+                        next[((y * n + x) * 4 + k) as usize] = ((sum + 2) / 4) as u8;
+                    }
+                }
+            }
+            w = n;
+            data = next;
+            mip += 1;
+        }
     }
 
     /// Decode and upload a sky dome `textureFile` when it changed. Synchronous: the first

@@ -396,10 +396,11 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
     }
     var base = mix(i.color, draw.tint.rgb, draw.tint.a);
     // Hardware Texturing: the map replaces the material colour, tinted by the JS scalar
-    // (`m.color = white * base/diffuse` in materials.js `applyAttrs`)
+    // (`m.color = white * base/diffuse` in materials.js `applyAttrs`).
+    // Sample before the branch so implicit derivatives (mip selection) are in uniform control flow.
+    let texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.tex.x, 0.0))).rgb;
     if (draw.params2.w > 0.5 && i.tex.x >= 0.0) {
-        let t = textureSampleLevel(tex_array, tex_samp, i.uv, i32(i.tex.x), 0.0).rgb;
-        base = t * i.tex.y;
+        base = texel * i.tex.y;
     }
     var c = base;
     if (draw.params.x < 0.5) {
