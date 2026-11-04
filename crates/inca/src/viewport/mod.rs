@@ -1249,6 +1249,18 @@ pub fn frame_uniform(s: &Scene, vp: &Viewport, cv: &CamView, bg_mode: usize) -> 
     }
 }
 
+/// Which mesh pass a material uses: three.js puts transmissive materials in their own list
+/// and draws them after the opaque scene, while alpha-mapped / x-ray meshes are transparent.
+fn mesh_pass(pbr: &inca_core::materials::Pbr, xray: bool, alpha_map: bool) -> Pass {
+    if pbr.transmission > 0.0 && !xray {
+        Pass::MeshTransmission
+    } else if xray || pbr.opacity < 0.99 || alpha_map {
+        Pass::MeshBlend
+    } else {
+        Pass::Mesh
+    }
+}
+
 /// Draw list for one viewport; uploads changed meshes.
 pub fn build_draws(
     s: &Scene,
@@ -1264,6 +1276,8 @@ pub fn build_draws(
     let mut draws = vec![];
     // transparent meshes, sorted back-to-front like three.js's transparent pass
     let mut blend_draws: Vec<(f32, DrawCmd)> = vec![];
+    // transmissive meshes, also sorted back-to-front (three.js sorts its transmission list)
+    let mut trans_draws: Vec<(f32, DrawCmd)> = vec![];
     if vp.grid {
         // drawn first without depth so any geometry (e.g. a ground plane) covers it
         draws.push(DrawCmd { pass: Pass::LinesUnder, geo: Geo::TransientLines(grid_lines(cv, vp.grid_cfg)), u: DrawUniform::new(Mat4::IDENTITY) });
@@ -1326,15 +1340,22 @@ pub fn build_draws(
                     // three.js sets `material.transparent` when an alpha map is assigned, even
                     // with opacity 1, so those meshes use the sorted transparent pass.
                     let alpha_map = !xray && vp.shade == ShadeMode::Textured && mesh_has_alpha_map(s, m);
-                    if xray || pbr.opacity < 0.99 || alpha_map {
-                        // JS: opacity = min(material opacity, 0.5), depth write off. Unlike the old
-                        // viewport, opacity 0 stays fully transparent (the JS clamps to [0, 1]).
-                        let a = if xray { pbr.opacity.min(0.5) } else { pbr.opacity };
-                        // three.js sorts the transparent pass back-to-front by world position
-                        let wp = DVec3::new(wm.w_axis.x as f64, wm.w_axis.y as f64, wm.w_axis.z as f64);
-                        blend_draws.push(((wp - cv.eye).dot(cv.fwd) as f32, DrawCmd { pass: Pass::MeshBlend, geo: Geo::MeshTris(id.clone()), u: u.alpha(a) }));
-                    } else {
-                        draws.push(DrawCmd { pass: Pass::Mesh, geo: Geo::MeshTris(id.clone()), u });
+                    // Standard Surface transmission (JS `material.transmission`): three.js draws
+                    // these after the opaque scene and samples the refracted screen colour.
+                    match mesh_pass(&pbr, xray, alpha_map) {
+                        Pass::MeshTransmission => {
+                            let wp = DVec3::new(wm.w_axis.x as f64, wm.w_axis.y as f64, wm.w_axis.z as f64);
+                            trans_draws.push(((wp - cv.eye).dot(cv.fwd) as f32, DrawCmd { pass: Pass::MeshTransmission, geo: Geo::MeshTris(id.clone()), u: u.transmission(pbr.transmission, pbr.thickness).alpha(pbr.opacity) }));
+                        }
+                        Pass::MeshBlend => {
+                            // JS: opacity = min(material opacity, 0.5), depth write off. Unlike the old
+                            // viewport, opacity 0 stays fully transparent (the JS clamps to [0, 1]).
+                            let a = if xray { pbr.opacity.min(0.5) } else { pbr.opacity };
+                            // three.js sorts the transparent pass back-to-front by world position
+                            let wp = DVec3::new(wm.w_axis.x as f64, wm.w_axis.y as f64, wm.w_axis.z as f64);
+                            blend_draws.push(((wp - cv.eye).dot(cv.fwd) as f32, DrawCmd { pass: Pass::MeshBlend, geo: Geo::MeshTris(id.clone()), u: u.alpha(a) }));
+                        }
+                        _ => draws.push(DrawCmd { pass: Pass::Mesh, geo: Geo::MeshTris(id.clone()), u }),
                     }
                 }
                 let show_wire = !vp.beauty && (vp.shade == ShadeMode::Wire || vp.wire_on_shaded || selected || in_comp || is_affected || template);
@@ -1493,6 +1514,8 @@ pub fn build_draws(
     }
     // back-to-front, like three.js's transparent pass; kept before the selected-face
     // overlay so an alpha-blended mesh does not dim the orange face highlight
+    trans_draws.sort_by(|a, b| b.0.total_cmp(&a.0));
+    draws.extend(trans_draws.into_iter().map(|(_, d)| d));
     blend_draws.sort_by(|a, b| b.0.total_cmp(&a.0));
     let insert_at = draws.iter().position(|d| d.pass == Pass::MeshBlend).unwrap_or(draws.len());
     for (i, (_, d)) in blend_draws.into_iter().enumerate() {
@@ -2731,6 +2754,22 @@ mod tests {
         let mut flat = mesh;
         flat.material = sid;
         assert!(!mesh_has_alpha_map(&s, &flat));
+    }
+
+    #[test]
+    fn transmissive_materials_use_the_transmission_pass() {
+        let mut pbr = inca_core::materials::Pbr::default();
+        pbr.transmission = 1.0;
+        assert_eq!(mesh_pass(&pbr, false, false), Pass::MeshTransmission);
+        // x-ray overrides transmission: the JS sets transparent + depthWrite off instead
+        assert_eq!(mesh_pass(&pbr, true, false), Pass::MeshBlend);
+        // no transmission: opaque unless transparent or alpha-mapped
+        pbr.transmission = 0.0;
+        assert_eq!(mesh_pass(&pbr, false, false), Pass::Mesh);
+        pbr.opacity = 0.5;
+        assert_eq!(mesh_pass(&pbr, false, false), Pass::MeshBlend);
+        pbr.opacity = 1.0;
+        assert_eq!(mesh_pass(&pbr, false, true), Pass::MeshBlend);
     }
 
     #[test]

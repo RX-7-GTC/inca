@@ -36,6 +36,7 @@ struct Draw {
     shadow: vec4<f32>,   // x receives shadows, y casts shadows, z coat, w coat roughness
     spec: vec4<f32>,     // rgb specular tint (JS specularColor), a metalness
     sheen: vec4<f32>,    // rgb sheenColor * sheen (three.js uniform), a sheen amount
+    trans: vec4<f32>,    // x transmission, y thickness (local space)
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -128,6 +129,10 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
 @group(2) @binding(4) var sky_samp: sampler;
 @group(3) @binding(0) var shadow_map: texture_depth_2d_array;
 @group(3) @binding(1) var shadow_samp: sampler_comparison;
+// resolved opaque colour (copy of the viewport target) for the transmission pass; it lives in
+// the frame group because the device only supports four bind groups
+@group(0) @binding(1) var transmission_tex: texture_2d<f32>;
+@group(0) @binding(2) var transmission_samp: sampler;
 
 const SHADOW_NEAR: f32 = 0.5;
 const SHADOW_FAR: f32 = 500.0;
@@ -180,6 +185,12 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     let lo = c * 12.92;
     let hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
     return select(hi, lo, c <= vec3(0.0031308));
+}
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lo = c / 12.92;
+    let hi = pow((max(c, vec3(0.0)) + 0.055) / 1.055, vec3(2.4));
+    return select(hi, lo, c <= vec3(0.04045));
 }
 
 // ---------------------------------------------------------------- tone mapping
@@ -421,7 +432,7 @@ fn env_radiance(r: vec3<f32>, n: vec3<f32>, rough: f32) -> vec3<f32> {
     return mix(env, sky_irradiance(n), rough) * frame.sky_col.rgb * frame.sky_col.w;
 }
 
-fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_in: f32, metal_in: f32, tint_in: vec3<f32>, emission: vec3<f32>, phi: f32) -> vec3<f32> {
+fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_in: f32, metal_in: f32, tint_in: vec3<f32>, emission: vec3<f32>, phi: f32, diffuse_scale: f32) -> vec3<f32> {
     var n = normalize(n_in);
     var v = normalize(frame.cam_pos.xyz - world);
     if (frame.cam_pos.w > 0.5) {
@@ -442,7 +453,7 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_
     let f0 = mix(min(vec3<f32>(dielectric_f0 * dielectric_f0) * tint, vec3<f32>(1.0)) * spec_k, base, metal);
     let f90 = mix(vec3<f32>(spec_k), vec3<f32>(1.0), metal);
     let ndv = max(dot(n, v), 1e-4);
-    let diffuse = base * (1.0 - metal);
+    let diffuse = base * (1.0 - metal) * diffuse_scale;
     // Standard Surface coat/sheen. The JS leaves `sheenRoughness` at the three.js default
     // (1.0) and the sheen colour is premultiplied by the amount in `build_draws`.
     let coat = clamp(draw.shadow.z, 0.0, 1.0);
@@ -471,10 +482,10 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_
         return (lit + emission) * (1.0 - coat * fcc) + cc_spec * coat;
     }
     if (frame.mode.x > 2.5) {
-        return base * 0.06 + emission;
+        return base * 0.06 * diffuse_scale + emission;
     }
     if (frame.mode.x > 1.5) {
-        return base + emission;
+        return base * diffuse_scale + emission;
     }
     var c = vec3(0.0);
     var cc = vec3(0.0);
@@ -614,7 +625,46 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
         // Emissive is additive and unlit, like three.js `totalEmissiveRadiance`.
         // three.js rotates its PCF kernel from the fragment's window coordinates
         let phi = interleaved_gradient_noise(i.clip.xy) * 6.28318530718;
-        c = shade(n, i.world, base, front, rough, metal, tint, emission, phi);
+        c = shade(n, i.world, base, front, rough, metal, tint, emission, phi, 1.0);
+        if (draw.trans.x > 0.0001) {
+            // three.js transmission pass: refract the view ray through the surface, offset by
+            // the local thickness and sample the opaque colour where the ray exits the object.
+            var nw = normalize(n);
+            var vw = normalize(frame.cam_pos.xyz - i.world);
+            if (frame.cam_pos.w > 0.5) {
+                vw = -frame.cam_dir.xyz;
+            }
+            if (dot(nw, vw) < 0.0) {
+                nw = -nw;
+            }
+            let ior_t = max(draw.params.z, 1.0);
+            let refr = refract(-vw, nw, 1.0 / ior_t);
+            let dir = select(-vw, normalize(refr), dot(refr, refr) > 1e-10);
+            let scale = vec3<f32>(length(draw.model[0].xyz), length(draw.model[1].xyz), length(draw.model[2].xyz));
+            let exit = i.world + dir * (draw.trans.y * scale);
+            let ndc = frame.view_proj * vec4<f32>(exit, 1.0);
+            let w = max(ndc.w, 1e-5);
+            let uv = clamp(vec2<f32>(ndc.x / w * 0.5 + 0.5, 0.5 - ndc.y / w * 0.5), vec2<f32>(0.0), vec2<f32>(1.0));
+            // `_trans` stores the same bytes as `color_view`: the shader applies
+            // `linear_to_srgb` and the sRGB target encodes again. Undo both to recover the
+            // linear shading value that the opaque pass sampled (there is no linear target).
+            // The copy already contains the viewport exposure, which is applied again at the
+            // end of this shader, so divide it back out here.
+            let raw = textureSample(transmission_tex, transmission_samp, uv).rgb;
+            let bg = srgb_to_linear(srgb_to_linear(raw)) / exp2(frame.post.x);
+            let spec_k = clamp(draw.params.w, 0.0, 1.0);
+            let dielectric = (ior_t - 1.0) / (ior_t + 1.0);
+            let f0 = mix(min(vec3<f32>(dielectric * dielectric) * tint, vec3<f32>(1.0)) * spec_k, base, metal);
+            let f90 = mix(vec3<f32>(spec_k), vec3<f32>(1.0), metal);
+            let f = fresnel_schlick(max(dot(nw, vw), 1e-4), f0, f90);
+            let f_avg = (f.r + f.g + f.b) / 3.0;
+            // three.js: outgoing = totalSpecular + mix(totalDiffuse, transmitted, transmission),
+            // where transmitted = (1 - F) * diffuseContribution * refracted colour.
+            let spec_only = shade(n, i.world, base, front, rough, metal, tint, emission, phi, 0.0);
+            let t = clamp(draw.trans.x, 0.0, 1.0);
+            let transmitted = (1.0 - f_avg) * base * (1.0 - metal) * bg;
+            c = spec_only + mix(c - spec_only, transmitted, t);
+        }
         c = tone_map(max(c * exp2(frame.post.x), vec3(0.0)));
         c = pow(max(c, vec3(0.0)), vec3(1.0 / frame.post.y));
         c = linear_to_srgb(c);

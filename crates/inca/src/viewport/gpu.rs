@@ -121,12 +121,14 @@ pub struct DrawUniform {
     pub spec: [f32; 4],
     /// rgb = sheen colour pre-multiplied by the sheen amount (the JS three.js uniform), a = amount
     pub sheen: [f32; 4],
+    /// x = transmission amount (JS `transmission`), y = thickness in local space
+    pub trans: [f32; 4],
 }
 
 impl DrawUniform {
     pub fn new(model: glam::Mat4) -> Self {
         let n = model.inverse().transpose();
-        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), mvp: model.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 1.5, 0.0], params2: [0.5, 0.0, 0.0, 0.0], shadow: [1.0, 1.0, 0.0, 0.0], spec: [1.0, 1.0, 1.0, 0.0], sheen: [0.0; 4] }
+        DrawUniform { model: model.to_cols_array_2d(), normal: n.to_cols_array_2d(), mvp: model.to_cols_array_2d(), tint: [0.0; 4], params: [0.0, 1.0, 1.5, 0.0], params2: [0.5, 0.0, 0.0, 0.0], shadow: [1.0, 1.0, 0.0, 0.0], spec: [1.0, 1.0, 1.0, 0.0], sheen: [0.0; 4], trans: [0.0; 4] }
     }
     pub fn tint(mut self, c: [f32; 3], a: f32) -> Self {
         self.tint = [c[0], c[1], c[2], a];
@@ -187,6 +189,11 @@ impl DrawUniform {
         self.sheen = [c[0] * amount, c[1] * amount, c[2] * amount, amount];
         self
     }
+    /// Refracted-background amount and JS `thickness` (0 for thin-walled glass).
+    pub fn transmission(mut self, amount: f32, thickness: f32) -> Self {
+        self.trans = [amount, thickness, 0.0, 0.0];
+        self
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -195,6 +202,8 @@ pub enum Pass {
     LinesUnder,
     /// opaque shaded triangles
     Mesh,
+    /// transmissive triangles (three.js transmission pass: samples the opaque scene)
+    MeshTransmission,
     /// transparent triangles (x-ray, selected-face overlay)
     MeshBlend,
     /// depth-tested lines
@@ -292,6 +301,8 @@ struct Target {
     color_view: wgpu::TextureView,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    /// Copy of the resolved opaque colour, sampled by the transmission pass.
+    _trans: wgpu::Texture,
     egui_id: egui::TextureId,
     frame_buf: wgpu::Buffer,
     frame_bg: wgpu::BindGroup,
@@ -376,8 +387,11 @@ pub struct Gpu {
     /// resolved path of the loaded sky file, and whether it loaded
     sky_key: Option<String>,
     sky_ok: bool,
+    /// group 0 binding 2: sampler for the resolved opaque colour (transmission pass)
+    trans_samp: wgpu::Sampler,
     bg_pipe: wgpu::RenderPipeline,
     mesh_pipe: wgpu::RenderPipeline,
+    trans_pipe: wgpu::RenderPipeline,
     blend_pipe: wgpu::RenderPipeline,
     line_pipe: wgpu::RenderPipeline,
     line_top_pipe: wgpu::RenderPipeline,
@@ -400,12 +414,23 @@ impl Gpu {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("inca viewport"), source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()) });
         let frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-                count: None,
-            }],
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // resolved opaque colour sampled by the transmission pass; it lives in the
+                // per-target frame group because max_bind_groups is only 4.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
         });
         let draw_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("draw"),
@@ -567,6 +592,14 @@ impl Gpu {
             multiview_mask: None,
             cache: None,
         });
+        let trans_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("transmission sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl), Some(&tex_bgl), Some(&shadow_bgl)], immediate_size: 0 });
         let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2, 5 => Float32x3, 6 => Float32x4, 7 => Float32x4];
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
@@ -603,6 +636,9 @@ impl Gpu {
         let point_vbs = [Some(point_vb)];
         let bg_pipe = mk("bg", "vs_bg", "fs_bg", &[], wgpu::PrimitiveTopology::TriangleList, depth(false, wgpu::CompareFunction::Always, no_bias), None);
         let mesh_pipe = mk("mesh", "vs_mesh", "fs_mesh", &mesh_vb, wgpu::PrimitiveTopology::TriangleList, depth(true, wgpu::CompareFunction::LessEqual, mesh_bias), None);
+        // transmissive meshes write depth like opaque ones (three.js keeps `transparent` false
+        // for transmission); alpha blending still handles a reduced material opacity.
+        let trans_pipe = mk("transmission", "vs_mesh", "fs_mesh", &mesh_vb, wgpu::PrimitiveTopology::TriangleList, depth(true, wgpu::CompareFunction::LessEqual, mesh_bias), alpha);
         let blend_pipe = mk("blend", "vs_mesh", "fs_mesh", &mesh_vb, wgpu::PrimitiveTopology::TriangleList, depth(false, wgpu::CompareFunction::LessEqual, no_bias), alpha);
         let line_pipe = mk("line", "vs_line", "fs_line", &line_vb, wgpu::PrimitiveTopology::LineList, depth(true, wgpu::CompareFunction::LessEqual, no_bias), alpha);
         let line_top_pipe = mk("line top", "vs_line", "fs_line", &line_vb, wgpu::PrimitiveTopology::LineList, depth(false, wgpu::CompareFunction::Always, no_bias), alpha);
@@ -631,8 +667,10 @@ impl Gpu {
             sky_samp,
             sky_key: None,
             sky_ok: false,
+            trans_samp,
             bg_pipe,
             mesh_pipe,
+            trans_pipe,
             blend_pipe,
             line_pipe,
             line_top_pipe,
@@ -904,12 +942,24 @@ impl Gpu {
             self.device.create_texture(&wgpu::TextureDescriptor { label: Some(label), size: ext, mip_level_count: 1, sample_count: samples, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
         };
         let color = tex("vp color", COLOR_FORMAT, 1, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
+        // Raw (non-sRGB) copy: `_color` holds the hardware-encoded bytes of the shader's own
+        // gamma-encoded output, so the transmission shader decodes the stored value explicitly.
+        let trans = tex("vp transmission", wgpu::TextureFormat::Rgba8Unorm, 1, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         let msaa = tex("vp msaa", COLOR_FORMAT, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let depth = tex("vp depth", DEPTH_FORMAT, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let color_view = color.create_view(&Default::default());
+        let trans_view = trans.create_view(&Default::default());
         let frame_buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("frame"), size: std::mem::size_of::<FrameUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let frame_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("frame"), layout: &self.frame_bgl, entries: &[wgpu::BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() }] });
-        Target { size, msaa_view: msaa.create_view(&Default::default()), depth_view: depth.create_view(&Default::default()), color_view, _color: color, egui_id: egui::TextureId::default(), frame_buf, frame_bg }
+        let frame_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frame"),
+            layout: &self.frame_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&trans_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.trans_samp) },
+            ],
+        });
+        Target { size, msaa_view: msaa.create_view(&Default::default()), depth_view: depth.create_view(&Default::default()), color_view, _color: color, _trans: trans, egui_id: egui::TextureId::default(), frame_buf, frame_bg }
     }
 
     /// Render into a throwaway target and read the pixels back (sRGB RGBA, row-major): the
@@ -1093,6 +1143,8 @@ impl Gpu {
                 rp.draw(0..*tri_count, 0..1);
             }
         }
+        let has_trans = draws.iter().any(|d| d.pass == Pass::MeshTransmission);
+        let keep = if has_trans { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard };
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewport"),
@@ -1100,11 +1152,11 @@ impl Gpu {
                     view: &t.msaa_view,
                     depth_slice: None,
                     resolve_target: Some(&t.color_view),
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Discard },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: keep },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: keep }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
@@ -1117,74 +1169,126 @@ impl Gpu {
             rp.set_bind_group(3, &shadow.bg, &[]);
             rp.set_pipeline(&self.bg_pipe);
             rp.draw(0..3, 0..1);
-            for pass in [Pass::LinesUnder, Pass::Mesh, Pass::Lines, Pass::Points, Pass::MeshBlend, Pass::LinesTop] {
-                rp.set_pipeline(match pass {
-                    Pass::LinesUnder => &self.line_top_pipe,
-                    Pass::Mesh => &self.mesh_pipe,
-                    Pass::MeshBlend => &self.blend_pipe,
-                    Pass::Lines => &self.line_pipe,
-                    Pass::Points => &self.point_pipe,
-                    Pass::LinesTop => &self.line_top_pipe,
-                });
-                for (i, d) in draws.iter().enumerate() {
-                    if d.pass != pass {
-                        continue;
-                    }
-                    let (buf, start, count) = match &d.geo {
-                        Geo::MeshTris(k) => match self.meshes.get(k) {
-                            Some(GpuMesh { tris: Some(b), tri_count, .. }) => (b, 0, *tri_count),
-                            _ => continue,
-                        },
-                        Geo::MeshWire(k) => match self.meshes.get(k) {
-                            Some(GpuMesh { wire: Some(b), wire_count, .. }) => (b, 0, *wire_count),
-                            _ => continue,
-                        },
-                        Geo::MeshPoints(k) => match self.meshes.get(k) {
-                            Some(GpuMesh { points: Some(b), point_count, .. }) => (b, 0, *point_count),
-                            _ => continue,
-                        },
-                        Geo::MeshFacePoints(k) => match self.meshes.get(k) {
-                            Some(GpuMesh { face_points: Some(b), face_point_count, .. }) => (b, 0, *face_point_count),
-                            _ => continue,
-                        },
-                        Geo::CompLines(k) => match self.meshes.get(k) {
-                            Some(GpuMesh { comp_lines: Some(b), comp_line_count, .. }) => (b, 0, *comp_line_count),
-                            _ => continue,
-                        },
-                        Geo::CompTris(k) => match self.meshes.get(k) {
-                            Some(GpuMesh { comp_tris: Some(b), comp_tri_count, .. }) => (b, 0, *comp_tri_count),
-                            _ => continue,
-                        },
-                        Geo::TransientTris(_) => match &tri_buf {
-                            Some(b) => (b, ranges[i].0, ranges[i].1),
-                            None => continue,
-                        },
-                        Geo::TransientLines(_) => match &line_buf {
-                            Some(b) => (b, ranges[i].0, ranges[i].1),
-                            None => continue,
-                        },
-                    };
-                    if count == 0 {
-                        continue;
-                    }
-                    rp.set_bind_group(1, &self.draw_bg, &[(i as u64 * DRAW_SLOT) as u32]);
-                    rp.set_vertex_buffer(0, buf.slice(..));
-                    if pass == Pass::Points {
-                        // one instanced quad (6 vertices) per dot
-                        rp.draw(0..6, start..start + count);
-                    } else {
-                        rp.draw(start..start + count, 0..1);
-                    }
+            let first: &[Pass] = if has_trans {
+                // keep the transmission copy free of lines / selection overlays, like the
+                // three.js transmission target, which only contains opaque geometry
+                &[Pass::LinesUnder, Pass::Mesh]
+            } else {
+                &[Pass::LinesUnder, Pass::Mesh, Pass::MeshTransmission, Pass::Lines, Pass::Points, Pass::MeshBlend, Pass::LinesTop]
+            };
+            self.draw_cmds(&mut rp, draws, tri_buf.as_ref(), line_buf.as_ref(), &ranges, first);
+        }
+        if has_trans {
+            // three.js renders the opaque scene into a separate transmission target first;
+            // here the resolved colour is copied and the transmissive meshes are drawn in a
+            // second pass that loads the opaque depth (so they still occlude correctly).
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &t._color, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &t._trans, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::Extent3d { width: t.size[0], height: t.size[1], depth_or_array_layers: 1 },
+            );
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("viewport transmission"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &t.msaa_view,
+                    depth_slice: None,
+                    resolve_target: Some(&t.color_view),
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &t.depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_bind_group(0, &t.frame_bg, &[]);
+            rp.set_bind_group(1, &self.draw_bg, &[0]);
+            rp.set_bind_group(2, &self.tex_bg, &[]);
+            rp.set_bind_group(3, &shadow.bg, &[]);
+            self.draw_cmds(&mut rp, draws, tri_buf.as_ref(), line_buf.as_ref(), &ranges, &[Pass::MeshTransmission, Pass::Lines, Pass::Points, Pass::MeshBlend, Pass::LinesTop]);
+        }
+        self.queue.submit([enc.finish()]);
+    }
+
+    fn draw_cmds(&self, rp: &mut wgpu::RenderPass<'_>, draws: &[DrawCmd], tri_buf: Option<&wgpu::Buffer>, line_buf: Option<&wgpu::Buffer>, ranges: &[(u32, u32)], passes: &[Pass]) {
+        for &pass in passes {
+            rp.set_pipeline(match pass {
+                Pass::LinesUnder => &self.line_top_pipe,
+                Pass::Mesh => &self.mesh_pipe,
+                Pass::MeshTransmission => &self.trans_pipe,
+                Pass::MeshBlend => &self.blend_pipe,
+                Pass::Lines => &self.line_pipe,
+                Pass::Points => &self.point_pipe,
+                Pass::LinesTop => &self.line_top_pipe,
+            });
+            for (i, d) in draws.iter().enumerate() {
+                if d.pass != pass {
+                    continue;
+                }
+                let (buf, start, count) = match &d.geo {
+                    Geo::MeshTris(k) => match self.meshes.get(k) {
+                        Some(GpuMesh { tris: Some(b), tri_count, .. }) => (b, 0, *tri_count),
+                        _ => continue,
+                    },
+                    Geo::MeshWire(k) => match self.meshes.get(k) {
+                        Some(GpuMesh { wire: Some(b), wire_count, .. }) => (b, 0, *wire_count),
+                        _ => continue,
+                    },
+                    Geo::MeshPoints(k) => match self.meshes.get(k) {
+                        Some(GpuMesh { points: Some(b), point_count, .. }) => (b, 0, *point_count),
+                        _ => continue,
+                    },
+                    Geo::MeshFacePoints(k) => match self.meshes.get(k) {
+                        Some(GpuMesh { face_points: Some(b), face_point_count, .. }) => (b, 0, *face_point_count),
+                        _ => continue,
+                    },
+                    Geo::CompLines(k) => match self.meshes.get(k) {
+                        Some(GpuMesh { comp_lines: Some(b), comp_line_count, .. }) => (b, 0, *comp_line_count),
+                        _ => continue,
+                    },
+                    Geo::CompTris(k) => match self.meshes.get(k) {
+                        Some(GpuMesh { comp_tris: Some(b), comp_tri_count, .. }) => (b, 0, *comp_tri_count),
+                        _ => continue,
+                    },
+                    Geo::TransientTris(_) => match tri_buf {
+                        Some(b) => (b, ranges[i].0, ranges[i].1),
+                        None => continue,
+                    },
+                    Geo::TransientLines(_) => match line_buf {
+                        Some(b) => (b, ranges[i].0, ranges[i].1),
+                        None => continue,
+                    },
+                };
+                if count == 0 {
+                    continue;
+                }
+                rp.set_bind_group(1, &self.draw_bg, &[(i as u64 * DRAW_SLOT) as u32]);
+                rp.set_vertex_buffer(0, buf.slice(..));
+                if pass == Pass::Points {
+                    // one instanced quad (6 vertices) per dot
+                    rp.draw(0..6, start..start + count);
+                } else {
+                    rp.draw(start..start + count, 0..1);
                 }
             }
         }
-        self.queue.submit([enc.finish()]);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transmission_packs_amount_and_thickness_into_the_draw_uniform() {
+        let u = DrawUniform::new(glam::Mat4::IDENTITY).transmission(0.8, 0.0);
+        assert_eq!(u.trans, [0.8, 0.0, 0.0, 0.0], "thin-walled glass passes thickness 0");
+        let u = DrawUniform::new(glam::Mat4::IDENTITY).transmission(1.0, 0.5);
+        assert_eq!(u.trans, [1.0, 0.5, 0.0, 0.0]);
+    }
 
     #[test]
     fn required_shadow_layers_covers_each_lights_faces() {

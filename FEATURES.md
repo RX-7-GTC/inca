@@ -77,6 +77,7 @@ Legend: ✅ built · 🟡 partial / simplified · ⏭ planned
 
 ## 7. Materials, shading & textures
 - ✅ Lambert, Blinn, Phong, Standard Surface, Surface Shader
+- ✅ Standard Surface PBR: metalness/roughness, IOR & specular, clearcoat, sheen, emission, opacity, transmission/refraction (viewport and hardware renderer, including thin-walled glass)
 - ✅ Assign New / Existing material (menus & marking menus), per-face assignment
 - ✅ Hypershade: material / texture tabs with rendered swatches, create bar, node graph work area (drag a texture's output onto a material slot, a material's output onto an object; right-click a slot to disconnect), property editor
 - ✅ File (PNG / JPEG / HDR), Checker, Ramp, Noise, Grid textures; bump, roughness, metalness, emission maps

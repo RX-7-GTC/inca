@@ -110,6 +110,8 @@ pub struct Pbr {
     pub emission: [f32; 3],
     pub opacity: f32,
     pub transmission: f32,
+    /// Refraction thickness in local space (JS `thickness`: 0 for thin walled, else 0.5).
+    pub thickness: f32,
     pub ior: f32,
     pub coat: f32,
     pub coat_roughness: f32,
@@ -120,7 +122,7 @@ pub struct Pbr {
 
 impl Default for Pbr {
     fn default() -> Self {
-        Pbr { base: [0.4, 0.4, 0.4], roughness: 0.6, metalness: 0.0, specular: 0.0, spec_color: [1.0; 3], emission: [0.0; 3], opacity: 1.0, transmission: 0.0, ior: 1.5, coat: 0.0, coat_roughness: 0.1, sheen: 0.0, sheen_color: [1.0; 3], unlit: false }
+        Pbr { base: [0.4, 0.4, 0.4], roughness: 0.6, metalness: 0.0, specular: 0.0, spec_color: [1.0; 3], emission: [0.0; 3], opacity: 1.0, transmission: 0.0, thickness: 0.5, ior: 1.5, coat: 0.0, coat_roughness: 0.1, sheen: 0.0, sheen_color: [1.0; 3], unlit: false }
     }
 }
 
@@ -146,6 +148,7 @@ impl Material {
                 p.emission = [ec[0] * e, ec[1] * e, ec[2] * e];
                 p.opacity = rgb(a.get("opacity")).map(|o| (o[0] + o[1] + o[2]) / 3.0).unwrap_or(1.0);
                 p.transmission = f(a.get("transmission")).unwrap_or(0.0);
+                p.thickness = if a.get("thinWalled").and_then(|v| v.as_bool()).unwrap_or(false) { 0.0 } else { 0.5 };
                 p.ior = f(a.get("specularIOR")).unwrap_or(1.5);
                 p.coat = f(a.get("coat")).unwrap_or(0.0);
                 p.coat_roughness = f(a.get("coatRoughness")).unwrap_or(0.1);
@@ -436,6 +439,19 @@ mod tests {
         let p = ss.pbr();
         assert_eq!((p.coat, p.coat_roughness, p.sheen), (0.7, 0.05, 0.4));
         assert_eq!(p.sheen_color, [0.2, 0.4, 0.6]);
+    }
+
+    #[test]
+    fn transmission_thickness_matches_js_apply_attrs() {
+        let mut m = Material::new("m".into(), "glass1".into(), "standardSurface");
+        assert_eq!(m.pbr().thickness, 0.5, "JS applyAttrs: thinWalled false -> 0.5");
+        m.attrs.insert("thinWalled".into(), serde_json::json!(true));
+        assert_eq!(m.pbr().thickness, 0.0, "JS applyAttrs: thinWalled true -> 0");
+        assert_eq!(m.pbr().transmission, 0.0);
+        m.attrs.insert("transmission".into(), serde_json::json!(0.8));
+        assert!((m.pbr().transmission - 0.8).abs() < 1e-6);
+        // other material types keep the default thickness (unused)
+        assert_eq!(Material::new("m2".into(), "lambert1".into(), "lambert").pbr().thickness, 0.5);
     }
 
     #[test]
