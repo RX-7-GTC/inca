@@ -575,11 +575,20 @@ impl RenderScene {
             let diffuse = base * (1.0 - metal);
             let spec_col = dielectric.lerp(base, metal);
             let v_dir = -ray.dir;
+            let ndv = n.dot(v_dir).max(1e-4);
+            // Standard Surface coat/sheen, using the same three.js lobes as the viewport.
+            let coat = m.pbr.coat as f64;
+            let coat_rough = (m.pbr.coat_roughness as f64).clamp(0.0525, 1.0);
+            let fcc = fresnel_schlick(ndv, 0.04, 1.0);
+            let sheen_col = DVec3::new(m.pbr.sheen_color[0] as f64, m.pbr.sheen_color[1] as f64, m.pbr.sheen_color[2] as f64) * m.pbr.sheen as f64;
+            let sheen_albedo_v = ibl_sheen_brdf(ndv, 1.0);
             // direct light
             for l in &self.lights {
                 let (ldir, dist, li) = match l.kind {
                     LightKind::Ambient | LightKind::Sky => {
-                        col += thr * diffuse * l.color * if matches!(l.kind, LightKind::Sky) { 0.0 } else { 1.0 };
+                        let sheen_energy = 1.0 - sheen_col.max_element() * sheen_albedo_v;
+                        let k = if matches!(l.kind, LightKind::Sky) { 0.0 } else { 1.0 };
+                        col += thr * diffuse * l.color * sheen_energy * (1.0 - coat * fcc) * k;
                         continue;
                     }
                     LightKind::Directional(d) => (-d, f64::INFINITY, l.color),
@@ -615,27 +624,47 @@ impl RenderScene {
                     continue;
                 }
                 let h = (ldir + v_dir).normalize();
+                let ndh = n.dot(h).max(0.0);
                 let shin = 2.0 / (rough * rough) - 2.0;
-                let spec = spec_col * (n.dot(h).max(0.0)).powf(shin.max(1.0)) * (shin + 8.0) / (8.0 * std::f64::consts::PI);
-                col += thr * li * ndl * (diffuse / std::f64::consts::PI * std::f64::consts::PI + spec);
+                let spec = spec_col * ndh.powf(shin.max(1.0)) * (shin + 8.0) / (8.0 * std::f64::consts::PI);
+                let sheen_energy = 1.0 - sheen_col.max_element() * sheen_albedo_v.max(ibl_sheen_brdf(ndl, 1.0));
+                let sheen = sheen_col * d_charlie(1.0, ndh) * v_neubelt(ndv, ndl) * ndl * std::f64::consts::PI;
+                let base_direct = (ndl * (diffuse + spec)) * sheen_energy + sheen;
+                // clearcoat: white GGX lobe over the attenuated base (three.js BRDF_GGX_Clearcoat)
+                let cc = fresnel_schlick(v_dir.dot(h).max(0.0), 0.04, 1.0) * d_ggx(ndh, coat_rough) * v_smith(ndv, ndl, coat_rough) * std::f64::consts::PI;
+                col += thr * li * (base_direct * (1.0 - coat * fcc) + cc * coat);
             }
             if depth == self.settings.bounces {
                 break;
             }
-            // indirect bounce: choose specular or diffuse
+            // indirect bounce: clearcoat reflection, base specular, or diffuse
+            let p_cc = if coat > 0.0 { (coat * fcc).clamp(0.05, 0.9) } else { 0.0 };
             let ps = (spec_col.max_element() * (1.0 - rough * 0.5)).clamp(0.05, 0.95);
-            if rng.f() < ps {
+            let r = rng.f();
+            if r < p_cc {
                 let refl = (ray.dir - n * 2.0 * ray.dir.dot(n)).normalize();
-                let d = (refl + random_unit(rng) * rough * rough).normalize_or(refl);
+                let d = (refl + random_unit(rng) * coat_rough * coat_rough).normalize_or(refl);
                 if d.dot(n) <= 0.0 {
                     break;
                 }
-                thr *= spec_col / ps;
+                // sampling proportional to coat * F makes the reflected radiance pass through
+                thr *= DVec3::splat(coat * fcc / p_cc);
                 ray = Ray { origin: p_off, dir: d };
             } else {
-                let d = (n + random_unit(rng)).normalize_or(n);
-                thr *= diffuse / (1.0 - ps);
-                ray = Ray { origin: p_off, dir: d };
+                let r2 = (r - p_cc) / (1.0 - p_cc);
+                if r2 < ps {
+                    let refl = (ray.dir - n * 2.0 * ray.dir.dot(n)).normalize();
+                    let d = (refl + random_unit(rng) * rough * rough).normalize_or(refl);
+                    if d.dot(n) <= 0.0 {
+                        break;
+                    }
+                    thr *= spec_col * (1.0 - coat * fcc) / (ps * (1.0 - p_cc));
+                    ray = Ray { origin: p_off, dir: d };
+                } else {
+                    let d = (n + random_unit(rng)).normalize_or(n);
+                    thr *= diffuse * (1.0 - coat * fcc) / ((1.0 - ps) * (1.0 - p_cc));
+                    ray = Ray { origin: p_off, dir: d };
+                }
             }
             if depth > 2 {
                 let q = thr.max_element().min(0.95);
@@ -718,6 +747,49 @@ fn random_unit(r: &mut Rng) -> DVec3 {
     DVec3::new(s * a.cos(), s * a.sin(), z)
 }
 
+fn fresnel_schlick(cos_theta: f64, f0: f64, f90: f64) -> f64 {
+    f0 + (f90 - f0) * (1.0 - cos_theta).clamp(0.0, 1.0).powi(5)
+}
+
+// GGX/Trowbridge-Reitz normal distribution (three.js `D_GGX`).
+fn d_ggx(ndh: f64, rough: f64) -> f64 {
+    let a = rough * rough;
+    let a2 = a * a;
+    let d = ndh * ndh * (a2 - 1.0) + 1.0;
+    a2 / (std::f64::consts::PI * d * d).max(1e-7)
+}
+
+// Smith height-correlated visibility; the NdotL factor stays inside `gl`.
+fn v_smith(ndv: f64, ndl: f64, rough: f64) -> f64 {
+    let a = rough * rough;
+    let k = a * 0.5;
+    let gv = ndv / (ndv * (1.0 - k) + k);
+    let gl = ndl / (ndl * (1.0 - k) + k);
+    gv * gl / (4.0 * ndv).max(1e-4)
+}
+
+// three.js `D_Charlie` (Production Friendly Microfacet Sheen BRDF).
+fn d_charlie(rough: f64, ndh: f64) -> f64 {
+    let alpha = rough * rough;
+    let inv_alpha = 1.0 / alpha.max(1e-5);
+    let sin2h = (1.0 - ndh * ndh).max(0.0078125);
+    (2.0 + inv_alpha) * sin2h.powf(inv_alpha * 0.5) / (2.0 * std::f64::consts::PI)
+}
+
+// three.js `V_Neubelt` (no NdotL factor).
+fn v_neubelt(ndv: f64, ndl: f64) -> f64 {
+    (1.0 / (4.0 * (ndl + ndv - ndl * ndv)).max(1e-5)).clamp(0.0, 1.0)
+}
+
+// three.js `IBLSheenBRDF`, the hemisphere-integrated Charlie lobe.
+fn ibl_sheen_brdf(ndv: f64, rough: f64) -> f64 {
+    let r2 = rough * rough;
+    let r_inv = 1.0 / (rough + 0.1);
+    let a = -1.9362 + 1.0678 * rough + 0.4573 * r2 - 0.8469 * r_inv;
+    let b = -0.6014 + 0.5538 * rough - 0.4670 * r2 - 0.1255 * r_inv;
+    (a * ndv + b).exp().clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +812,71 @@ mod tests {
         assert_eq!(acc[0], 0.0);
         let px = rs.resolve(&acc, 1);
         assert_eq!(px.len(), 32 * 24 * 4);
+    }
+
+    fn render_total(s: &Scene, samples: u32, bounces: u32) -> f64 {
+        let (w, h) = (32, 24);
+        let mut settings = RenderSettings::from_scene(s);
+        settings.width = w;
+        settings.height = h;
+        settings.samples = samples;
+        settings.bounces = bounces;
+        let rs = RenderScene::build(s, "persp", settings);
+        let mut acc = vec![0.0; (w * h * 3) as usize];
+        for pass in 0..samples {
+            rs.render_pass(&mut acc, pass);
+        }
+        acc.iter().map(|x| *x as f64).sum()
+    }
+
+    #[test]
+    fn path_tracer_includes_clearcoat_and_sheen() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let cam = s.find("persp").unwrap();
+        s.nodes.get_mut(&cam).unwrap().xf.t = [3.0, 2.25, 3.0];
+        let m = s.create_material("standardSurface", Some("coatMat"));
+        s.assign_material(&id, &m, None);
+        {
+            let a = &mut s.mats.get_mut(&m).unwrap().attrs;
+            a.insert("baseColor".into(), serde_json::json!([0.0, 0.0, 0.0]));
+            a.insert("specular".into(), serde_json::json!(0.0));
+            a.insert("metalness".into(), serde_json::json!(0.0));
+        }
+        let base = render_total(&s, 4, 0);
+        assert!(base < 1e-6, "a black material with no coat/sheen renders black: {base}");
+        s.mats.get_mut(&m).unwrap().attrs.insert("coat".into(), serde_json::json!(1.0));
+        s.mats.get_mut(&m).unwrap().attrs.insert("coatRoughness".into(), serde_json::json!(0.4));
+        let coat = render_total(&s, 4, 0);
+        assert!(coat > 1e-3, "clearcoat must add its specular lobe: {coat}");
+        s.mats.get_mut(&m).unwrap().attrs.insert("coat".into(), serde_json::json!(0.0));
+        s.mats.get_mut(&m).unwrap().attrs.insert("sheen".into(), serde_json::json!(1.0));
+        let sheen = render_total(&s, 4, 0);
+        assert!(sheen > 1e-3, "sheen must add its grazing lobe: {sheen}");
+    }
+
+    #[test]
+    fn path_tracer_clearcoat_reflects_the_background() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let cam = s.find("persp").unwrap();
+        s.nodes.get_mut(&cam).unwrap().xf.t = [3.0, 2.25, 3.0];
+        s.render.insert("background".into(), serde_json::json!([1.0, 1.0, 1.0]));
+        s.render.insert("toneMapping".into(), serde_json::json!("none"));
+        let m = s.create_material("standardSurface", Some("coatMat"));
+        s.assign_material(&id, &m, None);
+        {
+            let a = &mut s.mats.get_mut(&m).unwrap().attrs;
+            a.insert("baseColor".into(), serde_json::json!([0.0, 0.0, 0.0]));
+            a.insert("specular".into(), serde_json::json!(0.0));
+            a.insert("specularRoughness".into(), serde_json::json!(0.2));
+        }
+        let base = render_total(&s, 32, 1);
+        s.mats.get_mut(&m).unwrap().attrs.insert("coat".into(), serde_json::json!(1.0));
+        let coated = render_total(&s, 32, 1);
+        // the cube's indirect coat bounce picks up the white background, which the black
+        // base material cannot do on its own
+        assert!(coated > base + 0.05, "clearcoat must reflect the background: base {base}, coated {coated}");
     }
 
     #[test]
