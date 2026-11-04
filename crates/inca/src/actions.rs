@@ -1012,11 +1012,15 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "hypergraph" => {
             app.win.hypergraph = true;
             app.hg.connections = false;
+            app.hg.active_key = None;
+            app.hg.frame_all();
         }
         "hypergraphConnections" => {
             app.win.hypergraph = true;
             app.hg.connections = true;
             app.hg.io = app.s.sel.clone();
+            app.hg.active_key = None;
+            app.hg.frame_all();
         }
         "connectionEditor" => {
             app.win.connection_editor = true;
