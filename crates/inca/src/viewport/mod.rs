@@ -447,11 +447,14 @@ pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [
         for t in pm.triangulate_face(fi) {
             for &c in &t {
                 let uv = pm.face_uv(fi).and_then(|u| u.get(c)).copied().unwrap_or(DVec2::ZERO);
-                let uv = match tex {
-                    Some(t) => t.uv(uv),
-                    None => [uv.x as f32, uv.y as f32],
+                let raw = [uv.x as f32, uv.y as f32];
+                // three.js gives every texture its own repeat/offset/rotation matrix; bake each
+                // channel's transformed UV into a separate vertex attribute.
+                let uvs = match tex {
+                    Some(t) => t.uv_xf.map(|x| x.uv(raw)),
+                    None => [raw; 7],
                 };
-                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col, uv, tex: texv, emission, aux, extra });
+                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col, uv: uvs[0], uv_rough: uvs[1], uv_metal: uvs[2], uv_emit: uvs[3], uv_alpha: uvs[4], uv_spec: uvs[5], uv_bump: uvs[6], tex: texv, emission, aux, extra });
             }
         }
     }
@@ -788,9 +791,48 @@ fn tex_tint(m: &inca_core::materials::Material) -> f32 {
     }
 }
 
-/// Material maps for one face material: array layers, JS tint and the UV transform the maps
-/// share. three.js keeps a separate transform per texture; the Rust viewport uses the first
-/// assigned map's transform for all channels.
+/// A texture's UV transform, matching three.js `Matrix3.setUvTransform` with its default
+/// (0, 0) centre. three.js keeps one transform per texture; the viewport bakes each material
+/// channel's transform into its own vertex UV attribute.
+#[derive(Clone, Copy)]
+pub struct UvXf {
+    /// [m00, m01, m10, m11]
+    pub m: [f32; 4],
+    /// [offsetU, offsetV]
+    pub t: [f32; 2],
+}
+
+impl Default for UvXf {
+    fn default() -> Self {
+        UvXf { m: [1.0, 0.0, 0.0, 1.0], t: [0.0; 2] }
+    }
+}
+
+impl UvXf {
+    /// JS `getThreeTexture`: only File textures carry repeat / offset / rotateUV; procedural
+    /// textures bake their repeat into the generated image and keep the identity transform.
+    pub fn from_texture(t: Option<&inca_core::materials::Texture>) -> Self {
+        let Some(t) = t else { return UvXf::default() };
+        if t.ty != "file" {
+            return UvXf::default();
+        }
+        let a = &t.attrs;
+        let f = |k: &str, d: f64| a.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
+        // JS `a.repeatU || 1`: zero or missing means one repeat
+        let sx = f("repeatU", 1.0);
+        let sy = f("repeatV", 1.0);
+        let (sx, sy) = (if sx == 0.0 { 1.0 } else { sx }, if sy == 0.0 { 1.0 } else { sy });
+        let (tx, ty) = (f("offsetU", 0.0), f("offsetV", 0.0));
+        let (s, c) = f("rotateUV", 0.0).to_radians().sin_cos();
+        UvXf { m: [c * sx, s * sx, -s * sy, c * sy], t: [tx, ty] }
+    }
+
+    pub fn uv(&self, uv: [f32; 2]) -> [f32; 2] {
+        [self.m[0] * uv[0] + self.m[1] * uv[1] + self.t[0], self.m[2] * uv[0] + self.m[3] * uv[1] + self.t[1]]
+    }
+}
+
+/// Material maps for one face material: array layers, JS tint and one UV transform per channel.
 #[derive(Clone, Copy)]
 pub struct MatTex {
     pub color: Option<u32>,
@@ -804,27 +846,14 @@ pub struct MatTex {
     /// JS `max(a.emission, 0.0001)` for a Standard Surface emission map (1 otherwise).
     pub emission_scale: f32,
     pub bump_scale: f32,
-    pub repeat: [f32; 2],
-    pub offset: [f32; 2],
-    /// radians
-    pub rot: f32,
+    /// Per-channel UV transforms in the order color, roughness, metalness, emission, alpha,
+    /// specular, bump (the same order as the map slots in `mesh_textures`).
+    pub uv_xf: [UvXf; 7],
 }
 
 impl Default for MatTex {
     fn default() -> Self {
-        MatTex { color: None, roughness: None, metalness: None, emission: None, alpha: None, specular: None, bump: None, tint: 1.0, emission_scale: 1.0, bump_scale: 1.0, repeat: [1.0; 2], offset: [0.0; 2], rot: 0.0 }
-    }
-}
-
-impl MatTex {
-    pub fn uv(&self, uv: DVec2) -> [f32; 2] {
-        if self.rot == 0.0 && self.offset == [0.0; 2] && self.repeat == [1.0; 2] {
-            return [uv.x as f32, uv.y as f32];
-        }
-        let (s, c) = self.rot.sin_cos();
-        let x = uv.x as f32 * self.repeat[0];
-        let y = uv.y as f32 * self.repeat[1];
-        [c * x + s * y + self.offset[0], -s * x + c * y + self.offset[1]]
+        MatTex { color: None, roughness: None, metalness: None, emission: None, alpha: None, specular: None, bump: None, tint: 1.0, emission_scale: 1.0, bump_scale: 1.0, uv_xf: [UvXf::default(); 7] }
     }
 }
 
@@ -876,7 +905,6 @@ fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::sc
                 texture_slot(g, s, mat, "bump"),
             ),
         };
-        let first = [color, rough, metal, emission_slot, alpha, spec, bump].into_iter().flatten().next();
         let mut mt = MatTex::default();
         mt.color = color.map(|(_, l)| l);
         mt.roughness = rough.map(|(_, l)| l);
@@ -885,21 +913,13 @@ fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::sc
         mt.alpha = alpha.map(|(_, l)| l);
         mt.specular = spec.map(|(_, l)| l);
         mt.bump = bump.map(|(_, l)| l);
+        mt.uv_xf = [color, rough, metal, emission_slot, alpha, spec, bump].map(|s| UvXf::from_texture(s.map(|(t, _)| t)));
         mt.tint = tex_tint(mat);
         if mat.ty == "standardSurface" {
             mt.emission_scale = mat.attrs.get("emission").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0001) as f32;
         }
         let bump_amount = mat.attrs.get("bump").and_then(|v| v.as_f64()).unwrap_or(0.0);
         mt.bump_scale = if bump_amount == 0.0 { 1.0 } else { bump_amount as f32 };
-        if let Some((t, _)) = first {
-            if t.ty == "file" {
-                let a = &t.attrs;
-                let f = |k: &str, d: f64| a.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
-                mt.repeat = [f("repeatU", 1.0).max(0.0001), f("repeatV", 1.0).max(0.0001)];
-                mt.offset = [f("offsetU", 0.0), f("offsetV", 0.0)];
-                mt.rot = f("rotateUV", 0.0).to_radians();
-            }
-        }
         out.insert(mid.clone(), mt);
     }
     out
@@ -2714,7 +2734,7 @@ mod tests {
     fn non_colour_maps_fill_the_vertex_channels() {
         let (s, _, _, id) = setup();
         let pm = s.node(&id).unwrap().mesh().unwrap().mesh.clone();
-        let mt = MatTex {
+        let mut mt = MatTex {
             color: Some(2),
             roughness: Some(3),
             metalness: Some(4),
@@ -2727,6 +2747,8 @@ mod tests {
             bump_scale: 0.35,
             ..Default::default()
         };
+        // each channel has its own three.js texture transform
+        mt.uv_xf[1] = UvXf { m: [3.0, 0.0, 0.0, 1.0], t: [0.0; 2] };
         let (tris, _) = build_mesh_buffers(&pm, &|_| [0.4; 3], &|_| Some(mt), &|_| [1.0, 0.0, 0.0]);
         assert!(!tris.is_empty());
         let v = tris[0];
@@ -2734,6 +2756,9 @@ mod tests {
         assert_eq!(v.aux, [3.0, 4.0, 5.0, 6.0], "roughness, metalness, emission and alpha layers");
         assert_eq!(v.extra, [7.0, 8.0, 0.3, 0.35], "specular, bump, scales");
         assert_eq!(v.emission, [0.3; 3], "an emissive map replaces the flat emission");
+        assert!((v.uv_rough[0] - v.uv[0] * 3.0).abs() < 1e-6, "roughness keeps its own UV transform");
+        assert!((v.uv_rough[1] - v.uv[1]).abs() < 1e-6);
+        assert_eq!(v.uv_bump, v.uv, "untransformed channels keep the raw UV");
     }
 
     #[test]
@@ -2770,6 +2795,30 @@ mod tests {
         assert_eq!(mesh_pass(&pbr, false, false), Pass::MeshBlend);
         pbr.opacity = 1.0;
         assert_eq!(mesh_pass(&pbr, false, true), Pass::MeshBlend);
+    }
+
+    #[test]
+    fn uv_transforms_match_three_js_per_texture() {
+        let mut t = inca_core::materials::Texture { id: "t".into(), name: "uvTex".into(), ty: "file".into(), attrs: Params::new() };
+        t.attrs.insert("repeatU".into(), serde_json::json!(2.0));
+        t.attrs.insert("repeatV".into(), serde_json::json!(1.0));
+        t.attrs.insert("offsetU".into(), serde_json::json!(0.1));
+        t.attrs.insert("offsetV".into(), serde_json::json!(0.2));
+        t.attrs.insert("rotateUV".into(), serde_json::json!(90.0));
+        let xf = UvXf::from_texture(Some(&t));
+        // three.js Matrix3.setUvTransform(0.1, 0.2, 2, 1, pi/2, 0, 0)
+        let uv = xf.uv([0.25, 0.5]);
+        assert!((uv[0] - 1.1).abs() < 1e-5, "{uv:?}");
+        assert!((uv[1] + 0.05).abs() < 1e-5, "{uv:?}");
+        // procedural textures bake their repeat into the pixels and keep an identity transform
+        t.ty = "checker".into();
+        assert_eq!(UvXf::from_texture(Some(&t)).uv([0.25, 0.5]), [0.25, 0.5]);
+        // JS `a.repeatU || 1` maps zero to a single repeat
+        t.ty = "file".into();
+        t.attrs.insert("repeatU".into(), serde_json::json!(0.0));
+        t.attrs.insert("offsetU".into(), serde_json::json!(0.0));
+        t.attrs.insert("rotateUV".into(), serde_json::json!(0.0));
+        assert_eq!(UvXf::from_texture(Some(&t)).uv([0.3, 0.4])[0], 0.3);
     }
 
     #[test]

@@ -199,20 +199,22 @@ impl TexSampler {
         match self {
             TexSampler::Proc(t) => t.sample(uv.x, uv.y),
             TexSampler::Image { w, h, px, repeat, offset, rot } => {
-                // the same repeat / offset / rotateUV transform as the viewport `TexRef`
-                let (s, c) = rot.sin_cos();
-                let x = uv.x * repeat.0;
-                let y = uv.y * repeat.1;
-                let tu = c * x + s * y + offset.0;
-                let tv = -s * x + c * y + offset.1;
-                let u = tu.rem_euclid(1.0);
-                let v = (1.0 - tv.rem_euclid(1.0)).clamp(0.0, 0.9999);
+                // the same three.js `setUvTransform` matrix as the viewport `UvXf`
+                let t = uv_transform(uv, *repeat, *offset, *rot);
+                let u = t.x.rem_euclid(1.0);
+                let v = (1.0 - t.y.rem_euclid(1.0)).clamp(0.0, 0.9999);
                 let x = ((u * *w as f64) as u32).min(w - 1);
                 let y = ((v * *h as f64) as u32).min(h - 1);
                 px.get((y * w + x) as usize).copied()
             }
         }
     }
+}
+
+/// three.js `Matrix3.setUvTransform` with its default (0, 0) centre.
+fn uv_transform(uv: DVec2, repeat: (f64, f64), offset: (f64, f64), rot: f64) -> DVec2 {
+    let (s, c) = rot.sin_cos();
+    DVec2::new(repeat.0 * (c * uv.x + s * uv.y) + offset.0, repeat.1 * (-s * uv.x + c * uv.y) + offset.1)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -812,6 +814,14 @@ mod tests {
         assert_eq!(acc[0], 0.0);
         let px = rs.resolve(&acc, 1);
         assert_eq!(px.len(), 32 * 24 * 4);
+    }
+
+    #[test]
+    fn texture_uv_transform_matches_three_js() {
+        let t = uv_transform(DVec2::new(0.25, 0.5), (2.0, 1.0), (0.1, 0.2), std::f64::consts::FRAC_PI_2);
+        assert!((t.x - 1.1).abs() < 1e-9, "{t:?}");
+        assert!((t.y + 0.05).abs() < 1e-9, "{t:?}");
+        assert_eq!(uv_transform(DVec2::new(0.3, 0.4), (1.0, 1.0), (0.0, 0.0), 0.0), DVec2::new(0.3, 0.4));
     }
 
     fn render_total(s: &Scene, samples: u32, bounces: u32) -> f64 {

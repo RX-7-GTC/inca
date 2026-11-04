@@ -27,6 +27,7 @@ pub struct MeshVertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
+    /// Base/colour map UV.
     pub uv: [f32; 2],
     /// x = material texture layer (-1 = none), y = scalar tint multiplied with the sampled colour
     pub tex: [f32; 2],
@@ -36,11 +37,19 @@ pub struct MeshVertex {
     pub aux: [f32; 4],
     /// x = specular colour map, y = bump map (-1 = none); z = emissive scale, w = bump scale.
     pub extra: [f32; 4],
+    /// UVs for the other mapped channels, each with its own texture transform like three.js:
+    /// roughness, metalness, emission, alpha, specular and bump.
+    pub uv_rough: [f32; 2],
+    pub uv_metal: [f32; 2],
+    pub uv_emit: [f32; 2],
+    pub uv_alpha: [f32; 2],
+    pub uv_spec: [f32; 2],
+    pub uv_bump: [f32; 2],
 }
 
 impl Default for MeshVertex {
     fn default() -> Self {
-        MeshVertex { pos: [0.0; 3], normal: [0.0; 3], color: [0.0; 3], uv: [0.0; 2], tex: [-1.0, 1.0], emission: [0.0; 3], aux: [-1.0; 4], extra: [-1.0, -1.0, 1.0, 1.0] }
+        MeshVertex { pos: [0.0; 3], normal: [0.0; 3], color: [0.0; 3], uv: [0.0; 2], tex: [-1.0, 1.0], emission: [0.0; 3], aux: [-1.0; 4], extra: [-1.0, -1.0, 1.0, 1.0], uv_rough: [0.0; 2], uv_metal: [0.0; 2], uv_emit: [0.0; 2], uv_alpha: [0.0; 2], uv_spec: [0.0; 2], uv_bump: [0.0; 2] }
     }
 }
 
@@ -601,7 +610,7 @@ impl Gpu {
             ..Default::default()
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl), Some(&tex_bgl), Some(&shadow_bgl)], immediate_size: 0 });
-        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2, 5 => Float32x3, 6 => Float32x4, 7 => Float32x4];
+        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2, 5 => Float32x3, 6 => Float32x4, 7 => Float32x4, 8 => Float32x2, 9 => Float32x2, 10 => Float32x2, 11 => Float32x2, 12 => Float32x2, 13 => Float32x2];
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
         let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };

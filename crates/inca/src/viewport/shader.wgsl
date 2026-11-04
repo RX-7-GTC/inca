@@ -152,6 +152,13 @@ struct MeshIn {
     @location(6) aux: vec4<f32>,
     /// x = specular colour map, y = bump map (-1 = none); z/w = emissive/bump scale
     @location(7) extra: vec4<f32>,
+    /// per-channel UVs: each texture has its own repeat/offset/rotation matrix
+    @location(8) uv_rough: vec2<f32>,
+    @location(9) uv_metal: vec2<f32>,
+    @location(10) uv_emit: vec2<f32>,
+    @location(11) uv_alpha: vec2<f32>,
+    @location(12) uv_spec: vec2<f32>,
+    @location(13) uv_bump: vec2<f32>,
 };
 struct MeshOut {
     @builtin(position) clip: vec4<f32>,
@@ -163,6 +170,12 @@ struct MeshOut {
     @location(5) emission: vec3<f32>,
     @location(6) aux: vec4<f32>,
     @location(7) extra: vec4<f32>,
+    @location(8) uv_rough: vec2<f32>,
+    @location(9) uv_metal: vec2<f32>,
+    @location(10) uv_emit: vec2<f32>,
+    @location(11) uv_alpha: vec2<f32>,
+    @location(12) uv_spec: vec2<f32>,
+    @location(13) uv_bump: vec2<f32>,
 };
 
 @vertex
@@ -178,6 +191,12 @@ fn vs_mesh(v: MeshIn) -> MeshOut {
     o.emission = v.emission;
     o.aux = v.aux;
     o.extra = v.extra;
+    o.uv_rough = v.uv_rough;
+    o.uv_metal = v.uv_metal;
+    o.uv_emit = v.uv_emit;
+    o.uv_alpha = v.uv_alpha;
+    o.uv_spec = v.uv_spec;
+    o.uv_bump = v.uv_bump;
     return o;
 }
 
@@ -587,11 +606,11 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
     // is uniform per draw, so implicit derivatives (mip selection, bump) are well defined.
     if (draw.params2.w > 0.5) {
         let color_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.tex.x, 0.0))).rgb;
-        let rough_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.aux.x, 0.0))).g;
-        let metal_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.aux.y, 0.0))).b;
-        let emission_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.aux.z, 0.0))).rgb;
-        let alpha_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.aux.w, 0.0))).g;
-        let spec_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.extra.x, 0.0))).rgb;
+        let rough_texel = textureSample(tex_array, tex_samp, i.uv_rough, i32(max(i.aux.x, 0.0))).g;
+        let metal_texel = textureSample(tex_array, tex_samp, i.uv_metal, i32(max(i.aux.y, 0.0))).b;
+        let emission_texel = textureSample(tex_array, tex_samp, i.uv_emit, i32(max(i.aux.z, 0.0))).rgb;
+        let alpha_texel = textureSample(tex_array, tex_samp, i.uv_alpha, i32(max(i.aux.w, 0.0))).g;
+        let spec_texel = textureSample(tex_array, tex_samp, i.uv_spec, i32(max(i.extra.x, 0.0))).rgb;
         if (i.tex.x >= 0.0) {
             // `m.color = white * base/diffuse`, so the map is tinted by the material scalar
             base = color_texel * i.tex.y;
@@ -615,7 +634,7 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
             tint = tint * spec_texel;
         }
         if (i.extra.y >= 0.0) {
-            n = bump_normal(n, i.world, i.uv, i32(i.extra.y), i.extra.w);
+            n = bump_normal(n, i.world, i.uv_bump, i32(i.extra.y), i.extra.w);
         }
     }
     var c = base;
