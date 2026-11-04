@@ -129,7 +129,6 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
 @group(3) @binding(0) var shadow_map: texture_depth_2d_array;
 @group(3) @binding(1) var shadow_samp: sampler_comparison;
 
-const SHADOW_SIZE: f32 = 512.0;
 const SHADOW_NEAR: f32 = 0.5;
 const SHADOW_FAR: f32 = 500.0;
 const SHADOW_BIAS: f32 = -0.0005;
@@ -263,10 +262,11 @@ fn shadow_pcf(base: i32, uv: vec2<f32>, depth: f32, radius: f32, phi: f32) -> f3
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         return 1.0;
     }
-    // The JS renders 2048² maps; scale its `shadowRadius` (in JS texels) into our 512²
-    // map so the world-space PCF footprint stays the same. Never go below half a texel.
+    // The JS renders 2048² maps; scale its `shadowRadius` (in JS texels) into the active map
+    // so the world-space PCF footprint stays the same. Never go below half a texel.
     const JS_SHADOW_SIZE: f32 = 2048.0;
-    let texel = max(radius * (SHADOW_SIZE / JS_SHADOW_SIZE), 0.5) / SHADOW_SIZE;
+    let size = f32(textureDimensions(shadow_map).x);
+    let texel = max(radius / JS_SHADOW_SIZE, 0.5 / size);
     var sum = 0.0;
     for (var k = 0; k < 5; k = k + 1) {
         sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + vogel_disk_sample(k, 5, phi) * texel, base, depth);

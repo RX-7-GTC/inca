@@ -297,6 +297,57 @@ struct Target {
     frame_bg: wgpu::BindGroup,
 }
 
+/// A depth-array shadow atlas and its bind group. The viewport keeps one at 512²; the
+/// hardware renderer allocates one at the Render Settings `hwShadowMap` size.
+struct ShadowTarget {
+    size: u32,
+    layers: u32,
+    _tex: wgpu::Texture,
+    views: Vec<wgpu::TextureView>,
+    bg: wgpu::BindGroup,
+}
+
+/// Depth-array layers needed by the lights in `frame`: one for directional/spot lights and six
+/// for point lights (base indices are handed out sequentially by `build_draws`).
+fn required_shadow_layers(frame: &FrameUniform) -> u32 {
+    let mut n = 0;
+    for i in 0..MAX_LIGHTS {
+        let info = frame.shadow_info[i];
+        if info[0] < 0.0 {
+            continue;
+        }
+        let faces = if info[1] > 2.5 { 6 } else { 1 };
+        n = n.max(info[0] as u32 + faces);
+    }
+    n.clamp(1, SHADOW_LAYERS)
+}
+
+fn make_shadow(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, size: u32, layers: u32) -> ShadowTarget {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shadow maps"),
+        size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: layers },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let views: Vec<wgpu::TextureView> = (0..layers)
+        .map(|i| tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: i, array_layer_count: Some(1), ..Default::default() }))
+        .collect();
+    let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shadows"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    });
+    ShadowTarget { size, layers, _tex: tex, views, bg }
+}
+
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -311,8 +362,12 @@ pub struct Gpu {
     tex_layers: HashMap<String, u32>,
     /// texture id -> attributes hash of the pixels currently in the layer
     tex_hashes: HashMap<String, u64>,
-    shadow_views: Vec<wgpu::TextureView>,
-    shadow_bg: wgpu::BindGroup,
+    shadow_bgl: wgpu::BindGroupLayout,
+    shadow_samp: wgpu::Sampler,
+    /// viewport shadow maps (512²)
+    shadow: ShadowTarget,
+    /// hardware-renderer shadow maps at the configured `hwShadowMap` size
+    hw_shadow: Option<ShadowTarget>,
     shadow_buf: wgpu::Buffer,
     shadow_ubg: wgpu::BindGroup,
     shadow_pipe: wgpu::RenderPipeline,
@@ -461,23 +516,7 @@ impl Gpu {
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), count: None },
             ],
         });
-        let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("shadow maps"),
-            size: wgpu::Extent3d { width: SHADOW_SIZE, height: SHADOW_SIZE, depth_or_array_layers: SHADOW_LAYERS },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let shadow_views: Vec<wgpu::TextureView> = (0..SHADOW_LAYERS)
-            .map(|i| {
-                shadow_tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_array_layer: i, array_layer_count: Some(1), ..Default::default() })
-            })
-            .collect();
-        let shadow_view = shadow_tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
-        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let shadow_samp = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -489,14 +528,7 @@ impl Gpu {
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
-        let shadow_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadows"),
-            layout: &shadow_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&shadow_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&shadow_sampler) },
-            ],
-        });
+        let shadow = make_shadow(&device, &shadow_bgl, &shadow_samp, SHADOW_SIZE, SHADOW_LAYERS);
         // shadow pass: draw model (group 0, dynamic) + one light matrix (group 1, dynamic)
         let shadow_frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow frame"),
@@ -589,8 +621,10 @@ impl Gpu {
             tex_bg,
             tex_layers: HashMap::new(),
             tex_hashes: HashMap::new(),
-            shadow_views,
-            shadow_bg,
+            shadow_bgl,
+            shadow_samp,
+            shadow,
+            hw_shadow: None,
             shadow_buf,
             shadow_ubg,
             shadow_pipe,
@@ -879,12 +913,21 @@ impl Gpu {
     }
 
     /// Render into a throwaway target and read the pixels back (sRGB RGBA, row-major): the
-    /// "Inca Hardware" renderer.
-    pub fn render_offscreen(&mut self, size: [u32; 2], frame: &FrameUniform, draws: &[DrawCmd]) -> Vec<u8> {
+    /// "Inca Hardware" renderer. `shadow_size` is Render Settings `hwShadowMap`.
+    pub fn render_offscreen(&mut self, size: [u32; 2], shadow_size: u32, frame: &FrameUniform, draws: &[DrawCmd]) -> Vec<u8> {
         let size = [size[0].clamp(1, 8192), size[1].clamp(1, 8192)];
         self.reserve_draws(draws.len() as u64);
         let t = self.make_target(size);
-        self.draw_pass(&t, frame, draws);
+        if shadow_size > SHADOW_SIZE {
+            let layers = required_shadow_layers(frame);
+            let fresh = !self.hw_shadow.as_ref().is_some_and(|s| s.size == shadow_size && s.layers >= layers);
+            if fresh {
+                self.hw_shadow = Some(make_shadow(&self.device, &self.shadow_bgl, &self.shadow_samp, shadow_size, layers));
+            }
+            self.draw_pass(&t, frame, draws, self.hw_shadow.as_ref().unwrap());
+        } else {
+            self.draw_pass(&t, frame, draws, &self.shadow);
+        }
         let row = (size[0] * 4).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("readback"), size: (row * size[1]) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback") });
@@ -930,7 +973,7 @@ impl Gpu {
     pub fn render(&mut self, idx: usize, frame: &FrameUniform, draws: &[DrawCmd]) {
         self.reserve_draws(draws.len() as u64);
         let Some(t) = self.targets.get(&idx) else { return };
-        self.draw_pass(t, frame, draws);
+        self.draw_pass(t, frame, draws, &self.shadow);
     }
 
     /// Point-light cube faces: (direction, up). The up vectors match the cube lookup in the
@@ -985,7 +1028,7 @@ impl Gpu {
         faces
     }
 
-    fn draw_pass(&self, t: &Target, frame: &FrameUniform, draws: &[DrawCmd]) {
+    fn draw_pass(&self, t: &Target, frame: &FrameUniform, draws: &[DrawCmd], shadow: &ShadowTarget) {
         let n = draws.len() as u64;
         self.queue.write_buffer(&t.frame_buf, 0, bytemuck::bytes_of(frame));
         let mut slots = vec![0u8; (n.max(1) * DRAW_SLOT) as usize];
@@ -1021,11 +1064,12 @@ impl Gpu {
         let clear = if frame.render[1] > 0.5 { wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } } else { wgpu::Color::BLACK };
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport") });
         for (layer, _) in &shadow_faces {
+            let Some(view) = shadow.views.get(*layer as usize) else { continue };
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow map"),
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.shadow_views[*layer as usize],
+                    view,
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
@@ -1070,7 +1114,7 @@ impl Gpu {
             rp.set_bind_group(0, &t.frame_bg, &[]);
             rp.set_bind_group(1, &self.draw_bg, &[0]);
             rp.set_bind_group(2, &self.tex_bg, &[]);
-            rp.set_bind_group(3, &self.shadow_bg, &[]);
+            rp.set_bind_group(3, &shadow.bg, &[]);
             rp.set_pipeline(&self.bg_pipe);
             rp.draw(0..3, 0..1);
             for pass in [Pass::LinesUnder, Pass::Mesh, Pass::Lines, Pass::Points, Pass::MeshBlend, Pass::LinesTop] {
@@ -1135,5 +1179,26 @@ impl Gpu {
             }
         }
         self.queue.submit([enc.finish()]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_shadow_layers_covers_each_lights_faces() {
+        let mut f = FrameUniform::zeroed();
+        for info in &mut f.shadow_info {
+            info[0] = -1.0;
+        }
+        f.shadow_info[0] = [2.0, 1.0, 0.0, 0.0];
+        assert_eq!(required_shadow_layers(&f), 3);
+        // a point light with base 3 needs layers 3..8
+        f.shadow_info[1] = [3.0, 3.0, 0.0, 0.0];
+        assert_eq!(required_shadow_layers(&f), 9);
+        // the atlas never grows beyond the shared layer count
+        f.shadow_info[2] = [47.0, 3.0, 0.0, 0.0];
+        assert_eq!(required_shadow_layers(&f), SHADOW_LAYERS);
     }
 }

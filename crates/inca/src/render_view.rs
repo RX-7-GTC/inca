@@ -169,7 +169,7 @@ fn hardware(app: &mut IncaApp, cam: &str) {
         }
     }
     let render_size = [size[0] * ss, size[1] * ss];
-    let px = gpu.render_offscreen(render_size, &fu, &draws);
+    let px = gpu.render_offscreen(render_size, settings.hw_shadow_map, &fu, &draws);
     if let Some(w) = sky_warning {
         app.warn(w);
     }

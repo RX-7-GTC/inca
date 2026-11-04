@@ -112,6 +112,8 @@ pub struct RenderSettings {
     pub transparent: bool,
     /// hardware supersampling factor (JS `hwAA`)
     pub hw_aa: u32,
+    /// hardware shadow map resolution in pixels (JS `hwShadowMap`, default 2048)
+    pub hw_shadow_map: u32,
     /// hardware renderer forces every light to cast (JS `hwAllShadows`, default true)
     pub hw_all_shadows: bool,
 }
@@ -131,6 +133,7 @@ impl Default for RenderSettings {
             background: [0.0; 3],
             transparent: false,
             hw_aa: 3,
+            hw_shadow_map: 2048,
             hw_all_shadows: true,
         }
     }
@@ -165,6 +168,7 @@ impl RenderSettings {
             background: bg,
             transparent: b("transparentBg", d.transparent),
             hw_aa: aa_scale(&st("hwAA", "high")),
+            hw_shadow_map: (g("hwShadowMap", d.hw_shadow_map as f64) as u32).clamp(512, 8192),
             hw_all_shadows: b("hwAllShadows", d.hw_all_shadows),
         }
     }
@@ -748,6 +752,7 @@ mod tests {
         assert_eq!(d.pixel_aspect, 1.0);
         assert!(!d.transparent);
         assert_eq!(d.hw_aa, 3);
+        assert_eq!(d.hw_shadow_map, 2048);
         assert!(d.hw_all_shadows);
     }
 
@@ -757,6 +762,7 @@ mod tests {
         s.render.insert("toneMapping".into(), serde_json::json!("agx"));
         s.render.insert("hwToneMapping".into(), serde_json::json!("neutral"));
         s.render.insert("hwAA".into(), serde_json::json!("ultra"));
+        s.render.insert("hwShadowMap".into(), serde_json::json!(4096));
         s.render.insert("transparentBg".into(), serde_json::json!(true));
         s.render.insert("background".into(), serde_json::json!([0.1, 0.2, 0.3]));
         s.render.insert("pixelAspect".into(), serde_json::json!(2.0));
@@ -764,6 +770,7 @@ mod tests {
         assert_eq!(d.tone, ToneMap::AgX);
         assert_eq!(d.hw_tone, ToneMap::Neutral);
         assert_eq!(d.hw_aa, 4);
+        assert_eq!(d.hw_shadow_map, 4096);
         assert!(d.transparent);
         assert_eq!(d.pixel_aspect, 2.0);
         assert!((d.background[2] - 0.3).abs() < 1e-6);

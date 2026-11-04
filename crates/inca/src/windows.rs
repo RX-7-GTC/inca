@@ -669,6 +669,7 @@ fn render_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
     let mut bg: [f32; 3] = r.get("background").and_then(|v| v.as_array()).map(|a| [a.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32, a.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32, a.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32]).unwrap_or(d.background);
     let mut transparent = getb("transparentBg", d.transparent);
     let mut hw_aa = gets("hwAA", "high");
+    let mut hw_shadow = get("hwShadowMap", d.hw_shadow_map as f64) as u32;
     let mut all_shadows = getb("hwAllShadows", d.hw_all_shadows);
     let mut format = gets("format", "png");
     let mut jpg_quality = get("jpgQuality", 0.92);
@@ -770,6 +771,13 @@ fn render_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         });
         ui.end_row();
+        ui.label("Shadow map size");
+        egui::ComboBox::from_id_salt("rsShadowSize").selected_text(hw_shadow.to_string()).show_ui(ui, |ui| {
+            for s in [512, 1024, 2048, 4096, 8192] {
+                ui.selectable_value(&mut hw_shadow, s, s.to_string());
+            }
+        });
+        ui.end_row();
         ui.label("All lights cast shadows");
         ui.checkbox(&mut all_shadows, "");
         ui.end_row();
@@ -791,6 +799,7 @@ fn render_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
     r.insert("background".into(), json!(bg));
     r.insert("transparentBg".into(), json!(transparent));
     r.insert("hwAA".into(), json!(hw_aa));
+    r.insert("hwShadowMap".into(), json!(hw_shadow));
     r.insert("hwAllShadows".into(), json!(all_shadows));
     r.insert("format".into(), json!(format));
 }
