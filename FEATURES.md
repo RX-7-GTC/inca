@@ -91,7 +91,7 @@ Legend: ✅ built · 🟡 partial / simplified · ⏭ planned
 - ✅ Set Key (S), Shift+W/E/R, Key Selected channels, Auto Key, delete/copy/paste/bake keys
 - ✅ Scrubbing, ranges, playback (real-time / every frame / speeds), step frames/keys, frame rates
 - ✅ Graph Editor: curves, key select/move, tangent types, tangent handles, infinity modes, framing, stats fields
-- ✅ Dope Sheet; Playblast (PNG sequence)
+- ✅ Dope Sheet; Playblast (WebM video or PNG sequence)
 - ✅ Set Driven Key, Attach to Motion Path, ghosting, motion trails
 - ⏭ Animation layers, Time Editor/Trax, character sets, sound
 

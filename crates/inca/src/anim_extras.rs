@@ -5,7 +5,9 @@ use crate::viewport::gpu::{DrawCmd, DrawUniform, Geo, LineVertex, MeshVertex, Pa
 use crate::viewport::CamView;
 use egui::{vec2, Color32, Rect};
 use glam::{DVec3, Mat4};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 /// A ghost: world-space triangles of a mesh at another frame.
 pub struct Ghost {
@@ -140,13 +142,21 @@ pub struct PlayblastOpts {
     pub start: i64,
     pub end: i64,
     pub scale: u32,
+    /// `webm` (the JS default) or `png`
+    pub format: String,
     pub path: String,
 }
 
 impl Default for PlayblastOpts {
     fn default() -> Self {
-        PlayblastOpts { slider: true, start: 1, end: 120, scale: 100, path: String::new() }
+        PlayblastOpts { slider: true, start: 1, end: 120, scale: 100, format: "webm".into(), path: String::new() }
     }
+}
+
+/// Raw frames piped to ffmpeg, which encodes the WebM in the background.
+struct Encoder {
+    child: Option<Child>,
+    sink: Option<ChildStdin>,
 }
 
 /// A running playblast: one screenshot per frame, cropped to the active viewport.
@@ -158,6 +168,52 @@ pub struct Playblast {
     scale: u32,
     waiting: bool,
     saved: usize,
+    video: bool,
+    fps: f64,
+    encoder: Option<Encoder>,
+    error: Option<String>,
+}
+
+fn ffmpeg_exe() -> String {
+    std::env::var("INCA_FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
+}
+
+/// The JS falls back with a warning when MediaRecorder is unavailable; here WebM needs ffmpeg.
+fn ffmpeg_available() -> bool {
+    Command::new(ffmpeg_exe())
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Open the encoder for `size`, piping raw RGBA frames on stdin (JS MediaRecorder equivalent).
+fn start_encoder(out: &Path, size: [u32; 2], fps: f64) -> std::io::Result<Encoder> {
+    let bitrate = ((size[0] * size[1]) as f64 * fps * 0.25).max(2_000_000.0) as u64;
+    let mut child = Command::new(ffmpeg_exe())
+        .args([
+            "-y", "-loglevel", "error", "-f", "rawvideo", "-pixel_format", "rgba", "-video_size", &format!("{}x{}", size[0], size[1]), "-framerate", &format!("{fps}"), "-i", "-",
+            "-an", "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-b:v", &bitrate.to_string(),
+        ])
+        .arg(out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let sink = child.stdin.take();
+    Ok(Encoder { child: Some(child), sink })
+}
+
+/// Close stdin and wait for the encoder off the UI thread.
+fn finish_encoder(enc: Encoder) {
+    let Encoder { child, sink } = enc;
+    drop(sink);
+    if let Some(mut child) = child {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Marks screenshots taken for a playblast (the test hook ignores them).
@@ -177,20 +233,36 @@ fn frame_path(out: &std::path::Path, f: i64) -> PathBuf {
     out.with_file_name(format!("{stem}.{f:04}.png"))
 }
 
+/// The JS appends `.webm` when a video target has any other extension.
+fn video_path(out: PathBuf) -> PathBuf {
+    if out.to_string_lossy().to_lowercase().ends_with(".webm") {
+        out
+    } else {
+        PathBuf::from(format!("{}.webm", out.display()))
+    }
+}
+
 pub fn start(app: &mut IncaApp) {
     let o = app.playblast.opts.clone();
+    let video = o.format == "webm";
+    if video && !ffmpeg_available() {
+        app.warn("Video recording is not supported here (ffmpeg was not found); use a PNG image sequence.");
+        return;
+    }
     let (a, b) = if o.slider { (app.s.time.start as i64, app.s.time.end as i64) } else { (o.start.min(o.end), o.start.max(o.end)) };
     let out = if o.path.trim().is_empty() {
-        crate::project::default_dir(app, "movies").join("playblast.png")
+        crate::project::default_dir(app, "movies").join(if video { "playblast.webm" } else { "playblast.png" })
     } else {
         let p = PathBuf::from(o.path.trim());
         if p.is_absolute() { p } else { crate::project::default_dir(app, "movies").join(p) }
     };
+    let out = if video { video_path(out) } else { out };
     if let Some(d) = out.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    app.echo(format!("playblast -startTime {a} -endTime {b} -format image -percent {} -filename \"{}\";", o.scale, out.display()));
-    app.playblast.running = Some(Playblast { frame: a, end: b, restore: app.s.time.current, out, scale: o.scale, waiting: false, saved: 0 });
+    let fps = app.s.time.fps.max(1.0);
+    app.echo(format!("playblast -startTime {a} -endTime {b} -format {} -percent {} -filename \"{}\";", if video { "webm" } else { "image" }, o.scale, out.display()));
+    app.playblast.running = Some(Playblast { frame: a, end: b, restore: app.s.time.current, out, scale: o.scale, waiting: false, saved: 0, video, fps, encoder: None, error: None });
 }
 
 /// Advance a running playblast (called once per frame, before the viewports draw).
@@ -230,25 +302,63 @@ pub fn tick(app: &mut IncaApp, ctx: &egui::Context) {
                 }
             }
             let mut buf = image::RgbaImage::from_raw((x1 - x0) as u32, (y1 - y0) as u32, px).unwrap();
-            if pb.scale < 100 {
+            if pb.video {
+                // MediaRecorder dimensions are even; round like the JS capture canvas.
                 let k = pb.scale as f32 / 100.0;
-                let (nw, nh) = (((x1 - x0) as f32 * k).max(2.0) as u32, ((y1 - y0) as f32 * k).max(2.0) as u32);
-                buf = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
-            }
-            if buf.save(frame_path(&pb.out, pb.frame)).is_ok() {
-                pb.saved += 1;
+                let nw = (((x1 - x0) as f32 * k / 2.0).round() as u32 * 2).max(2);
+                let nh = (((y1 - y0) as f32 * k / 2.0).round() as u32 * 2).max(2);
+                if buf.width() != nw || buf.height() != nh {
+                    buf = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
+                }
+                let size = [buf.width(), buf.height()];
+                if pb.encoder.is_none() {
+                    match start_encoder(&pb.out, size, pb.fps) {
+                        Ok(enc) => pb.encoder = Some(enc),
+                        Err(e) => pb.error = Some(format!("Playblast failed: could not start ffmpeg ({e})")),
+                    }
+                }
+                if let Some(enc) = pb.encoder.as_mut() {
+                    let written = enc.sink.as_mut().is_some_and(|sink| sink.write_all(buf.as_raw()).and_then(|_| sink.flush()).is_ok());
+                    if written {
+                        pb.saved += 1;
+                    } else {
+                        pb.error = Some("Playblast failed: ffmpeg stopped accepting frames".into());
+                    }
+                }
+            } else {
+                if pb.scale < 100 {
+                    let k = pb.scale as f32 / 100.0;
+                    let (nw, nh) = (((x1 - x0) as f32 * k).max(2.0) as u32, ((y1 - y0) as f32 * k).max(2.0) as u32);
+                    buf = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
+                }
+                if buf.save(frame_path(&pb.out, pb.frame)).is_ok() {
+                    pb.saved += 1;
+                }
             }
         }
         pb.waiting = false;
         pb.frame += 1;
     }
+    if let Some(err) = app.playblast.running.as_ref().and_then(|p| p.error.clone()) {
+        if let Some(pb) = app.playblast.running.take() {
+            if let Some(enc) = pb.encoder {
+                finish_encoder(enc);
+            }
+            goto(app, pb.restore);
+        }
+        app.warn(err);
+        return;
+    }
     let pb = app.playblast.running.as_mut().unwrap();
     if pb.frame > pb.end {
-        let (restore, saved, out) = (pb.restore, pb.saved, pb.out.clone());
+        let (restore, saved, out, video, enc) = (pb.restore, pb.saved, pb.out.clone(), pb.video, pb.encoder.take());
         app.playblast.running = None;
+        if let Some(enc) = enc {
+            finish_encoder(enc);
+        }
         goto(app, restore);
         app.playblast.status = format!("Saved {saved} frames");
-        app.last_result = format!("// Result: playblast wrote {saved} frames to {}", frame_path(&out, 0).with_file_name("").display());
+        app.last_result = if video { format!("// Result: {}", out.display()) } else { format!("// Result: playblast wrote {saved} frames to {}", frame_path(&out, 0).with_file_name("").display()) };
         return;
     }
     let (f, end) = (pb.frame, pb.end);
@@ -262,6 +372,9 @@ pub fn tick(app: &mut IncaApp, ctx: &egui::Context) {
 
 pub fn cancel(app: &mut IncaApp) {
     if let Some(pb) = app.playblast.running.take() {
+        if let Some(enc) = pb.encoder {
+            finish_encoder(enc);
+        }
         goto(app, pb.restore);
         app.playblast.status = format!("Cancelled after {} frames", pb.saved);
     }
@@ -295,7 +408,18 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
             ui.add_enabled(!o.slider, egui::DragValue::new(&mut o.end));
             ui.end_row();
             ui.label("Format");
-            ui.label("PNG image sequence");
+            let mut format = o.format.clone();
+            egui::ComboBox::from_id_salt("pbformat").selected_text(if format == "webm" { "WebM video (.webm)" } else { "PNG image sequence" }).show_ui(ui, |ui| {
+                ui.selectable_value(&mut format, "webm".into(), "WebM video (.webm)");
+                ui.selectable_value(&mut format, "png".into(), "PNG image sequence");
+            });
+            if format != o.format {
+                o.format = format;
+                if !o.path.trim().is_empty() {
+                    let stem = Path::new(o.path.trim()).with_extension("");
+                    o.path = format!("{}.{}", stem.display(), if o.format == "webm" { "webm" } else { "png" });
+                }
+            }
             ui.end_row();
             ui.label("Scale");
             egui::ComboBox::from_id_salt("pbscale").selected_text(format!("{}%", o.scale)).show_ui(ui, |ui| {
@@ -304,11 +428,17 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
                 }
             });
             ui.end_row();
+            let video = o.format == "webm";
             ui.label("File");
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut o.path).hint_text("<project>/movies/playblast.####.png").desired_width(220.0));
+                ui.add(egui::TextEdit::singleline(&mut o.path).hint_text(if video { "<project>/movies/playblast.webm" } else { "<project>/movies/playblast.####.png" }).desired_width(220.0));
                 if ui.button("Browse…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter("PNG Image", &["png"]).set_file_name("playblast.png").save_file() {
+                    let dialog = if video {
+                        rfd::FileDialog::new().add_filter("WebM Video", &["webm"]).set_file_name("playblast.webm")
+                    } else {
+                        rfd::FileDialog::new().add_filter("PNG Image", &["png"]).set_file_name("playblast.png")
+                    };
+                    if let Some(p) = dialog.save_file() {
                         o.path = p.display().to_string();
                     }
                 }
@@ -332,4 +462,16 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         cancel(app);
     }
     app.playblast.open = open;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn video_targets_get_a_webm_extension() {
+        assert_eq!(video_path(PathBuf::from("clip.webm")), PathBuf::from("clip.webm"));
+        assert_eq!(video_path(PathBuf::from("clip")), PathBuf::from("clip.webm"));
+        assert_eq!(video_path(PathBuf::from("clip.png")), PathBuf::from("clip.png.webm"));
+    }
 }
