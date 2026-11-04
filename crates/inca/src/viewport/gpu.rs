@@ -482,8 +482,10 @@ impl Gpu {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            // three.js uses LinearFilter on the shadow map, so each comparison tap is a
+            // hardware 2x2 PCF average; the shader adds the five Vogel-disk taps.
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });

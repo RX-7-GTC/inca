@@ -244,8 +244,22 @@ fn tone_map(c: vec3<f32>) -> vec3<f32> {
     return c;
 }
 
-// three.js PCFShadowMap: a small comparison-filtered kernel scaled by `shadow.radius`.
-fn shadow_pcf(base: i32, uv: vec2<f32>, depth: f32, radius: f32) -> f32 {
+// three.js `interleavedGradientNoise`, which rotates the PCF kernel per pixel.
+fn interleaved_gradient_noise(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+// three.js `vogelDiskSample`: five samples with the golden-angle spiral.
+fn vogel_disk_sample(index: i32, count: i32, phi: f32) -> vec2<f32> {
+    const GOLDEN_ANGLE: f32 = 2.399963229728653;
+    let r = sqrt((f32(index) + 0.5) / f32(count));
+    let theta = f32(index) * GOLDEN_ANGLE + phi;
+    return vec2<f32>(cos(theta), sin(theta)) * r;
+}
+
+// three.js r186 PCFShadowMap: five Vogel-disk samples with the interleaved-gradient
+// rotation. The comparison sampler's linear filtering supplies the 2x2 hardware PCF taps.
+fn shadow_pcf(base: i32, uv: vec2<f32>, depth: f32, radius: f32, phi: f32) -> f32 {
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
         return 1.0;
     }
@@ -254,16 +268,14 @@ fn shadow_pcf(base: i32, uv: vec2<f32>, depth: f32, radius: f32) -> f32 {
     const JS_SHADOW_SIZE: f32 = 2048.0;
     let texel = max(radius * (SHADOW_SIZE / JS_SHADOW_SIZE), 0.5) / SHADOW_SIZE;
     var sum = 0.0;
-    for (var y = -1; y <= 1; y = y + 1) {
-        for (var x = -1; x <= 1; x = x + 1) {
-            sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + vec2<f32>(f32(x), f32(y)) * texel, base, depth);
-        }
+    for (var k = 0; k < 5; k = k + 1) {
+        sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + vogel_disk_sample(k, 5, phi) * texel, base, depth);
     }
-    return sum / 9.0;
+    return sum / 5.0;
 }
 
 // 1 = lit, 0 = fully shadowed. `n` is the two-sided normal used for shading.
-fn shadow_factor(world: vec3<f32>, n: vec3<f32>, pos: vec3<f32>, info: vec4<f32>, m: mat4x4<f32>) -> f32 {
+fn shadow_factor(world: vec3<f32>, n: vec3<f32>, pos: vec3<f32>, info: vec4<f32>, m: mat4x4<f32>, phi: f32) -> f32 {
     if (info.x < 0.0) {
         return 1.0;
     }
@@ -278,7 +290,7 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>, pos: vec3<f32>, info: vec4<f32>
         }
         let ndc = p.xyz / p.w;
         let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        return shadow_pcf(base, uv, ndc.z + SHADOW_BIAS, radius);
+        return shadow_pcf(base, uv, ndc.z + SHADOW_BIAS, radius, phi);
     }
     // point light: pick the cube face whose axis is largest and look it up like the
     // six 90-degree depth maps rendered by `prepare_shadow_faces`
@@ -322,7 +334,7 @@ fn shadow_factor(world: vec3<f32>, n: vec3<f32>, pos: vec3<f32>, info: vec4<f32>
     let uv = vec2<f32>(uv2.x * 0.5 + 0.5, 0.5 - uv2.y * 0.5);
     // wgpu's 0..1 perspective depth (glam `perspective_rh`)
     let depth = SHADOW_FAR * (z - SHADOW_NEAR) / (z * (SHADOW_FAR - SHADOW_NEAR));
-    return shadow_pcf(base + face, uv, depth + SHADOW_BIAS, radius);
+    return shadow_pcf(base + face, uv, depth + SHADOW_BIAS, radius, phi);
 }
 
 const PI: f32 = 3.14159265359;
@@ -409,7 +421,7 @@ fn env_radiance(r: vec3<f32>, n: vec3<f32>, rough: f32) -> vec3<f32> {
     return mix(env, sky_irradiance(n), rough) * frame.sky_col.rgb * frame.sky_col.w;
 }
 
-fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_in: f32, metal_in: f32, tint_in: vec3<f32>, emission: vec3<f32>) -> vec3<f32> {
+fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_in: f32, metal_in: f32, tint_in: vec3<f32>, emission: vec3<f32>, phi: f32) -> vec3<f32> {
     var n = normalize(n_in);
     var v = normalize(frame.cam_pos.xyz - world);
     if (frame.cam_pos.w > 0.5) {
@@ -537,7 +549,7 @@ fn shade(n_in: vec3<f32>, world: vec3<f32>, base: vec3<f32>, front: bool, rough_
         let cc_spec = fresnel_schlick(max(dot(v, h), 0.0), cc_f0, cc_f90) * d_ggx(ndh, coat_rough) * v_smith(ndv, ndl, coat_rough) * PI * step(0.0001, ndl);
         var shadow = 1.0;
         if (draw.shadow.x > 0.5) {
-            shadow = shadow_factor(world, n, L.pos.xyz, frame.shadow_info[i], frame.shadow_mats[i]);
+            shadow = shadow_factor(world, n, L.pos.xyz, frame.shadow_info[i], frame.shadow_mats[i], phi);
         }
         let radiance = L.color.rgb * att * shadow;
         c = c + ((diffuse * ndl + spec * step(0.0001, ndl)) * sheen_energy + sheen_direct) * radiance;
@@ -600,7 +612,9 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
         // lit surfaces: material colours are linear and the result is gamma-encoded once, as in the
         // JS (three.js sRGB output); the egui texture path shows these values as they are.
         // Emissive is additive and unlit, like three.js `totalEmissiveRadiance`.
-        c = shade(n, i.world, base, front, rough, metal, tint, emission);
+        // three.js rotates its PCF kernel from the fragment's window coordinates
+        let phi = interleaved_gradient_noise(i.clip.xy) * 6.28318530718;
+        c = shade(n, i.world, base, front, rough, metal, tint, emission, phi);
         c = tone_map(max(c * exp2(frame.post.x), vec3(0.0)));
         c = pow(max(c, vec3(0.0)), vec3(1.0 / frame.post.y));
         c = linear_to_srgb(c);
