@@ -191,6 +191,9 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                     app.windows_state.hs.pan = vec2(20.0, 20.0);
                     app.windows_state.hs.zoom = 1.0;
                 }
+                if ui.small_button("Connection Editor").on_hover_text("Load the selected material or texture into the Connection Editor").clicked() {
+                    crate::hypergraph::open_for_hypershade(app);
+                }
             });
             work_area(app, ui);
         });
