@@ -6,7 +6,7 @@ use crate::app::IncaApp;
 use crate::theme;
 use egui::{pos2, vec2, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use inca_core::scene::{NodeRef, Scene, SelMode, Shape};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const NW: f32 = 112.0;
 const NH: f32 = 46.0;
@@ -38,9 +38,18 @@ pub struct HgState {
     // Connection Editor
     pub ce_left: Option<NodeRef>,
     pub ce_right: Option<NodeRef>,
-    ce_attr: Option<String>,
+    /// selected output attribute (the role follows `ce_dir`)
+    ce_out: Option<String>,
     /// selected input attribute (Auto Connect off, for Make/Break)
     ce_in: Option<String>,
+    /// left side shows outputs (true) or inputs (false)
+    ce_dir: bool,
+    /// side last clicked: 0 left, 1 right (Remove)
+    ce_last: usize,
+    /// expanded compound attributes per side
+    ce_open: [HashSet<String>; 2],
+    /// per-side display filters
+    ce_filter: [CeFilter; 2],
     /// Maya Options > Auto-connect, on by default
     pub ce_auto: bool,
     /// raise the Connection Editor window on the next frame
@@ -73,8 +82,12 @@ impl Default for HgState {
             rename: None,
             ce_left: None,
             ce_right: None,
-            ce_attr: None,
+            ce_out: None,
             ce_in: None,
+            ce_dir: true,
+            ce_last: 0,
+            ce_open: std::array::from_fn(|_| HashSet::new()),
+            ce_filter: std::array::from_fn(|_| CeFilter::default()),
             ce_auto: true,
             ce_raise: false,
         }
@@ -746,37 +759,353 @@ fn graph(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 // ---------------------------------------------------------------- Connection Editor
 
-/// Attributes listed for a node.
-fn attrs_of(app: &IncaApp, r: &NodeRef) -> Vec<String> {
-    match r {
-        NodeRef::Dag(id) => {
-            let mut v: Vec<String> = inca_core::scene::CHANNELS.iter().map(|c| c.to_string()).collect();
-            if let Some(e) = app.s.node(id).and_then(|n| n.extra.as_object()) {
-                v.extend(e.iter().filter(|(_, x)| x.is_number() || x.is_boolean()).map(|(k, _)| k.clone()));
-            }
-            v.extend(app.s.shape_channels(id).into_iter().filter(|k| !v.contains(k)).collect::<Vec<_>>());
-            v
-        }
-        NodeRef::History(id, i) => app.s.node(id).and_then(|n| n.mesh()).and_then(|m| m.history.get(*i)).map(|h| h.params.iter().filter(|(_, x)| x.is_number()).map(|(k, _)| k.clone()).collect()).unwrap_or_default(),
-        NodeRef::Material(id) => app.s.mats.get(id).map(|m| {
-            let mut v: Vec<String> = m.attrs.keys().cloned().collect();
-            for slot in inca_core::materials::mat_type(&m.ty).mappable {
-                if !v.iter().any(|x| x == slot) {
-                    v.push((*slot).to_string());
-                }
-            }
-            v
-        }).unwrap_or_default(),
-        NodeRef::Texture(id) => {
-            let mut v = vec!["outColor".to_string(), "outAlpha".to_string()];
-            v.extend(app.s.texs.get(id).map(|t| t.attrs.iter().filter(|(_, x)| x.is_number()).map(|(k, _)| k.clone()).collect::<Vec<_>>()).unwrap_or_default());
-            v
-        }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CeType {
+    Float,
+    Int,
+    Bool,
+    Vector,
+    TexColor,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CeMode {
+    Readable,
+    Outputs,
+    Inputs,
+}
+
+#[derive(Clone)]
+struct CeFilter {
+    mode: CeMode,
+    non_keyable: bool,
+    connected_only: bool,
+    hidden: bool,
+}
+
+impl Default for CeFilter {
+    fn default() -> Self {
+        CeFilter { mode: CeMode::Readable, non_keyable: true, connected_only: false, hidden: false }
     }
 }
 
-/// The node a Reload button should load: the Hypershade material/texture when that window has
-/// focus, otherwise the DAG lead.
+/// One row in a Connection Editor pane. Compounds carry their children (translate -> translateX...).
+#[derive(Clone)]
+struct CeAttr {
+    name: String,
+    label: String,
+    ty: CeType,
+    keyable: bool,
+    readable: bool,
+    writable: bool,
+    mappable: bool,
+    children: Vec<CeAttr>,
+    parent: Option<String>,
+    hidden: bool,
+}
+
+impl CeAttr {
+    fn new(name: impl Into<String>, ty: CeType) -> Self {
+        let name = name.into();
+        let label = inca_core::ops::nice_name(&name);
+        CeAttr { name, label, ty, keyable: true, readable: true, writable: true, mappable: false, children: vec![], parent: None, hidden: false }
+    }
+    fn scalar(name: &str, ty: CeType) -> Self {
+        Self::new(name, ty)
+    }
+    fn vector(name: &str, axes: [&str; 3]) -> Self {
+        Self::vector_flags(name, axes, true, true)
+    }
+    fn vector_flags(name: &str, axes: [&str; 3], keyable: bool, writable: bool) -> Self {
+        let mut a = Self::new(name, CeType::Vector);
+        a.keyable = keyable;
+        a.writable = writable;
+        a.children = axes
+            .iter()
+            .map(|k| {
+                let mut c = Self::new(format!("{name}{k}"), CeType::Float);
+                c.parent = Some(name.to_string());
+                c.keyable = keyable;
+                c.writable = writable;
+                c
+            })
+            .collect();
+        a
+    }
+    fn with_keyable(mut self, yes: bool) -> Self {
+        self.keyable = yes;
+        self
+    }
+    fn with_writable(mut self, yes: bool) -> Self {
+        self.writable = yes;
+        self
+    }
+    fn with_mappable(mut self, yes: bool) -> Self {
+        self.mappable = yes;
+        self
+    }
+    fn with_hidden(mut self, yes: bool) -> Self {
+        self.hidden = yes;
+        self
+    }
+}
+
+/// Values from a light / material / texture bag, typed the way the Connection Editor needs them.
+fn bag_attrs(params: &inca_core::params::Params, mappable: &[&str], keyable: impl Fn(&str) -> bool) -> Vec<CeAttr> {
+    let mut out = Vec::new();
+    for (k, v) in params {
+        let mut a = match v {
+            serde_json::Value::Number(_) => CeAttr::scalar(k, CeType::Float),
+            serde_json::Value::Bool(_) => CeAttr::scalar(k, CeType::Bool),
+            serde_json::Value::Array(a) if a.len() == 3 && a.iter().all(|x| x.is_number()) => CeAttr::vector(k, ["R", "G", "B"]),
+            _ => continue,
+        };
+        a.keyable = keyable(k);
+        a.mappable = mappable.contains(&k.as_str());
+        out.push(a);
+    }
+    out
+}
+
+fn dag_attrs(s: &Scene, id: &str) -> Vec<CeAttr> {
+    let Some(n) = s.node(id) else { return vec![] };
+    let mut out = vec![
+        CeAttr::scalar("visibility", CeType::Bool),
+        CeAttr::scalar("template", CeType::Bool).with_keyable(false),
+        CeAttr::vector("translate", ["X", "Y", "Z"]),
+        CeAttr::vector("rotate", ["X", "Y", "Z"]),
+        CeAttr::vector("scale", ["X", "Y", "Z"]),
+        CeAttr::vector_flags("rotatePivot", ["X", "Y", "Z"], false, true),
+        CeAttr::vector_flags("scalePivot", ["X", "Y", "Z"], false, true),
+    ];
+    if let Some(e) = n.extra.as_object() {
+        for (k, v) in e {
+            match v {
+                serde_json::Value::Number(_) => out.push(CeAttr::scalar(k, CeType::Float)),
+                serde_json::Value::Bool(_) => out.push(CeAttr::scalar(k, CeType::Bool)),
+                _ => {}
+            }
+        }
+    }
+    match &n.shape {
+        Shape::Mesh(_) => out.push(CeAttr::scalar("smoothLevel", CeType::Int).with_keyable(false)),
+        Shape::Light(l) => out.extend(bag_attrs(&l.attrs, &[], |_| true)),
+        Shape::Camera(c) => {
+            if let Ok(serde_json::Value::Object(o)) = serde_json::to_value(c) {
+                out.extend(bag_attrs(&o, &[], |k| k == "focalLength"));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn history_attrs(s: &Scene, id: &str, i: usize) -> Vec<CeAttr> {
+    let Some(h) = s.node(id).and_then(|n| n.mesh()).and_then(|m| m.history.get(i)) else { return vec![] };
+    let mut out = Vec::new();
+    if let Some((_, _, channels)) = inca_core::ops::info(&h.ty) {
+        for ch in channels {
+            let ty = match ch.kind {
+                inca_core::primitives::ChanKind::Float => CeType::Float,
+                inca_core::primitives::ChanKind::Int => CeType::Int,
+                inca_core::primitives::ChanKind::Bool => CeType::Bool,
+                inca_core::primitives::ChanKind::Enum(_) => continue,
+            };
+            let mut a = CeAttr::scalar(ch.key, ty);
+            if let Some(label) = ch.label {
+                a.label = label.to_string();
+            }
+            out.push(a);
+        }
+    }
+    if out.is_empty() {
+        for (k, v) in &h.params {
+            if v.is_number() {
+                out.push(CeAttr::scalar(k, CeType::Float));
+            } else if v.is_boolean() {
+                out.push(CeAttr::scalar(k, CeType::Bool));
+            }
+        }
+    }
+    out
+}
+
+fn material_attrs(s: &Scene, id: &str) -> Vec<CeAttr> {
+    let Some(m) = s.mats.get(id) else { return vec![] };
+    let mappable = inca_core::materials::mat_type(&m.ty).mappable;
+    let mut out = bag_attrs(&m.attrs, mappable, |_| true);
+    for slot in mappable {
+        if !m.attrs.contains_key(*slot) {
+            out.push(CeAttr::scalar(slot, CeType::Float).with_mappable(true).with_writable(false));
+        }
+    }
+    out
+}
+
+fn texture_attrs(s: &Scene, id: &str) -> Vec<CeAttr> {
+    let Some(t) = s.texs.get(id) else { return vec![] };
+    let mut out = vec![
+        CeAttr::new("outColor", CeType::TexColor).with_keyable(false).with_writable(false),
+        CeAttr::new("outAlpha", CeType::Float).with_keyable(false).with_writable(false).with_hidden(true),
+    ];
+    out.extend(bag_attrs(&t.attrs, &[], |_| true));
+    out
+}
+
+fn ce_attrs(s: &Scene, r: &NodeRef) -> Vec<CeAttr> {
+    match r {
+        NodeRef::Dag(id) => dag_attrs(s, id),
+        NodeRef::History(id, i) => history_attrs(s, id, *i),
+        NodeRef::Material(id) => material_attrs(s, id),
+        NodeRef::Texture(id) => texture_attrs(s, id),
+    }
+}
+
+fn find_attr<'a>(attrs: &'a [CeAttr], name: &str) -> Option<&'a CeAttr> {
+    for a in attrs {
+        if a.name == name {
+            return Some(a);
+        }
+        if let Some(c) = a.children.iter().find(|c| c.name == name) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Can `src` (an output) drive `dst` (an input)? Textures with outColor drive any mappable slot.
+fn compatible(src: &CeAttr, dst: &CeAttr) -> bool {
+    if src.ty == CeType::TexColor {
+        return dst.mappable;
+    }
+    if !dst.writable {
+        return false;
+    }
+    match (src.ty, dst.ty) {
+        (CeType::Vector, CeType::Vector) => true,
+        (CeType::Float | CeType::Int | CeType::Bool, CeType::Float | CeType::Int | CeType::Bool) => true,
+        _ => false,
+    }
+}
+
+/// Is this attribute, one of its children, or its parent compound wired on that side?
+fn attr_connected(s: &Scene, node: &NodeRef, attr: &CeAttr, as_source: bool) -> bool {
+    let id = s.ref_id(node);
+    let fam: Vec<&str> = std::iter::once(attr.name.as_str())
+        .chain(attr.children.iter().map(|c| c.name.as_str()))
+        .chain(attr.parent.as_deref())
+        .collect();
+    if as_source {
+        if s.conns.iter().any(|c| c.src == id && fam.contains(&c.src_attr.as_str())) {
+            return true;
+        }
+        if matches!(node, NodeRef::Texture(_)) && (attr.name == "outColor" || attr.name == "outAlpha") {
+            return output_wired(s, node, &attr.name);
+        }
+        return false;
+    }
+    if s.conns.iter().any(|c| c.dst == id && fam.contains(&c.dst_attr.as_str())) {
+        return true;
+    }
+    if let NodeRef::Material(mid) = node {
+        if let Some(m) = s.mats.get(mid) {
+            return m.maps.keys().any(|k| fam.contains(&k.as_str()));
+        }
+    }
+    false
+}
+
+/// Exact connection, including a texture map stored on the material.
+fn connected(s: &Scene, src: &NodeRef, src_attr: &str, dst: &NodeRef, dst_attr: &str) -> bool {
+    if matches!(src, NodeRef::Texture(_)) && matches!(dst, NodeRef::Material(_)) && (src_attr == "outColor" || src_attr == "outAlpha") {
+        if let NodeRef::Material(mid) = dst {
+            return s.mats.get(mid).and_then(|m| m.maps.get(dst_attr)).and_then(|v| v.as_str()) == Some(s.ref_id(src).as_str());
+        }
+    }
+    let sid = s.ref_id(src);
+    let did = s.ref_id(dst);
+    s.conns.iter().any(|c| c.src == sid && c.src_attr == src_attr && c.dst == did && c.dst_attr == dst_attr)
+}
+
+fn shown(s: &Scene, node: &NodeRef, attr: &CeAttr, as_source: bool, filter: &CeFilter) -> bool {
+    if filter.mode == CeMode::Inputs && !attr.writable && !attr.mappable {
+        return false;
+    }
+    if filter.mode == CeMode::Outputs && !attr.readable {
+        return false;
+    }
+    if !filter.non_keyable && !attr.keyable {
+        return false;
+    }
+    if filter.connected_only && !attr_connected(s, node, attr, as_source) {
+        return false;
+    }
+    !(!filter.hidden && attr.hidden)
+}
+
+/// Nodes upstream or downstream of `node`: direct connections, texture maps, the history chain,
+/// the object's last history node, and its material.
+fn neighbours(s: &Scene, node: &NodeRef, down: bool) -> Vec<NodeRef> {
+    let id = s.ref_id(node);
+    let mut out: Vec<NodeRef> = Vec::new();
+    let mut push = |r: Option<NodeRef>| {
+        if let Some(r) = r {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    };
+    for c in &s.conns {
+        if down && c.src == id {
+            push(s.ref_by_id(&c.dst));
+        }
+        if !down && c.dst == id {
+            push(s.ref_by_id(&c.src));
+        }
+    }
+    for m in s.mats.values() {
+        for tid in m.maps.values() {
+            let Some(tid) = tid.as_str() else { continue };
+            if down && tid == id {
+                push(Some(NodeRef::Material(m.id.clone())));
+            }
+            if !down && m.id == id {
+                push(Some(NodeRef::Texture(tid.to_string())));
+            }
+        }
+    }
+    match node {
+        NodeRef::History(id2, i) => {
+            let hlen = s.node(id2).and_then(|n| n.mesh()).map(|m| m.history.len()).unwrap_or(0);
+            if down {
+                if *i + 1 < hlen {
+                    push(Some(NodeRef::History(id2.clone(), *i + 1)));
+                } else {
+                    push(Some(NodeRef::Dag(id2.clone())));
+                }
+            } else if *i > 0 {
+                push(Some(NodeRef::History(id2.clone(), *i - 1)));
+            }
+        }
+        NodeRef::Dag(id2) => {
+            let n = s.node(id2);
+            if !down {
+                if let Some(m) = n.and_then(|n| n.mesh()) {
+                    if !m.history.is_empty() {
+                        push(Some(NodeRef::History(id2.clone(), m.history.len() - 1)));
+                    }
+                }
+            } else if let Some(mid) = n.and_then(|n| n.mesh()).map(|m| m.material.clone()) {
+                push(Some(NodeRef::Material(mid)));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The node a Reload button should load: the Hypershade material/texture when that window is
+/// open and has a selection, otherwise the DAG lead.
 fn selected_node(app: &IncaApp) -> Option<NodeRef> {
     if app.win.hypershade {
         if let Some(id) = &app.windows_state.hs_selected {
@@ -801,12 +1130,12 @@ pub fn load_connection_editor(app: &mut IncaApp) {
     }
     app.hg.ce_left = nodes.first().cloned();
     app.hg.ce_right = if nodes.len() > 1 { nodes.last().cloned() } else { None };
-    app.hg.ce_attr = None;
+    app.hg.ce_out = None;
     app.hg.ce_in = None;
     app.hg.ce_raise = true;
 }
 
-/// Open the Connection Editor with the Hypershade's selected material or texture on the left.
+/// Open the Connection Editor with the Hypershade's selected material or texture.
 pub fn open_for_hypershade(app: &mut IncaApp) {
     let Some(id) = app.windows_state.hs_selected.clone() else { return };
     let node = if app.s.mats.contains_key(&id) {
@@ -829,7 +1158,7 @@ pub fn open_for_hypershade(app: &mut IncaApp) {
             app.hg.ce_left = None;
         }
     }
-    app.hg.ce_attr = None;
+    app.hg.ce_out = None;
     app.hg.ce_in = None;
     app.hg.ce_raise = true;
     app.win.connection_editor = true;
@@ -859,6 +1188,130 @@ fn output_wired(s: &Scene, src: &NodeRef, attr: &str) -> bool {
     false
 }
 
+fn reload_side(app: &mut IncaApp, side: usize) {
+    if let Some(n) = selected_node(app) {
+        if side == 0 {
+            app.hg.ce_left = Some(n);
+        } else {
+            app.hg.ce_right = Some(n);
+        }
+        app.hg.ce_out = None;
+        app.hg.ce_in = None;
+        app.hg.ce_last = side;
+    } else {
+        app.warn("// Warning: Nothing selected to load into the Connection Editor.");
+    }
+}
+
+fn navigate(app: &mut IncaApp, down: bool, pick: Option<NodeRef>) {
+    let (l, r) = (app.hg.ce_left.clone(), app.hg.ce_right.clone());
+    let base = if down { r.clone().or(l.clone()) } else { l.clone().or(r.clone()) };
+    let Some(base) = base else { return };
+    let next = pick.or_else(|| neighbours(&app.s, &base, down).first().cloned());
+    let Some(next) = next else {
+        app.help = format!("{} has no {} nodes", app.s.ref_name(&base), if down { "downstream" } else { "upstream" });
+        return;
+    };
+    if down {
+        app.hg.ce_left = Some(base);
+        app.hg.ce_right = Some(next);
+    } else {
+        app.hg.ce_left = Some(next);
+        app.hg.ce_right = Some(base);
+    }
+    app.hg.ce_out = None;
+    app.hg.ce_in = None;
+    app.hg.ce_raise = true;
+}
+
+fn nav_menu(app: &IncaApp, ui: &mut egui::Ui, down: bool, nav: &mut Option<(bool, Option<NodeRef>)>) {
+    let base = if down { app.hg.ce_right.clone().or(app.hg.ce_left.clone()) } else { app.hg.ce_left.clone().or(app.hg.ce_right.clone()) };
+    let Some(base) = base else {
+        ui.label("(no node)");
+        return;
+    };
+    let cands = neighbours(&app.s, &base, down);
+    if cands.is_empty() {
+        ui.label("(none)");
+        return;
+    }
+    for n in cands {
+        if ui.button(app.s.ref_name(&n)).clicked() {
+            *nav = Some((down, Some(n)));
+            ui.close();
+        }
+    }
+}
+
+fn ce_display_menu(ui: &mut egui::Ui, f: &mut CeFilter) {
+    ui.radio_value(&mut f.mode, CeMode::Readable, "Show Readable");
+    ui.radio_value(&mut f.mode, CeMode::Outputs, "Show Outputs Only");
+    ui.radio_value(&mut f.mode, CeMode::Inputs, "Show Inputs Only");
+    ui.separator();
+    ui.checkbox(&mut f.non_keyable, "Show Non-Keyable");
+    ui.checkbox(&mut f.connected_only, "Show Connected Only");
+    ui.checkbox(&mut f.hidden, "Show Hidden");
+}
+
+enum CeEdit {
+    Connect { src: String, src_attr: String, dst: String, dst_attr: String },
+    Disconnect { src: String, src_attr: String, dst: String, dst_attr: String },
+}
+
+fn connect_edit(s: &Scene, src: &NodeRef, src_attr: &str, dst: &NodeRef, dst_attr: &str) -> CeEdit {
+    CeEdit::Connect { src: s.ref_name(src), src_attr: src_attr.into(), dst: s.ref_name(dst), dst_attr: dst_attr.into() }
+}
+
+fn disconnect_edit(s: &Scene, src_id: &str, src_attr: &str, dst: &NodeRef, dst_attr: &str) -> CeEdit {
+    let src = s.ref_by_id(src_id).map(|r| s.ref_name(&r)).unwrap_or_else(|| src_id.to_string());
+    CeEdit::Disconnect { src, src_attr: src_attr.into(), dst: s.ref_name(dst), dst_attr: dst_attr.into() }
+}
+
+fn apply_edit(app: &mut IncaApp, edit: CeEdit) {
+    let (label, cmd) = match edit {
+        CeEdit::Connect { src, src_attr, dst, dst_attr } => ("connect", format!("connectAttr -f {src}.{src_attr} {dst}.{dst_attr};")),
+        CeEdit::Disconnect { src, src_attr, dst, dst_attr } => ("disconnect", format!("disconnectAttr {src}.{src_attr} {dst}.{dst_attr};")),
+    };
+    if let Err(e) = app.run_mel(label, &cmd) {
+        app.warn(e);
+    }
+}
+
+struct CeRow {
+    clicked: bool,
+    toggle: bool,
+}
+
+fn ce_row(ui: &mut egui::Ui, a: &CeAttr, child: bool, open: bool, selected: bool, connected: bool, disabled: bool) -> CeRow {
+    let (mut clicked, mut toggle) = (false, false);
+    ui.horizontal(|ui| {
+        if child {
+            ui.add_space(14.0);
+        }
+        if a.children.is_empty() {
+            ui.add_space(10.0);
+        } else {
+            let mark = if open { "▾" } else { "▸" };
+            let r = ui
+                .add(egui::Label::new(RichText::new(mark).size(9.0).color(theme::TEXT_DIM)).sense(Sense::click()))
+                .on_hover_text(if open { "Collapse" } else { "Expand" });
+            toggle = r.clicked();
+        }
+        let mut txt = RichText::new(&a.label);
+        if connected {
+            txt = txt.strong().italics();
+        }
+        if disabled {
+            txt = txt.color(Color32::from_rgb(107, 107, 107));
+        } else if connected {
+            txt = txt.color(Color32::from_rgb(140, 200, 255));
+        }
+        let r = ui.selectable_label(selected, txt).on_hover_text(&a.name);
+        clicked = r.clicked() && !disabled;
+    });
+    CeRow { clicked, toggle }
+}
+
 pub fn connection_editor(app: &mut IncaApp, ctx: &egui::Context) {
     let mut open = app.win.connection_editor;
     if !open {
@@ -868,133 +1321,228 @@ pub fn connection_editor(app: &mut IncaApp, ctx: &egui::Context) {
         ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("Connection Editor")));
         app.hg.ce_raise = false;
     }
+    let mut edit: Option<CeEdit> = None;
+    let mut clear_all = false;
+    let mut remove_side: Option<usize> = None;
+    let mut close = false;
+    let mut nav: Option<(bool, Option<NodeRef>)> = None;
     egui::Window::new("Connection Editor").order(egui::Order::Foreground).open(&mut open).default_size([560.0, 520.0]).show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.menu_button("Options", |ui| {
-                ui.checkbox(&mut app.hg.ce_auto, "Auto Connect");
-            });
-            if ui.button("Reload Left").clicked() {
-                if let Some(n) = selected_node(app) {
-                    app.hg.ce_left = Some(n);
-                    app.hg.ce_attr = None;
+                if ui.checkbox(&mut app.hg.ce_auto, "Auto Connect").changed() {
                     app.hg.ce_in = None;
-                } else {
-                    app.warn("// Warning: Nothing selected to load into the Connection Editor.");
                 }
+            });
+            ui.menu_button("Left Display", |ui| ce_display_menu(ui, &mut app.hg.ce_filter[0]));
+            ui.menu_button("Right Display", |ui| ce_display_menu(ui, &mut app.hg.ce_filter[1]));
+            ui.menu_button("Help", |ui| {
+                if ui.button("Help on Connection Editor...").clicked() {
+                    app.help = "Click an output attribute, then a highlighted input attribute to connect them; click a connected input again to break it. Reload Left / Right load the selected node.".into();
+                    ui.close();
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Reload Left").clicked() {
+                reload_side(app, 0);
             }
             if ui.button("Reload Right").clicked() {
-                if let Some(n) = selected_node(app) {
-                    app.hg.ce_right = Some(n);
-                    app.hg.ce_attr = None;
-                    app.hg.ce_in = None;
-                } else {
-                    app.warn("// Warning: Nothing selected to load into the Connection Editor.");
-                }
+                reload_side(app, 1);
             }
-            if ui.button("Swap").clicked() {
-                std::mem::swap(&mut app.hg.ce_left, &mut app.hg.ce_right);
-                app.hg.ce_attr = None;
+            ui.separator();
+            if ui.button(if app.hg.ce_dir { "from -> to" } else { "to <- from" }).on_hover_text("Swap which side shows outputs and inputs").clicked() {
+                app.hg.ce_dir = !app.hg.ce_dir;
+                app.hg.ce_out = None;
                 app.hg.ce_in = None;
             }
-            if ui.button("Clear All").clicked() {
-                app.hg.ce_left = None;
-                app.hg.ce_right = None;
-                app.hg.ce_attr = None;
-                app.hg.ce_in = None;
+            ui.separator();
+            let up = ui.button("<").on_hover_text("Upstream: load the node feeding the left node (right-click: choose)");
+            if up.clicked() {
+                nav = Some((false, None));
             }
+            let down = ui.button(">").on_hover_text("Downstream: load the node the right node feeds (right-click: choose)");
+            if down.clicked() {
+                nav = Some((true, None));
+            }
+            up.context_menu(|ui| nav_menu(app, ui, false, &mut nav));
+            down.context_menu(|ui| nav_menu(app, ui, true, &mut nav));
         });
-        ui.label(RichText::new("Click an output on the left, then an input on the right to connect (click a connected input to break it).").color(theme::TEXT_DIM).size(10.5));
         ui.separator();
         let (l, r) = (app.hg.ce_left.clone(), app.hg.ce_right.clone());
-        let mut connect: Option<(String, String)> = None;
-        let mut disconnect: Option<(String, String, String)> = None;
+        let out_node = if app.hg.ce_dir { l.as_ref() } else { r.as_ref() };
+        let in_node = if app.hg.ce_dir { r.as_ref() } else { l.as_ref() };
+        let out_attrs = out_node.map(|n| ce_attrs(&app.s, n)).unwrap_or_default();
+        let in_attrs = in_node.map(|n| ce_attrs(&app.s, n)).unwrap_or_default();
+        let out_sel = app.hg.ce_out.as_deref().and_then(|n| find_attr(&out_attrs, n)).cloned();
+        let mut ce_out = app.hg.ce_out.clone();
+        let mut ce_in = app.hg.ce_in.clone();
+        let mut ce_last = app.hg.ce_last;
+        let mut open_sets = [app.hg.ce_open[0].clone(), app.hg.ce_open[1].clone()];
         ui.columns(2, |cols| {
-            cols[0].label(RichText::new(format!("Outputs: {}", l.as_ref().map(|x| app.s.ref_name(x)).unwrap_or("-".into()))).strong());
-            if let Some(l) = &l {
-                egui::ScrollArea::vertical().id_salt("ceL").show(&mut cols[0], |ui| {
-                    for a in attrs_of(app, l) {
-                        let wired = output_wired(&app.s, l, &a);
-                        let txt = if wired { RichText::new(&a).italics().color(Color32::from_rgb(140, 200, 255)) } else { RichText::new(&a) };
-                        let selected = app.hg.ce_attr.as_deref() == Some(a.as_str());
-                        if ui.selectable_label(selected, txt).clicked() {
-                            app.hg.ce_attr = if selected { None } else { Some(a.clone()) };
-                            app.hg.ce_in = None;
+            for side in 0..2 {
+                let node = if side == 0 { &l } else { &r };
+                let out_role = (side == 0) == app.hg.ce_dir;
+                let title = if out_role { "Outputs" } else { "Inputs" };
+                let name = node.as_ref().map(|n| app.s.ref_name(n)).unwrap_or_else(|| "-".into());
+                cols[side].label(RichText::new(format!("{title}: {name}")).strong());
+                let Some(node) = node else {
+                    cols[side].label(
+                        RichText::new(format!("Select a node and click Reload {}", if side == 0 { "Left" } else { "Right" }))
+                            .italics()
+                            .color(theme::TEXT_DIM)
+                            .size(10.5),
+                    );
+                    continue;
+                };
+                let attrs = if out_role { &out_attrs } else { &in_attrs };
+                let filter = &app.hg.ce_filter[side];
+                cols[side].with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                egui::ScrollArea::vertical().id_salt(if side == 0 { "ceL" } else { "ceR" }).show(ui, |ui| {
+                    for a in attrs {
+                        let visible: Vec<&CeAttr> = a.children.iter().filter(|c| shown(&app.s, node, c, out_role, filter)).collect();
+                        if !shown(&app.s, node, a, out_role, filter) && visible.is_empty() {
+                            continue;
                         }
-                    }
-                });
-            }
-            cols[1].label(RichText::new(format!("Inputs: {}", r.as_ref().map(|x| app.s.ref_name(x)).unwrap_or("-".into()))).strong());
-            if let Some(r) = &r {
-                egui::ScrollArea::vertical().id_salt("ceR").show(&mut cols[1], |ui| {
-                    for a in attrs_of(app, r) {
-                        let from = input_conn(&app.s, r, &a);
-                        let txt = match &from {
-                            Some(_) => RichText::new(&a).italics().color(Color32::from_rgb(140, 200, 255)),
-                            None => RichText::new(&a),
-                        };
-                        let selected = app.hg.ce_in.as_deref() == Some(a.as_str());
-                        let resp = ui.selectable_label(selected, txt);
-                        let resp = match &from {
-                            Some((s, sa, _)) => resp.on_hover_text(format!("<- {}.{sa}", app.s.ref_by_id(s).map(|x| app.s.ref_name(&x)).unwrap_or_default())),
-                            None => resp,
-                        };
-                        if resp.clicked() {
-                            if app.hg.ce_auto {
-                                match &from {
-                                    Some((s, sa, _)) => disconnect = Some((s.clone(), sa.clone(), a.clone())),
-                                    None => {
-                                        if let Some(la) = &app.hg.ce_attr {
-                                            connect = Some((la.clone(), a.clone()));
-                                        } else {
-                                            app.hg.ce_in = Some(a.clone());
+                        let is_open = open_sets[side].contains(&a.name);
+                        let wired = attr_connected(&app.s, node, a, out_role);
+                        let selected = if out_role { ce_out.as_deref() == Some(a.name.as_str()) } else { ce_in.as_deref() == Some(a.name.as_str()) };
+                        let disabled = !out_role
+                            && match &out_sel {
+                                Some(sa) => !compatible(sa, a),
+                                None => !a.writable && !a.mappable,
+                            };
+                        let row = ce_row(ui, a, false, is_open, selected, wired, disabled);
+                        if row.toggle {
+                            if is_open {
+                                open_sets[side].remove(&a.name);
+                            } else {
+                                open_sets[side].insert(a.name.clone());
+                            }
+                        }
+                        if row.clicked {
+                            ce_last = side;
+                            if out_role {
+                                ce_out = if selected { None } else { Some(a.name.clone()) };
+                                ce_in = None;
+                            } else if app.hg.ce_auto {
+                                let from = input_conn(&app.s, node, &a.name);
+                                if let Some(oa) = ce_out.clone() {
+                                    if out_node.is_some_and(|on| connected(&app.s, on, &oa, node, &a.name)) {
+                                        if let Some((s, sa, _)) = from {
+                                            edit = Some(disconnect_edit(&app.s, &s, &sa, node, &a.name));
                                         }
+                                    } else if let Some(on) = out_node {
+                                        edit = Some(connect_edit(&app.s, on, &oa, node, &a.name));
                                     }
+                                } else if let Some((s, sa, _)) = from {
+                                    edit = Some(disconnect_edit(&app.s, &s, &sa, node, &a.name));
+                                } else {
+                                    ce_in = Some(a.name.clone());
                                 }
                             } else {
-                                app.hg.ce_in = if selected { None } else { Some(a.clone()) };
+                                ce_in = if selected { None } else { Some(a.name.clone()) };
+                            }
+                        }
+                        if is_open {
+                            for c in visible {
+                                let c_wired = attr_connected(&app.s, node, c, out_role);
+                                let c_selected = if out_role { ce_out.as_deref() == Some(c.name.as_str()) } else { ce_in.as_deref() == Some(c.name.as_str()) };
+                                let c_disabled = !out_role
+                                    && match &out_sel {
+                                        Some(sa) => !compatible(sa, c),
+                                        None => !c.writable && !c.mappable,
+                                    };
+                                let c_row = ce_row(ui, c, true, false, c_selected, c_wired, c_disabled);
+                                if c_row.clicked {
+                                    ce_last = side;
+                                    if out_role {
+                                        ce_out = if c_selected { None } else { Some(c.name.clone()) };
+                                        ce_in = None;
+                                    } else if app.hg.ce_auto {
+                                        let from = input_conn(&app.s, node, &c.name);
+                                        if let Some(oa) = ce_out.clone() {
+                                            if out_node.is_some_and(|on| connected(&app.s, on, &oa, node, &c.name)) {
+                                                if let Some((s, sa, _)) = from {
+                                                    edit = Some(disconnect_edit(&app.s, &s, &sa, node, &c.name));
+                                                }
+                                            } else if let Some(on) = out_node {
+                                                edit = Some(connect_edit(&app.s, on, &oa, node, &c.name));
+                                            }
+                                        } else if let Some((s, sa, _)) = from {
+                                            edit = Some(disconnect_edit(&app.s, &s, &sa, node, &c.name));
+                                        } else {
+                                            ce_in = Some(c.name.clone());
+                                        }
+                                    } else {
+                                        ce_in = if c_selected { None } else { Some(c.name.clone()) };
+                                    }
+                                }
                             }
                         }
                     }
                 });
+                });
             }
         });
-        if let (Some((la, ra)), Some(l), Some(r)) = (connect, &l, &r) {
-            if let Err(e) = app.run_mel("connect", &format!("connectAttr {}.{la} {}.{ra};", app.s.ref_name(l), app.s.ref_name(r))) {
-                app.warn(e);
-            }
-            app.hg.ce_in = None;
-        }
-        if let (Some((s, sa, ra)), Some(r)) = (disconnect, &r) {
-            let sn = app.s.ref_by_id(&s).map(|x| app.s.ref_name(&x)).unwrap_or_default();
-            if let Err(e) = app.run_mel("disconnect", &format!("disconnectAttr {sn}.{sa} {}.{ra};", app.s.ref_name(r))) {
-                app.warn(e);
-            }
-        }
+        app.hg.ce_out = ce_out.clone();
+        app.hg.ce_in = ce_in.clone();
+        app.hg.ce_last = ce_last;
+        app.hg.ce_open = open_sets;
         ui.separator();
         ui.horizontal(|ui| {
-            let make_ok = !app.hg.ce_auto && app.hg.ce_attr.is_some() && app.hg.ce_in.is_some();
+            if ui.button("Clear All").on_hover_text("Remove the nodes from both sides").clicked() {
+                clear_all = true;
+            }
+            let has_node = if ce_last == 0 { l.is_some() } else { r.is_some() };
+            if ui.add_enabled(has_node, egui::Button::new("Remove")).on_hover_text("Remove the node from the side last clicked").clicked() {
+                remove_side = Some(ce_last);
+            }
+            let make_ok = !app.hg.ce_auto && ce_out.is_some() && ce_in.is_some() && out_node.is_some() && in_node.is_some();
             if ui.add_enabled(make_ok, egui::Button::new("Make")).on_hover_text("Connect the selected output to the selected input").clicked() {
-                if let (Some(la), Some(ra), Some(l), Some(r)) = (app.hg.ce_attr.clone(), app.hg.ce_in.clone(), &l, &r) {
-                    if let Err(e) = app.run_mel("connect", &format!("connectAttr {}.{la} {}.{ra};", app.s.ref_name(l), app.s.ref_name(r))) {
-                        app.warn(e);
+                if let (Some(on), Some(inn), Some(oa), Some(ia)) = (out_node, in_node, &ce_out, &ce_in) {
+                    edit = Some(connect_edit(&app.s, on, oa, inn, ia));
+                }
+            }
+            let break_ok = !app.hg.ce_auto && ce_in.is_some() && in_node.is_some();
+            if ui.add_enabled(break_ok, egui::Button::new("Break")).on_hover_text("Break the connection driving the selected input").clicked() {
+                if let (Some(inn), Some(ia)) = (in_node, &ce_in) {
+                    if let Some((s, sa, _)) = input_conn(&app.s, inn, ia) {
+                        edit = Some(disconnect_edit(&app.s, &s, &sa, inn, ia));
                     }
                 }
             }
-            let break_ok = !app.hg.ce_auto && app.hg.ce_in.is_some();
-            if ui.add_enabled(break_ok, egui::Button::new("Break")).on_hover_text("Break the connection driving the selected input").clicked() {
-                if let (Some(ra), Some(r)) = (app.hg.ce_in.clone(), &r) {
-                    if let Some((s, sa, _)) = input_conn(&app.s, r, &ra) {
-                        let sn = app.s.ref_by_id(&s).map(|x| app.s.ref_name(&x)).unwrap_or_default();
-                        if let Err(e) = app.run_mel("disconnect", &format!("disconnectAttr {sn}.{sa} {}.{ra};", app.s.ref_name(r))) {
-                            app.warn(e);
-                        }
-                    }
-                }
+            if ui.button("Close").clicked() {
+                close = true;
             }
             ui.separator();
-            ui.label(RichText::new(if app.hg.ce_auto { "Auto Connect is on" } else { "Select an output and an input, then Make" }).color(theme::TEXT_DIM).size(10.5));
+            ui.label(RichText::new(if app.hg.ce_auto { "Auto Connect is on" } else { "Auto Connect is off" }).color(theme::TEXT_DIM).size(10.5));
         });
     });
+    if let Some(e) = edit {
+        apply_edit(app, e);
+    }
+    if clear_all {
+        app.hg.ce_left = None;
+        app.hg.ce_right = None;
+        app.hg.ce_out = None;
+        app.hg.ce_in = None;
+        app.hg.ce_open = std::array::from_fn(|_| HashSet::new());
+    }
+    if let Some(side) = remove_side {
+        if side == 0 {
+            app.hg.ce_left = None;
+        } else {
+            app.hg.ce_right = None;
+        }
+        app.hg.ce_out = None;
+        app.hg.ce_in = None;
+    }
+    if let Some((down, pick)) = nav {
+        navigate(app, down, pick);
+    }
+    if close {
+        open = false;
+    }
     app.win.connection_editor = open;
 }
 
@@ -1024,6 +1572,98 @@ mod tests {
         assert!(output_wired(&s, &NodeRef::Texture(t.clone()), "outColor"));
         assert!(!output_wired(&s, &NodeRef::Texture(t), "outAlpha"), "maps are recorded as outColor");
         assert_eq!(input_conn(&s, &NodeRef::Material(m), "specularRoughness"), None);
+    }
+
+    #[test]
+    fn connection_editor_lists_typed_compound_attributes() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), Some("a"));
+        let attrs = ce_attrs(&s, &NodeRef::Dag(a.clone()));
+        let translate = attrs.iter().find(|x| x.name == "translate").unwrap();
+        assert_eq!(translate.ty, CeType::Vector);
+        assert_eq!(translate.children.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["translateX", "translateY", "translateZ"]);
+        assert!(attrs.iter().any(|x| x.name == "visibility"));
+        assert!(attrs.iter().any(|x| x.name == "smoothLevel"));
+        assert!(find_attr(&attrs, "translateY").is_some());
+        let template = attrs.iter().find(|x| x.name == "template").unwrap();
+        assert!(!template.keyable);
+        assert!(!shown(&s, &NodeRef::Dag(a.clone()), template, true, &CeFilter { non_keyable: false, ..CeFilter::default() }));
+        assert!(!attrs.iter().find(|x| x.name == "smoothLevel").unwrap().keyable);
+
+        let history = ce_attrs(&s, &NodeRef::History(a.clone(), 0));
+        assert!(history.iter().any(|x| x.name == "width"), "generator channels are listed");
+        assert!(history.iter().any(|x| x.name == "subdivisionsWidth"));
+
+        let m = s.create_material("standardSurface", Some("m"));
+        let ma = ce_attrs(&s, &NodeRef::Material(m));
+        let base = ma.iter().find(|x| x.name == "baseColor").unwrap();
+        assert_eq!(base.ty, CeType::Vector);
+        assert!(base.mappable);
+        assert_eq!(base.children[0].name, "baseColorR");
+
+        let t = s.create_texture("checker", Some("tex"));
+        let ta = ce_attrs(&s, &NodeRef::Texture(t));
+        let out = ta.iter().find(|x| x.name == "outColor").unwrap();
+        assert_eq!(out.ty, CeType::TexColor);
+        assert!(!out.writable);
+        assert!(ta.iter().find(|x| x.name == "outAlpha").unwrap().hidden, "outAlpha is behind Show Hidden");
+    }
+
+    #[test]
+    fn connection_editor_filters_and_compatibility() {
+        let f = CeAttr::scalar("from", CeType::Float);
+        let i = CeAttr::scalar("to", CeType::Int);
+        let v = CeAttr::vector("v", ["X", "Y", "Z"]);
+        let tex = CeAttr::new("outColor", CeType::TexColor);
+        let mut map = CeAttr::scalar("baseColor", CeType::Float);
+        map.mappable = true;
+        map.writable = false;
+        assert!(compatible(&f, &i));
+        assert!(compatible(&v, &v));
+        assert!(!compatible(&v, &f));
+        assert!(compatible(&tex, &map));
+        assert!(!compatible(&tex, &f));
+        assert!(!compatible(&f, &map));
+
+        let filter = CeFilter { non_keyable: false, ..CeFilter::default() };
+        let mut hidden = CeAttr::scalar("x", CeType::Float);
+        hidden.keyable = false;
+        hidden.hidden = true;
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), Some("a"));
+        assert!(!shown(&s, &NodeRef::Dag(id.clone()), &hidden, true, &filter));
+        let filter = CeFilter { hidden: true, ..CeFilter::default() };
+        assert!(shown(&s, &NodeRef::Dag(id), &hidden, true, &filter));
+    }
+
+    #[test]
+    fn connection_editor_connected_families_and_neighbours() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), Some("a"));
+        let b = s.create_mesh("polyCube", &Params::new(), Some("b"));
+        let attrs = ce_attrs(&s, &NodeRef::Dag(a.clone()));
+        let translate = attrs.iter().find(|x| x.name == "translate").cloned().unwrap();
+        s.conns.push(inca_core::scene::Conn { src: a.clone(), src_attr: "translateX".into(), dst: b.clone(), dst_attr: "translateY".into() });
+        assert!(attr_connected(&s, &NodeRef::Dag(a.clone()), &translate, true), "a child connection lights up the compound");
+        let b_attrs = ce_attrs(&s, &NodeRef::Dag(b.clone()));
+        let b_translate = b_attrs.iter().find(|x| x.name == "translate").unwrap();
+        assert!(attr_connected(&s, &NodeRef::Dag(b.clone()), b_translate, false));
+
+        let down = neighbours(&s, &NodeRef::Dag(a.clone()), true);
+        assert_eq!(down.first(), Some(&NodeRef::Dag(b.clone())));
+        assert!(down.iter().any(|n| matches!(n, NodeRef::Material(_))), "the object's material is downstream");
+        assert!(neighbours(&s, &NodeRef::Dag(b.clone()), false).contains(&NodeRef::Dag(a.clone())));
+        assert_eq!(neighbours(&s, &NodeRef::Dag(a.clone()), false), vec![NodeRef::History(a, 0)], "the object's last history node is upstream");
+
+        let mat = s.create_material("standardSurface", Some("m"));
+        let tex = s.create_texture("checker", Some("t"));
+        s.mats.get_mut(&mat).unwrap().maps.insert("baseColor".into(), serde_json::json!(tex.clone()));
+        let ma = ce_attrs(&s, &NodeRef::Material(mat.clone()));
+        assert!(attr_connected(&s, &NodeRef::Material(mat.clone()), ma.iter().find(|x| x.name == "baseColor").unwrap(), false));
+        let ta = ce_attrs(&s, &NodeRef::Texture(tex.clone()));
+        assert!(attr_connected(&s, &NodeRef::Texture(tex.clone()), ta.iter().find(|x| x.name == "outColor").unwrap(), true));
+        assert_eq!(neighbours(&s, &NodeRef::Texture(tex), true), vec![NodeRef::Material(mat.clone())]);
+        assert!(neighbours(&s, &NodeRef::Material(mat), false).iter().any(|n| matches!(n, NodeRef::Texture(_))));
     }
 
     #[test]
