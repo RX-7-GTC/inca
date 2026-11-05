@@ -467,8 +467,15 @@ fn next_open(
 fn update_open_menu(ctx: &egui::Context, app: &mut IncaApp, titles: &[(&'static str, egui::Response)], source: MenuSource, hover_switch: bool) {
     let rects: Vec<(&'static str, egui::Rect)> = titles.iter().map(|(name, r)| (*name, r.rect)).collect();
     let (pressed_at, hover_at) = ctx.input(|i| {
-        let pressed = i.pointer.button_pressed(egui::PointerButton::Primary);
-        (if pressed { i.pointer.interact_pos() } else { None }, i.pointer.hover_pos())
+        // `contains_pointer` respects egui's layer order: a menu popup drawn above a panel's
+        // menu bar must keep clicks from reaching the title underneath. Raw rect tests made a
+        // press on a submenu item (e.g. Display > Heads Up Display > Camera Names) also count
+        // as a press on any panel title it happened to overlap (Show / Render).
+        let over_title = |pos: Option<egui::Pos2>| pos.is_some_and(|p| titles.iter().any(|(_, r)| r.contains_pointer() && r.rect.contains(p)));
+        let press_pos = i.pointer.interact_pos();
+        let hover_pos = i.pointer.hover_pos();
+        let pressed = i.pointer.button_pressed(egui::PointerButton::Primary) && over_title(press_pos);
+        (if pressed { press_pos } else { None }, hover_pos.filter(|p| over_title(Some(*p))))
     });
     app.open_menu = next_open(source, app.open_menu, pressed_at, hover_at, &rects, hover_switch);
 }
