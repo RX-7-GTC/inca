@@ -166,8 +166,26 @@ pub struct Node {
     pub shape: Shape,
     /// data we don't interpret yet (rigging) but keep so files round-trip
     pub passthrough: Map<String, Value>,
+    /// Maya-style published interface attributes: public name -> bound plug
+    pub published: IndexMap<String, PublishedAttr>,
     /// bumped whenever the shape's geometry changes (GPU caches key on it)
     pub rev: u64,
+}
+
+/// A published attribute on a container: the public name lives in `Node::published`,
+/// this record points at the internal plug it exposes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PublishedAttr {
+    /// "dag" | "material" | "texture" | "unbound"
+    pub kind: String,
+    pub node: Id,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub index: usize,
+    pub attr: String,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl Node {
@@ -572,6 +590,7 @@ impl Scene {
             extra: Value::Null,
             shape,
             passthrough: Map::new(),
+            published: IndexMap::new(),
             rev: 1,
         };
         match parent.and_then(|p| self.nodes.get_mut(p)) {
@@ -593,6 +612,10 @@ impl Scene {
 
     pub fn create_group(&mut self, name: &str, parent: Option<&str>) -> Id {
         self.make_dag("group", name, parent, Shape::Group, false, None)
+    }
+    /// A Maya-style container/asset node (a transform with a published interface).
+    pub fn create_container(&mut self, name: &str, parent: Option<&str>) -> Id {
+        self.make_dag("container", name, parent, Shape::Group, false, None)
     }
     pub fn create_locator(&mut self, name: &str) -> Id {
         self.make_dag("locator", name, None, Shape::Locator, false, None)
@@ -947,6 +970,9 @@ impl Scene {
         }
         self.sel.retain(|s| !ids.contains(s));
         self.hilite.retain(|h| !ids.contains(h));
+        for n in self.nodes.values_mut() {
+            n.published.retain(|_, p| !(matches!(p.kind.as_str(), "dag" | "history") && ids.contains(&p.node)));
+        }
         // booleans etc. that used a deleted mesh keep their current result
         let users: Vec<Id> = self
             .nodes
@@ -1218,9 +1244,79 @@ impl Scene {
         Some(n)
     }
 
+    // ------------------------------------------------------------ published attributes
+    /// The internal plug a published attribute points at.
+    pub fn published_ref(&self, p: &PublishedAttr) -> Option<NodeRef> {
+        match p.kind.as_str() {
+            "dag" => self.nodes.contains_key(&p.node).then(|| NodeRef::Dag(p.node.clone())),
+            "history" => {
+                let len = self.nodes.get(&p.node)?.mesh()?.history.len();
+                (p.index < len).then(|| NodeRef::History(p.node.clone(), p.index))
+            }
+            "material" => self.mats.contains_key(&p.node).then(|| NodeRef::Material(p.node.clone())),
+            "texture" => self.texs.contains_key(&p.node).then(|| NodeRef::Texture(p.node.clone())),
+            _ => None,
+        }
+    }
+
+    pub fn published_target(&self, id: &str, name: &str) -> Option<(NodeRef, String)> {
+        let p = self.nodes.get(id)?.published.get(name)?;
+        if p.kind == "dag" && p.node == id {
+            return None;
+        }
+        Some((self.published_ref(p)?, p.attr.clone()))
+    }
+
+    /// Resolve a published name to the internal node/attribute used by connections.
+    pub fn resolve_published_plug(&self, id: &Id, attr: &str) -> (Id, String) {
+        if let Some((r, a)) = self.published_target(id, attr) {
+            (self.ref_id(&r), a)
+        } else {
+            (id.clone(), attr.to_string())
+        }
+    }
+
+    /// Resolve a plug for MEL: published names first, then short attribute aliases.
+    pub fn resolve_plug(&self, r: &NodeRef, attr: &str) -> (Id, String) {
+        let id = self.ref_id(r);
+        if let Some((target, published_attr)) = self.published_target(&id, attr) {
+            (self.ref_id(&target), published_attr)
+        } else {
+            (id, alias(attr).to_string())
+        }
+    }
+
+    /// The container a node belongs to, either through the DAG hierarchy or a published plug.
+    pub fn container_of(&self, id: &str) -> Option<Id> {
+        if let Some(n) = self.nodes.get(id) {
+            let mut cur = n.parent.clone();
+            while let Some(p) = cur {
+                let parent = self.nodes.get(&p)?;
+                if parent.kind == "container" {
+                    return Some(p);
+                }
+                cur = parent.parent.clone();
+            }
+        }
+        self.nodes.values().find(|n| n.kind == "container" && n.published.values().any(|p| p.node == id)).map(|n| n.id.clone())
+    }
+
+    /// The published name of `target.attr` on a container, if there is one.
+    pub fn published_name_for(&self, container: &str, target: &NodeRef, attr: &str) -> Option<String> {
+        let tid = self.ref_id(target);
+        self.nodes.get(container)?.published.iter().find_map(|(name, p)| {
+            (p.node == tid && p.attr == attr && self.published_ref(p).as_ref() == Some(target)).then(|| name.clone())
+        })
+    }
+
     // ------------------------------------------------------------ attributes
     /// Get an attribute of a named node (`pCube1.translateX`, `polyCube1.width`, `lambert1.color`).
     pub fn get_attr(&self, r: &NodeRef, attr: &str) -> Option<Value> {
+        if let NodeRef::Dag(id) = r {
+            if let Some((target, target_attr)) = self.published_target(id, attr) {
+                return self.get_attr(&target, &target_attr);
+            }
+        }
         let attr = if matches!(r, NodeRef::Dag(_)) { alias(attr) } else { attr };
         match r {
             NodeRef::Dag(id) => {
@@ -1275,6 +1371,11 @@ impl Scene {
 
     /// `refresh` = re-evaluate meshes that depend on the node (off while batching).
     pub fn set_attr_ex(&mut self, r: &NodeRef, attr: &str, v: Value, refresh: bool) -> bool {
+        if let NodeRef::Dag(id) = r {
+            if let Some((target, target_attr)) = self.published_target(id, attr) {
+                return self.set_attr_ex(&target, &target_attr, v, refresh);
+            }
+        }
         // short names (t, r, s...) are transform aliases; history params keep their own keys
         let attr = if matches!(r, NodeRef::Dag(_)) { alias(attr) } else { attr }.to_string();
         let attr = attr.as_str();
@@ -1781,6 +1882,9 @@ impl Scene {
             }
             _ => {}
         }
+        if !n.published.is_empty() {
+            o.insert("published".into(), serde_json::to_value(&n.published).unwrap());
+        }
         for (k, v) in &n.passthrough {
             o.insert(k.clone(), v.clone());
         }
@@ -1831,7 +1935,7 @@ impl Scene {
             "camera" => Shape::Camera(serde_json::from_value(d["cam"].clone()).unwrap_or_default()),
             "curve" => Shape::Curve(serde_json::from_value(d["curve"].clone()).unwrap_or_default()),
             "locator" => Shape::Locator,
-            "group" => Shape::Group,
+            "group" | "container" => Shape::Group,
             _ => Shape::Locator, // rig nodes from the JS app (joints, handles, ...) show as locators
         };
         let exact = !fresh && startup;
@@ -1867,6 +1971,8 @@ impl Scene {
         n.xray = d["xray"].as_bool().unwrap_or(false);
         n.locks = d["locks"].as_object().cloned().unwrap_or_default();
         n.extra = d["extra"].clone();
+        // duplicated/imported nodes get new ids, so published targets would be stale
+        n.published = if fresh { IndexMap::new() } else { serde_json::from_value(d["published"].clone()).unwrap_or_default() };
         for k in ["rig", "extraAttrs"] {
             if let Some(v) = d.get(k) {
                 n.passthrough.insert(k.into(), v.clone());

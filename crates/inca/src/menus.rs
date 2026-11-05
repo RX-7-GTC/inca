@@ -141,6 +141,7 @@ pub fn common(name: &str) -> Vec<M> {
             A("searchReplace"),
             Sep,
             Sub("Convert", vec![A("convertNurbsToPoly")]),
+            Sub("Asset", vec![A("createContainer"), A("publishAttributes")]),
             A("renameSel"),
             Sep,
             A("addAttribute"),

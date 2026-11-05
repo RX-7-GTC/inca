@@ -122,6 +122,9 @@ struct Box_ {
 
 fn kind_label(s: &Scene, id: &str) -> String {
     let Some(n) = s.node(id) else { return String::new() };
+    if n.kind == "container" {
+        return "container".into();
+    }
     match &n.shape {
         Shape::Mesh(_) => "mesh".into(),
         Shape::Light(l) => l.ty.clone(),
@@ -1094,6 +1097,23 @@ fn dag_attrs(s: &Scene, id: &str) -> Vec<CeAttr> {
         }
         _ => {}
     }
+    for (name, p) in &n.published {
+        if out.iter().any(|a| a.name == *name) {
+            continue;
+        }
+        let Some(target) = s.published_ref(p) else { continue };
+        if matches!(&target, NodeRef::Dag(tid) if s.node(tid).is_some_and(|t| t.kind == "container")) {
+            continue;
+        }
+        let Some(bound) = find_attr(&ce_attrs(s, &target), &p.attr).cloned() else { continue };
+        let mut a = CeAttr::new(name, bound.ty);
+        a.keyable = bound.keyable;
+        a.readable = bound.readable;
+        a.writable = bound.writable;
+        a.mappable = bound.mappable;
+        a.published = true;
+        out.push(a);
+    }
     out
 }
 
@@ -1187,6 +1207,11 @@ fn compatible(src: &CeAttr, dst: &CeAttr) -> bool {
 
 /// Is this attribute, one of its children, or its parent compound wired on that side?
 fn attr_connected(s: &Scene, node: &NodeRef, attr: &CeAttr, as_source: bool) -> bool {
+    if let Some((target, target_attr)) = published_plug(s, node, &attr.name) {
+        if let Some(target_attr) = find_attr(&ce_attrs(s, &target), &target_attr) {
+            return attr_connected(s, &target, target_attr, as_source);
+        }
+    }
     let id = s.ref_id(node);
     let fam: Vec<&str> = std::iter::once(attr.name.as_str())
         .chain(attr.children.iter().map(|c| c.name.as_str()))
@@ -1214,13 +1239,15 @@ fn attr_connected(s: &Scene, node: &NodeRef, attr: &CeAttr, as_source: bool) -> 
 
 /// Exact connection, including a texture map stored on the material.
 fn connected(s: &Scene, src: &NodeRef, src_attr: &str, dst: &NodeRef, dst_attr: &str) -> bool {
+    let (src, src_attr) = resolve_ce_plug(s, src, src_attr);
+    let (dst, dst_attr) = resolve_ce_plug(s, dst, dst_attr);
     if matches!(src, NodeRef::Texture(_)) && matches!(dst, NodeRef::Material(_)) && (src_attr == "outColor" || src_attr == "outAlpha") {
-        if let NodeRef::Material(mid) = dst {
-            return s.mats.get(mid).and_then(|m| m.maps.get(dst_attr)).and_then(|v| v.as_str()) == Some(s.ref_id(src).as_str());
+        if let NodeRef::Material(mid) = &dst {
+            return s.mats.get(mid).and_then(|m| m.maps.get(&dst_attr)).and_then(|v| v.as_str()) == Some(s.ref_id(&src).as_str());
         }
     }
-    let sid = s.ref_id(src);
-    let did = s.ref_id(dst);
+    let sid = s.ref_id(&src);
+    let did = s.ref_id(&dst);
     s.conns.iter().any(|c| c.src == sid && c.src_attr == src_attr && c.dst == did && c.dst_attr == dst_attr)
 }
 
@@ -1271,6 +1298,19 @@ fn neighbours(s: &Scene, node: &NodeRef, down: bool) -> Vec<NodeRef> {
             }
             if !down && m.id == id {
                 push(Some(NodeRef::Texture(tid.to_string())));
+            }
+        }
+    }
+    if let NodeRef::Dag(id2) = node {
+        if let Some(n) = s.node(id2) {
+            if n.kind == "container" {
+                for p in n.published.values() {
+                    if let Some(target) = s.published_ref(p) {
+                        for next in neighbours(s, &target, down) {
+                            push(Some(next));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1364,9 +1404,28 @@ pub fn open_for_hypershade(app: &mut IncaApp) {
     app.win.connection_editor = true;
 }
 
+/// A container's published name resolved to its internal plug.
+fn published_plug(s: &Scene, node: &NodeRef, attr: &str) -> Option<(NodeRef, String)> {
+    if let NodeRef::Dag(id) = node {
+        s.published_target(id, attr)
+    } else {
+        None
+    }
+}
+
+fn resolve_ce_plug(s: &Scene, node: &NodeRef, attr: &str) -> (NodeRef, String) {
+    match published_plug(s, node, attr) {
+        Some((target, target_attr)) => (target, target_attr),
+        None => (node.clone(), attr.to_string()),
+    }
+}
+
 /// The connection driving `dst.attr`, including a texture map stored on a material. Returns
 /// (source id, source attribute, is a texture map).
 fn input_conn(s: &Scene, dst: &NodeRef, attr: &str) -> Option<(String, String, bool)> {
+    if let Some((target, target_attr)) = published_plug(s, dst, attr) {
+        return input_conn(s, &target, &target_attr);
+    }
     if let NodeRef::Material(mid) = dst {
         if let Some(tid) = s.mats.get(mid).and_then(|m| m.maps.get(attr)).and_then(|v| v.as_str()) {
             return Some((tid.to_string(), "outColor".into(), true));
@@ -1378,6 +1437,9 @@ fn input_conn(s: &Scene, dst: &NodeRef, attr: &str) -> Option<(String, String, b
 
 /// Whether this output attribute feeds any input, including texture maps.
 fn output_wired(s: &Scene, src: &NodeRef, attr: &str) -> bool {
+    if let Some((target, target_attr)) = published_plug(s, src, attr) {
+        return output_wired(s, &target, &target_attr);
+    }
     let sid = s.ref_id(src);
     if s.conns.iter().any(|c| c.src == sid && c.src_attr == attr) {
         return true;
@@ -1839,6 +1901,36 @@ mod tests {
         assert_eq!(out.short, "oc");
         assert!(!out.writable);
         assert!(ta.iter().find(|x| x.name == "outAlpha").unwrap().hidden, "outAlpha is behind Show Hidden");
+    }
+
+    #[test]
+    fn connection_editor_shows_published_container_attributes() {
+        let mut s = Scene::new();
+        let mat = s.create_material("standardSurface", Some("m"));
+        let tex = s.create_texture("checker", Some("t"));
+        let cube = s.create_mesh("polyCube", &Params::new(), Some("a"));
+        let other = s.create_mesh("polyCube", &Params::new(), Some("b"));
+        let container = s.create_container("asset1", None);
+        s.conns.push(inca_core::scene::Conn { src: cube.clone(), src_attr: "translateX".into(), dst: other, dst_attr: "translateY".into() });
+        s.mats.get_mut(&mat).unwrap().maps.insert("baseColor".into(), serde_json::json!(tex.clone()));
+        let published = |kind: &str, node: &str, attr: &str| inca_core::scene::PublishedAttr { kind: kind.into(), node: node.into(), index: 0, attr: attr.into() };
+        {
+            let n = s.nodes.get_mut(&container).unwrap();
+            n.published.insert("pubBase".into(), published("material", &mat, "baseColor"));
+            n.published.insert("pubTex".into(), published("texture", &tex, "outColor"));
+            n.published.insert("pubTx".into(), published("dag", &cube, "translateX"));
+        }
+        let attrs = ce_attrs(&s, &NodeRef::Dag(container.clone()));
+        let base = attrs.iter().find(|x| x.name == "pubBase" && x.published).unwrap();
+        assert_eq!(base.ty, CeType::Vector);
+        assert!(base.mappable);
+        let filter = CeFilter { mode: CeMode::Published, ..CeFilter::default() };
+        assert!(shown(&s, &NodeRef::Dag(container.clone()), base, true, &filter));
+
+        assert_eq!(input_conn(&s, &NodeRef::Dag(container.clone()), "pubBase"), Some((tex.clone(), "outColor".into(), true)));
+        assert!(output_wired(&s, &NodeRef::Dag(container.clone()), "pubTex"));
+        assert!(output_wired(&s, &NodeRef::Dag(container.clone()), "pubTx"));
+        assert_eq!(s.get_attr(&NodeRef::Dag(container), "pubBase"), s.get_attr(&NodeRef::Material(mat), "baseColor"));
     }
 
     #[test]

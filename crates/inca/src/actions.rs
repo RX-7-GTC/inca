@@ -57,6 +57,8 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("duplicateHistory", "Duplicate with Input Graph", ""),
     ("group", "Group", "Ctrl+G"),
     ("ungroup", "Ungroup", ""),
+    ("createContainer", "Create Container", ""),
+    ("publishAttributes", "Publish Attributes", ""),
     ("parent", "Parent", "P"),
     ("unparent", "Unparent", "Shift+P"),
     ("renameSel", "Rename...", ""),
@@ -386,6 +388,26 @@ fn primitive_mel(ty: &str, history: bool) -> String {
     s
 }
 
+/// Publish the Channel Box picks of the selected node on its container.
+fn publish_attributes_mel(app: &IncaApp) -> Option<String> {
+    let Some(id) = app.s.lead() else {
+        return Some("warning \"Select a node inside a container.\";".into());
+    };
+    let Some(container) = app.s.container_of(id) else {
+        return Some("warning \"Select a node inside a container.\";".into());
+    };
+    if app.panels.cb_sel.is_empty() {
+        return Some("warning \"Select channels in the Channel Box first.\";".into());
+    }
+    let node = app.s.name_of(id);
+    let container = app.s.name_of(&container);
+    let mut src = String::new();
+    for ch in &app.panels.cb_sel {
+        src.push_str(&format!("container -e -ba {node}.{ch} {ch} {container};\n"));
+    }
+    Some(src)
+}
+
 /// MEL for an action, if it is a scripted one.
 /// Attach to Motion Path: the selected objects follow the curve selected last.
 fn motion_path_mel(app: &IncaApp) -> Option<String> {
@@ -426,6 +448,8 @@ pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
             "duplicateHistory" => "duplicate -rr -un;".into(),
             "group" => if opt("group", "pivot") == 0.0 { "group; xform -cp;".into() } else { "group;".into() },
             "ungroup" => return ungroup_mel(app),
+            "createContainer" => "container;".into(),
+            "publishAttributes" => return publish_attributes_mel(app),
             "parent" => "parent;".into(),
             "unparent" => "parent -w;".into(),
             "resetTransformations" => "makeIdentity;".into(),

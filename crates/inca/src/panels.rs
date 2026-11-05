@@ -1002,6 +1002,25 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
     for (k, kind) in extra {
         channel_row(app, ui, &targets, &k, &ops::nice_name(&k), kind, None, None);
     }
+    // PUBLISHED (container interface attributes)
+    let published: Vec<(String, ChanKind)> = app.s.node(&lead).map(|n| {
+        n.published
+            .keys()
+            .filter_map(|name| match app.s.get_attr(&NodeRef::Dag(lead.clone()), name) {
+                Some(Value::Bool(_)) => Some((name.clone(), ChanKind::Bool)),
+                Some(Value::Number(x)) if x.is_f64() => Some((name.clone(), ChanKind::Float)),
+                Some(Value::Number(_)) => Some((name.clone(), ChanKind::Int)),
+                _ => None,
+            })
+            .collect()
+    }).unwrap_or_default();
+    if !published.is_empty() {
+        ui.add_space(4.0);
+        theme::section_header(ui, "PUBLISHED");
+        for (k, kind) in published {
+            channel_row(app, ui, &[NodeRef::Dag(lead.clone())], &k, &k, kind, None, None);
+        }
+    }
     // SHAPES
     let shape = shape.or_else(|| (!sh_channels.is_empty()).then(|| app.s.node(&lead).map(|n| n.kind.clone()).unwrap_or_default()));
     if let Some(sn) = shape {
@@ -1442,6 +1461,22 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
     match &r {
         NodeRef::Dag(id) if tab == 0 => {
             let targets = vec![r.clone()];
+            let published: Vec<(String, ChanKind)> = app.s.node(id).map(|n| {
+                n.published
+                    .keys()
+                    .filter_map(|name| match app.s.get_attr(&r, name) {
+                        Some(Value::Bool(_)) => Some((name.clone(), ChanKind::Bool)),
+                        Some(Value::Number(x)) if x.is_f64() => Some((name.clone(), ChanKind::Float)),
+                        Some(Value::Number(_)) => Some((name.clone(), ChanKind::Int)),
+                        _ => None,
+                    })
+                    .collect()
+            }).unwrap_or_default();
+            if !published.is_empty() && theme::fold(ui, "Published Attributes") {
+                for (k, kind) in published {
+                    channel_row(app, ui, &targets, &k, &k, kind, None, None);
+                }
+            }
             if theme::fold(ui, "Transform Attributes") {
                 for c in ["translateX", "translateY", "translateZ", "rotateX", "rotateY", "rotateZ", "scaleX", "scaleY", "scaleZ"] {
                     channel_row(app, ui, &targets, c, &ops::nice_name(c), ChanKind::Float, None, None);

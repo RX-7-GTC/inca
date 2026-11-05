@@ -101,7 +101,7 @@ fn strs(v: Vec<String>) -> Val {
 
 pub const CORE_COMMANDS: &[&str] = &[
     "sphere", "cylinder", "cone", "torus", "circle", "nurbsSquare", "curve", "spaceLocator", "group", "camera", "ambientLight", "directionalLight", "pointLight", "spotLight",
-    "areaLight", "skyDomeLight", "shadingNode", "createNode", "move", "rotate", "scale", "xform", "makeIdentity", "CenterPivot", "centerPivot", "setAttr", "getAttr", "select", "ls",
+    "areaLight", "skyDomeLight", "shadingNode", "createNode", "container", "move", "rotate", "scale", "xform", "makeIdentity", "CenterPivot", "centerPivot", "setAttr", "getAttr", "select", "ls",
     "objExists", "nodeType", "listRelatives", "listHistory", "rename", "parent", "delete", "duplicate", "hide", "showHidden", "currentTime", "playbackOptions", "setKeyframe",
     "cutKey", "keyframe", "hyperShade", "sets", "polyEvaluate", "polyExtrudeFacet", "polyExtrudeFace", "polyExtrudeEdge", "polySmooth", "polySubdivideFacet", "polyTriangulate",
     "polyQuad", "polyNormal", "polyPoke", "polyCloseBorder", "polyMirrorFace", "polyMergeVertex", "polyDelFacet", "polyDelEdge", "polyDelVertex", "polyUnite", "polySeparate",
@@ -118,6 +118,16 @@ pub fn exists(name: &str) -> bool {
 }
 
 /// Objects named in the args, or the selection.
+fn parse_plug(s: &Scene, t: &str) -> Result<(NodeRef, String), String> {
+    let (o, at) = t.split_once('.').ok_or(format!("{t}: expected node.attribute"))?;
+    let r = s.resolve(o).ok_or(format!("No object matches name: {o}"))?;
+    Ok((r, alias(at).to_string()))
+}
+
+fn valid_published_name(n: &str) -> bool {
+    !n.is_empty() && n != "note" && !n.contains('.')
+}
+
 fn targets(s: &Scene, a: &Args) -> Vec<Id> {
     let named: Vec<Id> = a.strings().iter().filter_map(|n| s.find(n.split('.').next().unwrap_or(n))).collect();
     if named.is_empty() {
@@ -569,6 +579,12 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "addAttr" => &[("ln|longName", 1), ("sn|shortName", 1), ("at|attributeType", 1), ("dt|dataType", 1), ("dv|defaultValue", 1), ("min|minValue", 1), ("max|maxValue", 1), ("k|keyable", 1)],
         "deleteAttr" => &[("at|attribute", 1)],
         "group" => &[("em|empty", 0), ("w|world", 0), ("n|name", 1), ("p|parent", 1), ("a|absolute", 0), ("r|relative", 0)],
+        "container" => &[
+            ("q|query", 0), ("e|edit", 0), ("n|name", 1), ("p|parent", 1),
+            ("ba|bindAttr", 3), ("pn|publishName", 0), ("publishAttr", 1),
+            ("unpublishName", 1), ("unbindAndUnpublish", 2), ("fc|findContainer", 1),
+            ("addNode|an", 1),
+        ],
         "shadingNode" => &[("asShader", 0), ("asTexture", 0), ("asUtility", 0), ("n|name", 1)],
         "hyperShade" => &[("assign", 1), ("objects", 1)],
         "sets" => &[("e|edit", 0), ("fe|forceElement", 1), ("n|name", 1), ("r|renderable", 1), ("nss|noSurfaceShader", 1), ("em|empty", 0)],
@@ -702,6 +718,143 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             }
             s.select(std::slice::from_ref(&g), SelMode::Replace);
             Ok(Val::Str(s.name_of(&g)))
+        }
+        "container" => {
+            if a.has(&["q", "query"]) {
+                if let Some(node) = a.s(&["fc", "findContainer"]) {
+                    let r = s.resolve(&node).ok_or(format!("No object matches name: {node}"))?;
+                    let c = s.container_of(&s.ref_id(&r)).ok_or(format!("{node} is not in a container"))?;
+                    return Ok(strs(vec![s.name_of(&c)]));
+                }
+                let container = a
+                    .strings()
+                    .last()
+                    .cloned()
+                    .or_else(|| a.get(&["ba", "bindAttr"]).and_then(|v| v.last()).map(|v| v.str()))
+                    .ok_or("container: no container name")?;
+                let cid = s.find(&container).ok_or(format!("No object matches name: {container}"))?;
+                let c = s.node(&cid).ok_or(format!("No object matches name: {container}"))?;
+                if c.kind != "container" {
+                    return Err(format!("'{container}' is not a container"));
+                }
+                if a.has(&["ba", "bindAttr"]) {
+                    let mut out = vec![];
+                    for p in c.published.values() {
+                        if let Some(r) = s.published_ref(p) {
+                            out.push(format!("{}.{}", s.ref_name(&r), p.attr));
+                        }
+                    }
+                    return Ok(strs(out));
+                }
+                if let Some(plug) = a.s(&["publishAttr"]) {
+                    let (r, at) = parse_plug(s, &plug)?;
+                    let mut out = vec![];
+                    for (name, p) in &c.published {
+                        if p.attr == at && s.published_ref(p).as_ref() == Some(&r) {
+                            out.push(name.clone());
+                        }
+                    }
+                    return Ok(strs(out));
+                }
+                return Ok(strs(c.published.keys().cloned().collect()));
+            }
+            if a.has(&["e", "edit"]) {
+                let container = a
+                    .strings()
+                    .last()
+                    .cloned()
+                    .or_else(|| a.get(&["ba", "bindAttr", "unbindAndUnpublish"]).and_then(|v| v.last()).map(|v| v.str()))
+                    .ok_or("container: no container name")?;
+                let cid = s.find(&container).ok_or(format!("No object matches name: {container}"))?;
+                if s.node(&cid).is_none_or(|n| n.kind != "container") {
+                    return Err(format!("'{container}' is not a container"));
+                }
+                if let Some(vals) = a.get(&["ba", "bindAttr"]) {
+                    let plug = vals.first().map(|v| v.str()).ok_or("container -ba: missing plug")?;
+                    let name = vals.get(1).map(|v| v.str()).ok_or("container -ba: missing published name")?;
+                    if !valid_published_name(&name) {
+                        return Err(format!("'{name}' is not a valid published attribute name"));
+                    }
+                    let (r, at) = parse_plug(s, &plug)?;
+                    let exists = if matches!(&r, NodeRef::Texture(_)) {
+                        at == "outColor" || at == "outAlpha" || s.get_attr(&r, &at).is_some()
+                    } else {
+                        s.get_attr(&r, &at).is_some()
+                    };
+                    if !exists {
+                        return Err(format!("No attribute matches name: {plug}"));
+                    }
+                    let (kind, node) = match &r {
+                        NodeRef::Dag(id) => ("dag", id.clone()),
+                        NodeRef::Material(id) => ("material", id.clone()),
+                        NodeRef::Texture(id) => ("texture", id.clone()),
+                        NodeRef::History(..) => return Err("container: publishing history attributes is not supported".into()),
+                    };
+                    if node == cid {
+                        return Err("container: cannot publish a container's own attribute".into());
+                    }
+                    if matches!(&r, NodeRef::Dag(id) if s.node(id).is_some_and(|n| n.kind == "container")) {
+                        return Err("container: cannot publish another container's interface".into());
+                    }
+                    let p = crate::scene::PublishedAttr { kind: kind.into(), node, index: 0, attr: at };
+                    s.node_mut(&cid).unwrap().published.insert(name.clone(), p);
+                    return Ok(Val::Str(name));
+                }
+                if a.has(&["pn", "publishName"]) {
+                    let strings = a.strings();
+                    let name = strings.first().cloned().ok_or("container -publishName: missing name")?;
+                    if !valid_published_name(&name) {
+                        return Err(format!("'{name}' is not a valid published attribute name"));
+                    }
+                    s.node_mut(&cid).unwrap().published.entry(name.clone()).or_insert(crate::scene::PublishedAttr {
+                        kind: "unbound".into(),
+                        node: String::new(),
+                        index: 0,
+                        attr: String::new(),
+                    });
+                    return Ok(Val::Str(name));
+                }
+                if let Some(vals) = a.get(&["unpublishName"]) {
+                    let name = vals.first().map(|v| v.str()).ok_or("container -unpublishName: missing name")?;
+                    s.node_mut(&cid).unwrap().published.shift_remove(&name);
+                    return Ok(Val::Str(name));
+                }
+                if let Some(vals) = a.get(&["unbindAndUnpublish"]) {
+                    let plug = vals.first().map(|v| v.str()).ok_or("container -unbindAndUnpublish: missing plug")?;
+                    let (r, at) = parse_plug(s, &plug)?;
+                    let names: Vec<String> = s
+                        .node(&cid)
+                        .unwrap()
+                        .published
+                        .iter()
+                        .filter(|(_, p)| p.attr == at && s.published_ref(p).as_ref() == Some(&r))
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    for n in &names {
+                        s.node_mut(&cid).unwrap().published.shift_remove(n);
+                    }
+                    return Ok(strs(names));
+                }
+                return Err("container: no edit operation given".into());
+            }
+            let name = a.s(&["n", "name"]).unwrap_or("container1".into());
+            let parent = a.s(&["p", "parent"]);
+            let selected = s.sel.clone();
+            let cid = s.create_container(&name, parent.as_deref());
+            let mut members = selected;
+            if let Some(v) = a.get(&["addNode", "an"]) {
+                members = v.iter().map(|x| x.str()).collect();
+            }
+            for m in members {
+                if m != cid {
+                    let id = s.nodes.contains_key(&m).then(|| m.clone()).or_else(|| s.find(&m));
+                    if let Some(id) = id {
+                        s.reparent(&id, Some(&cid), None);
+                    }
+                }
+            }
+            s.select(std::slice::from_ref(&cid), SelMode::Replace);
+            Ok(Val::Str(s.name_of(&cid)))
         }
         "camera" => {
             let cam = CamShape { focal_length: a.f(&["fl", "focalLength"]).unwrap_or(35.0), ortho: a.b(&["o", "orthographic"], false), ortho_width: a.f(&["ow"]).unwrap_or(30.0), ..Default::default() };
@@ -1673,8 +1826,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let t = a.strings().first().cloned().ok_or("connectionInfo: node.attribute required")?;
             let (o, at) = t.split_once('.').ok_or(format!("{t}: expected node.attribute"))?;
             let r = s.resolve(o).ok_or(format!("No object matches name: {o}"))?;
-            let id = s.ref_id(&r);
-            let at = alias(at).to_string();
+            let (id, at) = s.resolve_plug(&r, at);
             let input = s.conns.iter().find(|c| c.dst == id && c.dst_attr == at).cloned();
             let outs: Vec<Conn> = s.conns.iter().filter(|c| c.src == id && c.src_attr == at).cloned().collect();
             let plug = |s: &Scene, node: &str, attr: &str| s.ref_by_id(node).map(|r| format!("{}.{attr}", s.ref_name(&r))).unwrap_or_default();
@@ -2160,7 +2312,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let parse = |t: &str| -> Result<(Id, String), String> {
                 let (o, at) = t.split_once('.').ok_or(format!("{t}: expected node.attribute"))?;
                 let r = s.resolve(o).ok_or(format!("No object matches name: {o}"))?;
-                Ok((s.ref_id(&r), alias(at).to_string()))
+                Ok(s.resolve_plug(&r, at))
             };
             let (src, sa) = parse(&st[0])?;
             let (dst, da) = parse(&st[1])?;
@@ -2203,9 +2355,12 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "listConnections" => {
             let mut out = vec![];
             for t in a.strings() {
-                let (o, at) = t.split_once('.').map(|(a, b)| (a.to_string(), Some(alias(b).to_string()))).unwrap_or((t.clone(), None));
-                let Some(r) = s.resolve(&o) else { continue };
-                let id = s.ref_id(&r);
+                let parsed = match t.split_once('.') {
+                    Some((o, at)) => s.resolve(o).map(|r| s.resolve_plug(&r, at)),
+                    None => s.resolve(&t).map(|r| (s.ref_id(&r), String::new())),
+                };
+                let Some((id, at)) = parsed else { continue };
+                let at = (!at.is_empty()).then_some(at);
                 for c in &s.conns {
                     if c.dst == id && at.as_ref().is_none_or(|x| *x == c.dst_attr) {
                         if let Some(r) = s.ref_by_id(&c.src) {
@@ -3021,6 +3176,39 @@ mod tests {
         assert!((s.get_attr_f(&id, "tx") - 9.0).abs() < 1e-9);
         let r = mel(&mut s, "keyframe -q -tc -at tx pCube1;").unwrap();
         assert_eq!(r.list().len(), 2);
+    }
+
+    #[test]
+    fn container_published_attributes() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n pCube1; select -r pCube1; container -n asset1;").unwrap();
+        assert_eq!(s.node(&s.find("asset1").unwrap()).unwrap().kind, "container");
+        assert_eq!(s.node(&s.find("pCube1").unwrap()).unwrap().parent.as_deref(), Some(s.find("asset1").unwrap().as_str()));
+        mel(&mut s, "select -r pCube1; container -e -publishName pubTx asset1; container -e -ba pCube1.translateX pubTx asset1;").unwrap();
+        assert_eq!(mel(&mut s, "container -q -publishName -publishAttr pCube1.translateX asset1;").unwrap().list(), vec![Val::Str("pubTx".into())]);
+        assert_eq!(mel(&mut s, "container -q -ba asset1;").unwrap().list(), vec![Val::Str("pCube1.translateX".into())]);
+        assert_eq!(mel(&mut s, "container -q -fc pCube1;").unwrap().list(), vec![Val::Str("asset1".into())]);
+
+        let cube1 = s.find("pCube1").unwrap();
+        mel(&mut s, "setAttr asset1.pubTx 2.5;").unwrap();
+        assert!((s.get_attr_f(&cube1, "tx") - 2.5).abs() < 1e-9);
+        assert!((mel(&mut s, "getAttr asset1.pubTx;").unwrap().num() - 2.5).abs() < 1e-9);
+
+        mel(&mut s, "polyCube -n pCube2; connectAttr asset1.pubTx pCube2.translateY;").unwrap();
+        assert_eq!(mel(&mut s, "isConnected asset1.pubTx pCube2.translateY;").unwrap().num(), 1.0);
+        mel(&mut s, "setAttr asset1.pubTx 4;").unwrap();
+        s.apply_anim();
+        let cube2 = s.find("pCube2").unwrap();
+        assert!((s.get_attr_f(&cube2, "ty") - 4.0).abs() < 1e-9);
+
+        let data = s.serialize();
+        let mut s2 = Scene::new();
+        s2.load(&data).unwrap();
+        let a = s2.find("asset1").unwrap();
+        assert!(s2.node(&a).unwrap().published.contains_key("pubTx"));
+
+        mel(&mut s, "container -e -unpublishName pubTx asset1;").unwrap();
+        assert!(mel(&mut s, "getAttr asset1.pubTx;").is_err());
     }
 }
 
