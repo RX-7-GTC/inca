@@ -312,8 +312,8 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
             ui.separator();
             ui.menu_button("Edit", |ui| {
                 if ui.button("Select All").clicked() {
-                    let names: Vec<String> = app.s.all_dag(false).into_iter().filter(|id| app.s.is_visible(id)).collect();
-                    app.select_names(&names, SelMode::Replace);
+                    let ids: Vec<String> = app.s.all_dag(false).into_iter().filter(|id| app.s.is_visible(id)).collect();
+                    app.select_names(&ids, SelMode::Replace);
                     ui.close();
                 }
                 if ui.button("Unparent").clicked() {

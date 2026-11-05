@@ -87,7 +87,7 @@ fn ik_tool(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Rect, p
     let Some(j) = resp.interact_pointer_pos().and_then(|p| pick_joint(app, cv, rect, p)) else { return };
     match app.rig_tool.ik_start.take() {
         None => {
-            app.select_names(&[app.s.name_of(&j)], inca_core::scene::SelMode::Replace);
+            app.select_names(std::slice::from_ref(&j), inca_core::scene::SelMode::Replace);
             app.rig_tool.ik_start = Some(j);
             app.help = "Create IK Handle: click the end joint".into();
         }
@@ -462,12 +462,12 @@ pub fn sdk_window(app: &mut IncaApp, ctx: &egui::Context) {
                 let _ = app.run_mel("set driven key", &format!("setDrivenKeyframe -cd {drv} {};", targets.join(" ")));
             }
             if ui.button("Select Driver").clicked() {
-                if let Some(d) = &st.driver {
-                    app.select_names(&[app.s.name_of(d)], inca_core::scene::SelMode::Replace);
+                if let Some(d) = st.driver.clone() {
+                    app.select_names(std::slice::from_ref(&d), inca_core::scene::SelMode::Replace);
                 }
             }
             if ui.button("Select Driven").clicked() {
-                let n: Vec<String> = st.driven.iter().map(|d| app.s.name_of(d)).collect();
+                let n = st.driven.clone();
                 app.select_names(&n, inca_core::scene::SelMode::Replace);
             }
         });

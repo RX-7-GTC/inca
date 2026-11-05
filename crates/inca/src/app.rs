@@ -727,7 +727,10 @@ impl IncaApp {
         let _ = self.exec_mel(mel, true);
     }
 
+    /// Select DAG nodes by their scene IDs (not display names) and echo the equivalent MEL
+    /// `select` command. The scene filters out non-selectable / templated nodes.
     pub fn select_names(&mut self, ids: &[String], mode: SelMode) {
+        debug_assert!(ids.iter().all(|i| self.s.nodes.contains_key(i)), "select_names expects node IDs, not names");
         let names: Vec<String> = ids.iter().map(|i| self.s.name_of(i)).collect();
         let flag = match mode {
             SelMode::Replace => "-r",

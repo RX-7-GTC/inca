@@ -420,7 +420,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             Some((i, _)) => {
                 let n = &nodes[i];
                 if n.kind == Kind::Object {
-                    app.select_names(std::slice::from_ref(&n.name), SelMode::Replace);
+                    app.select_names(std::slice::from_ref(&n.id), SelMode::Replace);
                 } else {
                     app.windows_state.hs_selected = Some(n.id.clone());
                 }
