@@ -349,10 +349,25 @@ pub fn shelf(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.add_space(26.0);
+            // The button inner margin is `button_padding - bg_stroke.width`; overriding the
+            // stroke to NONE after that calculation made hovered tabs 1px narrower, shifting
+            // the adjacent tab under the pointer and causing a hover/layout oscillation. Keep
+            // the stroke width zero in every state so the tab widths never change.
+            let w = &mut ui.visuals_mut().widgets;
+            w.inactive.bg_stroke = egui::Stroke::NONE;
+            w.hovered.bg_stroke = egui::Stroke::NONE;
+            w.active.bg_stroke = egui::Stroke::NONE;
+            w.open.bg_stroke = egui::Stroke::NONE;
             ui.spacing_mut().item_spacing.x = 0.0;
             for (i, sh) in app.shelves.iter().enumerate() {
                 let on = tab == i;
-                let t = RichText::new(&sh.name).size(11.0).color(if on { Color32::WHITE } else { Color32::from_gray(0xbd) });
+                // JS `.shelf-tab:hover { color: #fff }`. The response from the previous frame
+                // gives us hover before the button is built; colour does not affect width, so
+                // this cannot feed back into the layout.
+                let id = ui.next_auto_id();
+                let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
+                let color = if on || hovered { Color32::WHITE } else { Color32::from_gray(0xbd) };
+                let t = RichText::new(&sh.name).size(11.0).color(color);
                 let b = egui::Button::new(t).fill(if on { theme::BG } else { Color32::TRANSPARENT }).stroke(egui::Stroke::NONE).corner_radius(egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 });
                 if ui.add(b).clicked() {
                     app.shelf_tab = i;
