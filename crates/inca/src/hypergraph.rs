@@ -1553,11 +1553,31 @@ fn ce_row(ui: &mut egui::Ui, a: &CeAttr, child: bool, open: bool, selected: bool
         if a.children.is_empty() {
             ui.add_space(10.0);
         } else {
-            let mark = if open { "▾" } else { "▸" };
-            let r = ui
-                .add(egui::Label::new(RichText::new(mark).size(9.0).color(theme::TEXT_DIM)).sense(Sense::click()))
-                .on_hover_text(if open { "Collapse" } else { "Expand" });
-            toggle = r.clicked();
+            let (r, resp) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), Sense::click());
+            let c = r.center();
+            let pts = if open {
+                vec![
+                    c + egui::vec2(-3.5, -2.0),
+                    c + egui::vec2(3.5, -2.0),
+                    c + egui::vec2(0.0, 2.5),
+                ]
+            } else {
+                vec![
+                    c + egui::vec2(-2.0, -3.5),
+                    c + egui::vec2(2.5, 0.0),
+                    c + egui::vec2(-2.0, 3.5),
+                ]
+            };
+            let col = if resp.hovered() {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            };
+            ui.painter()
+                .add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
+            toggle = resp
+                .on_hover_text(if open { "Collapse" } else { "Expand" })
+                .clicked();
         }
         let text = match names {
             CeName::Nice => &a.label,
