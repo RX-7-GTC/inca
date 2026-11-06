@@ -1545,7 +1545,7 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
                 }
             }
         }
-        NodeRef::Material(mid) => crate::windows::material_editor(app, ui, mid),
+        NodeRef::Material(mid) => crate::windows::material_editor(app, ui, mid, true),
         NodeRef::Texture(_) => {}
     }
 }

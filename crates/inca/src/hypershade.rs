@@ -716,6 +716,83 @@ fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
     }
 }
 
+fn texture_icon(ty: &str) -> &str {
+    match ty {
+        "file" => "fileTex",
+        "grid" => "gridTex",
+        other => other,
+    }
+}
+
+fn property_tabs(app: &IncaApp, id: &str) -> Vec<(String, String)> {
+    let mut out = vec![];
+    if let Some(m) = app.s.mats.get(id) {
+        out.push((m.id.clone(), m.name.clone()));
+        let mut seen = HashSet::new();
+        for tid in m.maps.values().filter_map(|v| v.as_str()) {
+            if seen.insert(tid.to_string()) {
+                if let Some(t) = app.s.texs.get(tid) {
+                    out.push((t.id.clone(), t.name.clone()));
+                }
+            }
+        }
+    } else if let Some(t) = app.s.texs.get(id) {
+        out.push((t.id.clone(), t.name.clone()));
+        for m in app.s.mats.values().filter(|m| m.maps.values().any(|v| v.as_str() == Some(id))) {
+            out.push((m.id.clone(), m.name.clone()));
+        }
+    } else if let Some(n) = app.s.node(id) {
+        out.push((n.id.clone(), n.name.clone()));
+        if let Some(mid) = n.mesh().map(|m| m.material.clone()) {
+            if let Some(m) = app.s.mats.get(&mid) {
+                out.push((m.id.clone(), m.name.clone()));
+                let mut seen = HashSet::new();
+                for tid in m.maps.values().filter_map(|v| v.as_str()) {
+                    if seen.insert(tid.to_string()) {
+                        if let Some(t) = app.s.texs.get(tid) {
+                            out.push((t.id.clone(), t.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn property_header(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
+    let (name, ty, icon, editable) = if let Some(m) = app.s.mats.get(id) {
+        (m.name.clone(), inca_core::materials::mat_type(&m.ty).label.to_string(), m.ty.clone(), true)
+    } else if let Some(t) = app.s.texs.get(id) {
+        let label = inca_core::materials::tex_type(&t.ty).map(|x| x.label).unwrap_or(&t.ty).to_string();
+        (t.name.clone(), label, texture_icon(&t.ty).to_string(), true)
+    } else if let Some(n) = app.s.node(id) {
+        let (ty, icon) = match &n.shape {
+            Shape::Light(l) => (l.ty.clone(), l.ty.clone()),
+            Shape::Camera(_) => ("camera".into(), "camera".into()),
+            _ => (n.kind.clone(), "hypershade".into()),
+        };
+        (n.name.clone(), ty, icon, false)
+    } else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+        crate::icons::paint(ui, r.shrink(2.0), &icon, Color32::WHITE);
+        if editable {
+            let mut new_name = name.clone();
+            let resp = ui.text_edit_singleline(&mut new_name);
+            let committed = resp.lost_focus() || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if committed && new_name != name && !new_name.trim().is_empty() {
+                rename_shading_node(app, id, &new_name);
+            }
+        } else {
+            ui.label(RichText::new(&name).strong());
+        }
+        ui.label(RichText::new(&ty).color(theme::TEXT_DIM));
+    });
+}
+
 fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
     let Some(id) = app.windows_state.hs_selected.clone() else {
         ui.label(RichText::new("Select a node to edit it").color(theme::TEXT_DIM));
@@ -725,6 +802,23 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
     // text field overflowed it and pushed the whole grid left under the work area.
     ui.set_max_width(ui.available_width());
     ui.spacing_mut().text_edit_width = 120.0;
+    property_header(app, ui, &id);
+    let tabs = property_tabs(app, &id);
+    if tabs.len() > 1 {
+        let mut pick = None;
+        ui.horizontal_wrapped(|ui| {
+            for (tid, label) in &tabs {
+                if ui.selectable_label(tid == &id, label).clicked() {
+                    pick = Some(tid.clone());
+                }
+            }
+        });
+        if let Some(tid) = pick {
+            select_graph_node(app, &tid, false);
+            return;
+        }
+    }
+    ui.separator();
     if app.s.mats.contains_key(&id) {
         ui.horizontal(|ui| {
             if ui.button("Assign to Selection").clicked() {
@@ -738,10 +832,9 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         });
         if app.s.mats.contains_key(&id) {
-            crate::windows::material_editor(app, ui, &id);
+            crate::windows::material_editor(app, ui, &id, false);
         }
     } else if let Some(t) = app.s.texs.get(&id).cloned() {
-        theme::section_header(ui, &format!("{} ({})", t.name, t.ty));
         let keys: Vec<String> = t.attrs.keys().filter(|k| *k != "colors").cloned().collect();
         crate::panels::attr_map_editor(app, ui, &NodeRef::Texture(id.clone()), &keys);
         if t.ty == "file" && ui.button("Browse image...").clicked() {
@@ -758,14 +851,26 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
             app.s.touch();
             app.windows_state.hs_selected = None;
         }
+        let conns: Vec<(String, String)> = app.s.mats.values().flat_map(|m| {
+            m.maps.iter().filter(|(_, v)| v.as_str() == Some(id.as_str())).map(move |(slot, _)| (m.id.clone(), format!("{}.{}", m.name, slot)))
+        }).collect();
+        if !conns.is_empty() {
+            theme::section_header(ui, "Connections");
+            for (mid, label) in conns {
+                if ui.button(label).clicked() {
+                    select_graph_node(app, &mid, false);
+                    return;
+                }
+            }
+        }
     } else if let Some(n) = app.s.node(&id) {
-        let kind = match &n.shape {
-            Shape::Light(l) => l.ty.clone(),
-            Shape::Camera(_) => "camera".into(),
-            _ => n.kind.clone(),
+        let keys: Vec<String> = match &n.shape {
+            Shape::Light(l) => l.attrs.keys().cloned().collect(),
+            Shape::Camera(_) => app.s.shape_channels(&id),
+            _ => ["translateX", "translateY", "translateZ", "rotateX", "rotateY", "rotateZ", "scaleX", "scaleY", "scaleZ", "visibility"].iter().map(|s| s.to_string()).collect(),
         };
-        theme::section_header(ui, &format!("{} ({kind})", n.name));
-        ui.label(RichText::new("Object attributes are shown in the Attribute Editor.").color(theme::TEXT_DIM));
+        theme::section_header(ui, "Attributes");
+        crate::panels::attr_map_editor(app, ui, &NodeRef::Dag(id.clone()), &keys);
     } else {
         ui.label(RichText::new("Select a node to edit it").color(theme::TEXT_DIM));
     }

@@ -348,9 +348,10 @@ fn run_script(app: &mut IncaApp) {
 
 // ------------------------------------------------------------------ hypershade
 
-pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str) {
+pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_name: bool) {
     let Some(m) = app.s.mats.get(mid).cloned() else { return };
     let read_only = crate::hypershade::read_only(app, mid);
+    if show_name {
     ui.horizontal(|ui| {
         let p = m.pbr();
         let (r, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
@@ -372,6 +373,7 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str) {
         }
         ui.label(RichText::new(inca_core::materials::mat_type(&m.ty).label).color(theme::TEXT_DIM));
     });
+    }
     theme::section_header(ui, "Common Material Attributes");
     let keys: Vec<String> = m.attrs.keys().cloned().collect();
     crate::panels::attr_map_editor(app, ui, &NodeRef::Material(mid.to_string()), &keys);
