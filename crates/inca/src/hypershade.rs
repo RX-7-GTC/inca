@@ -6,7 +6,7 @@ use crate::app::IncaApp;
 use crate::theme;
 use egui::{pos2, vec2, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use inca_core::materials::{MAT_TYPES, TEX_TYPES};
-use inca_core::scene::{NodeRef, SelMode};
+use inca_core::scene::{NodeRef, SelMode, Shape};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -50,11 +50,24 @@ pub struct HsState {
     pub selected_only: bool,
     swatches: HashMap<String, (u64, egui::TextureHandle)>,
     pub tab: usize,
+    pub filter: String,
+    pub create_filter: String,
 }
 
 impl Default for HsState {
     fn default() -> Self {
-        HsState { pos: HashMap::new(), pan: vec2(20.0, 20.0), zoom: 1.0, drag_node: None, wire: None, selected_only: false, swatches: HashMap::new(), tab: 0 }
+        HsState {
+            pos: HashMap::new(),
+            pan: vec2(20.0, 20.0),
+            zoom: 1.0,
+            drag_node: None,
+            wire: None,
+            selected_only: false,
+            swatches: HashMap::new(),
+            tab: 0,
+            filter: String::new(),
+            create_filter: String::new(),
+        }
     }
 }
 
@@ -149,9 +162,16 @@ fn default_pos(nodes: &[GNode], i: usize) -> Pos2 {
 
 pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
     // ---- create bar
-    ui.horizontal_wrapped(|ui| {
+    ui.horizontal(|ui| {
         ui.label("Create:");
+        ui.add(egui::TextEdit::singleline(&mut app.windows_state.hs.create_filter).hint_text("Filter nodes...").desired_width(120.0));
+    });
+    let create_filter = app.windows_state.hs.create_filter.to_lowercase();
+    ui.horizontal_wrapped(|ui| {
         for t in MAT_TYPES {
+            if !create_filter.is_empty() && !t.label.to_lowercase().contains(&create_filter) {
+                continue;
+            }
             if ui.small_button(t.label).on_hover_text(format!("Create a {} material", t.label)).clicked() {
                 let _ = app.run_mel("create material", &format!("shadingNode -asShader {};", t.ty));
                 app.windows_state.hs_selected = app.s.mats.keys().last().cloned();
@@ -159,6 +179,9 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         ui.separator();
         for t in TEX_TYPES {
+            if !create_filter.is_empty() && !t.label.to_lowercase().contains(&create_filter) {
+                continue;
+            }
             if ui.small_button(t.label).on_hover_text(format!("Create a {} texture", t.label)).clicked() {
                 let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {};", t.ty));
                 app.windows_state.hs_selected = app.s.texs.keys().last().cloned();
@@ -174,9 +197,11 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
         .exact_size(palette_w)
         .resizable(false)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut app.windows_state.hs.tab, 0, "Materials");
-                ui.selectable_value(&mut app.windows_state.hs.tab, 1, "Textures");
+            ui.add(egui::TextEdit::singleline(&mut app.windows_state.hs.filter).hint_text("Search...").desired_width(ui.available_width()));
+            ui.horizontal_wrapped(|ui| {
+                for (i, label) in ["Materials", "Textures", "Lights", "Cameras", "Shading Groups"].into_iter().enumerate() {
+                    ui.selectable_value(&mut app.windows_state.hs.tab, i, label);
+                }
             });
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("hspal").show(ui, |ui| palette(app, ui));
         });
@@ -206,29 +231,72 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
-    let ids: Vec<(String, String)> = if app.windows_state.hs.tab == 0 { app.s.mats.values().map(|m| (m.id.clone(), m.name.clone())).collect() } else { app.s.texs.values().map(|t| (t.id.clone(), t.name.clone())).collect() };
-    ui.horizontal_wrapped(|ui| {
-        for (id, name) in ids {
-            let sel = app.windows_state.hs_selected.as_deref() == Some(id.as_str());
-            let tex = swatch(app, &ctx, &id);
-            ui.vertical(|ui| {
-                ui.set_width(56.0);
-                let (r, resp) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::click());
-                ui.painter().rect_filled(r, 2.0, if sel { theme::HI } else { theme::BG_DARK });
-                if let Some(t) = tex {
-                    ui.painter().image(t, r.shrink(3.0), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                }
-                ui.label(RichText::new(&name).size(10.0));
-                if resp.clicked() {
-                    app.windows_state.hs_selected = Some(id.clone());
-                }
-                if resp.double_clicked() && app.s.mats.contains_key(&id) {
-                    let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
-                }
-                resp.on_hover_text("Click to edit, double-click to assign to the selection");
-            });
+    let filter = app.windows_state.hs.filter.to_lowercase();
+    let mut items: Vec<(String, String, Option<String>)> = vec![];
+    match app.windows_state.hs.tab {
+        0 => {
+            for m in app.s.mats.values() {
+                items.push((m.id.clone(), m.name.clone(), None));
+            }
         }
-    });
+        1 => {
+            for t in app.s.texs.values() {
+                items.push((t.id.clone(), t.name.clone(), None));
+            }
+        }
+        2 => {
+            for n in app.s.nodes.values() {
+                if let Shape::Light(l) = &n.shape {
+                    items.push((n.id.clone(), n.name.clone(), Some(l.ty.clone())));
+                }
+            }
+        }
+        3 => {
+            for n in app.s.nodes.values() {
+                if matches!(n.shape, Shape::Camera(_)) {
+                    items.push((n.id.clone(), n.name.clone(), Some("camera".into())));
+                }
+            }
+        }
+        _ => {
+            for m in app.s.mats.values() {
+                let label = if m.id == app.s.default_mat { "initialShadingGroup".to_string() } else { format!("{}SG", m.name) };
+                items.push((m.id.clone(), label, None));
+            }
+        }
+    }
+    items.retain(|(_, label, _)| filter.is_empty() || label.to_lowercase().contains(&filter));
+    // Fixed-width grid: wrap by whole tiles instead of relying on label widths.
+    let cols = (((ui.available_width() + 4.0) / 60.0).floor() as usize).max(1);
+    for row in items.chunks(cols) {
+        ui.horizontal(|ui| {
+            for (id, name, icon) in row {
+                let sel = app.windows_state.hs_selected.as_deref() == Some(id.as_str());
+                let tex = swatch(app, &ctx, id);
+                ui.vertical(|ui| {
+                    ui.set_width(56.0);
+                    let (r, resp) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::click());
+                    ui.painter().rect_filled(r, 2.0, if sel { theme::HI } else { theme::BG_DARK });
+                    if let Some(t) = tex {
+                        ui.painter().image(t, r.shrink(3.0), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    } else if let Some(icon) = icon {
+                        crate::icons::paint(ui, r.shrink(6.0), icon, Color32::WHITE);
+                    }
+                    ui.add_sized([56.0, 14.0], egui::Label::new(RichText::new(name).size(10.0)).truncate());
+                    if resp.clicked() {
+                        app.windows_state.hs_selected = Some(id.clone());
+                        if !app.s.mats.contains_key(id) && !app.s.texs.contains_key(id) {
+                            app.select_names(std::slice::from_ref(id), SelMode::Replace);
+                        }
+                    }
+                    if resp.double_clicked() && app.s.mats.contains_key(id) {
+                        let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
+                    }
+                    resp.on_hover_text(format!("{name} — click to edit, double-click to assign"));
+                });
+            }
+        });
+    }
 }
 
 fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
@@ -273,6 +341,14 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
             app.s.touch();
             app.windows_state.hs_selected = None;
         }
+    } else if let Some(n) = app.s.node(&id) {
+        let kind = match &n.shape {
+            Shape::Light(l) => l.ty.clone(),
+            Shape::Camera(_) => "camera".into(),
+            _ => n.kind.clone(),
+        };
+        theme::section_header(ui, &format!("{} ({kind})", n.name));
+        ui.label(RichText::new("Object attributes are shown in the Attribute Editor.").color(theme::TEXT_DIM));
     } else {
         ui.label(RichText::new("Select a node to edit it").color(theme::TEXT_DIM));
     }
