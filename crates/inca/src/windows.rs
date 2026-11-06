@@ -162,7 +162,9 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     egui::Window::new("Script Editor").open(&mut open).default_size([640.0, 460.0]).show(ctx, |ui| script_editor(app, ui));
     app.win.script_editor = open;
     let mut open = app.win.hypershade;
-    egui::Window::new("Hypershade").open(&mut open).default_size([980.0, 560.0]).show(ctx, |ui| crate::hypershade::window(app, ui));
+    // A distinct id discards the old stored area state that had grown to the screen width
+    // (the layout feedback bug); the window now starts at its default size again.
+    egui::Window::new("Hypershade").id(egui::Id::new("HypershadeWindow")).open(&mut open).default_size([980.0, 560.0]).show(ctx, |ui| crate::hypershade::window(app, ui));
     app.win.hypershade = open;
     let mut open = app.win.graph_editor;
     egui::Window::new("Graph Editor").open(&mut open).default_size([760.0, 420.0]).show(ctx, |ui| graph_editor(app, ui));

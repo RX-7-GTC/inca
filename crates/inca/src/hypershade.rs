@@ -166,43 +166,40 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     });
     ui.separator();
-    let avail = ui.available_size();
-    let side = 230.0f32.min(avail.x * 0.3);
-    ui.horizontal(|ui| {
-        ui.set_min_height(avail.y);
-        // ---- palette
-        ui.vertical(|ui| {
-            ui.set_width(side * 0.75);
+    let side = 230.0f32.min(ui.available_width() * 0.3);
+    // egui panels divide the remaining width exactly; sizing the columns from
+    // `available_width` inside a horizontal layout made the window grow every frame.
+    egui::Panel::left("hypershade_palette")
+        .exact_size(side * 0.75)
+        .resizable(false)
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut app.windows_state.hs.tab, 0, "Materials");
                 ui.selectable_value(&mut app.windows_state.hs.tab, 1, "Textures");
             });
-            egui::ScrollArea::vertical().id_salt("hspal").show(ui, |ui| palette(app, ui));
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("hspal").show(ui, |ui| palette(app, ui));
         });
-        ui.separator();
-        // ---- work area
-        ui.vertical(|ui| {
-            ui.set_width(avail.x - side * 1.75 - 24.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Work Area").strong());
-                ui.checkbox(&mut app.windows_state.hs.selected_only, "Graph selected network only");
-                if ui.small_button("Rearrange").clicked() {
-                    app.windows_state.hs.pos.clear();
-                    app.windows_state.hs.pan = vec2(20.0, 20.0);
-                    app.windows_state.hs.zoom = 1.0;
-                }
-                if ui.small_button("Connection Editor").on_hover_text("Load the selected material or texture into the Connection Editor").clicked() {
-                    crate::hypergraph::open_for_hypershade(app);
-                }
-            });
-            work_area(app, ui);
+    egui::Panel::right("hypershade_properties")
+        .exact_size(side)
+        .resizable(false)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("hsattr").show(ui, |ui| properties(app, ui));
         });
-        ui.separator();
-        // ---- property editor
-        ui.vertical(|ui| {
-            ui.set_width(side);
-            egui::ScrollArea::vertical().id_salt("hsattr").show(ui, |ui| properties(app, ui));
+    // ---- work area
+    egui::CentralPanel::default().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Work Area").strong());
+            ui.checkbox(&mut app.windows_state.hs.selected_only, "Graph selected network only");
+            if ui.small_button("Rearrange").clicked() {
+                app.windows_state.hs.pos.clear();
+                app.windows_state.hs.pan = vec2(20.0, 20.0);
+                app.windows_state.hs.zoom = 1.0;
+            }
+            if ui.small_button("Connection Editor").on_hover_text("Load the selected material or texture into the Connection Editor").clicked() {
+                crate::hypergraph::open_for_hypershade(app);
+            }
         });
+        work_area(app, ui);
     });
 }
 
