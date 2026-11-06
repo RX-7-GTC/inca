@@ -5,7 +5,7 @@
 //! `rig` record (kept in `passthrough`), keyable numbers in `extra` (saved as `extraAttrs` too).
 
 use crate::anim::{AnimCurve, Key};
-use crate::math::{euler_deg_from_quat, quat_from_euler_deg, DMat4, DQuat, DVec3};
+use crate::math::{euler_deg_from_quat, euler_deg_from_quat_near, quat_from_euler_deg, DMat4, DQuat, DVec3};
 use crate::scene::{Id, Scene};
 use serde_json::{json, Map, Value};
 
@@ -57,9 +57,9 @@ impl Scene {
     pub fn put_local(&mut self, id: &str, m: DMat4) {
         let Some(n) = self.nodes.get_mut(id) else { return };
         let (s, q, pos) = m.to_scale_rotation_translation();
-        let e = euler_deg_from_quat(n.xf.jo_quat().inverse() * q, &n.xf.ro);
+        let e = euler_deg_from_quat_near(n.xf.jo_quat().inverse() * q, &n.xf.ro, n.xf.r);
         let xf = &mut n.xf;
-        xf.r = [0, 1, 2].map(|i| crate::math::near_angle(xf.r[i], e[i]));
+        xf.r = e;
         xf.s = s.to_array();
         let rs = DMat4::from_scale_rotation_translation(s, q, DVec3::ZERO);
         let rp = rs.transform_point3(v3(xf.p));

@@ -806,9 +806,9 @@ impl Scene {
         let Some(n) = self.nodes.get_mut(id) else { return };
         let (s, q, pos) = m.to_scale_rotation_translation();
         // joints keep their orient: only the remaining rotation goes into rotate
-        let e = euler_deg_from_quat(n.xf.jo_quat().inverse() * q, &n.xf.ro);
+        let e = euler_deg_from_quat_near(n.xf.jo_quat().inverse() * q, &n.xf.ro, n.xf.r);
         let xf = &mut n.xf;
-        xf.r = [0, 1, 2].map(|i| round_to(near_angle(xf.r[i], e[i]), 6));
+        xf.r = e.map(|a| round_to(a, 6));
         xf.s = [s.x, s.y, s.z].map(|x| round_to(x, 6));
         let rs = DMat4::from_scale_rotation_translation(s, q, DVec3::ZERO);
         let rp = rs.transform_point3(v3(xf.p));
@@ -1603,9 +1603,9 @@ impl Scene {
                 // quiet update: no refresh here, the caller batches it
                 let Some(nd) = self.nodes.get_mut(&c.driven) else { continue };
                 let (s, q, pos) = local.to_scale_rotation_translation();
-                let e = euler_deg_from_quat(nd.xf.jo_quat().inverse() * q, &nd.xf.ro);
+                let e = euler_deg_from_quat_near(nd.xf.jo_quat().inverse() * q, &nd.xf.ro, nd.xf.r);
                 let xf = &mut nd.xf;
-                xf.r = [0, 1, 2].map(|i| near_angle(xf.r[i], e[i]));
+                xf.r = e;
                 xf.s = s.to_array();
                 let rs = DMat4::from_scale_rotation_translation(s, q, DVec3::ZERO);
                 let rp = rs.transform_point3(v3(xf.p));
@@ -2436,6 +2436,16 @@ mod tests {
         assert_eq!(s.get_attr_f(&a, "ty"), 3.0);
         s.redo();
         assert_eq!(s.get_attr_f(&a, "ty"), 5.0);
+    }
+
+    #[test]
+    fn rotation_channels_continue_past_360() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        for deg in (10..=720).step_by(10) {
+            s.set_local_matrix(&a, DMat4::from_rotation_y((deg as f64).to_radians()));
+            assert!((s.get_attr_f(&a, "ry") - deg as f64).abs() < 1e-6, "at {deg}: ry = {}", s.get_attr_f(&a, "ry"));
+        }
     }
 
     #[test]
