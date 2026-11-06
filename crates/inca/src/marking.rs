@@ -26,6 +26,17 @@ pub enum Act {
     History(String, usize),
     SetTool(Tool),
     DefaultCamera,
+    HypershadeAssign(String),
+    HypershadeSelectUsers(String),
+    HypershadeDuplicate(String),
+    HypershadeDelete(Vec<String>),
+    HypershadeRename(String),
+    HypershadeCreateMaterial(String),
+    HypershadeCreateTexture(String),
+    HypershadeFrameAll,
+    HypershadeFrameSelected,
+    HypershadeRearrange,
+    HypershadeSelectObject(String),
 }
 
 #[derive(Clone)]
@@ -68,12 +79,13 @@ pub struct Menu {
     button: egui::PointerButton,
     sticky: bool,
     hot_radial: Option<usize>,
+    painted_list: bool,
 }
 
 const DIRS: [(&str, f32); 8] = [("N", -90.0), ("NE", -45.0), ("E", 0.0), ("SE", 45.0), ("S", 90.0), ("SW", 135.0), ("W", 180.0), ("NW", -135.0)];
 
 fn menu(pos: Pos2, vp: usize, button: egui::PointerButton, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64) -> Menu {
-    Menu { pos, title, radial, list, vp, opened: now, button, sticky: false, hot_radial: None }
+    Menu { pos, title, radial, list, vp, opened: now, button, sticky: false, hot_radial: None, painted_list: false }
 }
 
 /// RMB in a viewport: build the menu for the modifiers and what's under the cursor.
@@ -204,6 +216,14 @@ pub fn open_tool(app: &mut IncaApp, idx: usize, tool: Tool, pos: Pos2, now: f64)
     app.marking = Some(menu(pos, idx, egui::PointerButton::Primary, Some(title), radial, list, now));
 }
 
+/// Open a marking menu outside a viewport (used by the Hypershade).
+pub fn open_custom(app: &mut IncaApp, pos: Pos2, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64) {
+    let mut m = menu(pos, app.active_vp, egui::PointerButton::Secondary, title, radial, list, now);
+    m.painted_list = true;
+    app.marking = Some(m);
+    app.marking_target = None;
+}
+
 fn run(app: &mut IncaApp, act: Act) {
     let vp = app.marking.as_ref().map(|m| m.vp).unwrap_or(app.active_vp);
     // menus opened over an object act on it
@@ -291,6 +311,42 @@ fn run(app: &mut IncaApp, act: Act) {
         }
         Act::SetTool(t) => app.set_tool(t),
         Act::DefaultCamera => app.vps[vp].camera = ["persp", "top", "front", "side"][vp.min(3)].into(),
+        Act::HypershadeAssign(id) => {
+            if let Some(m) = app.s.mats.get(&id) {
+                let _ = app.run_mel("assign material", &format!("hyperShade -assign {};", m.name));
+            }
+        }
+        Act::HypershadeSelectUsers(id) => {
+            let ids = crate::hypershade::material_users(app, &id);
+            app.select_names(&ids, SelMode::Replace);
+        }
+        Act::HypershadeDuplicate(id) => crate::hypershade::duplicate_shading_network(app, &id),
+        Act::HypershadeDelete(ids) => {
+            let ids: std::collections::HashSet<String> = ids.into_iter().collect();
+            crate::hypershade::delete_graph_nodes(app, &ids);
+        }
+        Act::HypershadeRename(id) => {
+            let name = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone()));
+            if let Some(name) = name {
+                app.windows_state.hs.rename_pos = app.marking.as_ref().map(|m| m.pos);
+                app.windows_state.hs.rename = Some((id, name));
+            }
+        }
+        Act::HypershadeCreateMaterial(ty) => {
+            let _ = app.run_mel("create material", &format!("shadingNode -asShader {ty};"));
+            app.windows_state.hs_selected = app.s.mats.keys().last().cloned();
+        }
+        Act::HypershadeCreateTexture(ty) => {
+            let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {ty};"));
+            app.windows_state.hs_selected = app.s.texs.keys().last().cloned();
+        }
+        Act::HypershadeFrameAll => app.windows_state.hs.frame = Some(false),
+        Act::HypershadeFrameSelected => app.windows_state.hs.frame = Some(true),
+        Act::HypershadeRearrange => {
+            app.windows_state.hs.pos.clear();
+            app.windows_state.hs.frame = Some(false);
+        }
+        Act::HypershadeSelectObject(id) => app.select_names(&[id], SelMode::Replace),
     }
 }
 
@@ -363,8 +419,6 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     let pos = m.pos;
     let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("marking"));
     let p = ctx.layer_painter(layer);
-    p.line_segment([pos, cur], Stroke::new(1.5, Color32::from_gray(0xdd)));
-    p.circle_filled(pos, 4.0, Color32::from_gray(0xdd));
     let mut sub_hit: Option<Act> = None;
     for (i, ((_, item), r)) in radial.iter().zip(&rects).enumerate() {
         let is_hot = hot == Some(i);
@@ -379,14 +433,17 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
             label = if radial[i].0.ends_with('W') { format!("◂ {label}") } else { format!("{label} ▸") };
         }
         p.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), if item.enabled { Color32::WHITE } else { Color32::from_gray(0x80) });
-        if is_hot && !item.sub.is_empty() {
-            let sr = sub_rect(i);
+    }
+    // Draw the open submenu after every radial item so it sits on top of them.
+    if let Some(h) = hot {
+        let item = &radial[h].1;
+        if !item.sub.is_empty() {
+            let sr = sub_rect(h);
             p.rect_filled(sr, 3.0, Color32::from_gray(0x44));
             p.rect_stroke(sr, 3.0, Stroke::new(1.0, Color32::from_gray(0x2a)), egui::StrokeKind::Inside);
             for (k, s) in item.sub.iter().enumerate() {
                 let rr = Rect::from_min_size(pos2(sr.min.x + 3.0, sr.min.y + 3.0 + k as f32 * 20.0), vec2(sr.width() - 6.0, 20.0));
-                let over = rr.contains(cur);
-                if over {
+                if rr.contains(cur) {
                     p.rect_filled(rr, 2.0, Color32::from_rgb(0x52, 0x85, 0xa6));
                     sub_hit = s.act.clone();
                 }
@@ -399,31 +456,63 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
             }
         }
     }
-    // the list below the radial items (egui menu widgets, so submenus work)
+    // the list below the radial items
+    let button = m.button;
+    let released = ptr.button_released(button);
     let mut list_rect = Rect::NOTHING;
     if !list.is_empty() || title.is_some() {
-        let area = egui::Area::new(egui::Id::new("marking-list")).order(egui::Order::Foreground).fixed_pos(pos2(pos.x - 85.0, list_top)).show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_min_width(170.0);
-                if let Some(t) = &title {
-                    ui.label(egui::RichText::new(t).italics().color(Color32::from_gray(0xaa)));
-                }
-                for i in &list {
-                    match i {
-                        None => {
-                            ui.separator();
+        if m.painted_list {
+            let h = 8.0 + title.as_ref().map_or(0.0, |_| 18.0) + list.iter().map(|i| if i.is_some() { 20.0 } else { 7.0 }).sum::<f32>();
+            let r = Rect::from_min_size(pos2(pos.x - 85.0, list_top), vec2(170.0, h));
+            p.rect_filled(r, 3.0, Color32::from_gray(0x44));
+            p.rect_stroke(r, 3.0, Stroke::new(1.0, Color32::from_gray(0x2a)), egui::StrokeKind::Inside);
+            let mut y = r.min.y + 4.0;
+            if let Some(t) = &title {
+                p.text(pos2(r.min.x + 6.0, y + 9.0), Align2::LEFT_CENTER, t, FontId::proportional(12.0), Color32::from_gray(0xaa));
+                y += 18.0;
+            }
+            for i in &list {
+                match i {
+                    None => y += 7.0,
+                    Some(item) => {
+                        let rr = Rect::from_min_size(pos2(r.min.x + 3.0, y), vec2(r.width() - 6.0, 20.0));
+                        if rr.contains(cur) {
+                            p.rect_filled(rr, 2.0, Color32::from_rgb(0x52, 0x85, 0xa6));
+                            if item.enabled && (ptr.any_click() || released) {
+                                picked = item.act.clone();
+                            }
                         }
-                        Some(i) => list_item(ui, i, &mut picked),
+                        p.text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, &item.label, FontId::proportional(12.0), if item.enabled { Color32::WHITE } else { Color32::from_gray(0x80) });
+                        y += 20.0;
                     }
                 }
+            }
+            list_rect = r;
+        } else {
+            let area = egui::Area::new(egui::Id::new("marking-list")).order(egui::Order::Tooltip).fixed_pos(pos2(pos.x - 85.0, list_top)).show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(170.0);
+                    if let Some(t) = &title {
+                        ui.label(egui::RichText::new(t).italics().color(Color32::from_gray(0xaa)));
+                    }
+                    for i in &list {
+                        match i {
+                            None => {
+                                ui.separator();
+                            }
+                            Some(i) => list_item(ui, i, &mut picked),
+                        }
+                    }
+                });
             });
-        });
-        list_rect = area.response.rect;
+            list_rect = area.response.rect;
+        }
     }
+    // The drag line is drawn last so it stays visible over every option.
+    p.line_segment([pos, cur], Stroke::new(1.5, Color32::from_gray(0xdd)));
+    p.circle_filled(pos, 4.0, Color32::from_gray(0xdd));
     let menu_open = ctx.any_popup_open();
     let quick = now - app.marking.as_ref().unwrap().opened < 0.26 && d.length() < 6.0;
-    let button = app.marking.as_ref().unwrap().button;
-    let released = ptr.button_released(button);
     let sticky = app.marking.as_ref().unwrap().sticky;
     if picked.is_none() {
         if released && !sticky {
