@@ -535,7 +535,7 @@ impl Scene {
         self.touch();
     }
     pub fn delete_material(&mut self, id: &str) {
-        if id == self.default_mat {
+        if id == self.default_mat || self.mats.get(id).is_some_and(|m| m.name == "standardSurface1") {
             return;
         }
         if let Some(m) = self.mats.shift_remove(id) {

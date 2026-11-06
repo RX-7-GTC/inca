@@ -17,7 +17,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Component Editor").open(&mut open).default_size([460.0, 380.0]).show(ctx, |ui| {
+    egui::Window::new("Component Editor").open(&mut open).default_size([460.0, 380.0]).constrain(false).show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut app.ce.tab, 0, "Polygons");
             ui.selectable_value(&mut app.ce.tab, 1, "Smooth Skins");

@@ -640,6 +640,12 @@ impl IncaApp {
         self.script_log.push((MsgKind::Warning, m));
     }
 
+    pub fn error(&mut self, msg: impl Into<String>) {
+        let m = format!("// Error: {}", msg.into());
+        self.last_result = m.clone();
+        self.script_log.push((MsgKind::Error, m));
+    }
+
     fn ui_command(&mut self, cmd: &str, args: &[Val]) {
         match cmd {
             "setToolTo" => {

@@ -79,7 +79,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
             }
         }
     }
-    egui::Window::new("Hotkey Editor").open(&mut open).default_size([520.0, 520.0]).show(ctx, |ui| {
+    egui::Window::new("Hotkey Editor").open(&mut open).default_size([520.0, 520.0]).constrain(false).show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.label("Search");
             ui.text_edit_singleline(&mut app.hk.filter);

@@ -388,7 +388,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     let (ts, te) = (app.s.time.start as i64, app.s.time.end as i64);
     let mut go = false;
     let mut stop = false;
-    egui::Window::new("Playblast Options").open(&mut open).resizable(false).show(ctx, |ui| {
+    egui::Window::new("Playblast Options").open(&mut open).resizable(false).constrain(false).show(ctx, |ui| {
         let o = &mut app.playblast.opts;
         egui::Grid::new("pb").num_columns(2).show(ui, |ui| {
             ui.label("Time range");

@@ -131,7 +131,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     crate::rig_tools::sdk_window(app, ctx);
     crate::anim_extras::window(app, ctx);
     let mut open = app.win.help;
-    egui::Window::new("Getting Started with Inca").open(&mut open).default_size([600.0, 520.0]).show(ctx, |ui| {
+    egui::Window::new("Getting Started with Inca").open(&mut open).default_size([600.0, 520.0]).constrain(false).show(ctx, |ui| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (title, lines) in HELP {
                 theme::section_header(ui, title);
@@ -145,7 +145,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     app.win.help = open;
     let mut open = app.win.assign_material;
     let mut pick: Option<&str> = None;
-    egui::Window::new("Assign New Material").open(&mut open).default_size([260.0, 300.0]).show(ctx, |ui| {
+    egui::Window::new("Assign New Material").open(&mut open).default_size([260.0, 300.0]).constrain(false).show(ctx, |ui| {
         ui.label(RichText::new("Assign a new material to the selection:").color(theme::TEXT_DIM));
         for t in MAT_TYPES {
             if ui.add(egui::Button::new(t.label).frame(false)).on_hover_text(format!("Assign a new {} to the selection", t.label)).clicked() {
@@ -159,24 +159,24 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     }
     app.win.assign_material = open;
     let mut open = app.win.script_editor;
-    egui::Window::new("Script Editor").open(&mut open).default_size([640.0, 460.0]).show(ctx, |ui| script_editor(app, ui));
+    egui::Window::new("Script Editor").open(&mut open).default_size([640.0, 460.0]).constrain(false).show(ctx, |ui| script_editor(app, ui));
     app.win.script_editor = open;
     let mut open = app.win.hypershade;
     // A distinct id discards the old stored area state that had grown to the screen width
     // (the layout feedback bug); the window now starts at its default size again.
-    egui::Window::new("Hypershade").id(egui::Id::new("HypershadeWindow")).open(&mut open).default_size([980.0, 560.0]).min_size([600.0, 420.0]).show(ctx, |ui| crate::hypershade::window(app, ui));
+    egui::Window::new("Hypershade").id(egui::Id::new("HypershadeWindow")).open(&mut open).default_size([980.0, 560.0]).min_size([600.0, 420.0]).constrain(false).show(ctx, |ui| crate::hypershade::window(app, ui));
     app.win.hypershade = open;
     let mut open = app.win.graph_editor;
-    egui::Window::new("Graph Editor").open(&mut open).default_size([760.0, 420.0]).show(ctx, |ui| graph_editor(app, ui));
+    egui::Window::new("Graph Editor").open(&mut open).default_size([760.0, 420.0]).constrain(false).show(ctx, |ui| graph_editor(app, ui));
     app.win.graph_editor = open;
     let mut open = app.win.dope_sheet;
-    egui::Window::new("Dope Sheet").open(&mut open).default_size([760.0, 260.0]).show(ctx, |ui| dope_sheet(app, ui));
+    egui::Window::new("Dope Sheet").open(&mut open).default_size([760.0, 260.0]).constrain(false).show(ctx, |ui| dope_sheet(app, ui));
     app.win.dope_sheet = open;
     let mut open = app.win.render_view;
-    egui::Window::new("Render View").open(&mut open).default_size([700.0, 560.0]).show(ctx, |ui| crate::render_view::render_view(app, ui));
+    egui::Window::new("Render View").open(&mut open).default_size([700.0, 560.0]).constrain(false).show(ctx, |ui| crate::render_view::render_view(app, ui));
     app.win.render_view = open;
     let mut open = app.win.render_settings;
-    egui::Window::new("Render Settings").open(&mut open).default_size([340.0, 260.0]).show(ctx, |ui| render_settings(app, ui));
+    egui::Window::new("Render Settings").open(&mut open).default_size([340.0, 260.0]).constrain(false).show(ctx, |ui| render_settings(app, ui));
     app.win.render_settings = open;
     crate::prefs::window(app, ctx);
     if app.panels.quit_confirm {
@@ -216,7 +216,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     crate::hypergraph::connection_editor(app, ctx);
     crate::hik_ui::window(app, ctx);
     let mut open = app.win.command_list;
-    egui::Window::new("MEL Command Reference").open(&mut open).default_size([380.0, 480.0]).show(ctx, |ui| {
+    egui::Window::new("MEL Command Reference").open(&mut open).default_size([380.0, 480.0]).constrain(false).show(ctx, |ui| {
         ui.label("Commands available to MEL scripts, the command line and the Script Editor:");
         egui::ScrollArea::vertical().show(ui, |ui| {
             for g in inca_core::primitives::GEN_INFO {

@@ -74,7 +74,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     if let Some(c) = current(app) {
         app.hik_ui.current = c;
     }
-    egui::Window::new("Character Controls").open(&mut open).default_size([360.0, 600.0]).show(ctx, |ui| {
+    egui::Window::new("Character Controls").open(&mut open).default_size([360.0, 600.0]).constrain(false).show(ctx, |ui| {
         let names: Vec<String> = app.s.characters.iter().map(|c| c.name.clone()).collect();
         let cur = app.hik_ui.current.clone();
         let ch = app.s.hik_character(&cur).cloned();

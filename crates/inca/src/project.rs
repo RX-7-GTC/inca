@@ -121,7 +121,7 @@ pub fn project_window(app: &mut IncaApp, ctx: &egui::Context) {
     let mut open = true;
     let mut accept = false;
     let mut cancel = false;
-    egui::Window::new("Project Window").open(&mut open).default_size([560.0, 520.0]).show(ctx, |ui| {
+    egui::Window::new("Project Window").open(&mut open).default_size([560.0, 520.0]).constrain(false).show(ctx, |ui| {
         egui::Grid::new("pw").num_columns(2).show(ui, |ui| {
             ui.label("Current Project:");
             ui.add(egui::TextEdit::singleline(&mut w.name).desired_width(320.0));

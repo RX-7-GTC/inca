@@ -324,7 +324,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         return;
     }
     let title = if app.hg.connections { "Hypergraph InputOutput" } else { "Hypergraph Hierarchy" };
-    egui::Window::new(title).id(egui::Id::new("hypergraph")).open(&mut open).default_size([820.0, 500.0]).show(ctx, |ui| {
+    egui::Window::new(title).id(egui::Id::new("hypergraph")).open(&mut open).default_size([820.0, 500.0]).constrain(false).show(ctx, |ui| {
         ui.horizontal(|ui| {
             if ui.selectable_label(!app.hg.connections, "Scene Hierarchy").on_hover_text("Show the scene DAG").clicked() && app.hg.connections {
                 app.hg.connections = false;
@@ -1613,7 +1613,7 @@ pub fn connection_editor(app: &mut IncaApp, ctx: &egui::Context) {
     let mut remove_output = false;
     let mut close = false;
     let mut nav: Option<(bool, Option<NodeRef>)> = None;
-    egui::Window::new("Connection Editor").order(egui::Order::Foreground).open(&mut open).default_size([560.0, 520.0]).show(ctx, |ui| {
+    egui::Window::new("Connection Editor").order(egui::Order::Foreground).open(&mut open).default_size([560.0, 520.0]).constrain(false).show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.menu_button("Options", |ui| {
                 if ui.checkbox(&mut app.hg.ce_auto, "Auto-connect").changed() {

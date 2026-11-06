@@ -310,7 +310,7 @@ pub fn dup_special_window(app: &mut IncaApp, ctx: &egui::Context) {
     let mut open = true;
     let mut run = false;
     let o = &mut app.dup_opts;
-    egui::Window::new("Duplicate Special Options").open(&mut open).resizable(false).show(ctx, |ui| {
+    egui::Window::new("Duplicate Special Options").open(&mut open).resizable(false).constrain(false).show(ctx, |ui| {
         egui::Grid::new("dupopts").num_columns(2).show(ui, |ui| {
             ui.label("Duplicate input graph");
             ui.checkbox(&mut o.keep_history, "");
@@ -456,7 +456,7 @@ pub fn add_attr_window(app: &mut IncaApp, ctx: &egui::Context) {
     let Some(w) = app.add_attr.as_mut() else { return };
     let mut open = true;
     let (mut add, mut close) = (false, false);
-    egui::Window::new("Add Attribute").open(&mut open).resizable(false).show(ctx, |ui| {
+    egui::Window::new("Add Attribute").open(&mut open).resizable(false).constrain(false).show(ctx, |ui| {
         egui::Grid::new("addattr").num_columns(2).show(ui, |ui| {
             ui.label("Long name:");
             ui.text_edit_singleline(&mut w.name);

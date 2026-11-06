@@ -1210,7 +1210,7 @@ pub fn attr_map_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, keys: 
                     // JS file fields (`textureFile`, `fileTextureName`) get a browse button.
                     let file_field = matches!(k.as_str(), "textureFile" | "fileTextureName");
                     let edited = ui.allocate_ui_with_layout(egui::vec2(152.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        let mut edited = ui.text_edit_singleline(&mut s).changed();
+                        let edited = ui.text_edit_singleline(&mut s).changed();
                         if file_field && ui.small_button("...").on_hover_text("Browse").clicked() {
                             let filters: &[&str] = if k == "textureFile" {
                                 &["hdr", "exr", "png", "jpg", "jpeg"]
@@ -1442,7 +1442,7 @@ pub fn ae_copies(app: &mut IncaApp, ctx: &egui::Context) {
         let tabs = ae_tabs(app, &id);
         let Some((title, _)) = tabs.get(tab).cloned() else { continue };
         let mut open = true;
-        egui::Window::new(format!("Attribute Editor: {title}")).id(egui::Id::new(("aecopy", i, &id, tab))).open(&mut open).default_size([380.0, 520.0]).show(ctx, |ui| {
+        egui::Window::new(format!("Attribute Editor: {title}")).id(egui::Id::new(("aecopy", i, &id, tab))).open(&mut open).default_size([380.0, 520.0]).constrain(false).show(ctx, |ui| {
             ui.push_id(("aecopy", i), |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
             });

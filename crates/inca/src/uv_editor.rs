@@ -250,7 +250,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         }
     }
     let mut open = true;
-    let shown = egui::Window::new("UV Editor").open(&mut open).default_size([760.0, 620.0]).show(ctx, |ui| {
+    let shown = egui::Window::new("UV Editor").open(&mut open).default_size([760.0, 620.0]).constrain(false).show(ctx, |ui| {
         menus(app, ui);
         toolbar(app, ui);
         let avail = ui.available_size() - vec2(0.0, 20.0);

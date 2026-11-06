@@ -59,6 +59,9 @@ pub struct HsState {
     pub create_filter: String,
     pub rename: Option<(String, String)>,
     pub rename_pos: Option<Pos2>,
+    pub palette_drag: Option<String>,
+    pub graph_rect: Option<Rect>,
+    pub window_rect: Option<Rect>,
 }
 
 impl Default for HsState {
@@ -80,6 +83,9 @@ impl Default for HsState {
             create_filter: String::new(),
             rename: None,
             rename_pos: None,
+            palette_drag: None,
+            graph_rect: None,
+            window_rect: None,
         }
     }
 }
@@ -135,6 +141,104 @@ fn file_swatch(path: &str, size: u32) -> Vec<u8> {
 /// Objects (meshes) that use a material.
 fn users(app: &IncaApp, mid: &str) -> Vec<String> {
     app.s.nodes.values().filter(|n| n.mesh().is_some_and(|m| m.material == mid || m.mesh.fm.as_ref().is_some_and(|fm| fm.iter().flatten().any(|x| x == mid)))).map(|n| n.id.clone()).collect()
+}
+
+fn select_dragged(app: &mut IncaApp, id: &str) {
+    app.windows_state.hs_selected = Some(id.to_string());
+    app.windows_state.hs.graph_sel.clear();
+    if app.s.mats.contains_key(id) || app.s.texs.contains_key(id) {
+        app.windows_state.hs.graph_sel.insert(id.to_string());
+    }
+}
+
+fn connect_texture(app: &mut IncaApp, tex: &str, mid: &str, attr: &str) {
+    let Some(mat) = app.s.mats.get(mid) else { return };
+    let (mat_name, tex_name) = (mat.name.clone(), app.s.texs.get(tex).map(|t| t.name.clone()).unwrap_or_default());
+    app.s.checkpoint("connect texture");
+    if let Some(mat) = app.s.mats.get_mut(mid) {
+        mat.maps.insert(attr.to_string(), json!(tex));
+    }
+    app.s.touch();
+    app.echo(format!("connectAttr -force {tex_name}.outColor {mat_name}.{attr};"));
+}
+
+fn assign_to_object(app: &mut IncaApp, mat: &str, obj: &str) {
+    let Some(name) = app.s.mats.get(mat).map(|m| m.name.clone()) else { return };
+    app.s.checkpoint("assign material");
+    app.s.assign_material(obj, mat, None);
+    app.s.touch();
+    app.echo(format!("hyperShade -assign {name};"));
+}
+
+fn drop_on_viewport(app: &mut IncaApp, id: &str, q: Pos2) -> bool {
+    let Some(idx) = app.vps.iter().position(|vp| vp.rect.contains(q)) else { return false };
+    let rect = app.vps[idx].rect;
+    let cam = app.vps[idx].camera.clone();
+    let cv = crate::viewport::cam_view(&app.s, &cam, [rect.width(), rect.height()]);
+    let Some(obj) = crate::viewport::pick_object_if(&app.s, &app.vps[idx], &cv, q, &mut app.mesh_cache, &|_| true) else { return false };
+    if app.s.node(&obj).and_then(|n| n.mesh()).is_none() {
+        return false;
+    }
+    if app.s.mats.contains_key(id) {
+        assign_to_object(app, id, &obj);
+    } else if app.s.texs.contains_key(id) {
+        let mid = app.s.node(&obj).and_then(|n| n.mesh().map(|m| m.material.clone())).unwrap_or_else(|| app.s.default_mat.clone());
+        let attr = app.s.mats.get(&mid).map(|m| m.color_attr().to_string()).unwrap_or_else(|| "color".into());
+        connect_texture(app, id, &mid, &attr);
+    } else {
+        return false;
+    }
+    select_dragged(app, id);
+    true
+}
+
+fn drop_on_graph(app: &mut IncaApp, id: &str, q: Pos2) -> bool {
+    let Some(rect) = app.windows_state.hs.graph_rect else { return false };
+    if !rect.contains(q) {
+        return false;
+    }
+    let nodes = graph_nodes(app);
+    let (pan, zoom) = (app.windows_state.hs.pan, app.windows_state.hs.zoom);
+    let pos = app.windows_state.hs.pos.clone();
+    for n in &nodes {
+        let Some(p) = pos.get(&n.id) else { continue };
+        let r = Rect::from_min_size(rect.min + pan + p.to_vec2() * zoom, vec2(NODE_W, node_h(n)) * zoom);
+        if !r.contains(q) {
+            continue;
+        }
+        if n.kind == Kind::Object && app.s.mats.contains_key(id) {
+            assign_to_object(app, id, &n.id);
+            select_dragged(app, id);
+            return true;
+        }
+        if n.kind == Kind::Material && app.s.texs.contains_key(id) {
+            let attr = n.inputs.iter().enumerate().map(|(i, s)| (in_port_pos(n, r, i, zoom).distance(q), s)).filter(|(d, _)| *d < 20.0 * zoom).min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, s)| s.clone()).unwrap_or_else(|| app.s.mats.get(&n.id).map(|m| m.color_attr().to_string()).unwrap_or_else(|| "color".into()));
+            connect_texture(app, id, &n.id, &attr);
+            select_dragged(app, id);
+            return true;
+        }
+        if n.kind == Kind::Object && app.s.texs.contains_key(id) {
+            let mid = app.s.node(&n.id).and_then(|node| node.mesh().map(|m| m.material.clone())).unwrap_or_else(|| app.s.default_mat.clone());
+            let attr = app.s.mats.get(&mid).map(|m| m.color_attr().to_string()).unwrap_or_else(|| "color".into());
+            connect_texture(app, id, &mid, &attr);
+            select_dragged(app, id);
+            return true;
+        }
+        return false;
+    }
+    select_dragged(app, id);
+    true
+}
+
+fn handle_palette_drop(app: &mut IncaApp, id: &str, q: Pos2) {
+    if drop_on_graph(app, id, q) {
+        return;
+    }
+    // Don't drop through the Hypershade window onto an object behind it.
+    if app.windows_state.hs.window_rect.is_some_and(|r| r.contains(q)) {
+        return;
+    }
+    drop_on_viewport(app, id, q);
 }
 
 fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
@@ -231,22 +335,30 @@ pub(crate) fn material_users(app: &IncaApp, mid: &str) -> Vec<String> {
     users(app, mid)
 }
 
+fn non_deletable(app: &IncaApp, id: &str) -> bool {
+    // shortcut: name check; a renamed standardSurface1 would become deletable
+    id == app.s.default_mat || app.s.mats.get(id).is_some_and(|m| m.name == "standardSurface1")
+}
+
 pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
     let mut mats = vec![];
     let mut texs = vec![];
+    let mut blocked = vec![];
     for id in ids {
-        if app.s.mats.contains_key(id) {
-            if id != &app.s.default_mat {
+        if let Some(m) = app.s.mats.get(id) {
+            if non_deletable(app, id) {
+                blocked.push(m.name.clone());
+            } else {
                 mats.push(id.clone());
             }
         } else if app.s.texs.contains_key(id) {
             texs.push(id.clone());
         }
     }
+    for name in blocked {
+        app.error(format!("file: C:/Program Files/Autodesk/Maya2020/scripts/others/hyperShadePanel.mel line 6837: Non-deletable node '{name}' cannot be deleted"));
+    }
     if mats.is_empty() && texs.is_empty() {
-        if ids.iter().any(|id| id == &app.s.default_mat) {
-            app.warn("Cannot delete the default material.");
-        }
         return;
     }
     app.s.checkpoint("delete shading nodes");
@@ -406,6 +518,7 @@ fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
 }
 
 pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
+    app.windows_state.hs.window_rect = Some(ui.max_rect());
     // ---- create bar
     ui.horizontal(|ui| {
         ui.label("Create:");
@@ -554,7 +667,7 @@ fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
                 let tex = swatch(app, &ctx, id);
                 ui.vertical(|ui| {
                     ui.set_width(56.0);
-                    let (r, resp) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::click());
+                    let (r, resp) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::click_and_drag());
                     ui.painter().rect_filled(r, 2.0, if sel { theme::HI } else { theme::BG_DARK });
                     if let Some(t) = tex {
                         ui.painter().image(t, r.shrink(3.0), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
@@ -574,10 +687,28 @@ fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
                     if resp.double_clicked() && app.s.mats.contains_key(id) {
                         let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
                     }
-                    resp.on_hover_text(format!("{name} — click to edit, double-click to assign"));
+                    if resp.drag_started() {
+                        app.windows_state.hs.palette_drag = Some(id.clone());
+                    }
+                    if resp.drag_stopped() {
+                        if let Some(drag) = app.windows_state.hs.palette_drag.take() {
+                            if let Some(q) = ctx.pointer_hover_pos() {
+                                handle_palette_drop(app, &drag, q);
+                            }
+                        }
+                    }
+                    resp.on_hover_text(format!("{name} — click to edit, drag to assign/connect"));
                 });
             }
         });
+    }
+    if let (Some(id), Some(q)) = (app.windows_state.hs.palette_drag.clone(), ctx.pointer_hover_pos()) {
+        let name = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone())).unwrap_or_default();
+        let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("hs-palette-drag")));
+        let rect = Rect::from_min_size(q + vec2(12.0, 12.0), vec2(120.0, 20.0));
+        p.rect_filled(rect, 3.0, Color32::from_gray(0x44));
+        p.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(0x2a)), egui::StrokeKind::Inside);
+        p.text(rect.min + vec2(6.0, 10.0), egui::Align2::LEFT_CENTER, format!("{name}"), egui::FontId::proportional(11.0), Color32::WHITE);
     }
 }
 
@@ -596,7 +727,7 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
                 let n = app.s.mats[&id].name.clone();
                 let _ = app.run_mel("assign material", &format!("hyperShade -assign {n};"));
             }
-            if id != app.s.default_mat && ui.button("Delete").clicked() {
+            if !non_deletable(app, &id) && ui.button("Delete").clicked() {
                 app.s.checkpoint("delete material");
                 app.s.delete_material(&id);
                 app.windows_state.hs_selected = None;
@@ -664,6 +795,7 @@ fn bezier(p: &egui::Painter, a: Pos2, b: Pos2, col: Color32, w: f32) {
 fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+    app.windows_state.hs.graph_rect = Some(rect);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::from_rgb(38, 38, 38));
     let nodes = graph_nodes(app);

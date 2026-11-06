@@ -10,6 +10,7 @@ use egui::RichText;
 #[serde(default)]
 pub struct Prefs {
     pub ui_scale: f32,
+    pub follow_os_scale: bool,
     pub menu_set: usize,
     pub tooltips: bool,
     pub confirm_quit: bool,
@@ -45,7 +46,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true }
+        Prefs { ui_scale: 1.0, follow_os_scale: false, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true }
     }
 }
 
@@ -68,8 +69,10 @@ pub fn apply(app: &mut IncaApp, ctx: &egui::Context) {
     // like the JS, the menu set in use is the one the next session starts with
     app.prefs.menu_set = MENU_SETS.iter().position(|m| m.1 == app.menu_set).unwrap_or(0);
     let p = &app.prefs;
-    if (ctx.zoom_factor() - p.ui_scale).abs() > 1e-4 {
-        ctx.set_zoom_factor(p.ui_scale.clamp(0.5, 2.0));
+    let native = ctx.native_pixels_per_point().unwrap_or(1.0);
+    let target = if p.follow_os_scale { p.ui_scale } else { p.ui_scale / native };
+    if (ctx.zoom_factor() - target).abs() > 1e-4 {
+        ctx.set_zoom_factor(target.clamp(0.25, 2.0));
     }
     let delay = if p.tooltips { 0.5 } else { f32::INFINITY };
     if ctx.global_style().interaction.tooltip_delay != delay {
@@ -113,7 +116,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Preferences").open(&mut open).default_size([640.0, 440.0]).show(ctx, |ui| {
+    egui::Window::new("Preferences").open(&mut open).default_size([640.0, 440.0]).constrain(false).show(ctx, |ui| {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(170.0);
@@ -145,6 +148,9 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             ui.end_row();
             row(ui, "Interface scaling", |ui| {
                 ui.add(egui::Slider::new(&mut app.prefs.ui_scale, 0.8..=1.5).step_by(0.05));
+            });
+            row(ui, "Follow OS display scaling", |ui| {
+                ui.checkbox(&mut app.prefs.follow_os_scale, "");
             });
             row(ui, "Default menu set", |ui| {
                 let names: Vec<&str> = MENU_SETS.iter().map(|m| m.0).collect();

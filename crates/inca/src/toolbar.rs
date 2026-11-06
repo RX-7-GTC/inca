@@ -470,7 +470,7 @@ pub fn shelf_editor(app: &mut IncaApp, ctx: &egui::Context) {
     if app.shelves.is_empty() {
         app.shelves = default_shelves(&[]);
     }
-    egui::Window::new("Shelf Editor").open(&mut open).default_size([760.0, 420.0]).show(ctx, |ui| {
+    egui::Window::new("Shelf Editor").open(&mut open).default_size([760.0, 420.0]).constrain(false).show(ctx, |ui| {
         let (mut si, mut ii) = app.shelf_edit;
         si = si.min(app.shelves.len().saturating_sub(1));
         ui.horizontal_top(|ui| {
