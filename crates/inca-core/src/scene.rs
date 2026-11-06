@@ -1510,19 +1510,43 @@ impl Scene {
                 self.set_attr(&r, &a, json!(v));
             }
         }
-        // direct connections: dst = src
-        for c in self.conns.clone() {
-            if let (Some(sr), Some(dr)) = (self.ref_by_id(&c.src), self.ref_by_id(&c.dst)) {
-                if let Some(v) = self.get_attr(&sr, &c.src_attr) {
-                    self.set_attr_ex(&dr, &c.dst_attr, v, false);
-                    if matches!(dr, NodeRef::Dag(_)) {
-                        moved.push(c.dst.clone());
+        moved.extend(self.eval_connections());
+        moved.extend(self.eval_constraints());
+        self.refresh_many(&moved);
+    }
+
+    /// Propagate direct connections (`dst = src`) until values settle; returns the DAG nodes
+    /// that changed. Runs every frame so connected attributes follow gizmo drags and channel
+    /// edits live, not only when the timeline moves.
+    pub fn eval_connections(&mut self) -> Vec<Id> {
+        let mut moved: Vec<Id> = vec![];
+        // chains can need one pass per link; the cap also stops A -> B -> A cycles
+        for _ in 0..self.conns.len().max(1) {
+            let mut changed = false;
+            for c in self.conns.clone() {
+                let (Some(sr), Some(dr)) = (self.ref_by_id(&c.src), self.ref_by_id(&c.dst)) else { continue };
+                let Some(v) = self.get_attr(&sr, &c.src_attr) else { continue };
+                // numbers can round-trip as int/float JSON values; treat them as equal
+                let unchanged = self.get_attr(&dr, &c.dst_attr).is_some_and(|cur| {
+                    cur == v || (cur.is_number() && v.is_number() && cur.as_f64() == v.as_f64())
+                });
+                if unchanged {
+                    continue;
+                }
+                if self.set_attr_ex(&dr, &c.dst_attr, v, false) {
+                    changed = true;
+                    if let NodeRef::Dag(id) = &dr {
+                        if !moved.contains(id) {
+                            moved.push(id.clone());
+                        }
                     }
                 }
             }
+            if !changed {
+                break;
+            }
         }
-        moved.extend(self.eval_constraints());
-        self.refresh_many(&moved);
+        moved
     }
 
     // ------------------------------------------------------------ constraints
@@ -2412,6 +2436,30 @@ mod tests {
         assert_eq!(s.get_attr_f(&a, "ty"), 3.0);
         s.redo();
         assert_eq!(s.get_attr_f(&a, "ty"), 5.0);
+    }
+
+    #[test]
+    fn direct_connections_follow_changes_live() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let b = s.create_mesh("polyCone", &Params::new(), None);
+        let c = s.create_mesh("polySphere", &Params::new(), None);
+        s.set_attr_f(&a, "ry", 30.0);
+        // inserted out of order: evaluating a -> b must also feed b -> c in the same call
+        s.conns.push(Conn { src: b.clone(), src_attr: "rotateY".into(), dst: c.clone(), dst_attr: "rotateY".into() });
+        s.conns.push(Conn { src: a.clone(), src_attr: "rotateY".into(), dst: b.clone(), dst_attr: "rotateY".into() });
+        assert_eq!(s.get_attr_f(&b, "ry"), 0.0);
+        let moved = s.eval_connections();
+        assert!(moved.contains(&b) && moved.contains(&c));
+        assert_eq!(s.get_attr_f(&b, "ry"), 30.0);
+        assert_eq!(s.get_attr_f(&c, "ry"), 30.0);
+        // a source change is picked up on the next evaluation (the app runs one per frame)
+        s.set_attr_f(&a, "ry", 75.0);
+        s.eval_connections();
+        assert_eq!(s.get_attr_f(&b, "ry"), 75.0);
+        assert_eq!(s.get_attr_f(&c, "ry"), 75.0);
+        // settled values report no movement
+        assert!(s.eval_connections().is_empty());
     }
 
     #[test]

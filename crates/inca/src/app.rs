@@ -959,7 +959,9 @@ impl eframe::App for IncaApp {
         crate::anim_extras::tick(self, &ctx);
         crate::render_view::tick(self, &ctx);
         crate::rig_tools::sync_lattice_divisions(self);
-        let moved = self.s.eval_constraints();
+        // direct connections and constraints follow their sources live (gizmo drags, channel edits)
+        let mut moved = self.s.eval_connections();
+        moved.extend(self.s.eval_constraints());
         if !moved.is_empty() {
             self.s.refresh_many(&moved);
         }
