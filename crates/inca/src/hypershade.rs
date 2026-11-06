@@ -8,7 +8,7 @@ use egui::{pos2, vec2, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use inca_core::materials::{MAT_TYPES, TEX_TYPES};
 use inca_core::scene::{NodeRef, SelMode, Shape};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const NODE_W: f32 = 150.0;
 const HEAD_H: f32 = 20.0;
@@ -45,7 +45,11 @@ pub struct HsState {
     pos: HashMap<String, Pos2>,
     pan: Vec2,
     zoom: f32,
-    drag_node: Option<String>,
+    graph_sel: HashSet<String>,
+    drag_start: Option<Vec<(String, Pos2)>>,
+    marquee: Option<(Pos2, Pos2)>,
+    marquee_base: HashSet<String>,
+    frame: Option<bool>,
     wire: Option<Wire>,
     pub selected_only: bool,
     swatches: HashMap<String, (u64, egui::TextureHandle)>,
@@ -60,7 +64,11 @@ impl Default for HsState {
             pos: HashMap::new(),
             pan: vec2(20.0, 20.0),
             zoom: 1.0,
-            drag_node: None,
+            graph_sel: HashSet::new(),
+            drag_start: None,
+            marquee: None,
+            marquee_base: HashSet::new(),
+            frame: None,
             wire: None,
             selected_only: false,
             swatches: HashMap::new(),
@@ -160,6 +168,87 @@ fn default_pos(nodes: &[GNode], i: usize) -> Pos2 {
     pos2(col, y)
 }
 
+fn frame_graph(app: &mut IncaApp, rect: Rect, selected: bool) {
+    let nodes = graph_nodes(app);
+    let list: Vec<&GNode> = if selected && !app.windows_state.hs.graph_sel.is_empty() {
+        nodes.iter().filter(|n| app.windows_state.hs.graph_sel.contains(&n.id)).collect()
+    } else {
+        nodes.iter().collect()
+    };
+    if list.is_empty() {
+        return;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for n in list {
+        let p = *app.windows_state.hs.pos.get(&n.id).unwrap_or(&pos2(0.0, 0.0));
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x + NODE_W);
+        y1 = y1.max(p.y + node_h(n));
+    }
+    let (w, h) = ((x1 - x0).max(1.0), (y1 - y0).max(1.0));
+    let zoom = ((rect.width() - 40.0) / w).min((rect.height() - 40.0) / h).clamp(0.2, 2.5);
+    app.windows_state.hs.zoom = zoom;
+    app.windows_state.hs.pan = vec2((rect.width() - w * zoom) * 0.5 - x0 * zoom, (rect.height() - h * zoom) * 0.5 - y0 * zoom);
+}
+
+fn in_port_pos(n: &GNode, r: Rect, i: usize, zoom: f32) -> Pos2 {
+    pos2(r.min.x, r.min.y + (HEAD_H + if n.kind == Kind::Object { 0.0 } else { SWATCH + 6.0 } + ROW_H * (i as f32 + 0.5)) * zoom)
+}
+
+fn wire_compatible(w: &Wire, n: &GNode, slot: Option<usize>) -> bool {
+    match w {
+        Wire::Tex(_) => n.kind == Kind::Material,
+        Wire::Mat(_) => n.kind == Kind::Object && (slot.is_none() || slot == Some(0)),
+    }
+}
+
+fn graph_drop_target(w: &Wire, nodes: &[GNode], rects: &[Rect], q: Pos2, zoom: f32) -> Option<(usize, Option<usize>)> {
+    let mut best: Option<(f32, usize, usize)> = None;
+    for (i, n) in nodes.iter().enumerate() {
+        for (si, _) in n.inputs.iter().enumerate() {
+            if !wire_compatible(w, n, Some(si)) {
+                continue;
+            }
+            let d = in_port_pos(n, rects[i], si, zoom).distance(q);
+            if d < 22.0 && best.is_none_or(|(bd, _, _)| d < bd) {
+                best = Some((d, i, si));
+            }
+        }
+    }
+    if let Some((_, i, si)) = best {
+        return Some((i, Some(si)));
+    }
+    nodes.iter().enumerate().find(|(i, n)| rects[*i].contains(q) && wire_compatible(w, n, None)).map(|(i, _)| (i, None))
+}
+
+fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
+    let selected_now;
+    {
+        let hs = &mut app.windows_state.hs;
+        if additive {
+            selected_now = hs.graph_sel.insert(id.to_string());
+            if !selected_now {
+                hs.graph_sel.remove(id);
+            }
+        } else if hs.graph_sel.contains(id) {
+            selected_now = true;
+        } else {
+            hs.graph_sel.clear();
+            hs.graph_sel.insert(id.to_string());
+            selected_now = true;
+        }
+    }
+    if selected_now {
+        app.windows_state.hs_selected = Some(id.to_string());
+        if !app.s.mats.contains_key(id) && !app.s.texs.contains_key(id) {
+            app.select_names(&[id.to_string()], SelMode::Replace);
+        }
+    } else if app.windows_state.hs_selected.as_deref() == Some(id) {
+        app.windows_state.hs_selected = None;
+    }
+}
+
 pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
     // ---- create bar
     ui.horizontal(|ui| {
@@ -216,10 +305,15 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Work Area").strong());
             ui.checkbox(&mut app.windows_state.hs.selected_only, "Graph selected network only");
+            if ui.small_button("Frame All").on_hover_text("Fit the whole graph").clicked() {
+                app.windows_state.hs.frame = Some(false);
+            }
+            if ui.small_button("Frame Sel").on_hover_text("Fit the selected nodes").clicked() {
+                app.windows_state.hs.frame = Some(true);
+            }
             if ui.small_button("Rearrange").clicked() {
                 app.windows_state.hs.pos.clear();
-                app.windows_state.hs.pan = vec2(20.0, 20.0);
-                app.windows_state.hs.zoom = 1.0;
+                app.windows_state.hs.frame = Some(false);
             }
             if ui.small_button("Connection Editor").on_hover_text("Load the selected material or texture into the Connection Editor").clicked() {
                 crate::hypergraph::open_for_hypershade(app);
@@ -285,7 +379,10 @@ fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
                     ui.add_sized([56.0, 14.0], egui::Label::new(RichText::new(name).size(10.0)).truncate());
                     if resp.clicked() {
                         app.windows_state.hs_selected = Some(id.clone());
-                        if !app.s.mats.contains_key(id) && !app.s.texs.contains_key(id) {
+                        app.windows_state.hs.graph_sel.clear();
+                        if app.s.mats.contains_key(id) || app.s.texs.contains_key(id) {
+                            app.windows_state.hs.graph_sel.insert(id.clone());
+                        } else if app.s.node(id).is_some() {
                             app.select_names(std::slice::from_ref(id), SelMode::Replace);
                         }
                     }
@@ -356,13 +453,27 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 fn bezier(p: &egui::Painter, a: Pos2, b: Pos2, col: Color32, w: f32) {
     let d = ((b.x - a.x).abs() * 0.5).max(30.0);
-    let pts: Vec<Pos2> = (0..=24).map(|i| {
-        let t = i as f32 / 24.0;
+    let (c1, c2) = (a + vec2(d, 0.0), b - vec2(d, 0.0));
+    let point = |t: f32| {
         let u = 1.0 - t;
-        let (c1, c2) = (a + vec2(d, 0.0), b - vec2(d, 0.0));
-        pos2(u * u * u * a.x + 3.0 * u * u * t * c1.x + 3.0 * u * t * t * c2.x + t * t * t * b.x, u * u * u * a.y + 3.0 * u * u * t * c1.y + 3.0 * u * t * t * c2.y + t * t * t * b.y)
-    }).collect();
+        pos2(
+            u * u * u * a.x + 3.0 * u * u * t * c1.x + 3.0 * u * t * t * c2.x + t * t * t * b.x,
+            u * u * u * a.y + 3.0 * u * u * t * c1.y + 3.0 * u * t * t * c2.y + t * t * t * b.y,
+        )
+    };
+    let pts: Vec<Pos2> = (0..=24).map(|i| point(i as f32 / 24.0)).collect();
     p.add(egui::Shape::line(pts, Stroke::new(w, col)));
+    // Direction marker near the destination.
+    let t = 0.78;
+    let u = 1.0 - t;
+    let pt = point(t);
+    let tangent = (c1 - a) * (3.0 * u * u) + (c2 - c1) * (6.0 * u * t) + (b - c2) * (3.0 * t * t);
+    if tangent.length_sq() > 1e-6 {
+        let dir = tangent.normalized();
+        let perp = vec2(-dir.y, dir.x) * 2.5;
+        let base = pt - dir * 4.0;
+        p.add(egui::Shape::convex_polygon(vec![pt + dir * 2.0, base + perp, base - perp], col, Stroke::NONE));
+    }
 }
 
 fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
@@ -378,49 +489,71 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             app.windows_state.hs.pos.insert(n.id.clone(), p);
         }
     }
+    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    if pointer.is_some_and(|q| rect.contains(q)) {
+        if ctx.input(|i| i.key_pressed(egui::Key::A)) {
+            app.windows_state.hs.frame = Some(false);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+            app.windows_state.hs.frame = Some(true);
+        }
+    }
+    if let Some(sel) = app.windows_state.hs.frame.take() {
+        frame_graph(app, rect, sel);
+    }
     let (pan, zoom) = (app.windows_state.hs.pan, app.windows_state.hs.zoom);
     let to_scr = |p: Pos2| rect.min + pan + p.to_vec2() * zoom;
     let node_rect = |n: &GNode, pos: &HashMap<String, Pos2>| Rect::from_min_size(to_scr(pos[&n.id]), vec2(NODE_W, node_h(n)) * zoom);
-    let in_port = |n: &GNode, r: Rect, i: usize| pos2(r.min.x, r.min.y + (HEAD_H + if n.kind == Kind::Object { 0.0 } else { SWATCH + 6.0 } + ROW_H * (i as f32 + 0.5)) * zoom);
     let out_port = |r: Rect| pos2(r.max.x, r.min.y + HEAD_H * 0.5 * zoom);
     let pos = app.windows_state.hs.pos.clone();
     let rects: Vec<Rect> = nodes.iter().map(|n| node_rect(n, &pos)).collect();
     let find = |id: &str| nodes.iter().position(|n| n.id == id);
+    let wire = app.windows_state.hs.wire.clone();
+    let drop_target = wire.as_ref().and_then(|w| pointer.and_then(|q| graph_drop_target(w, &nodes, &rects, q, zoom)));
     // ---- wires
     for (mi, m) in nodes.iter().enumerate().filter(|(_, n)| n.kind == Kind::Material) {
         let Some(mat) = app.s.mats.get(&m.id) else { continue };
         for (si, slot) in m.inputs.iter().enumerate() {
             if let Some(ti) = mat.maps.get(slot).and_then(|v| v.as_str()).and_then(find) {
-                bezier(&painter, out_port(rects[ti]), in_port(m, rects[mi], si), Color32::from_rgb(110, 190, 255), 2.0);
+                bezier(&painter, out_port(rects[ti]), in_port_pos(m, rects[mi], si, zoom), Color32::from_rgb(110, 190, 255), 2.0);
             }
         }
         for (oi, o) in nodes.iter().enumerate().filter(|(_, n)| n.kind == Kind::Object) {
             if users(app, &m.id).contains(&o.id) {
-                bezier(&painter, out_port(rects[mi]), in_port(o, rects[oi], 0), Color32::from_rgb(120, 220, 120), 2.0);
+                bezier(&painter, out_port(rects[mi]), in_port_pos(o, rects[oi], 0, zoom), Color32::from_rgb(120, 220, 120), 2.0);
             }
         }
     }
     // ---- nodes
     let font = egui::FontId::proportional(11.0 * zoom.clamp(0.6, 1.4));
-    let pointer = ctx.input(|i| i.pointer.hover_pos());
+    let wire_src = wire.as_ref().map(|w| match w {
+        Wire::Tex(t) | Wire::Mat(t) => t.as_str(),
+    });
     let mut hovered_port: Option<(usize, Option<usize>)> = None; // (node, input index or None = body)
     for (i, n) in nodes.iter().enumerate() {
         let r = rects[i];
         if !rect.intersects(r) {
             continue;
         }
-        let sel = app.windows_state.hs_selected.as_deref() == Some(n.id.as_str()) || (n.kind == Kind::Object && app.s.sel.contains(&n.id));
+        let sel = app.windows_state.hs.graph_sel.contains(&n.id) || (n.kind == Kind::Object && app.s.sel.contains(&n.id));
+        let is_source = wire_src == Some(n.id.as_str());
+        let accepts = wire.as_ref().is_none_or(|w| n.inputs.iter().enumerate().any(|(si, _)| wire_compatible(w, n, Some(si))) || wire_compatible(w, n, None));
+        let inactive = wire.is_some() && !is_source && !accepts;
+        let target_node = drop_target.is_some_and(|(ti, _)| ti == i);
         let head = match n.kind {
             Kind::Texture => Color32::from_rgb(120, 90, 50),
             Kind::Material => Color32::from_rgb(60, 95, 130),
             Kind::Object => Color32::from_rgb(70, 110, 70),
         };
-        painter.rect_filled(r, 4.0, Color32::from_rgb(58, 58, 58));
+        let head = if inactive { head.gamma_multiply(0.45) } else { head };
+        painter.rect_filled(r, 4.0, if inactive { Color32::from_rgb(44, 44, 44) } else { Color32::from_rgb(58, 58, 58) });
         painter.rect_filled(Rect::from_min_size(r.min, vec2(r.width(), HEAD_H * zoom)), 4.0, head);
-        if sel {
+        if target_node {
+            painter.rect_stroke(r, 4.0, Stroke::new(2.0, Color32::from_rgb(255, 230, 80)), egui::StrokeKind::Outside);
+        } else if sel {
             painter.rect_stroke(r, 4.0, Stroke::new(2.0, theme::HI), egui::StrokeKind::Outside);
         }
-        painter.text(r.min + vec2(6.0, HEAD_H * 0.5 * zoom), egui::Align2::LEFT_CENTER, &n.name, font.clone(), Color32::WHITE);
+        painter.text(r.min + vec2(6.0, HEAD_H * 0.5 * zoom), egui::Align2::LEFT_CENTER, &n.name, font.clone(), if inactive { Color32::from_gray(120) } else { Color32::WHITE });
         if n.kind != Kind::Object {
             if let Some(t) = swatch(app, &ctx, &n.id) {
                 let sr = Rect::from_min_size(r.min + vec2(6.0, (HEAD_H + 3.0) * zoom), vec2(SWATCH, SWATCH) * zoom);
@@ -428,17 +561,31 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
         for (si, slot) in n.inputs.iter().enumerate() {
-            let p = in_port(n, r, si);
+            let p = in_port_pos(n, r, si, zoom);
             let connected = app.s.mats.get(&n.id).is_some_and(|m| m.maps.contains_key(slot));
-            painter.circle_filled(p, 4.0 * zoom, if connected { Color32::from_rgb(110, 190, 255) } else { Color32::from_gray(150) });
-            painter.text(p + vec2(8.0 * zoom, 0.0), egui::Align2::LEFT_CENTER, inca_core::ops::nice_name(slot), font.clone(), theme::TEXT_DIM);
+            let compatible = wire.as_ref().is_none_or(|w| wire_compatible(w, n, Some(si)));
+            let target = drop_target == Some((i, Some(si))) || (drop_target == Some((i, None)) && si == 0);
+            let col = if target {
+                Color32::from_rgb(255, 230, 80)
+            } else if wire.is_some() && !compatible {
+                Color32::from_gray(70)
+            } else if wire.is_some() {
+                Color32::from_rgb(120, 220, 120)
+            } else if connected {
+                Color32::from_rgb(110, 190, 255)
+            } else {
+                Color32::from_gray(150)
+            };
+            painter.circle_filled(p, if target { 5.5 * zoom } else { 4.0 * zoom }, col);
+            painter.text(p + vec2(8.0 * zoom, 0.0), egui::Align2::LEFT_CENTER, inca_core::ops::nice_name(slot), font.clone(), if wire.is_some() && !compatible { Color32::from_gray(80) } else { theme::TEXT_DIM });
             if pointer.is_some_and(|q| q.distance(p) < 8.0 * zoom.max(0.8)) {
                 hovered_port = Some((i, Some(si)));
             }
         }
         if n.output {
             let p = out_port(r);
-            painter.circle_filled(p, 4.5 * zoom, Color32::from_rgb(230, 200, 90));
+            let source_out = wire.is_some() && is_source;
+            painter.circle_filled(p, if source_out { 5.5 * zoom } else { 4.5 * zoom }, if wire.is_some() && !is_source { Color32::from_gray(70) } else { Color32::from_rgb(230, 200, 90) });
         }
         if hovered_port.is_none() && pointer.is_some_and(|q| r.contains(q)) {
             hovered_port = Some((i, None));
@@ -446,36 +593,77 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     }
     // ---- interaction
     let press = ctx.input(|i| i.pointer.press_origin());
+    let additive = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
     if resp.drag_started_by(egui::PointerButton::Primary) {
         if let Some(p) = press {
-            // an output port starts a wire, a node body drags the node, empty space pans
+            // an output port starts a wire, a node body moves the selection, empty space marquees
             let out_hit = nodes.iter().enumerate().find(|(i, n)| n.output && out_port(rects[*i]).distance(p) < 9.0);
+            let in_hit = nodes.iter().enumerate().find_map(|(i, n)| {
+                n.inputs.iter().enumerate().find_map(|(si, _)| (in_port_pos(n, rects[i], si, zoom).distance(p) < 9.0).then_some((i, si)))
+            });
             if let Some((_, n)) = out_hit {
                 app.windows_state.hs.wire = Some(if n.kind == Kind::Texture { Wire::Tex(n.id.clone()) } else { Wire::Mat(n.id.clone()) });
+            } else if let Some((i, si)) = in_hit {
+                let mid = nodes[i].id.clone();
+                let attr = nodes[i].inputs[si].clone();
+                if let Some(tex) = app.s.mats.get(&mid).and_then(|m| m.maps.get(&attr)).and_then(|v| v.as_str()).map(String::from) {
+                    app.s.checkpoint("disconnect texture");
+                    app.s.mats.get_mut(&mid).unwrap().maps.remove(&attr);
+                    app.s.touch();
+                    app.echo(format!("disconnectAttr {}.{attr};", app.s.mats[&mid].name));
+                    app.windows_state.hs.wire = Some(Wire::Tex(tex));
+                }
             } else if let Some(i) = rects.iter().rposition(|r| r.contains(p)) {
-                app.windows_state.hs.drag_node = Some(nodes[i].id.clone());
+                select_graph_node(app, &nodes[i].id, additive);
+                let start = app.windows_state.hs.graph_sel.iter().filter_map(|id| app.windows_state.hs.pos.get(id).map(|p| (id.clone(), *p))).collect();
+                app.windows_state.hs.drag_start = Some(start);
+            } else {
+                let base = if additive { app.windows_state.hs.graph_sel.clone() } else { HashSet::new() };
+                if !additive {
+                    app.windows_state.hs.graph_sel.clear();
+                }
+                app.windows_state.hs.marquee_base = base;
+                app.windows_state.hs.marquee = Some((p, p));
             }
         }
     }
-    if resp.dragged_by(egui::PointerButton::Middle) || (resp.dragged_by(egui::PointerButton::Primary) && app.windows_state.hs.drag_node.is_none() && app.windows_state.hs.wire.is_none()) {
+    if resp.dragged_by(egui::PointerButton::Middle) {
         app.windows_state.hs.pan += resp.drag_delta();
     }
-    if let Some(id) = app.windows_state.hs.drag_node.clone() {
-        if let Some(p) = app.windows_state.hs.pos.get_mut(&id) {
-            *p += resp.drag_delta() / zoom;
+    if let Some(d) = app.windows_state.hs.drag_start.clone() {
+        let delta = resp.drag_delta() / zoom;
+        for (id, _) in d {
+            if let Some(p) = app.windows_state.hs.pos.get_mut(&id) {
+                *p += delta;
+            }
         }
     }
-    if let (Some(w), Some(q)) = (app.windows_state.hs.wire.clone(), pointer) {
+    if let Some((a, b)) = app.windows_state.hs.marquee {
+        let q = pointer.unwrap_or(b);
+        app.windows_state.hs.marquee = Some((a, q));
+        let m = Rect::from_two_pos(a, q);
+        let mut sel = app.windows_state.hs.marquee_base.clone();
+        for (i, n) in nodes.iter().enumerate() {
+            if m.intersects(rects[i]) {
+                sel.insert(n.id.clone());
+            }
+        }
+        app.windows_state.hs.graph_sel = sel;
+        painter.rect_filled(m, 0.0, Color32::from_rgba_unmultiplied(120, 170, 220, 30));
+        painter.rect_stroke(m, 0.0, Stroke::new(1.0, Color32::from_rgb(156, 208, 245)), egui::StrokeKind::Inside);
+    }
+    if let (Some(w), Some(q)) = (wire.clone(), pointer) {
         let src = match &w {
             Wire::Tex(t) | Wire::Mat(t) => find(t).map(|i| out_port(rects[i])),
         };
         if let Some(a) = src {
-            bezier(&painter, a, q, Color32::from_rgb(255, 230, 120), 1.5);
+            let end = drop_target.map(|(i, slot)| in_port_pos(&nodes[i], rects[i], slot.unwrap_or(0), zoom)).unwrap_or(q);
+            bezier(&painter, a, end, Color32::from_rgb(255, 230, 120), 1.5);
         }
     }
-    if resp.drag_stopped() {
+    if resp.drag_stopped_by(egui::PointerButton::Primary) {
         if let Some(w) = app.windows_state.hs.wire.take() {
-            match (w, hovered_port) {
+            match (w, drop_target) {
                 (Wire::Tex(t), Some((ni, slot))) if nodes[ni].kind == Kind::Material => {
                     let mid = nodes[ni].id.clone();
                     let attr = match slot {
@@ -494,19 +682,19 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
                 _ => {}
             }
         }
-        app.windows_state.hs.drag_node = None;
+        app.windows_state.hs.drag_start = None;
+        if app.windows_state.hs.marquee.take().is_some() {
+            app.windows_state.hs_selected = nodes.iter().rev().find(|n| app.windows_state.hs.graph_sel.contains(&n.id)).map(|n| n.id.clone());
+            app.windows_state.hs.marquee_base.clear();
+        }
     }
     if resp.clicked() {
-        match hovered_port {
-            Some((i, _)) => {
-                let n = &nodes[i];
-                if n.kind == Kind::Object {
-                    app.select_names(std::slice::from_ref(&n.id), SelMode::Replace);
-                } else {
-                    app.windows_state.hs_selected = Some(n.id.clone());
-                }
-            }
-            None => {}
+        if let Some((i, _)) = hovered_port {
+            let id = nodes[i].id.clone();
+            select_graph_node(app, &id, additive);
+        } else {
+            app.windows_state.hs.graph_sel.clear();
+            app.windows_state.hs_selected = None;
         }
     }
     if resp.double_clicked() {
@@ -539,5 +727,5 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             app.windows_state.hs.pan = q - rect.min - g * nz;
         }
     }
-    painter.text(rect.left_bottom() + vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "Drag an output (yellow) onto a material slot or object · right-click a slot to disconnect · wheel zooms · drag empty space to pan", egui::FontId::proportional(10.0), theme::TEXT_DIM);
+    painter.text(rect.left_bottom() + vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "Drag output to connect · Shift/Ctrl multi-select · primary-drag empty space to marquee · MMB pan · wheel zoom · A/F frame", egui::FontId::proportional(10.0), theme::TEXT_DIM);
 }
