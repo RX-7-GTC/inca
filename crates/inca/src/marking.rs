@@ -79,13 +79,12 @@ pub struct Menu {
     button: egui::PointerButton,
     sticky: bool,
     hot_radial: Option<usize>,
-    painted_list: bool,
 }
 
 const DIRS: [(&str, f32); 8] = [("N", -90.0), ("NE", -45.0), ("E", 0.0), ("SE", 45.0), ("S", 90.0), ("SW", 135.0), ("W", 180.0), ("NW", -135.0)];
 
 fn menu(pos: Pos2, vp: usize, button: egui::PointerButton, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64) -> Menu {
-    Menu { pos, title, radial, list, vp, opened: now, button, sticky: false, hot_radial: None, painted_list: false }
+    Menu { pos, title, radial, list, vp, opened: now, button, sticky: false, hot_radial: None }
 }
 
 /// RMB in a viewport: build the menu for the modifiers and what's under the cursor.
@@ -216,10 +215,24 @@ pub fn open_tool(app: &mut IncaApp, idx: usize, tool: Tool, pos: Pos2, now: f64)
     app.marking = Some(menu(pos, idx, egui::PointerButton::Primary, Some(title), radial, list, now));
 }
 
+/// Block clicks from reaching the UI under a painter-drawn marking menu.
+pub fn block_pointer(app: &IncaApp, ctx: &egui::Context) {
+    if app.marking.is_none() {
+        return;
+    }
+    let rect = ctx.content_rect();
+    egui::Area::new(egui::Id::new("marking-block"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(rect.min)
+        .interactable(true)
+        .show(ctx, |ui| {
+            ui.allocate_exact_size(rect.size(), egui::Sense::click());
+        });
+}
+
 /// Open a marking menu outside a viewport (used by the Hypershade).
 pub fn open_custom(app: &mut IncaApp, pos: Pos2, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64) {
-    let mut m = menu(pos, app.active_vp, egui::PointerButton::Secondary, title, radial, list, now);
-    m.painted_list = true;
+    let m = menu(pos, app.active_vp, egui::PointerButton::Secondary, title, radial, list, now);
     app.marking = Some(m);
     app.marking_target = None;
 }
@@ -326,8 +339,7 @@ fn run(app: &mut IncaApp, act: Act) {
             crate::hypershade::delete_graph_nodes(app, &ids);
         }
         Act::HypershadeRename(id) => {
-            let name = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone()));
-            if let Some(name) = name {
+            if let Some(name) = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone())) {
                 app.windows_state.hs.rename_pos = app.marking.as_ref().map(|m| m.pos);
                 app.windows_state.hs.rename = Some((id, name));
             }
@@ -379,10 +391,10 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
         return;
     }
     let cur = ptr.hover_pos().unwrap_or(m.pos);
+    let d = cur - m.pos;
     let rects: Vec<Rect> = m.radial.iter().map(|(d, i)| radial_rect(ctx, m, d, &i.label)).collect();
     let list_top = m.pos.y + 2.0 * ROW + 22.0;
     // hot radial item: under the cursor, or by direction once past the dead zone
-    let d = cur - m.pos;
     let mut hot = rects.iter().position(|r| r.contains(cur));
     let in_list_zone = cur.y > list_top - 6.0 && d.x.abs() < 120.0 && !m.list.is_empty();
     if hot.is_none() && d.length() > 28.0 && !in_list_zone {
@@ -413,6 +425,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     }
     let mut picked: Option<Act> = None;
     let mut close = false;
+    let primary_click = ptr.button_clicked(egui::PointerButton::Primary);
     let list = m.list.clone();
     let title = m.title.clone();
     let radial = m.radial.clone();
@@ -433,6 +446,9 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
             label = if radial[i].0.ends_with('W') { format!("◂ {label}") } else { format!("{label} ▸") };
         }
         p.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), if item.enabled { Color32::WHITE } else { Color32::from_gray(0x80) });
+        if is_hot && item.enabled && item.sub.is_empty() && primary_click {
+            picked = item.act.clone();
+        }
     }
     // Draw the open submenu after every radial item so it sits on top of them.
     if let Some(h) = hot {
@@ -446,6 +462,9 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
                 if rr.contains(cur) {
                     p.rect_filled(rr, 2.0, Color32::from_rgb(0x52, 0x85, 0xa6));
                     sub_hit = s.act.clone();
+                    if s.enabled && primary_click {
+                        picked = s.act.clone();
+                    }
                 }
                 let l = match s.check {
                     Some(true) => format!("✔ {}", s.label),
@@ -461,52 +480,82 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     let released = ptr.button_released(button);
     let mut list_rect = Rect::NOTHING;
     if !list.is_empty() || title.is_some() {
-        if m.painted_list {
-            let h = 8.0 + title.as_ref().map_or(0.0, |_| 18.0) + list.iter().map(|i| if i.is_some() { 20.0 } else { 7.0 }).sum::<f32>();
-            let r = Rect::from_min_size(pos2(pos.x - 85.0, list_top), vec2(170.0, h));
-            p.rect_filled(r, 3.0, Color32::from_gray(0x44));
-            p.rect_stroke(r, 3.0, Stroke::new(1.0, Color32::from_gray(0x2a)), egui::StrokeKind::Inside);
-            let mut y = r.min.y + 4.0;
-            if let Some(t) = &title {
-                p.text(pos2(r.min.x + 6.0, y + 9.0), Align2::LEFT_CENTER, t, FontId::proportional(12.0), Color32::from_gray(0xaa));
-                y += 18.0;
-            }
-            for i in &list {
-                match i {
-                    None => y += 7.0,
-                    Some(item) => {
-                        let rr = Rect::from_min_size(pos2(r.min.x + 3.0, y), vec2(r.width() - 6.0, 20.0));
-                        if rr.contains(cur) {
-                            p.rect_filled(rr, 2.0, Color32::from_rgb(0x52, 0x85, 0xa6));
-                            if item.enabled && (ptr.any_click() || released) {
-                                picked = item.act.clone();
-                            }
-                        }
-                        p.text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, &item.label, FontId::proportional(12.0), if item.enabled { Color32::WHITE } else { Color32::from_gray(0x80) });
-                        y += 20.0;
-                    }
+        let h = 8.0 + title.as_ref().map_or(0.0, |_| 18.0) + list.iter().map(|i| if i.is_some() { 20.0 } else { 7.0 }).sum::<f32>();
+        let r = Rect::from_min_size(pos2(pos.x - 85.0, list_top), vec2(170.0, h));
+        p.rect_filled(r, 3.0, Color32::from_gray(0x44));
+        p.rect_stroke(r, 3.0, Stroke::new(1.0, Color32::from_gray(0x2a)), egui::StrokeKind::Inside);
+        let mut y = r.min.y + 4.0;
+        if let Some(t) = &title {
+            p.text(pos2(r.min.x + 6.0, y + 9.0), Align2::LEFT_CENTER, t, FontId::proportional(12.0), Color32::from_gray(0xaa));
+            y += 18.0;
+        }
+        let mut rows: Vec<Option<Rect>> = Vec::with_capacity(list.len());
+        for i in &list {
+            match i {
+                None => {
+                    rows.push(None);
+                    y += 7.0;
+                }
+                Some(_) => {
+                    rows.push(Some(Rect::from_min_size(pos2(r.min.x + 3.0, y), vec2(r.width() - 6.0, 20.0))));
+                    y += 20.0;
                 }
             }
-            list_rect = r;
-        } else {
-            let area = egui::Area::new(egui::Id::new("marking-list")).order(egui::Order::Tooltip).fixed_pos(pos2(pos.x - 85.0, list_top)).show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(170.0);
-                    if let Some(t) = &title {
-                        ui.label(egui::RichText::new(t).italics().color(Color32::from_gray(0xaa)));
-                    }
-                    for i in &list {
-                        match i {
-                            None => {
-                                ui.separator();
-                            }
-                            Some(i) => list_item(ui, i, &mut picked),
-                        }
-                    }
-                });
-            });
-            list_rect = area.response.rect;
         }
+        let screen = ctx.content_rect();
+        let mut open_sub: Option<(usize, Rect)> = None;
+        for (idx, item) in list.iter().enumerate() {
+            let Some(item) = item else { continue };
+            if item.sub.is_empty() {
+                continue;
+            }
+            let Some(rr) = rows[idx] else { continue };
+            let sw = 150.0;
+            let sh = 6.0 + item.sub.len() as f32 * 20.0;
+            let left = rr.max.x + sw + 4.0 > screen.max.x;
+            let sx = if left { rr.min.x - sw - 2.0 } else { rr.max.x + 2.0 };
+            let sr = Rect::from_min_size(pos2(sx, rr.min.y), vec2(sw, sh));
+            if rr.contains(cur) || sr.contains(cur) {
+                open_sub = Some((idx, sr));
+            }
+        }
+        for (idx, item) in list.iter().enumerate() {
+            let Some(item) = item else { continue };
+            let Some(rr) = rows[idx] else { continue };
+            if rr.contains(cur) {
+                p.rect_filled(rr, 2.0, Color32::from_rgb(0x52, 0x85, 0xa6));
+            }
+            let l = match item.check {
+                Some(true) => format!("✔ {}", item.label),
+                Some(false) => format!("   {}", item.label),
+                None => item.label.clone(),
+            };
+            p.text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, l, FontId::proportional(12.0), if item.enabled { Color32::WHITE } else { Color32::from_gray(0x80) });
+            if item.sub.is_empty() && rr.contains(cur) && item.enabled && (primary_click || released) {
+                picked = item.act.clone();
+            }
+        }
+        if let Some((idx, sr)) = open_sub {
+            let Some(Some(item)) = list.get(idx) else { return };
+            p.rect_filled(sr, 3.0, Color32::from_gray(0x44));
+            p.rect_stroke(sr, 3.0, Stroke::new(1.0, Color32::from_gray(0x2a)), egui::StrokeKind::Inside);
+            for (k, s) in item.sub.iter().enumerate() {
+                let rr = Rect::from_min_size(pos2(sr.min.x + 3.0, sr.min.y + 3.0 + k as f32 * 20.0), vec2(sr.width() - 6.0, 20.0));
+                if rr.contains(cur) {
+                    p.rect_filled(rr, 2.0, Color32::from_rgb(0x52, 0x85, 0xa6));
+                    if s.enabled && (primary_click || released) {
+                        picked = s.act.clone();
+                    }
+                }
+                let l = match s.check {
+                    Some(true) => format!("✔ {}", s.label),
+                    Some(false) => format!("   {}", s.label),
+                    None => s.label.clone(),
+                };
+                p.text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, l, FontId::proportional(12.0), Color32::WHITE);
+            }
+        }
+        list_rect = r;
     }
     // The drag line is drawn last so it stays visible over every option.
     p.line_segment([pos, cur], Stroke::new(1.5, Color32::from_gray(0xdd)));
@@ -517,21 +566,27 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     if picked.is_none() {
         if released && !sticky {
             if quick {
-                app.marking.as_mut().unwrap().sticky = true;
+                if button == egui::PointerButton::Primary {
+                    app.marking.as_mut().unwrap().sticky = true;
+                } else {
+                    close = true;
+                }
             } else if let Some(a) = sub_hit.clone() {
                 picked = Some(a);
             } else if let Some(h) = hot {
                 if radial[h].1.enabled && radial[h].1.sub.is_empty() {
                     picked = radial[h].1.act.clone();
                 } else if !radial[h].1.sub.is_empty() {
-                    app.marking.as_mut().unwrap().sticky = true;
+                    if button == egui::PointerButton::Primary {
+                        app.marking.as_mut().unwrap().sticky = true;
+                    } else {
+                        close = true;
+                    }
                 } else {
                     close = true;
                 }
-            } else if !list_rect.contains(cur) {
-                close = true;
             } else {
-                app.marking.as_mut().unwrap().sticky = true;
+                close = true;
             }
         } else if sticky && ptr.any_click() {
             if let Some(a) = sub_hit {
@@ -559,22 +614,4 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     ctx.request_repaint();
 }
 
-fn list_item(ui: &mut egui::Ui, i: &Item, picked: &mut Option<Act>) {
-    if !i.sub.is_empty() {
-        ui.menu_button(&i.label, |ui| {
-            for s in &i.sub {
-                list_item(ui, s, picked);
-            }
-        });
-        return;
-    }
-    let label = match i.check {
-        Some(true) => format!("✔ {}", i.label),
-        Some(false) => format!("   {}", i.label),
-        None => i.label.clone(),
-    };
-    if ui.add_enabled(i.enabled, egui::Button::new(label).frame_when_inactive(false)).clicked() {
-        *picked = i.act.clone();
-        ui.close();
-    }
-}
+

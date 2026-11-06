@@ -335,8 +335,8 @@ pub(crate) fn material_users(app: &IncaApp, mid: &str) -> Vec<String> {
     users(app, mid)
 }
 
-fn non_deletable(app: &IncaApp, id: &str) -> bool {
-    // shortcut: name check; a renamed standardSurface1 would become deletable
+pub(crate) fn read_only(app: &IncaApp, id: &str) -> bool {
+    // shortcut: name check; startup nodes are not renamed, so the names stay stable
     id == app.s.default_mat || app.s.mats.get(id).is_some_and(|m| m.name == "standardSurface1")
 }
 
@@ -346,7 +346,7 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
     let mut blocked = vec![];
     for id in ids {
         if let Some(m) = app.s.mats.get(id) {
-            if non_deletable(app, id) {
+            if read_only(app, id) {
                 blocked.push(m.name.clone());
             } else {
                 mats.push(id.clone());
@@ -384,6 +384,10 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
 }
 
 fn rename_shading_node(app: &mut IncaApp, id: &str, name: &str) {
+    if read_only(app, id) {
+        app.error("line 1: Cannot rename a read only node.");
+        return;
+    }
     let name = name.trim();
     if name.is_empty() {
         return;
@@ -459,7 +463,7 @@ fn open_node_marking(app: &mut IncaApp, id: &str, pos: Pos2, now: f64) {
         radial.push(("S", menu_item("Duplicate Network", Act::HypershadeDuplicate(id.into()))));
         radial.push(("W", menu_item("Rename...", Act::HypershadeRename(id.into()))));
         let mut delete = menu_item("Delete", Act::HypershadeDelete(selected));
-        if id == app.s.default_mat {
+        if read_only(app, id) {
             delete.enabled = false;
         }
         list.push(Some(delete));
@@ -609,7 +613,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                     cancel = true;
                 }
             });
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if ui.input(|i| i.key_pressed(egui::Key::Enter)) && (resp.has_focus() || resp.lost_focus()) {
                 commit = true;
             }
         });
@@ -727,7 +731,7 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
                 let n = app.s.mats[&id].name.clone();
                 let _ = app.run_mel("assign material", &format!("hyperShade -assign {n};"));
             }
-            if !non_deletable(app, &id) && ui.button("Delete").clicked() {
+            if !read_only(app, &id) && ui.button("Delete").clicked() {
                 app.s.checkpoint("delete material");
                 app.s.delete_material(&id);
                 app.windows_state.hs_selected = None;

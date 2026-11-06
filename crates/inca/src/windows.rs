@@ -350,19 +350,25 @@ fn run_script(app: &mut IncaApp) {
 
 pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str) {
     let Some(m) = app.s.mats.get(mid).cloned() else { return };
+    let read_only = crate::hypershade::read_only(app, mid);
     ui.horizontal(|ui| {
         let p = m.pbr();
         let (r, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
         ui.painter().circle_filled(r.center(), 13.0, Color32::from(egui::Rgba::from_rgb(p.base[0], p.base[1], p.base[2])));
         let mut name = m.name.clone();
         let resp = ui.text_edit_singleline(&mut name);
-        if resp.lost_focus() && name != m.name && !name.trim().is_empty() {
-            app.s.checkpoint("rename material");
-            let old = m.name.clone();
-            app.s.release_name(&old);
-            let nn = app.s.unique_name(name.trim());
-            app.s.mats.get_mut(mid).unwrap().name = nn;
-            app.s.touch();
+        let committed = resp.lost_focus() || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+        if committed && name != m.name && !name.trim().is_empty() {
+            if read_only {
+                app.error("line 1: Cannot rename a read only node.");
+            } else {
+                app.s.checkpoint("rename material");
+                let old = m.name.clone();
+                app.s.release_name(&old);
+                let nn = app.s.unique_name(name.trim());
+                app.s.mats.get_mut(mid).unwrap().name = nn;
+                app.s.touch();
+            }
         }
         ui.label(RichText::new(inca_core::materials::mat_type(&m.ty).label).color(theme::TEXT_DIM));
     });
