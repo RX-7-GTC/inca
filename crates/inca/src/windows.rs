@@ -164,7 +164,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     let mut open = app.win.hypershade;
     // A distinct id discards the old stored area state that had grown to the screen width
     // (the layout feedback bug); the window now starts at its default size again.
-    egui::Window::new("Hypershade").id(egui::Id::new("HypershadeWindow")).open(&mut open).default_size([980.0, 560.0]).show(ctx, |ui| crate::hypershade::window(app, ui));
+    egui::Window::new("Hypershade").id(egui::Id::new("HypershadeWindow")).open(&mut open).default_size([980.0, 560.0]).min_size([600.0, 420.0]).show(ctx, |ui| crate::hypershade::window(app, ui));
     app.win.hypershade = open;
     let mut open = app.win.graph_editor;
     egui::Window::new("Graph Editor").open(&mut open).default_size([760.0, 420.0]).show(ctx, |ui| graph_editor(app, ui));
@@ -399,20 +399,6 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str) {
                 }
             });
         });
-        if let Some(tid) = m.maps.get(*slot).and_then(|v| v.as_str()) {
-            if let Some(t) = app.s.texs.get(tid).cloned() {
-                ui.indent(("tex", tid), |ui| {
-                    ui.label(RichText::new(format!("{} ({})", t.name, t.ty)).color(theme::TEXT_DIM));
-                    let keys: Vec<String> = t.attrs.keys().filter(|k| *k != "colors").cloned().collect();
-                    crate::panels::attr_map_editor(app, ui, &NodeRef::Texture(tid.to_string()), &keys);
-                    if t.ty == "file" && ui.button("Browse image...").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "hdr"]).pick_file() {
-                            app.s.set_attr(&NodeRef::Texture(tid.to_string()), "fileTextureName", json!(p.to_string_lossy()));
-                        }
-                    }
-                });
-            }
-        }
     }
 }
 

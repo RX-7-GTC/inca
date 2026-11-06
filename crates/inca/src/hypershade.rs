@@ -166,11 +166,12 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     });
     ui.separator();
-    let side = 230.0f32.min(ui.available_width() * 0.3);
+    let side = 300.0f32; // fixed like the JS property panel; the work area takes the remainder
+    let palette_w = (side * 0.75).min((ui.available_width() - side - 120.0).max(120.0));
     // egui panels divide the remaining width exactly; sizing the columns from
     // `available_width` inside a horizontal layout made the window grow every frame.
     egui::Panel::left("hypershade_palette")
-        .exact_size(side * 0.75)
+        .exact_size(palette_w)
         .resizable(false)
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -235,6 +236,10 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.label(RichText::new("Select a node to edit it").color(theme::TEXT_DIM));
         return;
     };
+    // Two-column attribute rows must fit the narrow properties panel; the default 280px
+    // text field overflowed it and pushed the whole grid left under the work area.
+    ui.set_max_width(ui.available_width());
+    ui.spacing_mut().text_edit_width = 160.0;
     if app.s.mats.contains_key(&id) {
         ui.horizontal(|ui| {
             if ui.button("Assign to Selection").clicked() {
