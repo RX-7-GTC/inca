@@ -492,7 +492,7 @@ pub fn command_line(app: &mut IncaApp, ui: &mut egui::Ui) {
             theme::TEXT
         };
         egui::Frame::NONE.fill(theme::FIELD).inner_margin(egui::Margin::symmetric(4, 1)).show(ui, |ui| {
-            ui.set_width(ui.available_width() - 30.0);
+            ui.set_width((ui.available_width() - 30.0).max(0.0));
             ui.label(RichText::new(&app.last_result).monospace().color(color));
         });
         if ui.small_button("{}").on_hover_text("Script Editor").clicked() {
