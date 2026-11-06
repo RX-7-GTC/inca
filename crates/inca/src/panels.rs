@@ -1160,21 +1160,25 @@ pub fn attr_map_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, keys: 
     egui::Grid::new(("ae", app.s.ref_id(r))).num_columns(2).spacing([8.0, 4.0]).striped(false).show(ui, |ui| {
         for k in keys {
             let Some(v) = app.s.get_attr(r, k) else { continue };
-            ui.label(ops::nice_name(k));
+            // Fixed label column: keeps every node's attributes aligned instead of
+            // re-flowing the panel width as the selected node changes.
+            ui.add_sized([108.0, 18.0], egui::Label::new(ops::nice_name(k)).truncate());
             match v {
                 Value::Array(a) if a.len() == 3 && a.iter().all(|x| x.is_number()) => {
                     let mut c = [a[0].as_f64().unwrap_or(0.0) as f32, a[1].as_f64().unwrap_or(0.0) as f32, a[2].as_f64().unwrap_or(0.0) as f32];
                     let is_color = k.to_lowercase().contains("color") || k.contains("transparency") || k.contains("incandescence") || k == "opacity";
                     let changed = if is_color {
-                        ui.color_edit_button_rgb(&mut c).changed()
+                        ui.allocate_ui_with_layout(egui::vec2(152.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.color_edit_button_rgb(&mut c).changed()
+                        }).inner
                     } else {
-                        let mut ch = false;
-                        ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(egui::vec2(152.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let mut ch = false;
                             for x in c.iter_mut() {
-                                ch |= ui.add(egui::DragValue::new(x).speed(0.02)).changed();
+                                ch |= ui.add_sized([48.0, 18.0], egui::DragValue::new(x).speed(0.02)).changed();
                             }
-                        });
-                        ch
+                            ch
+                        }).inner
                     };
                     if changed {
                         if !app.panels.editing {
@@ -1185,14 +1189,19 @@ pub fn attr_map_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, keys: 
                 }
                 Value::Number(n) => {
                     let mut x = n.as_f64().unwrap_or(0.0);
-                    let resp = ui.add(egui::DragValue::new(&mut x).speed(0.01).max_decimals(3));
+                    let resp = ui.allocate_ui_with_layout(egui::vec2(152.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_sized([64.0, 18.0], egui::DragValue::new(&mut x).speed(0.01).max_decimals(3))
+                    }).inner;
                     if resp.changed() {
                         edit_channel(app, std::slice::from_ref(r), k, json!(x), &resp);
                     }
                     finish_edit(app, std::slice::from_ref(r), k, &resp);
                 }
                 Value::Bool(mut b) => {
-                    if ui.checkbox(&mut b, "").changed() {
+                    let changed = ui.allocate_ui_with_layout(egui::vec2(152.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.checkbox(&mut b, "").changed()
+                    }).inner;
+                    if changed {
                         app.s.checkpoint(&format!("setAttr {k}"));
                         app.s.set_attr(r, k, json!(b));
                     }
@@ -1200,9 +1209,8 @@ pub fn attr_map_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, keys: 
                 Value::String(mut s) => {
                     // JS file fields (`textureFile`, `fileTextureName`) get a browse button.
                     let file_field = matches!(k.as_str(), "textureFile" | "fileTextureName");
-                    let mut edited = false;
-                    ui.horizontal(|ui| {
-                        edited = ui.text_edit_singleline(&mut s).changed();
+                    let edited = ui.allocate_ui_with_layout(egui::vec2(152.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let mut edited = ui.text_edit_singleline(&mut s).changed();
                         if file_field && ui.small_button("...").on_hover_text("Browse").clicked() {
                             let filters: &[&str] = if k == "textureFile" {
                                 &["hdr", "exr", "png", "jpg", "jpeg"]
@@ -1228,13 +1236,16 @@ pub fn attr_map_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, keys: 
                                 s = v;
                             }
                         }
-                    });
+                        edited
+                    }).inner;
                     if edited {
                         app.s.set_attr(r, k, json!(s));
                     }
                 }
                 other => {
-                    ui.label(RichText::new(other.to_string()).color(theme::TEXT_DIM));
+                    ui.allocate_ui_with_layout(egui::vec2(152.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_sized([152.0, 18.0], egui::Label::new(RichText::new(other.to_string()).color(theme::TEXT_DIM)).truncate());
+                    });
                 }
             }
             ui.end_row();

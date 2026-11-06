@@ -239,7 +239,7 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
     // Two-column attribute rows must fit the narrow properties panel; the default 280px
     // text field overflowed it and pushed the whole grid left under the work area.
     ui.set_max_width(ui.available_width());
-    ui.spacing_mut().text_edit_width = 160.0;
+    ui.spacing_mut().text_edit_width = 120.0;
     if app.s.mats.contains_key(&id) {
         ui.horizontal(|ui| {
             if ui.button("Assign to Selection").clicked() {

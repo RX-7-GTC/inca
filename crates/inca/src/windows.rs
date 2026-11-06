@@ -372,10 +372,10 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str) {
     theme::section_header(ui, "Texture Maps");
     for slot in inca_core::materials::mat_type(&m.ty).mappable {
         ui.horizontal(|ui| {
-            ui.label(inca_core::ops::nice_name(slot));
+            ui.add_sized([108.0, 18.0], egui::Label::new(inca_core::ops::nice_name(slot)).truncate());
             let cur = m.maps.get(*slot).and_then(|v| v.as_str()).map(String::from);
             let cur_name = cur.as_ref().and_then(|t| app.s.texs.get(t)).map(|t| t.name.clone()).unwrap_or("None".into());
-            egui::ComboBox::from_id_salt(("map", mid, *slot)).selected_text(cur_name).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt(("map", mid, *slot)).width(120.0).selected_text(cur_name).show_ui(ui, |ui| {
                 if ui.selectable_label(cur.is_none(), "None").clicked() {
                     app.s.checkpoint("disconnect texture");
                     app.s.mats.get_mut(mid).unwrap().maps.remove(*slot);
