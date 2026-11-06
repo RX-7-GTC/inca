@@ -4004,8 +4004,6 @@ dependencies = [
 [[package]]
 name = "transform-gizmo"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcd9584531c33435ec2e9c2f194a27e60c65a36a2168f0519e1483e06934c8ec"
 dependencies = [
  "ahash",
  "ecolor",

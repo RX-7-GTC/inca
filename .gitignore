@@ -1,5 +1,7 @@
 *.log
-vendor/
+vendor/*
+!vendor/transform-gizmo/
+!vendor/transform-gizmo/**
 .claude/
 *.pdf
 inca-outreach-plan.md

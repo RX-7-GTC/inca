@@ -21,3 +21,8 @@ opt-level = 3
 
 [profile.release]
 lto = "thin"
+
+# Local patch: draw a Maya-style rotation arc instead of transform-gizmo's
+# accumulating sector fill (which becomes opaque after several full turns).
+[patch.crates-io]
+transform-gizmo = { path = "vendor/transform-gizmo" }
