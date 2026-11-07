@@ -5,7 +5,7 @@ use crate::theme;
 use egui::{Color32, RichText};
 use inca_core::materials::{MAT_TYPES, TEX_TYPES};
 use inca_core::render::{RenderScene, RenderSettings};
-use inca_core::scene::{MsgKind, NodeRef, Scene};
+use inca_core::scene::{MsgKind, Scene};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -374,9 +374,7 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_nam
         ui.label(RichText::new(inca_core::materials::mat_type(&m.ty).label).color(theme::TEXT_DIM));
     });
     }
-    theme::section_header(ui, "Common Material Attributes");
-    let keys: Vec<String> = m.attrs.keys().cloned().collect();
-    crate::panels::attr_map_editor(app, ui, &NodeRef::Material(mid.to_string()), &keys);
+    crate::panels::material_fields_editor(app, ui, mid, &m.ty);
     theme::section_header(ui, "Texture Maps");
     for slot in inca_core::materials::mat_type(&m.ty).mappable {
         ui.horizontal(|ui| {

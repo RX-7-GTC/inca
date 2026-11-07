@@ -835,8 +835,7 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
             crate::windows::material_editor(app, ui, &id, false);
         }
     } else if let Some(t) = app.s.texs.get(&id).cloned() {
-        let keys: Vec<String> = t.attrs.keys().filter(|k| *k != "colors").cloned().collect();
-        crate::panels::attr_map_editor(app, ui, &NodeRef::Texture(id.clone()), &keys);
+        crate::panels::texture_fields_editor(app, ui, &id, &t.ty);
         if t.ty == "file" && ui.button("Browse image...").clicked() {
             if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "hdr"]).pick_file() {
                 app.s.set_attr(&NodeRef::Texture(id.clone()), "fileTextureName", json!(p.to_string_lossy()));

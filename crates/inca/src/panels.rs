@@ -2,7 +2,7 @@
 
 use crate::app::{IncaApp, RightTab, Tool};
 use crate::theme;
-use egui::{Color32, RichText};
+use egui::{pos2, vec2, Color32, Rect, RichText};
 use inca_core::math::fmt_num;
 use inca_core::ops;
 use inca_core::primitives::ChanKind;
@@ -1155,6 +1155,269 @@ fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 // ------------------------------------------------------------------ attribute editor
 
+#[derive(Clone, Copy)]
+enum FieldKind {
+    Float,
+    Color,
+    Bool,
+    Text,
+    Enum(&'static [&'static str]),
+}
+
+#[derive(Clone, Copy)]
+struct FieldSpec {
+    key: &'static str,
+    label: &'static str,
+    kind: FieldKind,
+    min: f32,
+    max: f32,
+}
+
+fn fspec(key: &'static str, label: &'static str, min: f32, max: f32) -> FieldSpec {
+    FieldSpec { key, label, kind: FieldKind::Float, min, max }
+}
+fn cspec(key: &'static str, label: &'static str) -> FieldSpec {
+    FieldSpec { key, label, kind: FieldKind::Color, min: 0.0, max: 1.0 }
+}
+fn bspec(key: &'static str, label: &'static str) -> FieldSpec {
+    FieldSpec { key, label, kind: FieldKind::Bool, min: 0.0, max: 1.0 }
+}
+fn tspec(key: &'static str, label: &'static str) -> FieldSpec {
+    FieldSpec { key, label, kind: FieldKind::Text, min: 0.0, max: 1.0 }
+}
+fn espec(key: &'static str, label: &'static str, options: &'static [&'static str]) -> FieldSpec {
+    FieldSpec { key, label, kind: FieldKind::Enum(options), min: 0.0, max: 1.0 }
+}
+
+fn material_layout(ty: &str) -> Vec<(&'static str, Vec<FieldSpec>)> {
+    match ty {
+        "blinn" => vec![
+            ("Common Material Attributes", vec![cspec("color", "Color"), cspec("transparency", "Transparency"), cspec("ambientColor", "Ambient Color"), cspec("incandescence", "Incandescence"), fspec("bump", "Bump", 0.0, 2.0), fspec("diffuse", "Diffuse", 0.0, 1.0)]),
+            ("Specular Shading", vec![fspec("eccentricity", "Eccentricity", 0.0, 1.0), fspec("specularRollOff", "Specular Roll Off", 0.0, 1.0), cspec("specularColor", "Specular Color"), fspec("reflectivity", "Reflectivity", 0.0, 1.0)]),
+        ],
+        "phong" => vec![
+            ("Common Material Attributes", vec![cspec("color", "Color"), cspec("transparency", "Transparency"), cspec("ambientColor", "Ambient Color"), cspec("incandescence", "Incandescence"), fspec("bump", "Bump", 0.0, 2.0), fspec("diffuse", "Diffuse", 0.0, 1.0)]),
+            ("Specular Shading", vec![fspec("cosinePower", "Cosine Power", 2.0, 100.0), cspec("specularColor", "Specular Color"), fspec("reflectivity", "Reflectivity", 0.0, 1.0)]),
+        ],
+        "standardSurface" => vec![
+            ("Base", vec![fspec("base", "Base", 0.0, 1.0), cspec("baseColor", "Base Color"), fspec("diffuseRoughness", "Diffuse Roughness", 0.0, 1.0), fspec("metalness", "Metalness", 0.0, 1.0)]),
+            ("Specular", vec![fspec("specular", "Specular", 0.0, 1.0), cspec("specularColor", "Specular Color"), fspec("specularRoughness", "Specular Roughness", 0.0, 1.0), fspec("specularIOR", "Specular IOR", 1.0, 3.0)]),
+            ("Transmission", vec![fspec("transmission", "Transmission", 0.0, 1.0), cspec("transmissionColor", "Transmission Color")]),
+            ("Coat", vec![fspec("coat", "Coat", 0.0, 1.0), fspec("coatRoughness", "Coat Roughness", 0.0, 1.0)]),
+            ("Sheen", vec![fspec("sheen", "Sheen", 0.0, 1.0), cspec("sheenColor", "Sheen Color")]),
+            ("Emission", vec![fspec("emission", "Emission", 0.0, 10.0), cspec("emissionColor", "Emission Color")]),
+            ("Geometry", vec![cspec("opacity", "Opacity"), bspec("thinWalled", "Thin Walled"), fspec("bump", "Bump", 0.0, 2.0)]),
+        ],
+        "surfaceShader" => vec![("Surface Shader Attributes", vec![cspec("outColor", "Out Color"), cspec("outTransparency", "Out Transparency")])],
+        _ => vec![("Common Material Attributes", vec![cspec("color", "Color"), cspec("transparency", "Transparency"), cspec("ambientColor", "Ambient Color"), cspec("incandescence", "Incandescence"), fspec("bump", "Bump", 0.0, 2.0), fspec("diffuse", "Diffuse", 0.0, 1.0)])],
+    }
+}
+
+fn field_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, spec: FieldSpec) {
+    let Some(v) = app.s.get_attr(r, spec.key) else { return };
+    match spec.kind {
+        FieldKind::Float => {
+            let mut x = v.as_f64().unwrap_or(0.0) as f32;
+            let resp = ui.add(egui::Slider::new(&mut x, spec.min..=spec.max).max_decimals(3));
+            if resp.changed() {
+                edit_channel(app, std::slice::from_ref(r), spec.key, json!(x), &resp);
+            }
+            finish_edit(app, std::slice::from_ref(r), spec.key, &resp);
+        }
+        FieldKind::Color => {
+            let a = v.as_array();
+            let mut c = [0.0, 0.0, 0.0];
+            if let Some(a) = a {
+                for i in 0..3 {
+                    c[i] = a.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                }
+            }
+            if ui.color_edit_button_rgb(&mut c).changed() {
+                if !app.panels.editing {
+                    app.s.checkpoint(&format!("set {}", spec.key));
+                }
+                app.s.set_attr(r, spec.key, json!([c[0], c[1], c[2]]));
+            }
+        }
+        FieldKind::Bool => {
+            let mut b = v.as_bool().unwrap_or(false);
+            if ui.checkbox(&mut b, "").changed() {
+                app.s.checkpoint(&format!("set {}", spec.key));
+                app.s.set_attr(r, spec.key, json!(b));
+            }
+        }
+        FieldKind::Text => {
+            let mut s = v.as_str().unwrap_or("").to_string();
+            if ui.text_edit_singleline(&mut s).changed() {
+                app.s.checkpoint(&format!("set {}", spec.key));
+                app.s.set_attr(r, spec.key, json!(s));
+            }
+        }
+        FieldKind::Enum(options) => {
+            let mut cur = v.as_str().unwrap_or(options[0]).to_string();
+            egui::ComboBox::from_id_salt(("field", app.s.ref_id(r), spec.key)).selected_text(&cur).show_ui(ui, |ui| {
+                for o in options {
+                    ui.selectable_value(&mut cur, o.to_string(), *o);
+                }
+            });
+            if cur != v.as_str().unwrap_or(options[0]) {
+                app.s.checkpoint(&format!("set {}", spec.key));
+                app.s.set_attr(r, spec.key, json!(cur));
+            }
+        }
+    }
+}
+
+fn field_grid(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, specs: &[FieldSpec]) {
+    egui::Grid::new(("fields", app.s.ref_id(r), specs.first().map(|s| s.key).unwrap_or(""))).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+        for spec in specs {
+            if app.s.get_attr(r, spec.key).is_none() {
+                continue;
+            }
+            ui.add_sized([108.0, 18.0], egui::Label::new(spec.label).truncate());
+            field_editor(app, ui, r, *spec);
+            ui.end_row();
+        }
+    });
+}
+
+fn ramp_entries(v: &Value) -> Vec<(f64, [f32; 3], String)> {
+    v.as_array().map(|a| a.iter().filter_map(|e| {
+        let p = e.as_array()?;
+        let pos = p.first()?.as_f64()?;
+        let c = p.get(1)?.as_array()?;
+        let interp = p.get(2).and_then(|x| x.as_str()).unwrap_or("Linear").to_string();
+        Some((pos, [c.first()?.as_f64()? as f32, c.get(1)?.as_f64()? as f32, c.get(2)?.as_f64()? as f32], interp))
+    }).collect()).unwrap_or_default()
+}
+
+const RAMP_INTERP: [&str; 7] = ["None", "Linear", "Exponential Up", "Exponential Down", "Smooth", "Bump", "Spike"];
+
+fn ramp_factor(name: &str, t: f32) -> f32 {
+    match name {
+        "None" => 0.0,
+        "Exponential Up" => t * t,
+        "Exponential Down" => 1.0 - (1.0 - t) * (1.0 - t),
+        "Smooth" => t * t * (3.0 - 2.0 * t),
+        "Bump" => (t * std::f32::consts::PI).sin(),
+        "Spike" => 1.0 - (2.0 * t - 1.0).abs(),
+        _ => t,
+    }
+}
+
+/// Samples a ramp in linear RGB, matching the stored values and the color picker.
+fn ramp_color(entries: &[(f64, [f32; 3], String)], t: f64) -> [f32; 3] {
+    if entries.is_empty() {
+        return [0.09, 0.09, 0.09];
+    }
+    if t <= entries[0].0 {
+        return entries[0].1;
+    }
+    for w in entries.windows(2) {
+        let (p0, c0, interp) = (w[0].0, w[0].1, &w[0].2);
+        let (p1, c1) = (w[1].0, w[1].1);
+        if t <= p1 {
+            let raw = if p1 > p0 { ((t - p0) / (p1 - p0)) as f32 } else { 0.0 };
+            let f = ramp_factor(interp, raw);
+            return [0, 1, 2].map(|i| c0[i] + (c1[i] - c0[i]) * f);
+        }
+    }
+    entries[entries.len() - 1].1
+}
+
+/// Linear RGB to a screen color, same conversion egui's color button uses.
+fn lin_color(c: [f32; 3]) -> Color32 {
+    Color32::from(egui::Rgba::from_rgb(c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0)))
+}
+
+fn ramp_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef) {
+    let Some(v) = app.s.get_attr(r, "colors") else { return };
+    // Keep stored order stable: sorting here would swap the index identities of the
+    // dot widgets mid-drag, making the dragged dot hand off to its neighbour.
+    let mut entries = ramp_entries(&v);
+    let sorted = |e: &[(f64, [f32; 3], String)]| {
+        let mut s = e.to_vec();
+        s.sort_by(|a, b| a.0.total_cmp(&b.0));
+        s
+    };
+    let state_id = ui.make_persistent_id(("ramp_selected", app.s.ref_id(r)));
+    let mut selected = ui.data_mut(|d| d.get_temp::<usize>(state_id).unwrap_or(0));
+    selected = selected.min(entries.len().saturating_sub(1));
+    theme::section_header(ui, "Ramp");
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), egui::Sense::hover());
+    let painter = ui.painter().clone();
+    let bar = Rect::from_min_max(pos2(rect.left() + 6.0, rect.top() + 14.0), pos2(rect.right() - 6.0, rect.top() + 38.0));
+    let steps = bar.width().max(1.0).ceil() as i32;
+    let display = sorted(&entries);
+    for x in 0..steps {
+        let t = x as f64 / steps.max(1) as f64;
+        painter.line_segment([pos2(bar.left() + x as f32, bar.top()), pos2(bar.left() + x as f32, bar.bottom())], egui::Stroke::new(1.0, lin_color(ramp_color(&display, t))));
+    }
+    painter.rect_stroke(bar, 2.0, egui::Stroke::new(1.0, Color32::from_gray(0x22)), egui::StrokeKind::Inside);
+    let mut changed = false;
+    let bar_resp = ui.interact(bar, ui.make_persistent_id(("ramp_bar", app.s.ref_id(r))), egui::Sense::click());
+    if bar_resp.clicked() {
+        if let Some(q) = bar_resp.interact_pointer_pos() {
+            let pos = (((q.x - bar.left()) / bar.width()) as f64).clamp(0.0, 1.0);
+            entries.push((pos, ramp_color(&display, pos), "Linear".into()));
+            selected = entries.len() - 1;
+            changed = true;
+        }
+    }
+    let mut remove = None;
+    for i in 0..entries.len() {
+        let hx = bar.left() + entries[i].0 as f32 * bar.width();
+        let hy = rect.top() + 7.0;
+        let cr = Rect::from_center_size(pos2(hx, hy), vec2(16.0, 16.0));
+        let cr = ui.interact(cr, ui.make_persistent_id(("ramp_handle", app.s.ref_id(r), i)), egui::Sense::click_and_drag());
+        if cr.dragged() {
+            if let Some(p) = cr.interact_pointer_pos() {
+                entries[i].0 = (((p.x - bar.left()) / bar.width()) as f64).clamp(0.0, 1.0);
+                changed = true;
+            }
+        }
+        if cr.clicked() {
+            selected = i;
+        }
+        if cr.secondary_clicked() && entries.len() > 1 {
+            remove = Some(i);
+        }
+        painter.circle_filled(pos2(hx, hy), 5.0, lin_color(entries[i].1));
+        painter.circle_stroke(pos2(hx, hy), 6.0, egui::Stroke::new(if selected == i { 2.0 } else { 1.0 }, if selected == i { Color32::WHITE } else { Color32::from_gray(0x33) }));
+    }
+    if let Some(i) = remove {
+        entries.remove(i);
+        selected = selected.min(entries.len().saturating_sub(1));
+        changed = true;
+    }
+    if let Some((pos, rgb, interp)) = entries.get_mut(selected) {
+        ui.horizontal(|ui| {
+            ui.label("Selected Color");
+            changed |= ui.color_edit_button_rgb(rgb).changed();
+            ui.label("Position");
+            changed |= ui.add(egui::DragValue::new(pos).range(0.0..=1.0).speed(0.01).max_decimals(3)).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Interpolation");
+            let mut cur = interp.clone();
+            egui::ComboBox::from_id_salt(("ramp_interp", app.s.ref_id(r))).selected_text(&cur).show_ui(ui, |ui| {
+                for o in RAMP_INTERP {
+                    ui.selectable_value(&mut cur, o.to_string(), o);
+                }
+            });
+            if cur != *interp {
+                *interp = cur;
+                changed = true;
+            }
+        });
+    }
+    ui.data_mut(|d| d.insert_temp(state_id, selected));
+    if changed {
+        app.s.checkpoint("edit ramp");
+        app.s.set_attr(r, "colors", json!(entries.iter().map(|(p, c, i)| json!([p, c, i])).collect::<Vec<_>>()));
+    }
+}
+
 /// Generic editor for a JSON attribute map (materials, lights, textures, history params).
 pub fn attr_map_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, keys: &[String]) {
     egui::Grid::new(("ae", app.s.ref_id(r))).num_columns(2).spacing([8.0, 4.0]).striped(false).show(ui, |ui| {
@@ -1251,6 +1514,48 @@ pub fn attr_map_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, keys: 
             ui.end_row();
         }
     });
+}
+
+pub fn material_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, ty: &str) {
+    let r = NodeRef::Material(mid.to_string());
+    for (group, specs) in material_layout(ty) {
+        theme::section_header(ui, group);
+        field_grid(app, ui, &r, &specs);
+    }
+}
+
+pub fn texture_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, ty: &str) {
+    let r = NodeRef::Texture(id.to_string());
+    let Some(t) = app.s.texs.get(id).cloned() else { return };
+    let mut specs = vec![];
+    for k in t.attrs.keys() {
+        let spec = match k.as_str() {
+            "fileTextureName" => tspec("fileTextureName", "Image Name"),
+            "colorSpace" => espec("colorSpace", "Color Space", &["sRGB", "Raw"]),
+            "type" if ty == "ramp" => espec("type", "Type", &["V Ramp", "U Ramp", "Circular Ramp"]),
+            "color1" => cspec("color1", "Color 1"),
+            "color2" => cspec("color2", "Color 2"),
+            "lineColor" => cspec("lineColor", "Line Color"),
+            "fillerColor" => cspec("fillerColor", "Filler Color"),
+            "repeatU" => fspec("repeatU", "Repeat U", 0.0, 16.0),
+            "repeatV" => fspec("repeatV", "Repeat V", 0.0, 16.0),
+            "offsetU" => fspec("offsetU", "Offset U", -1.0, 1.0),
+            "offsetV" => fspec("offsetV", "Offset V", -1.0, 1.0),
+            "rotateUV" => fspec("rotateUV", "Rotate UV", 0.0, 360.0),
+            "contrast" => fspec("contrast", "Contrast", 0.0, 2.0),
+            "frequency" => fspec("frequency", "Frequency", 0.0, 32.0),
+            "amplitude" => fspec("amplitude", "Amplitude", 0.0, 2.0),
+            "uWidth" => fspec("uWidth", "U Width", 0.0, 1.0),
+            "vWidth" => fspec("vWidth", "V Width", 0.0, 1.0),
+            _ => continue,
+        };
+        specs.push(spec);
+    }
+    theme::section_header(ui, "Attributes");
+    field_grid(app, ui, &r, &specs);
+    if ty == "ramp" {
+        ramp_editor(app, ui, &r);
+    }
 }
 
 /// Attribute Editor tabs for a node: transform, shape, history nodes, material.

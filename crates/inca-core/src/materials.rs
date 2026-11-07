@@ -233,11 +233,14 @@ impl Texture {
                 Some(mix(c2, c1, value_noise(u * fq, v * fq) as f32))
             }
             "ramp" => {
-                let stops: Vec<(f64, [f32; 3])> = a
+                let mut stops: Vec<(f64, [f32; 3])> = a
                     .get("colors")
                     .and_then(|c| c.as_array())
                     .map(|l| l.iter().filter_map(|s| Some((s.get(0)?.as_f64()?, rgb(s.get(1))?))).collect())
                     .unwrap_or_default();
+                // The editor keeps stops in their original order so dot identities survive
+                // drags across one another; sample them in position order.
+                stops.sort_by(|a, b| a.0.total_cmp(&b.0));
                 let horizontal = a.get("type").and_then(|t| t.as_str()) == Some("U Ramp");
                 let t = if horizontal { u.fract() } else { v.fract() };
                 if stops.is_empty() {
