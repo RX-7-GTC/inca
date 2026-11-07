@@ -510,11 +510,6 @@ fn menu_sub(label: &str, sub: Vec<Item>) -> Item {
 
 fn open_node_marking(app: &mut IncaApp, id: &str, pos: Pos2, now: f64) {
     let name = app.s.mats.get(id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(id).map(|t| t.name.clone())).or_else(|| app.s.node(id).map(|n| n.name.clone())).unwrap_or_default();
-    let selected: Vec<String> = if app.windows_state.hs.graph_sel.contains(id) {
-        app.windows_state.hs.graph_sel.iter().map(|s| s.strip_prefix("sg:").unwrap_or(s).to_string()).collect::<HashSet<_>>().into_iter().collect()
-    } else {
-        vec![id.to_string()]
-    };
     let mut radial = vec![];
     let mut list = vec![];
     if app.s.mats.contains_key(id) {
@@ -522,17 +517,11 @@ fn open_node_marking(app: &mut IncaApp, id: &str, pos: Pos2, now: f64) {
         radial.push(("E", menu_item("Select Objects With Material", Act::HypershadeSelectUsers(id.into()))));
         radial.push(("S", menu_item("Duplicate Network", Act::HypershadeDuplicate(id.into()))));
         radial.push(("W", menu_item("Rename...", Act::HypershadeRename(id.into()))));
-        let mut delete = menu_item("Delete", Act::HypershadeDelete(selected));
-        if read_only(app, id) {
-            delete.enabled = false;
-        }
-        list.push(Some(delete));
         list.push(Some(menu_item("Frame Selected", Act::HypershadeFrameSelected)));
         list.push(Some(menu_item("Frame All", Act::HypershadeFrameAll)));
     } else if app.s.texs.contains_key(id) {
         radial.push(("N", menu_item("Rename...", Act::HypershadeRename(id.into()))));
         radial.push(("E", menu_item("Frame Selected", Act::HypershadeFrameSelected)));
-        radial.push(("S", menu_item("Delete", Act::HypershadeDelete(selected))));
         radial.push(("W", menu_item("Frame All", Act::HypershadeFrameAll)));
     } else if app.s.node(id).is_some() {
         radial.push(("N", menu_item("Select", Act::HypershadeSelectObject(id.into()))));
@@ -590,6 +579,56 @@ fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
 
 pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
     app.windows_state.hs.window_rect = Some(ui.max_rect());
+    // ---- menu bar
+    ui.horizontal(|ui| {
+        ui.menu_button("Edit", |ui| {
+            let lead = app.snode_sel.clone().or_else(|| app.windows_state.hs_selected.clone()).filter(|id| app.s.mats.contains_key(id) || app.s.texs.contains_key(id));
+            let mut delete_ids = app.windows_state.hs.graph_sel.clone();
+            if let Some(id) = &app.snode_sel {
+                delete_ids.insert(id.clone());
+            }
+            delete_ids.retain(|id| {
+                let base = id.strip_prefix("sg:").unwrap_or(id);
+                app.s.mats.contains_key(base) || app.s.texs.contains_key(base)
+            });
+            let can_delete = delete_ids.iter().any(|id| !read_only(app, id.strip_prefix("sg:").unwrap_or(id)));
+            if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
+                delete_graph_nodes(app, &delete_ids);
+                ui.close();
+            }
+            let is_mat = lead.as_deref().is_some_and(|id| app.s.mats.contains_key(id));
+            if ui.add_enabled(is_mat, egui::Button::new("Duplicate Shading Network")).clicked() {
+                if let Some(id) = lead.clone() {
+                    duplicate_shading_network(app, &id);
+                }
+                ui.close();
+            }
+            if ui.add_enabled(lead.is_some(), egui::Button::new("Rename...")).clicked() {
+                if let Some(id) = lead.clone() {
+                    let name = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone())).unwrap_or_default();
+                    app.windows_state.hs.rename_pos = Some(ui.min_rect().left_top());
+                    app.windows_state.hs.rename = Some((id, name));
+                }
+                ui.close();
+            }
+            ui.separator();
+            if ui.add_enabled(is_mat, egui::Button::new("Select Objects with Materials")).clicked() {
+                if let Some(id) = lead.clone() {
+                    let ids = material_users(app, &id);
+                    app.select_names(&ids, SelMode::Replace);
+                }
+                ui.close();
+            }
+            if ui.add_enabled(is_mat, egui::Button::new("Assign Material to Viewport Selection")).clicked() {
+                if let Some(id) = lead.clone() {
+                    if let Some(m) = app.s.mats.get(&id) {
+                        let _ = app.run_mel("assign material", &format!("hyperShade -assign {};", m.name));
+                    }
+                }
+                ui.close();
+            }
+        });
+    });
     // ---- create bar
     ui.horizontal(|ui| {
         ui.label("Create:");
@@ -1273,9 +1312,8 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             let now = ctx.input(|i| i.time);
             let pos = pointer.unwrap_or(rect.center());
             if let Some(i) = pointer.and_then(|q| rects.iter().rposition(|r| r.contains(q))) {
-                if !app.windows_state.hs.graph_sel.contains(&nodes[i].id) {
-                    select_graph_node(app, &nodes[i].id, false);
-                }
+                // RMB opens the node menu without selecting, so a viewport selection can
+                // still be the target of "Assign to Selection" (Maya behavior).
                 let id = nodes[i].id.strip_prefix("sg:").unwrap_or(&nodes[i].id).to_string();
                 open_node_marking(app, &id, pos, now);
             } else {

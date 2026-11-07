@@ -29,7 +29,6 @@ pub enum Act {
     HypershadeAssign(String),
     HypershadeSelectUsers(String),
     HypershadeDuplicate(String),
-    HypershadeDelete(Vec<String>),
     HypershadeRename(String),
     HypershadeCreateMaterial(String),
     HypershadeCreateTexture(String),
@@ -334,10 +333,6 @@ fn run(app: &mut IncaApp, act: Act) {
             app.select_names(&ids, SelMode::Replace);
         }
         Act::HypershadeDuplicate(id) => crate::hypershade::duplicate_shading_network(app, &id),
-        Act::HypershadeDelete(ids) => {
-            let ids: std::collections::HashSet<String> = ids.into_iter().collect();
-            crate::hypershade::delete_graph_nodes(app, &ids);
-        }
         Act::HypershadeRename(id) => {
             if let Some(name) = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone())) {
                 app.windows_state.hs.rename_pos = app.marking.as_ref().map(|m| m.pos);
