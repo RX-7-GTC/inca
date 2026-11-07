@@ -420,6 +420,19 @@ fn motion_path_mel(app: &IncaApp) -> Option<String> {
     Some(format!("pathAnimation -c {} -f {f} -fa x -ua y {};", app.s.name_of(curve), objs.join(" ")))
 }
 
+/// Shading nodes selected in the Hypershade/Hypergraph, normalized to their actual ids.
+fn shading_selection(app: &IncaApp) -> std::collections::HashSet<String> {
+    let mut ids = app.windows_state.hs.graph_sel.clone();
+    if let Some(id) = &app.snode_sel {
+        ids.insert(id.clone());
+    }
+    ids.retain(|id| {
+        let base = id.strip_prefix("sg:").unwrap_or(id);
+        app.s.mats.contains_key(base) || app.s.texs.contains_key(base)
+    });
+    ids
+}
+
 pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
     if GEN_INFO.iter().any(|g| g.ty == id) {
         return Some(primitive_mel(id, app.history_on));
@@ -440,7 +453,13 @@ pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
             "instance" => "instance;".into(),
             "createLocator" => "spaceLocator -p 0 0 0;".into(),
             "createEmptyGroup" => "group -em;".into(),
-            "deleteSel" => "delete;".into(),
+            "deleteSel" => {
+                if shading_selection(app).is_empty() {
+                    "delete;".into()
+                } else {
+                    return None;
+                }
+            }
             "deleteHistory" => "delete -ch;".into(),
             "deleteAllHistory" => "delete -all -ch;".into(),
             "deleteChannels" => "delete -c;".into(),
@@ -1131,6 +1150,13 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "toggleWorld" => {
             let t = app.manip_tool();
             app.set_space_world(t, !app.space_world(t));
+        }
+        "deleteSel" => {
+            // Shading nodes in the shared Hypershade/Hypergraph selection.
+            let ids = shading_selection(app);
+            if !ids.is_empty() {
+                crate::hypershade::delete_graph_nodes(app, &ids);
+            }
         }
         "toggleHistory" => app.history_on = !app.history_on,
         "toggleShelf" => app.set_shown("shelf", !app.shown("shelf")),

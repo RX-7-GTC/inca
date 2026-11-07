@@ -384,14 +384,14 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_nam
             egui::ComboBox::from_id_salt(("map", mid, *slot)).width(120.0).selected_text(cur_name).show_ui(ui, |ui| {
                 if ui.selectable_label(cur.is_none(), "None").clicked() {
                     app.s.checkpoint("disconnect texture");
-                    app.s.mats.get_mut(mid).unwrap().maps.remove(*slot);
+                    app.s.mats.get_mut(mid).unwrap().clear_map(slot);
                     app.s.touch();
                 }
                 for t in TEX_TYPES {
                     if ui.button(format!("New {}", t.label)).clicked() {
                         app.s.checkpoint("connect texture");
                         let tid = app.s.create_texture(t.ty, None);
-                        app.s.mats.get_mut(mid).unwrap().maps.insert(slot.to_string(), json!(tid));
+                        app.s.mats.get_mut(mid).unwrap().set_map(slot, &tid, "outColor");
                         app.s.touch();
                     }
                 }
@@ -399,7 +399,7 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_nam
                 for (tid, tn) in texs {
                     if ui.selectable_label(cur.as_deref() == Some(tid.as_str()), &tn).clicked() {
                         app.s.checkpoint("connect texture");
-                        app.s.mats.get_mut(mid).unwrap().maps.insert(slot.to_string(), json!(tid));
+                        app.s.mats.get_mut(mid).unwrap().set_map(slot, &tid, "outColor");
                         app.s.touch();
                     }
                 }

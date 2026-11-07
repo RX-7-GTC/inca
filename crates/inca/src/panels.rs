@@ -1612,6 +1612,44 @@ fn ae_target(app: &mut IncaApp) -> Option<String> {
     app.s.lead().cloned()
 }
 
+/// Attribute Editor view for a material or texture picked in the Hypershade/Hypergraph.
+fn shading_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
+    let Some(id) = app.snode_sel.clone() else { return };
+    let mut tabs: Vec<(String, NodeRef)> = vec![];
+    if let Some(m) = app.s.mats.get(&id) {
+        tabs.push((m.name.clone(), NodeRef::Material(id.clone())));
+        let mut seen: Vec<String> = vec![];
+        for tid in m.maps.values().filter_map(|v| v.as_str()).map(String::from) {
+            if !seen.contains(&tid) {
+                if let Some(t) = app.s.texs.get(&tid) {
+                    tabs.push((t.name.clone(), NodeRef::Texture(tid.clone())));
+                }
+                seen.push(tid);
+            }
+        }
+    } else if let Some(t) = app.s.texs.get(&id) {
+        tabs.push((t.name.clone(), NodeRef::Texture(id.clone())));
+    } else {
+        app.snode_sel = None;
+        return;
+    }
+    let mut tab = app.panels.ae_tab.min(tabs.len().saturating_sub(1));
+    ui.horizontal_wrapped(|ui| {
+        for (i, (t, _)) in tabs.iter().enumerate() {
+            if ui.selectable_label(tab == i, t).clicked() {
+                tab = i;
+            }
+        }
+    });
+    app.panels.ae_tab = tab;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("node:").color(theme::TEXT_DIM));
+        ui.label(RichText::new(&tabs[tab].0).strong());
+    });
+    let h = ui.available_height() - 26.0;
+    egui::ScrollArea::vertical().id_salt("aescroll_snode").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
+}
+
 pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
     let target = ae_target(app);
@@ -1656,6 +1694,10 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
     });
+    if app.snode_sel.is_some() {
+        shading_attribute_editor(app, ui);
+        return;
+    }
     let Some(id) = target else {
         ui.label(RichText::new("Select an object to see its attributes.").color(theme::TEXT_DIM));
         return;
@@ -1851,7 +1893,15 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
             }
         }
         NodeRef::Material(mid) => crate::windows::material_editor(app, ui, mid, true),
-        NodeRef::Texture(_) => {}
+        NodeRef::Texture(tid) => {
+            let ty = app.s.texs.get(tid).map(|t| t.ty.clone()).unwrap_or_default();
+            texture_fields_editor(app, ui, tid, &ty);
+            if ty == "file" && ui.button("Browse image...").clicked() {
+                if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "hdr"]).pick_file() {
+                    app.s.set_attr(&NodeRef::Texture(tid.clone()), "fileTextureName", json!(p.to_string_lossy()));
+                }
+            }
+        }
     }
 }
 

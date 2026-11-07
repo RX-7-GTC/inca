@@ -454,7 +454,7 @@ pub fn build_mesh_buffers(pm: &PolyMesh, color_of: &dyn Fn(Option<&String>) -> [
                     Some(t) => t.uv_xf.map(|x| x.uv(raw)),
                     None => [raw; 7],
                 };
-                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col, uv: uvs[0], uv_rough: uvs[1], uv_metal: uvs[2], uv_emit: uvs[3], uv_alpha: uvs[4], uv_spec: uvs[5], uv_bump: uvs[6], tex: texv, emission, aux, extra });
+                tris.push(MeshVertex { pos: to_f32(pm.v[f[c] as usize]), normal: to_f32(normals[fi][c]), color: col, uv: uvs[0], uv_rough: uvs[1], uv_metal: uvs[2], uv_emit: uvs[3], uv_alpha: uvs[4], uv_spec: uvs[5], uv_bump: uvs[6], tex: texv, emission, aux, extra, alpha_src: tex.map(|t| t.alpha_src as f32).unwrap_or(0.0) });
             }
         }
     }
@@ -846,6 +846,9 @@ pub struct MatTex {
     /// JS `max(a.emission, 0.0001)` for a Standard Surface emission map (1 otherwise).
     pub emission_scale: f32,
     pub bump_scale: f32,
+    /// Bits for maps connected from `outAlpha`: color, roughness, metalness, emission,
+    /// alpha/opacity, specular, bump. Those channels sample alpha instead of RGB.
+    pub alpha_src: u8,
     /// Per-channel UV transforms in the order color, roughness, metalness, emission, alpha,
     /// specular, bump (the same order as the map slots in `mesh_textures`).
     pub uv_xf: [UvXf; 7],
@@ -853,7 +856,7 @@ pub struct MatTex {
 
 impl Default for MatTex {
     fn default() -> Self {
-        MatTex { color: None, roughness: None, metalness: None, emission: None, alpha: None, specular: None, bump: None, tint: 1.0, emission_scale: 1.0, bump_scale: 1.0, uv_xf: [UvXf::default(); 7] }
+        MatTex { color: None, roughness: None, metalness: None, emission: None, alpha: None, specular: None, bump: None, tint: 1.0, emission_scale: 1.0, bump_scale: 1.0, alpha_src: 0, uv_xf: [UvXf::default(); 7] }
     }
 }
 
@@ -866,11 +869,11 @@ fn ensure_texture(g: &mut crate::viewport::gpu::Gpu, s: &Scene, t: &inca_core::m
     g.texture_layer(&t.id, h.finish(), || inca_core::materials::viewport_texture_pixels(t, project.as_deref()))
 }
 
-fn texture_slot<'a>(g: &mut crate::viewport::gpu::Gpu, s: &'a Scene, mat: &inca_core::materials::Material, slot: &str) -> Option<(&'a inca_core::materials::Texture, u32)> {
+fn texture_slot<'a>(g: &mut crate::viewport::gpu::Gpu, s: &'a Scene, mat: &inca_core::materials::Material, slot: &str) -> Option<(&'a inca_core::materials::Texture, u32, bool)> {
     let tid = mat.maps.get(slot)?.as_str()?;
     let t = s.texs.get(tid)?;
     let layer = ensure_texture(g, s, t)?;
-    Some((t, layer))
+    Some((t, layer, mat.map_out(slot) == "outAlpha"))
 }
 
 /// Map layers of every material used by a mesh (empty = no maps).
@@ -905,15 +908,24 @@ fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::sc
                 texture_slot(g, s, mat, "bump"),
             ),
         };
+        let mut alpha_src = 0u8;
+        let mut take = |bit: u8, s: Option<(&inca_core::materials::Texture, u32, bool)>| -> Option<u32> {
+            let (_, layer, alpha) = s?;
+            if alpha {
+                alpha_src |= 1 << bit;
+            }
+            Some(layer)
+        };
         let mut mt = MatTex::default();
-        mt.color = color.map(|(_, l)| l);
-        mt.roughness = rough.map(|(_, l)| l);
-        mt.metalness = metal.map(|(_, l)| l);
-        mt.emission = emission_slot.map(|(_, l)| l);
-        mt.alpha = alpha.map(|(_, l)| l);
-        mt.specular = spec.map(|(_, l)| l);
-        mt.bump = bump.map(|(_, l)| l);
-        mt.uv_xf = [color, rough, metal, emission_slot, alpha, spec, bump].map(|s| UvXf::from_texture(s.map(|(t, _)| t)));
+        mt.color = take(0, color);
+        mt.roughness = take(1, rough);
+        mt.metalness = take(2, metal);
+        mt.emission = take(3, emission_slot);
+        mt.alpha = take(4, alpha);
+        mt.specular = take(5, spec);
+        mt.bump = take(6, bump);
+        mt.alpha_src = alpha_src;
+        mt.uv_xf = [color, rough, metal, emission_slot, alpha, spec, bump].map(|s| UvXf::from_texture(s.map(|(t, _, _)| t)));
         mt.tint = tex_tint(mat);
         if mat.ty == "standardSurface" {
             mt.emission_scale = mat.attrs.get("emission").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0001) as f32;
@@ -974,6 +986,7 @@ pub fn mesh_key(s: &Scene, id: &str, divisions: u32) -> u64 {
                     if let Some(t) = mat.maps.get(*slot).and_then(|v| v.as_str()).and_then(|tid| s.texs.get(tid)) {
                         t.id.hash(&mut h);
                         t.ty.hash(&mut h);
+                        mat.map_out(slot).hash(&mut h);
                         serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
                     }
                 }

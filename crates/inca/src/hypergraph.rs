@@ -711,8 +711,9 @@ fn graph(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             None => {
                 if let Some(i) = hovered.filter(|i| boxes[*i].material) {
-                    app.hg.active_key = Some(boxes[i].key.clone());
-                    app.windows_state.hs_selected = Some(boxes[i].key.clone());
+                    let mid = boxes[i].key.clone();
+                    app.hg.active_key = Some(mid.clone());
+                    crate::hypershade::select_shading_node(app, &mid);
                     app.win.hypershade = true;
                 } else if !shift {
                     app.select_names(&[], SelMode::Replace);
@@ -1427,8 +1428,10 @@ fn input_conn(s: &Scene, dst: &NodeRef, attr: &str) -> Option<(String, String, b
         return input_conn(s, &target, &target_attr);
     }
     if let NodeRef::Material(mid) = dst {
-        if let Some(tid) = s.mats.get(mid).and_then(|m| m.maps.get(attr)).and_then(|v| v.as_str()) {
-            return Some((tid.to_string(), "outColor".into(), true));
+        if let Some(m) = s.mats.get(mid) {
+            if let Some(tid) = m.maps.get(attr).and_then(|v| v.as_str()) {
+                return Some((tid.to_string(), m.map_out(attr).to_string(), true));
+            }
         }
     }
     let did = s.ref_id(dst);
@@ -1444,8 +1447,8 @@ fn output_wired(s: &Scene, src: &NodeRef, attr: &str) -> bool {
     if s.conns.iter().any(|c| c.src == sid && c.src_attr == attr) {
         return true;
     }
-    if matches!(src, NodeRef::Texture(_)) && attr == "outColor" {
-        return s.mats.values().any(|m| m.maps.values().any(|v| v.as_str() == Some(sid.as_str())));
+    if matches!(src, NodeRef::Texture(_)) {
+        return s.mats.values().any(|m| m.maps.iter().any(|(slot, v)| v.as_str() == Some(sid.as_str()) && m.map_out(slot) == attr));
     }
     false
 }

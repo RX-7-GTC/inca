@@ -45,11 +45,13 @@ pub struct MeshVertex {
     pub uv_alpha: [f32; 2],
     pub uv_spec: [f32; 2],
     pub uv_bump: [f32; 2],
+    /// Bitmask of maps connected from `outAlpha` (see `MatTex::alpha_src`).
+    pub alpha_src: f32,
 }
 
 impl Default for MeshVertex {
     fn default() -> Self {
-        MeshVertex { pos: [0.0; 3], normal: [0.0; 3], color: [0.0; 3], uv: [0.0; 2], tex: [-1.0, 1.0], emission: [0.0; 3], aux: [-1.0; 4], extra: [-1.0, -1.0, 1.0, 1.0], uv_rough: [0.0; 2], uv_metal: [0.0; 2], uv_emit: [0.0; 2], uv_alpha: [0.0; 2], uv_spec: [0.0; 2], uv_bump: [0.0; 2] }
+        MeshVertex { pos: [0.0; 3], normal: [0.0; 3], color: [0.0; 3], uv: [0.0; 2], tex: [-1.0, 1.0], emission: [0.0; 3], aux: [-1.0; 4], extra: [-1.0, -1.0, 1.0, 1.0], uv_rough: [0.0; 2], uv_metal: [0.0; 2], uv_emit: [0.0; 2], uv_alpha: [0.0; 2], uv_spec: [0.0; 2], uv_bump: [0.0; 2], alpha_src: 0.0 }
     }
 }
 
@@ -610,7 +612,7 @@ impl Gpu {
             ..Default::default()
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("inca"), bind_group_layouts: &[Some(&frame_bgl), Some(&draw_bgl), Some(&tex_bgl), Some(&shadow_bgl)], immediate_size: 0 });
-        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2, 5 => Float32x3, 6 => Float32x4, 7 => Float32x4, 8 => Float32x2, 9 => Float32x2, 10 => Float32x2, 11 => Float32x2, 12 => Float32x2, 13 => Float32x2];
+        let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2, 5 => Float32x3, 6 => Float32x4, 7 => Float32x4, 8 => Float32x2, 9 => Float32x2, 10 => Float32x2, 11 => Float32x2, 12 => Float32x2, 13 => Float32x2, 14 => Float32];
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
         let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };

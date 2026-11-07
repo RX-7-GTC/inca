@@ -165,6 +165,9 @@ pub struct IncaApp {
     pub right_tab: RightTab,
     pub show_right: bool,
     pub show_outliner: bool,
+    /// Material or texture selected in the Hypershade/Hypergraph. Mutually exclusive with
+    /// `s.sel`, like Maya's single selection: one Attribute Editor target at a time.
+    pub snode_sel: Option<String>,
     /// UI elements switched off (workspace::ELEMENTS keys)
     pub hidden: std::collections::BTreeSet<String>,
     /// what Ctrl+Space hid, to bring back
@@ -375,6 +378,7 @@ impl IncaApp {
             win: Windows::default(),
             right_tab: cc.storage.and_then(|s| eframe::get_value(s, "rightTab")).unwrap_or(RightTab::ChannelBox),
             show_right: cc.storage.and_then(|s| eframe::get_value(s, "showRight")).unwrap_or(true),
+            snode_sel: None,
             show_outliner: cc.storage.and_then(|s| eframe::get_value(s, "showOutliner")).unwrap_or(false),
             hidden: cc.storage.and_then(|s| eframe::get_value(s, "hiddenUi")).unwrap_or_default(),
             ui_stash: None,
@@ -737,6 +741,10 @@ impl IncaApp {
     /// `select` command. The scene filters out non-selectable / templated nodes.
     pub fn select_names(&mut self, ids: &[String], mode: SelMode) {
         debug_assert!(ids.iter().all(|i| self.s.nodes.contains_key(i)), "select_names expects node IDs, not names");
+        // The viewport/outliner and the Hypershade share one AE target, like Maya.
+        self.snode_sel = None;
+        self.windows_state.hs_selected = None;
+        self.windows_state.hs.graph_sel.clear();
         let names: Vec<String> = ids.iter().map(|i| self.s.name_of(i)).collect();
         let flag = match mode {
             SelMode::Replace => "-r",
@@ -961,6 +969,13 @@ impl eframe::App for IncaApp {
             self.fps_measured = self.fps_measured * 0.9 + 0.1 / dt;
         }
         self.hotkeys(&ctx);
+        // One selection, like Maya: a scene selection (also set by MEL) wins over a stale
+        // Hypershade shading-node selection.
+        if self.snode_sel.is_some() && !self.s.sel.is_empty() {
+            self.snode_sel = None;
+            self.windows_state.hs_selected = None;
+            self.windows_state.hs.graph_sel.clear();
+        }
         // constraints follow their targets live (gizmo drags, channel edits)
         crate::prefs::apply(self, &ctx);
         crate::anim_extras::tick(self, &ctx);

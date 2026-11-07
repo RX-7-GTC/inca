@@ -159,6 +159,8 @@ struct MeshIn {
     @location(11) uv_alpha: vec2<f32>,
     @location(12) uv_spec: vec2<f32>,
     @location(13) uv_bump: vec2<f32>,
+    /// bitmask of maps connected from outAlpha (color, rough, metal, emission, alpha, spec, bump)
+    @location(14) alpha_src: f32,
 };
 struct MeshOut {
     @builtin(position) clip: vec4<f32>,
@@ -176,6 +178,7 @@ struct MeshOut {
     @location(11) uv_alpha: vec2<f32>,
     @location(12) uv_spec: vec2<f32>,
     @location(13) uv_bump: vec2<f32>,
+    @location(14) @interpolate(flat) alpha_src: u32,
 };
 
 @vertex
@@ -197,6 +200,7 @@ fn vs_mesh(v: MeshIn) -> MeshOut {
     o.uv_alpha = v.uv_alpha;
     o.uv_spec = v.uv_spec;
     o.uv_bump = v.uv_bump;
+    o.alpha_src = u32(v.alpha_src);
     return o;
 }
 
@@ -210,6 +214,15 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     let lo = c / 12.92;
     let hi = pow((max(c, vec3(0.0)) + 0.055) / 1.055, vec3(2.4));
     return select(hi, lo, c <= vec3(0.04045));
+}
+
+// outAlpha connections use the alpha channel; outColor connections use RGB.
+fn map_vec3(texel: vec4<f32>, alpha: bool) -> vec3<f32> {
+    return select(texel.rgb, texel.aaa, alpha);
+}
+
+fn map_scalar(texel: vec4<f32>, alpha: bool, fallback: f32) -> f32 {
+    return select(fallback, texel.a, alpha);
 }
 
 // ---------------------------------------------------------------- tone mapping
@@ -424,13 +437,18 @@ fn ibl_sheen_brdf(n: vec3<f32>, v: vec3<f32>, rough: f32) -> f32 {
 
 // three.js `bumpmap_pars_fragment`: perturb the normal from the screen-space derivative of the
 // height map. Explicit LOD sampling keeps this valid when only some faces have a bump map.
-fn bump_normal(n_in: vec3<f32>, world: vec3<f32>, uv: vec2<f32>, layer: i32, scale: f32) -> vec3<f32> {
+fn bump_height(uv: vec2<f32>, layer: i32, alpha: bool) -> f32 {
+    let t = textureSampleLevel(tex_array, tex_samp, uv, layer, 0.0);
+    return select(t.r, t.a, alpha);
+}
+
+fn bump_normal(n_in: vec3<f32>, world: vec3<f32>, uv: vec2<f32>, layer: i32, scale: f32, alpha: bool) -> vec3<f32> {
     let n = normalize(n_in);
     let dx = dpdx(uv);
     let dy = dpdy(uv);
-    let h = textureSampleLevel(tex_array, tex_samp, uv, layer, 0.0).r;
-    let hx = textureSampleLevel(tex_array, tex_samp, uv + dx, layer, 0.0).r;
-    let hy = textureSampleLevel(tex_array, tex_samp, uv + dy, layer, 0.0).r;
+    let h = bump_height(uv, layer, alpha);
+    let hx = bump_height(uv + dx, layer, alpha);
+    let hy = bump_height(uv + dy, layer, alpha);
     let dhdx = (hx - h) * scale;
     let dhdy = (hy - h) * scale;
     let sx = dpdx(world);
@@ -605,36 +623,37 @@ fn fs_mesh(i: MeshOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32
     // Hardware Texturing: every channel `applyAttrs` assigns to the textured material. The branch
     // is uniform per draw, so implicit derivatives (mip selection, bump) are well defined.
     if (draw.params2.w > 0.5) {
-        let color_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.tex.x, 0.0))).rgb;
-        let rough_texel = textureSample(tex_array, tex_samp, i.uv_rough, i32(max(i.aux.x, 0.0))).g;
-        let metal_texel = textureSample(tex_array, tex_samp, i.uv_metal, i32(max(i.aux.y, 0.0))).b;
-        let emission_texel = textureSample(tex_array, tex_samp, i.uv_emit, i32(max(i.aux.z, 0.0))).rgb;
-        let alpha_texel = textureSample(tex_array, tex_samp, i.uv_alpha, i32(max(i.aux.w, 0.0))).g;
-        let spec_texel = textureSample(tex_array, tex_samp, i.uv_spec, i32(max(i.extra.x, 0.0))).rgb;
+        let flags = i.alpha_src;
+        let color_texel = textureSample(tex_array, tex_samp, i.uv, i32(max(i.tex.x, 0.0)));
+        let rough_texel = textureSample(tex_array, tex_samp, i.uv_rough, i32(max(i.aux.x, 0.0)));
+        let metal_texel = textureSample(tex_array, tex_samp, i.uv_metal, i32(max(i.aux.y, 0.0)));
+        let emission_texel = textureSample(tex_array, tex_samp, i.uv_emit, i32(max(i.aux.z, 0.0)));
+        let alpha_texel = textureSample(tex_array, tex_samp, i.uv_alpha, i32(max(i.aux.w, 0.0)));
+        let spec_texel = textureSample(tex_array, tex_samp, i.uv_spec, i32(max(i.extra.x, 0.0)));
         if (i.tex.x >= 0.0) {
             // `m.color = white * base/diffuse`, so the map is tinted by the material scalar
-            base = color_texel * i.tex.y;
+            base = map_vec3(color_texel, (flags & 1u) != 0u) * i.tex.y;
         }
         if (i.aux.x >= 0.0) {
-            // three.js roughnessMap reads G and multiplies the material roughness
-            rough = clamp(rough * rough_texel, 0.03, 1.0);
+            // three.js roughnessMap reads G; outAlpha uses alpha instead
+            rough = clamp(rough * map_scalar(rough_texel, (flags & 2u) != 0u, rough_texel.g), 0.03, 1.0);
         }
         if (i.aux.y >= 0.0) {
-            // three.js metalnessMap reads B
-            metal = clamp(metal * metal_texel, 0.0, 1.0);
+            // three.js metalnessMap reads B; outAlpha uses alpha instead
+            metal = clamp(metal * map_scalar(metal_texel, (flags & 4u) != 0u, metal_texel.b), 0.0, 1.0);
         }
         if (i.aux.z >= 0.0) {
-            emission = emission * emission_texel;
+            emission = emission * map_vec3(emission_texel, (flags & 8u) != 0u);
         }
         if (i.aux.w >= 0.0) {
-            // three.js alphaMap reads G and multiplies the material opacity
-            alpha = alpha * alpha_texel;
+            // three.js alphaMap reads G; outAlpha uses alpha instead
+            alpha = alpha * map_scalar(alpha_texel, (flags & 16u) != 0u, alpha_texel.g);
         }
         if (i.extra.x >= 0.0) {
-            tint = tint * spec_texel;
+            tint = tint * map_vec3(spec_texel, (flags & 32u) != 0u);
         }
         if (i.extra.y >= 0.0) {
-            n = bump_normal(n, i.world, i.uv_bump, i32(i.extra.y), i.extra.w);
+            n = bump_normal(n, i.world, i.uv_bump, i32(i.extra.y), i.extra.w, (flags & 64u) != 0u);
         }
     }
     var c = base;

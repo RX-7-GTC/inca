@@ -52,6 +52,9 @@ pub struct Material {
     /// attribute -> texture id
     #[serde(default)]
     pub maps: Params,
+    /// attribute -> texture output ("outAlpha"); absent means outColor
+    #[serde(rename = "mapOuts", default, skip_serializing_if = "Params::is_empty")]
+    pub map_outs: Params,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -128,7 +131,26 @@ impl Default for Pbr {
 
 impl Material {
     pub fn new(id: String, name: String, ty: &str) -> Self {
-        Material { id, name, ty: ty.into(), attrs: defaults_for(ty), maps: Params::new() }
+        Material { id, name, ty: ty.into(), attrs: defaults_for(ty), maps: Params::new(), map_outs: Params::new() }
+    }
+
+    /// Source output of a texture map: "outAlpha", or "outColor" by default.
+    pub fn map_out(&self, slot: &str) -> &str {
+        self.map_outs.get(slot).and_then(|v| v.as_str()).unwrap_or("outColor")
+    }
+
+    pub fn set_map(&mut self, slot: &str, tex: &str, out: &str) {
+        self.maps.insert(slot.to_string(), json!(tex));
+        if out == "outAlpha" {
+            self.map_outs.insert(slot.to_string(), json!("outAlpha"));
+        } else {
+            self.map_outs.remove(slot);
+        }
+    }
+
+    pub fn clear_map(&mut self, slot: &str) {
+        self.maps.remove(slot);
+        self.map_outs.remove(slot);
     }
 
     pub fn pbr(&self) -> Pbr {
