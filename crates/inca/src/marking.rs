@@ -341,11 +341,19 @@ fn run(app: &mut IncaApp, act: Act) {
         }
         Act::HypershadeCreateMaterial(ty) => {
             let _ = app.run_mel("create material", &format!("shadingNode -asShader {ty};"));
-            app.windows_state.hs_selected = app.s.mats.keys().last().cloned();
+            if let Some(id) = app.s.mats.keys().last().cloned() {
+                let at = app.windows_state.hs.create_pos.take();
+                crate::hypershade::place_new_node(app, &id, at);
+                app.windows_state.hs_selected = Some(id);
+            }
         }
         Act::HypershadeCreateTexture(ty) => {
             let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {ty};"));
-            app.windows_state.hs_selected = app.s.texs.keys().last().cloned();
+            if let Some(id) = app.s.texs.keys().last().cloned() {
+                let at = app.windows_state.hs.create_pos.take();
+                crate::hypershade::place_new_node(app, &id, at);
+                app.windows_state.hs_selected = Some(id);
+            }
         }
         Act::HypershadeFrameAll => app.windows_state.hs.frame = Some(false),
         Act::HypershadeFrameSelected => app.windows_state.hs.frame = Some(true),

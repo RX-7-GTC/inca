@@ -48,6 +48,8 @@ pub struct HsState {
     pan: Vec2,
     zoom: f32,
     pub(crate) graph_sel: HashSet<String>,
+    /// Consecutive creations with no free spot; offsets the overlap so the nodes stay visible.
+    overflow: u32,
     drag_start: Option<Vec<(String, Pos2)>>,
     marquee: Option<(Pos2, Pos2)>,
     marquee_base: HashSet<String>,
@@ -60,6 +62,8 @@ pub struct HsState {
     pub create_filter: String,
     pub rename: Option<(String, String)>,
     pub rename_pos: Option<Pos2>,
+    /// Screen position where the empty marking menu was opened; new nodes go there.
+    pub(crate) create_pos: Option<Pos2>,
     pub palette_drag: Option<String>,
     pub graph_rect: Option<Rect>,
     pub window_rect: Option<Rect>,
@@ -72,6 +76,7 @@ impl Default for HsState {
             pan: vec2(20.0, 20.0),
             zoom: 1.0,
             graph_sel: HashSet::new(),
+            overflow: 0,
             drag_start: None,
             marquee: None,
             marquee_base: HashSet::new(),
@@ -84,10 +89,89 @@ impl Default for HsState {
             create_filter: String::new(),
             rename: None,
             rename_pos: None,
+            create_pos: None,
             palette_drag: None,
             graph_rect: None,
             window_rect: None,
         }
+    }
+}
+
+/// Place a freshly created material or texture near `at` (screen position) or the view center,
+/// avoiding the visible nodes. Falls back to the preferred spot when the view is full.
+pub(crate) fn place_new_node(app: &mut IncaApp, id: &str, at: Option<Pos2>) {
+    let (size, material) = if let Some(m) = app.s.mats.get(id) {
+        let rows = inca_core::materials::mat_type(&m.ty).mappable.len() + 1;
+        let h = HEAD_H + SWATCH + 6.0 + ROW_H * rows as f32 + 4.0;
+        let sg_h = HEAD_H + SWATCH + 6.0 + ROW_H + 4.0;
+        (vec2(NODE_W * 2.0 + 36.0, h.max(sg_h)), true)
+    } else if app.s.texs.contains_key(id) {
+        (vec2(NODE_W, HEAD_H + SWATCH + 6.0 + ROW_H * 2.0 + 4.0), false)
+    } else {
+        return;
+    };
+    let Some(rect) = app.windows_state.hs.graph_rect else { return };
+    let (pan, zoom) = (app.windows_state.hs.pan, app.windows_state.hs.zoom);
+    let to_graph = |q: Pos2| {
+        let v = (q - rect.min - pan) / zoom;
+        pos2(v.x, v.y)
+    };
+    let occupied: Vec<Rect> = {
+        let sg_id = format!("sg:{id}");
+        graph_nodes(app)
+            .iter()
+            .filter(|n| n.id != id && (!material || n.id != sg_id))
+            .filter_map(|n| app.windows_state.hs.pos.get(&n.id).map(|p| Rect::from_min_size(*p, vec2(NODE_W, node_h(n))).expand(8.0)))
+            .collect()
+    };
+    let lo = (-pan) / zoom;
+    let hi = (rect.size() - pan) / zoom;
+    let (min_x, max_x) = (lo.x, (hi.x - size.x).max(lo.x));
+    let (min_y, max_y) = (lo.y, (hi.y - size.y).max(lo.y));
+    let preferred = if let Some(q) = at {
+        let g = to_graph(q);
+        pos2(g.x - NODE_W * 0.5, g.y)
+    } else {
+        let v = (rect.center() - rect.min - pan) / zoom;
+        pos2(v.x - size.x * 0.5, v.y - size.y * 0.5)
+    };
+    let preferred = pos2(preferred.x.clamp(min_x, max_x), preferred.y.clamp(min_y, max_y));
+    let hits = |p: Pos2| occupied.iter().any(|r| r.intersects(Rect::from_min_size(p, size)));
+    let mut best: Option<(f32, Pos2)> = (!hits(preferred)).then_some((0.0, preferred));
+    if best.is_none() {
+        let step = 24.0;
+        let mut x = min_x;
+        while x <= max_x {
+            let mut y = min_y;
+            while y <= max_y {
+                let p = pos2(x, y);
+                if !hits(p) {
+                    let d = (p - preferred).length_sq();
+                    if best.is_none_or(|(bd, _)| d < bd) {
+                        best = Some((d, p));
+                    }
+                }
+                y += step;
+            }
+            x += step;
+        }
+    }
+    let (p, free) = match best {
+        Some((_, p)) => (p, true),
+        None => {
+            // The view is full. Cascade the overlap diagonally so the stacked nodes are visible.
+            let k = (app.windows_state.hs.overflow % 10 + 1) as f32;
+            let step = 20.0;
+            let dx = if preferred.x + size.x + step * k <= hi.x { step } else { -step };
+            let dy = if preferred.y + size.y + step * k <= hi.y { step } else { -step };
+            let p = pos2(preferred.x + dx * k, preferred.y + dy * k);
+            (pos2(p.x.clamp(min_x, max_x), p.y.clamp(min_y, max_y)), false)
+        }
+    };
+    app.windows_state.hs.overflow = if free { 0 } else { app.windows_state.hs.overflow + 1 };
+    app.windows_state.hs.pos.insert(id.to_string(), p);
+    if material {
+        app.windows_state.hs.pos.insert(format!("sg:{id}"), p + vec2(NODE_W + 36.0, 0.0));
     }
 }
 
@@ -532,6 +616,7 @@ fn open_node_marking(app: &mut IncaApp, id: &str, pos: Pos2, now: f64) {
 }
 
 fn open_empty_marking(app: &mut IncaApp, pos: Pos2, now: f64) {
+    app.windows_state.hs.create_pos = Some(pos);
     let mats = MAT_TYPES.iter().map(|t| menu_item(t.label, Act::HypershadeCreateMaterial(t.ty.into()))).collect();
     let texs = TEX_TYPES.iter().map(|t| menu_item(t.label, Act::HypershadeCreateTexture(t.ty.into()))).collect();
     let radial = vec![
@@ -642,7 +727,10 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             if ui.small_button(t.label).on_hover_text(format!("Create a {} material", t.label)).clicked() {
                 let _ = app.run_mel("create material", &format!("shadingNode -asShader {};", t.ty));
-                app.windows_state.hs_selected = app.s.mats.keys().last().cloned();
+                if let Some(id) = app.s.mats.keys().last().cloned() {
+                    place_new_node(app, &id, None);
+                    app.windows_state.hs_selected = Some(id);
+                }
             }
         }
         ui.separator();
@@ -652,7 +740,10 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             if ui.small_button(t.label).on_hover_text(format!("Create a {} texture", t.label)).clicked() {
                 let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {};", t.ty));
-                app.windows_state.hs_selected = app.s.texs.keys().last().cloned();
+                if let Some(id) = app.s.texs.keys().last().cloned() {
+                    place_new_node(app, &id, None);
+                    app.windows_state.hs_selected = Some(id);
+                }
             }
         }
     });

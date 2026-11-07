@@ -391,6 +391,7 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_nam
                     if ui.button(format!("New {}", t.label)).clicked() {
                         app.s.checkpoint("connect texture");
                         let tid = app.s.create_texture(t.ty, None);
+                        crate::hypershade::place_new_node(app, &tid, None);
                         app.s.mats.get_mut(mid).unwrap().set_map(slot, &tid, "outColor");
                         app.s.touch();
                     }
