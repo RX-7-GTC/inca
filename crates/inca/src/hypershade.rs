@@ -48,6 +48,8 @@ pub struct HsState {
     pan: Vec2,
     zoom: f32,
     pub(crate) graph_sel: HashSet<String>,
+    /// Nodes explicitly in the work area. `None` = show every shading node (overview mode).
+    pub(crate) graph_ids: Option<HashSet<String>>,
     /// Draw order: higher values are painted on top.
     z: HashMap<String, u64>,
     z_next: u64,
@@ -58,7 +60,6 @@ pub struct HsState {
     marquee_base: HashSet<String>,
     pub(crate) frame: Option<bool>,
     wire: Option<Wire>,
-    pub selected_only: bool,
     swatches: HashMap<String, (u64, egui::TextureHandle)>,
     pub tab: usize,
     pub filter: String,
@@ -79,6 +80,7 @@ impl Default for HsState {
             pan: vec2(20.0, 20.0),
             zoom: 1.0,
             graph_sel: HashSet::new(),
+            graph_ids: None,
             z: HashMap::new(),
             z_next: 0,
             overflow: 0,
@@ -87,7 +89,6 @@ impl Default for HsState {
             marquee_base: HashSet::new(),
             frame: None,
             wire: None,
-            selected_only: false,
             swatches: HashMap::new(),
             tab: 0,
             filter: String::new(),
@@ -129,6 +130,9 @@ pub(crate) fn place_new_node(app: &mut IncaApp, id: &str, at: Option<Pos2>) {
     } else {
         return;
     };
+    if let Some(graph) = &mut app.windows_state.hs.graph_ids {
+        graph.insert(id.to_string());
+    }
     let Some(rect) = app.windows_state.hs.graph_rect else { return };
     let (pan, zoom) = (app.windows_state.hs.pan, app.windows_state.hs.zoom);
     let to_graph = |q: Pos2| {
@@ -372,12 +376,11 @@ fn handle_palette_drop(app: &mut IncaApp, id: &str, q: Pos2) {
 }
 
 fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
-    let sel = app.windows_state.hs_selected.clone().filter(|m| app.s.mats.contains_key(m));
-    let only = app.windows_state.hs.selected_only;
-    let mats: Vec<&inca_core::materials::Material> = app.s.mats.values().filter(|m| !only || Some(&m.id) == sel.as_ref()).collect();
+    let graph = app.windows_state.hs.graph_ids.as_ref();
+    let sel = app.windows_state.hs_selected.clone().filter(|m| app.s.mats.contains_key(m) && graph.is_none_or(|ids| ids.contains(m)));
+    let mats: Vec<&inca_core::materials::Material> = app.s.mats.values().filter(|m| graph.is_none_or(|ids| ids.contains(&m.id))).collect();
     let mut out = vec![];
-    let used: Vec<String> = mats.iter().flat_map(|m| m.maps.values().filter_map(|v| v.as_str().map(String::from))).collect();
-    for t in app.s.texs.values().filter(|t| !only || used.contains(&t.id)) {
+    for t in app.s.texs.values().filter(|t| graph.is_none_or(|ids| ids.contains(&t.id))) {
         out.push(GNode {
             id: t.id.clone(),
             kind: Kind::Texture,
@@ -398,6 +401,97 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
         }
     }
     out
+}
+
+/// Shading nodes selected in the work area, or the current Hypershade lead.
+fn selected_shading_ids(app: &IncaApp) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for id in &app.windows_state.hs.graph_sel {
+        let base = id.strip_prefix("sg:").unwrap_or(id);
+        if app.s.mats.contains_key(base) || app.s.texs.contains_key(base) {
+            ids.insert(base.to_string());
+        }
+    }
+    if ids.is_empty() {
+        if let Some(id) = app.snode_sel.as_ref().or(app.windows_state.hs_selected.as_ref()) {
+            if app.s.mats.contains_key(id) || app.s.texs.contains_key(id) {
+                ids.insert(id.clone());
+            }
+        }
+    }
+    ids
+}
+
+/// Replace the work area with the network of the selected objects or shading node.
+fn graph_selected_network(app: &mut IncaApp) {
+    let mut seeds: Vec<String> = vec![];
+    if let Some(id) = app.snode_sel.clone() {
+        seeds.push(id);
+    }
+    if seeds.is_empty() {
+        if let Some(id) = app.windows_state.hs_selected.clone() {
+            if app.s.mats.contains_key(&id) || app.s.texs.contains_key(&id) {
+                seeds.push(id);
+            }
+        }
+    }
+    if seeds.is_empty() {
+        for oid in app.s.sel.clone() {
+            for id in app.s.subtree(&oid) {
+                let Some(mesh) = app.s.node(&id).and_then(|n| n.mesh()) else { continue };
+                seeds.push(mesh.material.clone());
+                if let Some(fm) = &mesh.mesh.fm {
+                    seeds.extend(fm.iter().flatten().cloned());
+                }
+            }
+        }
+    }
+    let mut ids = HashSet::new();
+    for id in seeds {
+        if app.s.mats.contains_key(&id) {
+            ids.insert(id.clone());
+            if let Some(m) = app.s.mats.get(&id) {
+                for t in m.maps.values().filter_map(|v| v.as_str()) {
+                    if app.s.texs.contains_key(t) {
+                        ids.insert(t.to_string());
+                    }
+                }
+            }
+        } else if app.s.texs.contains_key(&id) {
+            ids.insert(id);
+        }
+    }
+    if ids.is_empty() {
+        app.warn("Select an object or shading node to graph its network.");
+        return;
+    }
+    app.windows_state.hs.graph_ids = Some(ids);
+    app.windows_state.hs.graph_sel.clear();
+    app.windows_state.hs.frame = Some(false);
+}
+
+fn add_selected_to_graph(app: &mut IncaApp) {
+    let ids = selected_shading_ids(app);
+    if ids.is_empty() {
+        app.warn("Select a material or texture to add to the graph.");
+        return;
+    }
+    if let Some(graph) = &mut app.windows_state.hs.graph_ids {
+        graph.extend(ids);
+    }
+}
+
+fn remove_selected_from_graph(app: &mut IncaApp) {
+    let ids = selected_shading_ids(app);
+    if ids.is_empty() {
+        return;
+    }
+    if let Some(graph) = &mut app.windows_state.hs.graph_ids {
+        for id in &ids {
+            graph.remove(id);
+        }
+    }
+    app.windows_state.hs.graph_sel.retain(|id| !ids.contains(id.strip_prefix("sg:").unwrap_or(id)));
 }
 
 fn port_top(n: &GNode) -> f32 {
@@ -530,6 +624,9 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
         app.windows_state.hs.pos.remove(&format!("sg:{id}"));
         app.windows_state.hs.graph_sel.remove(id);
         app.windows_state.hs.graph_sel.remove(&format!("sg:{id}"));
+        if let Some(graph) = &mut app.windows_state.hs.graph_ids {
+            graph.remove(id);
+        }
         if app.windows_state.hs_selected.as_deref() == Some(id.as_str()) {
             app.windows_state.hs_selected = None;
         }
@@ -595,6 +692,10 @@ pub(crate) fn duplicate_shading_network(app: &mut IncaApp, mid: &str) {
         nm.map_outs = m.map_outs.clone();
     }
     app.s.touch();
+    if let Some(graph) = &mut app.windows_state.hs.graph_ids {
+        graph.insert(nid.clone());
+        graph.extend(remap.values().cloned());
+    }
     app.echo(format!("duplicate -upstreamNodes {};", m.name));
     app.windows_state.hs_selected = Some(nid.clone());
     app.windows_state.hs.graph_sel.clear();
@@ -800,6 +901,25 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             }
             "Graph" => {
+                if menu_row(app, ui, true, "Graph Network") {
+                    graph_selected_network(app);
+                }
+                let in_graph = app.windows_state.hs.graph_ids.is_some();
+                if menu_row(app, ui, in_graph, "Add Selected to Graph") {
+                    add_selected_to_graph(app);
+                }
+                if menu_row(app, ui, in_graph, "Remove Selected from Graph") {
+                    remove_selected_from_graph(app);
+                }
+                if menu_row(app, ui, true, "Clear Graph") {
+                    app.windows_state.hs.graph_ids = Some(HashSet::new());
+                    app.windows_state.hs.graph_sel.clear();
+                }
+                if menu_row(app, ui, in_graph, "Show All Nodes") {
+                    app.windows_state.hs.graph_ids = None;
+                    app.windows_state.hs.frame = Some(false);
+                }
+                ui.separator();
                 if menu_row(app, ui, true, "Rearrange") {
                     app.windows_state.hs.pos.clear();
                     app.windows_state.hs.frame = Some(false);
@@ -821,9 +941,9 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             }
             "Options" => {
-                let only = app.windows_state.hs.selected_only;
-                if crate::menus::menu_check(app, ui, only, "Graph Selected Network Only") {
-                    app.windows_state.hs.selected_only = !only;
+                let shadow = app.prefs.menu_shadow;
+                if crate::menus::menu_check(app, ui, shadow, "Drop shadow") {
+                    app.prefs.menu_shadow = !shadow;
                 }
             }
             "Help" => {
@@ -894,7 +1014,14 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Work Area").strong());
-            ui.checkbox(&mut app.windows_state.hs.selected_only, "Graph selected network only");
+            let graph_count = app.windows_state.hs.graph_ids.as_ref().map(|ids| ids.len());
+            if let Some(n) = graph_count {
+                ui.label(RichText::new(format!("{n} nodes")).color(theme::TEXT_DIM));
+                if ui.small_button("Show All").on_hover_text("Leave graph membership and show every shading node").clicked() {
+                    app.windows_state.hs.graph_ids = None;
+                    app.windows_state.hs.frame = Some(false);
+                }
+            }
             if ui.small_button("Frame All").on_hover_text("Fit the whole graph").clicked() {
                 app.windows_state.hs.frame = Some(false);
             }

@@ -637,6 +637,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             app.s.reset();
             app.echo("file -f -new;");
             app.smooth_cache.clear();
+            app.windows_state.hs.graph_ids = None;
         }
         "openScene" => {
             if let Some(p) = rfd::FileDialog::new().add_filter("Scenes", &["inca", "ma", "mb", "fbx"]).add_filter("Inca scene", &["inca"]).add_filter("Maya ASCII", &["ma"]).add_filter("FBX", &["fbx"]).set_directory(crate::project::default_dir(app, "scenes")).pick_file() {

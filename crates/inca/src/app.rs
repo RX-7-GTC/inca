@@ -781,6 +781,7 @@ impl IncaApp {
                 self.echo(format!("file -o \"{}\";", p.display()));
                 self.smooth_cache.clear();
                 self.stats_cache.clear();
+                self.windows_state.hs.graph_ids = None;
                 self.add_recent(p);
             }
             Err(e) => self.last_result = format!("// Error: {e} //"),
