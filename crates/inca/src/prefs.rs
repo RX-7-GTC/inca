@@ -5,6 +5,7 @@
 use crate::app::{IncaApp, MenuSet};
 use crate::theme;
 use egui::RichText;
+use std::path::PathBuf;
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -42,15 +43,21 @@ pub struct Prefs {
     pub manip_plane_handles: bool,
     /// show the handles on the negative axes (JS `manipNegativeHandles`)
     pub manip_negative_handles: bool,
+    /// viewport anti-aliasing samples: 1 (off) or 4
+    pub msaa: u32,
+    /// subtle menu/popup drop shadow
+    pub menu_shadow: bool,
+    /// "auto", "dx12", "vulkan", "metal" or "gl"; applied on restart
+    pub backend: String,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, follow_os_scale: false, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true }
+        Prefs { ui_scale: 1.0, follow_os_scale: false, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true, msaa: 4, menu_shadow: true, backend: "auto".into() }
     }
 }
 
-pub const CATEGORIES: &[&str] = &["Interface", "UI Elements", "Display", "Kinematics / Manipulators", "Animation", "Time Slider", "Modeling", "Settings", "Undo", "Files/Projects", "Save"];
+pub const CATEGORIES: &[&str] = &["Interface", "UI Elements", "Display", "GPU", "Kinematics / Manipulators", "Animation", "Time Slider", "Modeling", "Settings", "Undo", "Files/Projects", "Save"];
 const MENU_SETS: [(&str, MenuSet); 5] = [("Modeling", MenuSet::Modeling), ("Rigging", MenuSet::Rigging), ("Animation", MenuSet::Animation), ("FX", MenuSet::Fx), ("Rendering", MenuSet::Rendering)];
 const UNITS: [&str; 6] = ["millimeter", "centimeter", "meter", "inch", "foot", "yard"];
 const SPEEDS: [(&str, f64); 4] = [("Play every frame", 0.0), ("Real-time [fps]", 1.0), ("Half", 0.5), ("Twice", 2.0)];
@@ -64,11 +71,76 @@ impl Prefs {
     }
 }
 
+fn backend_path() -> Option<PathBuf> {
+    let dir = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("APPDATA")?).join("Inca")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/Inca")
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"))
+            .join("inca")
+    };
+    Some(dir.join("backend.txt"))
+}
+
+pub fn read_backend() -> String {
+    let Some(p) = backend_path() else { return "auto".into() };
+    let Ok(s) = std::fs::read_to_string(p) else { return "auto".into() };
+    match s.trim().to_ascii_lowercase().as_str() {
+        "dx12" | "vulkan" | "metal" | "gl" => s.trim().to_ascii_lowercase(),
+        _ => "auto".into(),
+    }
+}
+
+pub fn write_backend(v: &str) {
+    let Some(p) = backend_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(p, v);
+}
+
+/// Must run before eframe creates the wgpu instance.
+pub fn apply_backend_env() {
+    if std::env::var_os("WGPU_BACKEND").is_some() {
+        return;
+    }
+    let b = read_backend();
+    if b != "auto" {
+        std::env::set_var("WGPU_BACKEND", b);
+    }
+}
+
 /// Apply the settings that act every frame (UI scale, tooltips, grid, list sizes, time).
 pub fn apply(app: &mut IncaApp, ctx: &egui::Context) {
     // like the JS, the menu set in use is the one the next session starts with
     app.prefs.menu_set = MENU_SETS.iter().position(|m| m.1 == app.menu_set).unwrap_or(0);
+    app.prefs.msaa = match app.prefs.msaa {
+        1 | 4 => app.prefs.msaa,
+        _ => 4,
+    };
+    if app.gpu.as_ref().is_some_and(|g| g.msaa() != app.prefs.msaa) {
+        if let Some(rs) = app.gpu_rs.clone() {
+            app.gpu = Some(crate::viewport::gpu::Gpu::new(&rs, app.prefs.msaa));
+            app.vp_state.render_keys = [None; 4];
+        }
+    }
     let p = &app.prefs;
+    // Smaller blur/spread than egui's default shadows; off removes the overdraw.
+    let shadow = if p.menu_shadow {
+        egui::epaint::Shadow { offset: [2, 3], blur: 6, spread: 1, color: egui::Color32::from_black_alpha(90) }
+    } else {
+        egui::epaint::Shadow::NONE
+    };
+    let style = ctx.global_style();
+    if style.visuals.popup_shadow != shadow || style.visuals.window_shadow != shadow {
+        ctx.global_style_mut(|s| {
+            s.visuals.popup_shadow = shadow;
+            s.visuals.window_shadow = shadow;
+        });
+    }
     let native = ctx.native_pixels_per_point().unwrap_or(1.0);
     let target = if p.follow_os_scale { p.ui_scale } else { p.ui_scale / native };
     if (ctx.zoom_factor() - target).abs() > 1e-4 {
@@ -160,6 +232,9 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             row(ui, "Show tooltips", |ui| {
                 ui.checkbox(&mut app.prefs.tooltips, "");
             });
+            row(ui, "Drop shadow", |ui| {
+                ui.checkbox(&mut app.prefs.menu_shadow, "");
+            });
             row(ui, "Ask before quitting with unsaved changes", |ui| {
                 ui.checkbox(&mut app.prefs.confirm_quit, "");
             });
@@ -208,6 +283,57 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
                 ui.checkbox(v, "");
                 ui.end_row();
             }
+        }
+        "GPU" => {
+            theme::section_header(ui, "Graphics Device");
+            ui.end_row();
+            if let Some(rs) = &app.gpu_rs {
+                let i = rs.adapter.get_info();
+                row(ui, "Rendering engine", |ui| {
+                    ui.label(format!("{:?}", i.backend));
+                });
+                row(ui, "Adapter", |ui| {
+                    ui.label(&i.name);
+                });
+                row(ui, "Device type", |ui| {
+                    ui.label(format!("{:?}", i.device_type));
+                });
+                row(ui, "Driver", |ui| {
+                    ui.label(if i.driver_info.is_empty() { i.driver.clone() } else { i.driver_info.clone() });
+                });
+            } else {
+                row(ui, "Renderer", |ui| {
+                    ui.label("wgpu unavailable");
+                });
+            }
+            let (names, values): (&[&str], &[&str]) = if cfg!(windows) {
+                (&["Automatic", "DirectX 12", "Vulkan"], &["auto", "dx12", "vulkan"])
+            } else if cfg!(target_os = "macos") {
+                (&["Automatic", "Metal"], &["auto", "metal"])
+            } else {
+                (&["Automatic", "Vulkan", "OpenGL"], &["auto", "vulkan", "gl"])
+            };
+            let mut backend_idx = values.iter().position(|v| *v == app.prefs.backend).unwrap_or(0);
+            row(ui, "Backend preference", |ui| {
+                combo(ui, "pbackend", &mut backend_idx, names);
+            });
+            if values[backend_idx] != app.prefs.backend {
+                app.prefs.backend = values[backend_idx].to_string();
+                crate::prefs::write_backend(values[backend_idx]);
+                let msg = if values[backend_idx] == "auto" {
+                    "Inca will choose the viewport rendering backend automatically the next time it starts.".to_string()
+                } else {
+                    format!("Inca will use {} for the viewport rendering backend after it is restarted.", names[backend_idx])
+                };
+                app.win.backend_notice = Some(msg);
+            }
+            row(ui, "Viewport anti-aliasing", |ui| {
+                let mut aa = if app.prefs.msaa == 1 { 0 } else { 1 };
+                combo(ui, "pmsaa", &mut aa, &["Off", "4x"]);
+                app.prefs.msaa = [1, 4][aa.min(1)];
+            });
+            ui.label("Backend preference applies after restart; WGPU_BACKEND overrides it.");
+            ui.end_row();
         }
         "Kinematics / Manipulators" => {
             theme::section_header(ui, "Manipulators");

@@ -165,7 +165,8 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     // A distinct id discards the old stored area state that had grown to the screen width
     // (the layout feedback bug); the window now starts at its default size again.
     egui::Window::new("Hypershade").id(egui::Id::new("HypershadeWindow")).open(&mut open).default_size([980.0, 560.0]).min_size([600.0, 420.0]).constrain(false).show(ctx, |ui| crate::hypershade::window(app, ui));
-    app.win.hypershade = open;
+    // File > Close sets the flag from inside the window; the X button clears `open`.
+    app.win.hypershade = open && app.win.hypershade;
     let mut open = app.win.graph_editor;
     egui::Window::new("Graph Editor").open(&mut open).default_size([760.0, 420.0]).constrain(false).show(ctx, |ui| graph_editor(app, ui));
     app.win.graph_editor = open;
@@ -179,6 +180,25 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     egui::Window::new("Render Settings").open(&mut open).default_size([340.0, 260.0]).constrain(false).show(ctx, |ui| render_settings(app, ui));
     app.win.render_settings = open;
     crate::prefs::window(app, ctx);
+    if let Some(msg) = app.win.backend_notice.clone() {
+        let mut close = false;
+        let frame = egui::Frame::popup(&ctx.global_style()).inner_margin(egui::Margin::same(12));
+        egui::Modal::new(egui::Id::new("backend-notice")).frame(frame).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(RichText::new("Rendering backend").strong());
+            ui.add_space(6.0);
+            ui.label(msg);
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.win.backend_notice = None;
+        }
+    }
     if app.panels.quit_confirm {
         let mut decided = None;
         egui::Window::new("Quit Inca").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {

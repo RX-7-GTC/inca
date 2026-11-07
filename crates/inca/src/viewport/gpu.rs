@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu::{self, wgpu};
 use std::collections::HashMap;
 
-pub const MSAA: u32 = 4;
+pub const DEFAULT_MSAA: u32 = 4;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const DRAW_SLOT: u64 = 512;
@@ -373,6 +373,7 @@ fn make_shadow(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    msaa: u32,
     frame_bgl: wgpu::BindGroupLayout,
     draw_bgl: wgpu::BindGroupLayout,
     tex_bgl: wgpu::BindGroupLayout,
@@ -419,9 +420,19 @@ fn vb_layout<'a>(stride: u64, attrs: &'a [wgpu::VertexAttribute]) -> wgpu::Verte
 }
 
 impl Gpu {
-    pub fn new(rs: &egui_wgpu::RenderState) -> Self {
+    pub fn msaa(&self) -> u32 {
+        self.msaa
+    }
+
+    pub fn new(rs: &egui_wgpu::RenderState, msaa: u32) -> Self {
         let device = rs.device.clone();
         let queue = rs.queue.clone();
+        // WebGPU guarantees only 1 and 4 samples for Rgba8UnormSrgb; 2 needs an optional
+        // adapter feature that eframe's device may not request.
+        let msaa = match msaa {
+            1 | 4 => msaa,
+            _ => DEFAULT_MSAA,
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("inca viewport"), source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()) });
         let frame_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
@@ -615,7 +626,7 @@ impl Gpu {
         let mesh_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2, 4 => Float32x2, 5 => Float32x3, 6 => Float32x4, 7 => Float32x4, 8 => Float32x2, 9 => Float32x2, 10 => Float32x2, 11 => Float32x2, 12 => Float32x2, 13 => Float32x2, 14 => Float32];
         let line_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Float32x3];
         let point_attrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3];
-        let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };
+        let ms = wgpu::MultisampleState { count: msaa, mask: !0, alpha_to_coverage_enabled: false };
         let depth = |write: bool, compare: wgpu::CompareFunction, bias: wgpu::DepthBiasState| {
             Some(wgpu::DepthStencilState { format: DEPTH_FORMAT, depth_write_enabled: Some(write), depth_compare: Some(compare), stencil: Default::default(), bias })
         };
@@ -659,6 +670,7 @@ impl Gpu {
         Gpu {
             device,
             queue,
+            msaa,
             frame_bgl,
             draw_bgl,
             tex_bgl,
@@ -956,8 +968,8 @@ impl Gpu {
         // Raw (non-sRGB) copy: `_color` holds the hardware-encoded bytes of the shader's own
         // gamma-encoded output, so the transmission shader decodes the stored value explicitly.
         let trans = tex("vp transmission", wgpu::TextureFormat::Rgba8Unorm, 1, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
-        let msaa = tex("vp msaa", COLOR_FORMAT, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let depth = tex("vp depth", DEPTH_FORMAT, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let msaa = tex("vp msaa", COLOR_FORMAT, self.msaa, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let depth = tex("vp depth", DEPTH_FORMAT, self.msaa, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let color_view = color.create_view(&Default::default());
         let trans_view = trans.create_view(&Default::default());
         let frame_buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("frame"), size: std::mem::size_of::<FrameUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -1156,14 +1168,18 @@ impl Gpu {
         }
         let has_trans = draws.iter().any(|d| d.pass == Pass::MeshTransmission);
         let keep = if has_trans { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard };
+        let single = self.msaa <= 1;
+        let view = if single { &t.color_view } else { &t.msaa_view };
+        let resolve = if single { None } else { Some(&t.color_view) };
+        let color_store = if single { wgpu::StoreOp::Store } else { keep };
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewport"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.msaa_view,
+                    view,
                     depth_slice: None,
-                    resolve_target: Some(&t.color_view),
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: keep },
+                    resolve_target: resolve,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: color_store },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth_view,
@@ -1201,10 +1217,10 @@ impl Gpu {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewport transmission"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.msaa_view,
+                    view,
                     depth_slice: None,
-                    resolve_target: Some(&t.color_view),
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard },
+                    resolve_target: resolve,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: if single { wgpu::StoreOp::Store } else { wgpu::StoreOp::Discard } },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth_view,

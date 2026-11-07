@@ -60,6 +60,8 @@ pub struct VpState {
     /// Three Point Arc editing: point being dragged (0-2, 3 = centre) and the last drag position
     pub arc_drag: Option<usize>,
     pub arc_anchor: Option<DVec3>,
+    /// Inputs of the last rendered 3D image per viewport, so UI-only repaints can reuse it.
+    pub render_keys: [Option<u64>; 4],
 }
 
 impl Default for VpState {
@@ -82,6 +84,7 @@ impl Default for VpState {
             press_handle: None,
             arc_drag: None,
             arc_anchor: None,
+            render_keys: [None; 4],
         }
     }
 }
@@ -145,6 +148,34 @@ fn tf_matrix(t: &Transform) -> DMat4 {
     DMat4::from_scale_rotation_translation(DVec3::from(t.scale), DQuat::from(t.rotation), DVec3::from(t.translation))
 }
 
+/// Everything the 3D pass depends on. If it is unchanged, a repaint caused by menus,
+/// toolbar hover, panels etc. can reuse the previous viewport texture.
+fn vp_render_key(app: &IncaApp, idx: usize, px: [u32; 2], cv: &CamView) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    app.s.rev.hash(&mut h);
+    app.s.time.current.to_bits().hash(&mut h);
+    app.s.project.hash(&mut h);
+    px.hash(&mut h);
+    app.bg_mode.hash(&mut h);
+    app.prefs.smooth_divisions.hash(&mut h);
+    format!("{:?}", app.s.comp_mode).hash(&mut h);
+    app.s.sel.hash(&mut h);
+    app.s.hilite().hash(&mut h);
+    app.s.lead().hash(&mut h);
+    format!("{:?}", app.vps[idx]).hash(&mut h);
+    app.soft.on.hash(&mut h);
+    app.soft.radius.to_bits().hash(&mut h);
+    app.soft.linear.hash(&mut h);
+    let mut live: Vec<String> = app.vp_state.live_meshes().into_iter().collect();
+    live.sort();
+    live.hash(&mut h);
+    for x in cv.view_proj().to_cols_array() {
+        x.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
 pub fn viewports(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
     let full = ui.available_rect_before_wrap();
     let panes: Vec<(usize, Rect)> = match app.layout {
@@ -198,34 +229,39 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
     let ppp = ui.ctx().pixels_per_point();
     let px = [(img_rect.width() * ppp).round().max(1.0) as u32, (img_rect.height() * ppp).round().max(1.0) as u32];
     let cv = viewport::cam_view(&app.s, &app.vps[idx].camera.clone(), [img_rect.width(), img_rect.height()]);
+    let render_key = vp_render_key(app, idx, px, &cv);
+    let force_render = !app.viz.ghosts.is_empty() || !app.viz.trails.is_empty();
     // ---- render
     if let (Some(rs), Some(gpu)) = (frame.wgpu_render_state(), app.gpu.as_mut()) {
         let tex = {
             let mut r = rs.renderer.write();
             gpu.target(&mut r, idx, px)
         };
-        let live = app.vp_state.live_meshes();
-        let soft = app.soft.on.then_some((app.soft.radius, app.soft.linear));
-        let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.mesh_cache, soft, app.prefs.smooth_divisions);
-        draws.extend(crate::anim_extras::draws(&app.viz));
-        let mut fu = viewport::frame_uniform(&app.s, &app.vps[idx], &cv, app.bg_mode);
-        let mut sky_warning = None;
-        if fu.sky[0] > 1.5 {
-            match viewport::sky_texture_file(&app.s, &app.vps[idx]) {
-                Some(file) => match gpu.prepare_sky(app.s.project.as_deref(), &file) {
-                    viewport::gpu::SkyLoad::Ready => {}
-                    viewport::gpu::SkyLoad::Failed(e) => {
-                        fu.sky[0] = 1.0;
-                        sky_warning = Some(format!("Sky dome texture could not be loaded: {file} ({e})"));
-                    }
-                    viewport::gpu::SkyLoad::Unavailable => fu.sky[0] = 1.0,
-                },
-                None => fu.sky[0] = 1.0,
+        if force_render || app.vp_state.render_keys[idx] != Some(render_key) {
+            let live = app.vp_state.live_meshes();
+            let soft = app.soft.on.then_some((app.soft.radius, app.soft.linear));
+            let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.mesh_cache, soft, app.prefs.smooth_divisions);
+            draws.extend(crate::anim_extras::draws(&app.viz));
+            let mut fu = viewport::frame_uniform(&app.s, &app.vps[idx], &cv, app.bg_mode);
+            let mut sky_warning = None;
+            if fu.sky[0] > 1.5 {
+                match viewport::sky_texture_file(&app.s, &app.vps[idx]) {
+                    Some(file) => match gpu.prepare_sky(app.s.project.as_deref(), &file) {
+                        viewport::gpu::SkyLoad::Ready => {}
+                        viewport::gpu::SkyLoad::Failed(e) => {
+                            fu.sky[0] = 1.0;
+                            sky_warning = Some(format!("Sky dome texture could not be loaded: {file} ({e})"));
+                        }
+                        viewport::gpu::SkyLoad::Unavailable => fu.sky[0] = 1.0,
+                    },
+                    None => fu.sky[0] = 1.0,
+                }
             }
-        }
-        gpu.render(idx, &fu, &draws);
-        if let Some(w) = sky_warning {
-            app.warn(w);
+            gpu.render(idx, &fu, &draws);
+            if let Some(w) = sky_warning {
+                app.warn(w);
+            }
+            app.vp_state.render_keys[idx] = Some(render_key);
         }
         ui.painter().image(tex, img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
     } else {

@@ -14,6 +14,7 @@ pub enum MenuSource {
     AttrEditor,
     RenderView,
     UvEditor,
+    Hypershade,
     Panel(usize),
 }
 
@@ -227,7 +228,18 @@ pub fn set_menus(ms: MenuSet) -> Vec<(&'static str, Vec<M>)> {
     }
 }
 
+/// Menu rows use Maya's blue selection fill, not the general gray button hover.
+pub(crate) fn menu_hover(ui: &mut egui::Ui) {
+    ui.style_mut().animation_time = 0.0;
+    let v = &mut ui.style_mut().visuals.widgets;
+    // Highlight only the row under the pointer. Keeping `active` blue made the row where
+    // the press started stay highlighted while the pointer moved into a submenu.
+    v.hovered.bg_fill = crate::theme::HI;
+    v.hovered.weak_bg_fill = crate::theme::HI;
+}
+
 pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
+    menu_hover(ui);
     for it in list {
         match it {
             A(id) => {
@@ -243,11 +255,13 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
                         let main = ui.add(b);
+                        highlight_under_press(ui, &main);
                         if main.clicked() || released_here(ui, &main) {
                             menu_pick(app, ui, id);
                             ui.close();
                         }
                         let opt = crate::icons::button_ex(ui, "optionBox", "Options", false, 16.0, 12.0, true);
+                        highlight_under_press(ui, &opt);
                         if opt.clicked() || released_here(ui, &opt) {
                             opened = true;
                         }
@@ -259,6 +273,7 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                     }
                 } else {
                     let r = ui.add(b);
+                    highlight_under_press(ui, &r);
                     if r.clicked() || released_here(ui, &r) {
                         menu_pick(app, ui, id);
                         ui.close();
@@ -285,6 +300,7 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                         }
                         for r in list {
                             let resp = ui.button(&r);
+                            highlight_under_press(ui, &resp);
                             if resp.clicked() || released_here(ui, &resp) {
                                 if files {
                                     app.open_path(std::path::Path::new(&r));
@@ -300,6 +316,7 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                         let mats: Vec<(String, String)> = app.s.mats.values().map(|m| (m.id.clone(), m.name.clone())).collect();
                         for (_, name) in mats {
                             let resp = ui.button(&name);
+                            highlight_under_press(ui, &resp);
                             if resp.clicked() || released_here(ui, &resp) {
                                 let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
                                 app.open_menu = None;
@@ -499,10 +516,19 @@ fn show_menu_popup_ui(
     suppress_close: bool,
     body: impl FnOnce(&mut IncaApp, &mut egui::Ui),
 ) -> Option<egui::Rect> {
+    // Don't repaint continuously while a menu is open (that runs the whole window at
+    // vsync). One delayed frame after pointer movement is enough to settle hover/submenu
+    // state without leaving the previous row highlighted.
+    if response.ctx.input(|i| i.pointer.is_moving()) {
+        response.ctx.request_repaint_after(std::time::Duration::from_millis(30));
+    }
     let mut open = true;
     let popup = egui::Popup::menu(response).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
     let popup = if suppress_close { popup.open(true) } else { popup.open_bool(&mut open) };
-    let shown = popup.show(|ui| body(app, ui));
+    let shown = popup.show(|ui| {
+        menu_hover(ui);
+        body(app, ui);
+    });
     if !open {
         app.open_menu = None;
     }
@@ -512,13 +538,17 @@ fn show_menu_popup_ui(
 /// True when a row was clicked, or when the button was released over it. The JS menus run rows
 /// on `mouseup`, so holding the button after opening a menu and releasing over a row runs it.
 /// Closes the open menu, as every JS menu row does.
-pub fn activated(app: &mut IncaApp, ui: &egui::Ui, r: &egui::Response) -> bool {
+pub fn highlight_under_press(ui: &egui::Ui, r: &egui::Response) {
     // While the button is held after opening a menu, the pressed title owns the interaction, so
     // egui reports the row as `contains_pointer` but not `hovered`. Highlight it ourselves to
     // show which row a release will run (Maya highlights it during the drag).
     if r.contains_pointer() && ui.input(|i| i.pointer.primary_down()) {
         r.clone().highlight();
     }
+}
+
+pub fn activated(app: &mut IncaApp, ui: &egui::Ui, r: &egui::Response) -> bool {
+    highlight_under_press(ui, r);
     if r.clicked() || released_here(ui, r) {
         app.open_menu = None;
         true
@@ -529,12 +559,14 @@ pub fn activated(app: &mut IncaApp, ui: &egui::Ui, r: &egui::Response) -> bool {
 
 /// A plain menu row.
 pub fn menu_item(app: &mut IncaApp, ui: &mut egui::Ui, label: &str) -> bool {
+    menu_hover(ui);
     let r = ui.button(label);
     activated(app, ui, &r)
 }
 
 /// A checkable menu row; like the JS menus it closes the popup when toggled.
 pub fn menu_check(app: &mut IncaApp, ui: &mut egui::Ui, on: bool, label: &str) -> bool {
+    menu_hover(ui);
     let r = ui.add(egui::Button::new(format!("{} {label}", if on { "✔" } else { "  " })));
     activated(app, ui, &r)
 }
@@ -548,6 +580,7 @@ pub fn menu_radio(app: &mut IncaApp, ui: &mut egui::Ui, on: bool, label: &str) -
 
 /// A highlighted menu row for the current choice; closes the popup when picked.
 pub fn menu_selectable(app: &mut IncaApp, ui: &mut egui::Ui, on: bool, label: &str) -> bool {
+    menu_hover(ui);
     let r = ui.selectable_label(on, label);
     activated(app, ui, &r)
 }

@@ -68,8 +68,10 @@ pub fn restore_all(app: &mut IncaApp) {
 
 /// Windows > Workspaces and the menu bar selector share this list.
 pub fn menu(app: &mut IncaApp, ui: &mut egui::Ui) {
+    crate::menus::menu_hover(ui);
     for w in WORKSPACES {
         let resp = ui.selectable_label(app.workspace == w.name, w.name);
+        crate::menus::highlight_under_press(ui, &resp);
         if resp.clicked() || crate::menus::released_here(ui, &resp) {
             apply(app, w.name);
             app.open_menu = None;
@@ -78,6 +80,7 @@ pub fn menu(app: &mut IncaApp, ui: &mut egui::Ui) {
     }
     ui.separator();
     let reset = ui.button("Reset Current Workspace");
+    crate::menus::highlight_under_press(ui, &reset);
     if reset.clicked() || crate::menus::released_here(ui, &reset) {
         let n = app.workspace.clone();
         apply(app, &n);
@@ -88,9 +91,11 @@ pub fn menu(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 /// Display > UI Elements.
 pub fn elements_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
+    crate::menus::menu_hover(ui);
     for (k, l) in ELEMENTS {
         let mut on = app.shown(k);
         let resp = ui.checkbox(&mut on, *l);
+        crate::menus::highlight_under_press(ui, &resp);
         if resp.clicked() {
             app.set_shown(k, on);
             app.open_menu = None;
@@ -104,6 +109,7 @@ pub fn elements_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
     }
     let mut on = app.show_right;
     let resp = ui.checkbox(&mut on, "Channel Box / Attribute Editor");
+    crate::menus::highlight_under_press(ui, &resp);
     if resp.clicked() {
         app.show_right = on;
         app.open_menu = None;
@@ -115,6 +121,7 @@ pub fn elements_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
     }
     let mut on = app.show_outliner;
     let resp = ui.checkbox(&mut on, "Outliner");
+    crate::menus::highlight_under_press(ui, &resp);
     if resp.clicked() {
         app.show_outliner = on;
         app.open_menu = None;
@@ -126,12 +133,14 @@ pub fn elements_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
     }
     ui.separator();
     let hide = ui.add(egui::Button::new("Hide UI Elements").shortcut_text("Ctrl+Space"));
+    crate::menus::highlight_under_press(ui, &hide);
     if hide.clicked() || crate::menus::released_here(ui, &hide) {
         toggle_all(app);
         app.open_menu = None;
         ui.close();
     }
     let restore = ui.button("Restore UI Elements");
+    crate::menus::highlight_under_press(ui, &restore);
     if restore.clicked() || crate::menus::released_here(ui, &restore) {
         restore_all(app);
         app.open_menu = None;

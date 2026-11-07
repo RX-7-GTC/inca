@@ -123,6 +123,8 @@ pub struct Windows {
     pub connection_editor: bool,
     pub hik: bool,
     pub rename: Option<String>,
+    /// In-app notice shown after changing the rendering backend.
+    pub backend_notice: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -190,6 +192,8 @@ pub struct IncaApp {
     /// Edit Pivot: the move manipulator moves pivots instead of objects
     pub pivot_mode: bool,
     pub gpu: Option<Gpu>,
+    /// Kept so the GPU renderer can be rebuilt when MSAA changes at runtime.
+    pub gpu_rs: Option<eframe::egui_wgpu::RenderState>,
     pub smooth_cache: HashMap<String, (u64, inca_core::mesh::PolyMesh)>,
     /// Per-node mesh statistics (verts, edges, faces, tris, uvs) cached by node revision.
     /// The edge count needs the whole edge topology, so `Scene::poly_count` on every frame is
@@ -249,6 +253,8 @@ pub struct IncaApp {
     pub overlay_border: HashSet<String>,
     /// measured redraw rate for the fps HUD
     pub fps_measured: f32,
+    /// Last window title sent to the OS; avoid a window event every frame.
+    window_title: String,
     pub mesh_tool: crate::mesh_tools::MeshToolState,
     pub rig_tool: crate::rig_tools::RigToolState,
     /// Create > Type text
@@ -359,8 +365,10 @@ impl IncaApp {
     }
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
-        let gpu = cc.wgpu_render_state.as_ref().map(Gpu::new);
-        let prefs: crate::prefs::Prefs = cc.storage.and_then(|s| eframe::get_value(s, "prefs")).unwrap_or_default();
+        let mut prefs: crate::prefs::Prefs = cc.storage.and_then(|s| eframe::get_value(s, "prefs")).unwrap_or_default();
+        prefs.backend = crate::prefs::read_backend();
+        let gpu_rs = cc.wgpu_render_state.clone();
+        let gpu = gpu_rs.as_ref().map(|rs| Gpu::new(rs, prefs.msaa));
         let test = match (std::env::var("INCA_TEST").ok(), std::env::var("INCA_SHOT").ok()) {
             (None, None) => None,
             (script, shot) => Some(TestRun { script: script.and_then(|p| std::fs::read_to_string(p).ok()), shot: shot.map(Into::into), frame: 0, requested: false }),
@@ -397,6 +405,7 @@ impl IncaApp {
             manip_size: cc.storage.and_then(|s| eframe::get_value(s, "manipSize")).unwrap_or(1.0),
             pivot_mode: false,
             gpu,
+            gpu_rs,
             smooth_cache: HashMap::new(),
             stats_cache: HashMap::new(),
             mesh_cache: Default::default(),
@@ -443,6 +452,7 @@ impl IncaApp {
             overlay_normals: HashSet::new(),
             overlay_border: HashSet::new(),
             fps_measured: 0.0,
+            window_title: String::new(),
             mesh_tool: Default::default(),
             rig_tool: crate::rig_tools::RigToolState::new(),
             type_text: "Inca".into(),
@@ -962,11 +972,19 @@ impl eframe::App for IncaApp {
                 let _ = self.run_mel("import", &format!("file -i \"{}\";", p.display().to_string().replace('\\', "/")));
             }
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
+        let title = self.title();
+        if self.window_title != title {
+            self.window_title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
         self.tick_playback(&ctx);
         let dt = ctx.input(|i| i.unstable_dt);
-        if dt > 0.0 {
-            self.fps_measured = self.fps_measured * 0.9 + 0.1 / dt;
+        if dt > 0.0 && dt < 0.25 {
+            // ~1 s time constant, so the HUD does not jump on every frame; ignore long
+            // idle gaps, otherwise one repaint after a pause would count as very low FPS.
+            let alpha = 1.0 - (-dt).exp();
+            let inst = 1.0 / dt;
+            self.fps_measured = if self.fps_measured > 0.0 { self.fps_measured * (1.0 - alpha) + inst * alpha } else { inst };
         }
         self.hotkeys(&ctx);
         // One selection, like Maya: a scene selection (also set by MEL) wins over a stale

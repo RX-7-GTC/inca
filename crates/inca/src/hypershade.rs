@@ -48,6 +48,9 @@ pub struct HsState {
     pan: Vec2,
     zoom: f32,
     pub(crate) graph_sel: HashSet<String>,
+    /// Draw order: higher values are painted on top.
+    z: HashMap<String, u64>,
+    z_next: u64,
     /// Consecutive creations with no free spot; offsets the overlap so the nodes stay visible.
     overflow: u32,
     drag_start: Option<Vec<(String, Pos2)>>,
@@ -76,6 +79,8 @@ impl Default for HsState {
             pan: vec2(20.0, 20.0),
             zoom: 1.0,
             graph_sel: HashSet::new(),
+            z: HashMap::new(),
+            z_next: 0,
             overflow: 0,
             drag_start: None,
             marquee: None,
@@ -94,6 +99,20 @@ impl Default for HsState {
             graph_rect: None,
             window_rect: None,
         }
+    }
+}
+
+impl HsState {
+    fn bump_z(&mut self, id: &str) {
+        self.z_next = self.z_next.wrapping_add(1);
+        self.z.insert(id.to_string(), self.z_next);
+    }
+
+    /// Node indices ordered back-to-front; the last one is painted on top.
+    fn draw_order(&self, nodes: &[GNode]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..nodes.len()).collect();
+        order.sort_by_key(|&i| *self.z.get(&nodes[i].id).unwrap_or(&0));
+        order
     }
 }
 
@@ -170,8 +189,10 @@ pub(crate) fn place_new_node(app: &mut IncaApp, id: &str, at: Option<Pos2>) {
     };
     app.windows_state.hs.overflow = if free { 0 } else { app.windows_state.hs.overflow + 1 };
     app.windows_state.hs.pos.insert(id.to_string(), p);
+    app.windows_state.hs.bump_z(id);
     if material {
         app.windows_state.hs.pos.insert(format!("sg:{id}"), p + vec2(NODE_W + 36.0, 0.0));
+        app.windows_state.hs.bump_z(&format!("sg:{id}"));
     }
 }
 
@@ -234,6 +255,7 @@ fn select_dragged(app: &mut IncaApp, id: &str) {
     if app.s.mats.contains_key(id) || app.s.texs.contains_key(id) {
         app.windows_state.hs.graph_sel.insert(id.to_string());
         select_shading_node(app, id);
+        app.windows_state.hs.bump_z(id);
     }
 }
 
@@ -304,9 +326,11 @@ fn drop_on_graph(app: &mut IncaApp, id: &str, q: Pos2) -> bool {
         return false;
     }
     let nodes = graph_nodes(app);
+    let order = app.windows_state.hs.draw_order(&nodes);
     let (pan, zoom) = (app.windows_state.hs.pan, app.windows_state.hs.zoom);
     let pos = app.windows_state.hs.pos.clone();
-    for n in &nodes {
+    for &i in order.iter().rev() {
+        let n = &nodes[i];
         let Some(p) = pos.get(&n.id) else { continue };
         let r = Rect::from_min_size(rect.min + pan + p.to_vec2() * zoom, vec2(NODE_W, node_h(n)) * zoom);
         if !r.contains(q) {
@@ -442,23 +466,16 @@ fn wire_compatible(w: &Wire, n: &GNode, slot: Option<usize>) -> bool {
     }
 }
 
-fn graph_drop_target(w: &Wire, nodes: &[GNode], rects: &[Rect], q: Pos2, zoom: f32) -> Option<(usize, Option<usize>)> {
-    let mut best: Option<(f32, usize, usize)> = None;
-    for (i, n) in nodes.iter().enumerate() {
+fn graph_drop_target(w: &Wire, nodes: &[GNode], rects: &[Rect], order: &[usize], q: Pos2, zoom: f32) -> Option<(usize, Option<usize>)> {
+    for &i in order.iter().rev() {
+        let n = &nodes[i];
         for (si, _) in n.inputs.iter().enumerate() {
-            if !wire_compatible(w, n, Some(si)) {
-                continue;
-            }
-            let d = in_port_pos(n, rects[i], si, zoom).distance(q);
-            if d < 22.0 && best.is_none_or(|(bd, _, _)| d < bd) {
-                best = Some((d, i, si));
+            if wire_compatible(w, n, Some(si)) && in_port_pos(n, rects[i], si, zoom).distance(q) < 22.0 {
+                return Some((i, Some(si)));
             }
         }
     }
-    if let Some((_, i, si)) = best {
-        return Some((i, Some(si)));
-    }
-    nodes.iter().enumerate().find(|(i, n)| rects[*i].contains(q) && wire_compatible(w, n, None)).map(|(i, _)| (i, None))
+    order.iter().rev().find(|&&i| rects[i].contains(q) && wire_compatible(w, &nodes[i], None)).map(|&i| (i, None))
 }
 
 pub(crate) fn material_users(app: &IncaApp, mid: &str) -> Vec<String> {
@@ -647,6 +664,7 @@ fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
     }
     let target = id.strip_prefix("sg:").unwrap_or(id).to_string();
     if selected_now {
+        app.windows_state.hs.bump_z(id);
         if app.s.mats.contains_key(&target) || app.s.texs.contains_key(&target) {
             select_shading_node(app, &target);
         } else {
@@ -662,58 +680,160 @@ fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
     }
 }
 
+fn menu_row(app: &mut IncaApp, ui: &mut egui::Ui, enabled: bool, label: &str) -> bool {
+    if enabled {
+        crate::menus::menu_item(app, ui, label)
+    } else {
+        ui.add_enabled(false, egui::Button::new(label));
+        false
+    }
+}
+
 pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
     app.windows_state.hs.window_rect = Some(ui.max_rect());
     // ---- menu bar
-    ui.horizontal(|ui| {
-        ui.menu_button("Edit", |ui| {
-            let lead = app.snode_sel.clone().or_else(|| app.windows_state.hs_selected.clone()).filter(|id| app.s.mats.contains_key(id) || app.s.texs.contains_key(id));
-            let mut delete_ids = app.windows_state.hs.graph_sel.clone();
-            if let Some(id) = &app.snode_sel {
-                delete_ids.insert(id.clone());
-            }
-            delete_ids.retain(|id| {
-                let base = id.strip_prefix("sg:").unwrap_or(id);
-                app.s.mats.contains_key(base) || app.s.texs.contains_key(base)
-            });
-            let can_delete = delete_ids.iter().any(|id| !read_only(app, id.strip_prefix("sg:").unwrap_or(id)));
-            if ui.add_enabled(can_delete, egui::Button::new("Delete")).clicked() {
-                delete_graph_nodes(app, &delete_ids);
-                ui.close();
-            }
-            let is_mat = lead.as_deref().is_some_and(|id| app.s.mats.contains_key(id));
-            if ui.add_enabled(is_mat, egui::Button::new("Duplicate Shading Network")).clicked() {
-                if let Some(id) = lead.clone() {
-                    duplicate_shading_network(app, &id);
-                }
-                ui.close();
-            }
-            if ui.add_enabled(lead.is_some(), egui::Button::new("Rename...")).clicked() {
-                if let Some(id) = lead.clone() {
-                    let name = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone())).unwrap_or_default();
-                    app.windows_state.hs.rename_pos = Some(ui.min_rect().left_top());
-                    app.windows_state.hs.rename = Some((id, name));
-                }
-                ui.close();
-            }
-            ui.separator();
-            if ui.add_enabled(is_mat, egui::Button::new("Select Objects with Materials")).clicked() {
-                if let Some(id) = lead.clone() {
-                    let ids = material_users(app, &id);
-                    app.select_names(&ids, SelMode::Replace);
-                }
-                ui.close();
-            }
-            if ui.add_enabled(is_mat, egui::Button::new("Assign Material to Viewport Selection")).clicked() {
-                if let Some(id) = lead.clone() {
-                    if let Some(m) = app.s.mats.get(&id) {
-                        let _ = app.run_mel("assign material", &format!("hyperShade -assign {};", m.name));
+    crate::menus::panel_bar(
+        app,
+        ui,
+        crate::menus::MenuSource::Hypershade,
+        &["File", "Edit", "View", "Create", "Tabs", "Graph", "Window", "Options", "Help"],
+        false,
+        |app, ui, title| match title {
+            "File" => {
+                if menu_row(app, ui, true, "Import Texture File...") {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "hdr"]).pick_file() {
+                        app.s.checkpoint("import texture");
+                        let tid = app.s.create_texture("file", None);
+                        app.s.set_attr(&NodeRef::Texture(tid.clone()), "fileTextureName", json!(p.to_string_lossy()));
+                        place_new_node(app, &tid, None);
+                        app.windows_state.hs_selected = Some(tid);
                     }
                 }
-                ui.close();
+                ui.separator();
+                if menu_row(app, ui, true, "Close") {
+                    app.win.hypershade = false;
+                }
             }
-        });
-    });
+            "Edit" => {
+                let lead = app.snode_sel.clone().or_else(|| app.windows_state.hs_selected.clone()).filter(|id| app.s.mats.contains_key(id) || app.s.texs.contains_key(id));
+                let mut delete_ids = app.windows_state.hs.graph_sel.clone();
+                if let Some(id) = &lead {
+                    delete_ids.insert(id.clone());
+                }
+                delete_ids.retain(|id| {
+                    let base = id.strip_prefix("sg:").unwrap_or(id);
+                    app.s.mats.contains_key(base) || app.s.texs.contains_key(base)
+                });
+                let can_delete = delete_ids.iter().any(|id| !read_only(app, id.strip_prefix("sg:").unwrap_or(id)));
+                if menu_row(app, ui, can_delete, "Delete") {
+                    delete_graph_nodes(app, &delete_ids);
+                }
+                let is_mat = lead.as_deref().is_some_and(|id| app.s.mats.contains_key(id));
+                if menu_row(app, ui, is_mat, "Duplicate Shading Network") {
+                    if let Some(id) = lead.clone() {
+                        duplicate_shading_network(app, &id);
+                    }
+                }
+                if menu_row(app, ui, lead.is_some(), "Rename...") {
+                    if let Some(id) = lead.clone() {
+                        let name = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone())).unwrap_or_default();
+                        app.windows_state.hs.rename_pos = Some(ui.min_rect().left_top());
+                        app.windows_state.hs.rename = Some((id, name));
+                    }
+                }
+                ui.separator();
+                if menu_row(app, ui, is_mat, "Select Objects with Materials") {
+                    if let Some(id) = lead.clone() {
+                        let ids = material_users(app, &id);
+                        app.select_names(&ids, SelMode::Replace);
+                    }
+                }
+                if menu_row(app, ui, is_mat, "Assign Material to Viewport Selection") {
+                    if let Some(id) = lead.clone() {
+                        if let Some(m) = app.s.mats.get(&id) {
+                            let _ = app.run_mel("assign material", &format!("hyperShade -assign {};", m.name));
+                        }
+                    }
+                }
+            }
+            "View" => {
+                if menu_row(app, ui, true, "Frame All") {
+                    app.windows_state.hs.frame = Some(false);
+                }
+                if menu_row(app, ui, true, "Frame Selected") {
+                    app.windows_state.hs.frame = Some(true);
+                }
+                if menu_row(app, ui, true, "Reset Zoom") {
+                    app.windows_state.hs.zoom = 1.0;
+                }
+            }
+            "Create" => {
+                ui.menu_button("Material", |ui| {
+                    for t in MAT_TYPES {
+                        if crate::menus::menu_item(app, ui, t.label) {
+                            let _ = app.run_mel("create material", &format!("shadingNode -asShader {};", t.ty));
+                            if let Some(id) = app.s.mats.keys().last().cloned() {
+                                place_new_node(app, &id, None);
+                                app.windows_state.hs_selected = Some(id);
+                            }
+                        }
+                    }
+                });
+                ui.menu_button("Texture", |ui| {
+                    for t in TEX_TYPES {
+                        if crate::menus::menu_item(app, ui, t.label) {
+                            let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {};", t.ty));
+                            if let Some(id) = app.s.texs.keys().last().cloned() {
+                                place_new_node(app, &id, None);
+                                app.windows_state.hs_selected = Some(id);
+                            }
+                        }
+                    }
+                });
+            }
+            "Tabs" => {
+                for (i, label) in ["Materials", "Textures", "Lights", "Cameras", "Shading Groups"].into_iter().enumerate() {
+                    let on = app.windows_state.hs.tab == i;
+                    if crate::menus::menu_selectable(app, ui, on, label) {
+                        app.windows_state.hs.tab = i;
+                    }
+                }
+            }
+            "Graph" => {
+                if menu_row(app, ui, true, "Rearrange") {
+                    app.windows_state.hs.pos.clear();
+                    app.windows_state.hs.frame = Some(false);
+                }
+                if menu_row(app, ui, true, "Connection Editor") {
+                    crate::hypergraph::open_for_hypershade(app);
+                }
+            }
+            "Window" => {
+                if menu_row(app, ui, true, "Attribute Editor") {
+                    app.show_right = true;
+                    app.right_tab = crate::app::RightTab::AttributeEditor;
+                }
+                if menu_row(app, ui, true, "Render View") {
+                    app.win.render_view = true;
+                }
+                if menu_row(app, ui, true, "Render Settings") {
+                    app.win.render_settings = true;
+                }
+            }
+            "Options" => {
+                let only = app.windows_state.hs.selected_only;
+                if crate::menus::menu_check(app, ui, only, "Graph Selected Network Only") {
+                    app.windows_state.hs.selected_only = !only;
+                }
+            }
+            "Help" => {
+                if menu_row(app, ui, true, "Hypershade Help") {
+                    app.help = "Drag swatches onto objects in a viewport to assign. Drag from a texture output to a material attribute to connect. RMB opens node menus; Edit > Delete removes the selected shading node.".into();
+                }
+            }
+            _ => {}
+        },
+    );
     // ---- create bar
     ui.horizontal(|ui| {
         ui.label("Create:");
@@ -882,6 +1002,7 @@ fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
                             app.windows_state.hs_selected = Some(id.clone());
                             app.windows_state.hs.graph_sel.insert(id.clone());
                             select_shading_node(app, id);
+                            app.windows_state.hs.bump_z(id);
                         } else if app.s.node(id).is_some() {
                             app.select_names(std::slice::from_ref(id), SelMode::Replace);
                             app.windows_state.hs_selected = Some(id.clone());
@@ -1140,8 +1261,9 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     let pos = app.windows_state.hs.pos.clone();
     let rects: Vec<Rect> = nodes.iter().map(|n| node_rect(n, &pos)).collect();
     let find = |id: &str| nodes.iter().position(|n| n.id == id);
+    let order = app.windows_state.hs.draw_order(&nodes);
     let wire = app.windows_state.hs.wire.clone();
-    let drop_target = wire.as_ref().and_then(|w| pointer.and_then(|q| graph_drop_target(w, &nodes, &rects, q, zoom)));
+    let drop_target = wire.as_ref().and_then(|w| pointer.and_then(|q| graph_drop_target(w, &nodes, &rects, &order, q, zoom)));
     // ---- wires
     for (mi, m) in nodes.iter().enumerate().filter(|(_, n)| n.kind == Kind::Material) {
         let Some(mat) = app.s.mats.get(&m.id) else { continue };
@@ -1166,7 +1288,8 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         Wire::Tex(t, _) | Wire::Mat(t) => t.as_str(),
     });
     let mut hovered_port: Option<(usize, Option<usize>)> = None; // (node, input index or None = body)
-    for (i, n) in nodes.iter().enumerate() {
+    for &i in &order {
+        let n = &nodes[i];
         let r = rects[i];
         if !rect.intersects(r) {
             continue;
@@ -1219,9 +1342,6 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             };
             painter.circle_filled(p, if target { 5.5 * zoom } else { 4.0 * zoom }, col);
             painter.text(p + vec2(8.0 * zoom, 0.0), egui::Align2::LEFT_CENTER, inca_core::ops::nice_name(slot), font.clone(), if wire.is_some() && !compatible { Color32::from_gray(80) } else { theme::TEXT_DIM });
-            if pointer.is_some_and(|q| q.distance(p) < 8.0 * zoom.max(0.8)) {
-                hovered_port = Some((i, Some(si)));
-            }
         }
         for (oi, port) in n.outputs.iter().enumerate() {
             let p = out_port_pos(n, r, oi, zoom);
@@ -1241,9 +1361,19 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             painter.circle_filled(p, if source_out { 5.5 * zoom } else { 4.5 * zoom }, col);
             painter.text(p - vec2(8.0 * zoom, 0.0), egui::Align2::RIGHT_CENTER, inca_core::ops::nice_name(port), font.clone(), if wire.is_some() && !source_out { Color32::from_gray(80) } else { theme::TEXT_DIM });
         }
-        if hovered_port.is_none() && pointer.is_some_and(|q| r.contains(q)) {
-            hovered_port = Some((i, None));
-        }
+    }
+    // Hit-test back-to-front so the node drawn on top (later in the list) wins.
+    if let Some(q) = pointer {
+        hovered_port = order.iter().rev().find_map(|&i| {
+            let n = &nodes[i];
+            if let Some(si) = n.inputs.iter().enumerate().position(|(si, _)| in_port_pos(n, rects[i], si, zoom).distance(q) < 8.0 * zoom.max(0.8)) {
+                Some((i, Some(si)))
+            } else if rects[i].contains(q) {
+                Some((i, None))
+            } else {
+                None
+            }
+        });
     }
     // ---- interaction
     let press = ctx.input(|i| i.pointer.press_origin());
@@ -1251,10 +1381,12 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     if resp.drag_started_by(egui::PointerButton::Primary) {
         if let Some(p) = press {
             // an output port starts a wire, a node body moves the selection, empty space marquees
-            let out_hit = nodes.iter().enumerate().find_map(|(i, n)| {
+            let out_hit = order.iter().rev().find_map(|&i| {
+                let n = &nodes[i];
                 n.outputs.iter().enumerate().find_map(|(oi, _)| (out_port_pos(n, rects[i], oi, zoom).distance(p) < 9.0).then_some((i, oi)))
             });
-            let in_hit = nodes.iter().enumerate().find_map(|(i, n)| {
+            let in_hit = order.iter().rev().find_map(|&i| {
+                let n = &nodes[i];
                 n.inputs.iter().enumerate().find_map(|(si, _)| (in_port_pos(n, rects[i], si, zoom).distance(p) < 9.0).then_some((i, si)))
             });
             if let Some((i, oi)) = out_hit {
@@ -1275,8 +1407,15 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
                     app.s.echo(format!("disconnectAttr {}.{attr};", app.s.mats[&mid].name));
                     app.windows_state.hs.wire = Some(Wire::Tex(tex, out));
                 }
-            } else if let Some(i) = rects.iter().rposition(|r| r.contains(p)) {
-                select_graph_node(app, &nodes[i].id, additive);
+            } else if let Some(i) = order.iter().rev().copied().find(|&i| rects[i].contains(p)) {
+                let id = nodes[i].id.clone();
+                select_graph_node(app, &id, additive);
+                // Raise the whole dragged selection, with the grabbed node on top.
+                let selected: Vec<String> = app.windows_state.hs.graph_sel.iter().cloned().collect();
+                for sid in &selected {
+                    app.windows_state.hs.bump_z(sid);
+                }
+                app.windows_state.hs.bump_z(&id);
                 let start = app.windows_state.hs.graph_sel.iter().filter_map(|id| app.windows_state.hs.pos.get(id).map(|p| (id.clone(), *p))).collect();
                 app.windows_state.hs.drag_start = Some(start);
             } else {
@@ -1372,11 +1511,12 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         app.windows_state.hs.drag_start = None;
         if app.windows_state.hs.marquee.take().is_some() {
-            app.windows_state.hs_selected = nodes
+            app.windows_state.hs_selected = order
                 .iter()
                 .rev()
-                .find(|n| app.windows_state.hs.graph_sel.contains(&n.id))
-                .map(|n| n.id.strip_prefix("sg:").unwrap_or(&n.id).to_string());
+                .copied()
+                .find(|&i| app.windows_state.hs.graph_sel.contains(&nodes[i].id))
+                .map(|i| nodes[i].id.strip_prefix("sg:").unwrap_or(&nodes[i].id).to_string());
             app.windows_state.hs.marquee_base.clear();
         }
     }
@@ -1402,7 +1542,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         if !matches!(hovered_port, Some((_, Some(_)))) {
             let now = ctx.input(|i| i.time);
             let pos = pointer.unwrap_or(rect.center());
-            if let Some(i) = pointer.and_then(|q| rects.iter().rposition(|r| r.contains(q))) {
+            if let Some(i) = pointer.and_then(|q| order.iter().rev().copied().find(|&i| rects[i].contains(q))) {
                 // RMB opens the node menu without selecting, so a viewport selection can
                 // still be the target of "Assign to Selection" (Maya behavior).
                 let id = nodes[i].id.strip_prefix("sg:").unwrap_or(&nodes[i].id).to_string();
