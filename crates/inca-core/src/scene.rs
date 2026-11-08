@@ -1695,8 +1695,9 @@ impl Scene {
 
     // ------------------------------------------------------------ selection
     pub fn select(&mut self, ids: &[Id], mode: SelMode) {
-        // JS `Sel.select`: templated and unselectable nodes never enter the selection
-        let ids: Vec<Id> = ids.iter().filter(|i| self.nodes.get(*i).is_some_and(|n| !n.template && n.selectable)).cloned().collect();
+        // Unselectable nodes never enter the selection. Templated nodes do: Maya only blocks
+        // them in the view, while the Outliner and Hypergraph can still select them.
+        let ids: Vec<Id> = ids.iter().filter(|i| self.nodes.get(*i).is_some_and(|n| n.selectable)).cloned().collect();
         let ids = &ids[..];
         match mode {
             SelMode::Replace => self.sel = ids.to_vec(),
@@ -2388,7 +2389,7 @@ mod tests {
     }
 
     #[test]
-    fn unselectable_and_templated_nodes_never_enter_the_selection() {
+    fn unselectable_nodes_never_enter_the_selection_but_templates_do() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
         s.nodes.get_mut(&a).unwrap().selectable = false;
@@ -2397,9 +2398,10 @@ mod tests {
         s.nodes.get_mut(&a).unwrap().selectable = true;
         s.select(std::slice::from_ref(&a), SelMode::Replace);
         assert_eq!(s.sel, vec![a.clone()]);
+        // Templated nodes stay selectable from the Outliner/Hypergraph; only the viewport blocks them.
         s.nodes.get_mut(&a).unwrap().template = true;
         s.select(std::slice::from_ref(&a), SelMode::Replace);
-        assert!(s.sel.is_empty());
+        assert_eq!(s.sel, vec![a.clone()]);
         // the flag round-trips (JS keeps it on the object only until the scene is saved)
         s.nodes.get_mut(&a).unwrap().template = false;
         s.nodes.get_mut(&a).unwrap().selectable = false;

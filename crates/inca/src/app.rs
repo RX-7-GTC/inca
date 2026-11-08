@@ -811,7 +811,7 @@ impl IncaApp {
     }
 
     /// Select DAG nodes by their scene IDs (not display names) and echo the equivalent MEL
-    /// `select` command. The scene filters out non-selectable / templated nodes.
+    /// `select` command. The scene filters out non-selectable nodes; templates stay selectable.
     pub fn select_names(&mut self, ids: &[String], mode: SelMode) {
         debug_assert!(ids.iter().all(|i| self.s.nodes.contains_key(i)), "select_names expects node IDs, not names");
         // The viewport/outliner and the Hypershade share one AE target, like Maya.
