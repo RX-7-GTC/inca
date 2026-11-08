@@ -578,6 +578,38 @@ pub(crate) fn graph_node_network(app: &mut IncaApp, id: &str) {
     app.windows_state.hs.frame = Some(false);
 }
 
+/// Graph the shading networks applied to the selected scene objects.
+fn graph_object_materials(app: &mut IncaApp) {
+    let mut mats = HashSet::new();
+    for oid in app.s.sel.clone() {
+        for id in app.s.subtree(&oid) {
+            let Some(mesh) = app.s.node(&id).and_then(|n| n.mesh()) else { continue };
+            mats.insert(mesh.material.clone());
+            if let Some(fm) = &mesh.mesh.fm {
+                mats.extend(fm.iter().flatten().cloned());
+            }
+        }
+    }
+    if mats.is_empty() {
+        app.warn("Select objects to graph their materials.");
+        return;
+    }
+    let mut ids = HashSet::new();
+    for mid in mats {
+        ids.insert(mid.clone());
+        if let Some(m) = app.s.mats.get(&mid) {
+            for t in m.maps.values().filter_map(|v| v.as_str()) {
+                if app.s.texs.contains_key(t) {
+                    ids.insert(t.to_string());
+                }
+            }
+        }
+    }
+    app.windows_state.hs.graph_ids = Some(ids);
+    app.windows_state.hs.graph_sel.clear();
+    app.windows_state.hs.frame = Some(false);
+}
+
 /// Selected graph nodes, with objects mapped to their materials and shading groups to shaders.
 fn connection_seeds(app: &IncaApp) -> HashSet<String> {
     let mut seeds = HashSet::new();
@@ -1228,6 +1260,9 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             "Graph" => {
                 if menu_row(app, ui, true, "Graph Network") {
                     graph_selected_network(app);
+                }
+                if menu_row(app, ui, true, "Graph Materials on Selected Objects") {
+                    graph_object_materials(app);
                 }
                 let in_graph = app.windows_state.hs.graph_ids.is_some();
                 if menu_row(app, ui, in_graph, "Add Selected to Graph") {
