@@ -25,7 +25,6 @@ pub enum Act {
     AssignExisting(String),
     History(String, usize),
     SetTool(Tool),
-    DefaultCamera,
     HypershadeAssign(String),
     HypershadeSelectUsers(String),
     HypershadeDuplicate(String),
@@ -84,12 +83,14 @@ pub struct Menu {
     button: egui::PointerButton,
     sticky: bool,
     hot_radial: Option<usize>,
+    /// Index of the open bottom-list submenu. It only opens from its parent row.
+    list_sub: Option<usize>,
 }
 
 const DIRS: [(&str, f32); 8] = [("N", -90.0), ("NE", -45.0), ("E", 0.0), ("SE", 45.0), ("S", 90.0), ("SW", 135.0), ("W", 180.0), ("NW", -135.0)];
 
 fn menu(pos: Pos2, vp: usize, button: egui::PointerButton, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64) -> Menu {
-    Menu { pos, title, radial, list, vp, opened: now, button, sticky: false, hot_radial: None }
+    Menu { pos, title, radial, list, vp, opened: now, button, sticky: false, hot_radial: None, list_sub: None }
 }
 
 /// RMB in a viewport: build the menu for the modifiers and what's under the cursor.
@@ -127,7 +128,14 @@ pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: eg
     }
     let s = &app.s;
     let off = &app.sel_mask_off;
-    let under = viewport::pick_object_if(s, &vp, cv, pos, &mut app.mesh_cache, &|id| crate::toolbar::mask_allows_scene(s, off, id));
+    // Templates never get the object menu, even when the Template selection mask is on.
+    let under = viewport::pick_object_if(s, &vp, cv, pos, &mut app.mesh_cache, &|id| !s.is_template(id) && crate::toolbar::mask_allows_scene(s, off, id));
+    // Templates get no component modes, but keep the object list menu.
+    let template = if under.is_none() {
+        viewport::pick_object_if(s, &vp, cv, pos, &mut app.mesh_cache, &|id| s.is_template(id) && crate::toolbar::mask_allows_scene(s, off, id))
+    } else {
+        None
+    };
     let target = under.clone().filter(|o| app.s.node(o).is_some_and(|n| matches!(n.shape, Shape::Mesh(_) | Shape::Curve(_)))).or_else(|| app.s.comp_mode.and_then(|_| app.s.hilite().first().cloned()));
     if let Some(t) = target {
         let is_curve = matches!(app.s.node(&t).map(|n| &n.shape), Some(Shape::Curve(_)));
@@ -137,25 +145,7 @@ pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: eg
         } else {
             vec![("N", it("Edge", Act::Mode(Some(CompMode::Edge)))), ("W", it("Vertex", Act::Mode(Some(CompMode::Vertex)))), ("S", it("Face", Act::Mode(Some(CompMode::Face)))), ("E", it("Object Mode", Act::Mode(None))), ("SE", disabled(it("UV", Act::Mode(Some(CompMode::Vertex))))), ("NE", it("Select", Act::Select(t.clone()))), ("NW", it("Multi", Act::Mode(Some(CompMode::Vertex)))), ("SW", it("Vertex Face", Act::Mode(Some(CompMode::Vertex))))]
         };
-        let inputs: Vec<Item> = app.s.node(&t).and_then(|n| n.mesh()).map(|m| m.history.iter().enumerate().rev().filter(|(_, h)| !h.name.contains('#') && inca_core::ops::info(&h.ty).is_some_and(|i| !i.1)).map(|(i, h)| it(&h.name, Act::History(t.clone(), i))).collect()).unwrap_or_default();
-        let shape = app.s.node(&t).and_then(|n| n.shape_name.clone()).unwrap_or("(none)".into());
-        let list = vec![
-            Some(cmd("Select All", "selectAll")),
-            Some(cmd("Deselect", "deselectAll")),
-            Some(cmd("Select Hierarchy", "selectHierarchy")),
-            Some(cmd("Inverse Selection", "invertSelection")),
-            None,
-            Some(sub("Assign New Material...", new_mats())),
-            Some(sub("Assign Existing Material", app.s.mats.values().map(|m| it(&m.name, Act::AssignExisting(m.name.clone()))).collect())),
-            Some(it("Material Attributes...", Act::Action("hypershade".into()))),
-            None,
-            Some(sub("Actions", ["hideSelection", "showLastHidden", "templateSel", "centerPivot", "freezeTransformations", "deleteHistory"].iter().map(|a| acmd(a)).collect())),
-            Some(sub("Inputs", inputs)),
-            Some(sub("Outputs", vec![disabled(cmd(&shape, ""))])),
-            None,
-            Some(sub("Paint", vec![it("Paint Select Tool", Act::SetTool(Tool::Paint)), cmd("Sculpt Tool", "sculptTool")])),
-            Some(disabled(cmd("Metadata", ""))),
-        ];
+        let list = object_menu_list(app, &t);
         // picking from this menu works on the object under the cursor
         app.marking_target = Some(t);
         app.marking = Some(menu(pos, idx, r, Some(format!("{name}...")), radial, list, now));
@@ -169,14 +159,41 @@ pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: eg
         app.marking = Some(menu(pos, idx, r, Some(format!("{name}...")), radial, list, now));
         return;
     }
-    let radial = vec![("N", cmd("Select All", "selectAll")), ("S", cmd("Complete Tool", "finishTool")), ("E", it("Object Mode", Act::Mode(None))), ("W", cmd("Deselect All", "deselectAll")), ("NE", cmd("Frame All", "frameAll")), ("NW", cmd("Repeat Last", "repeatLast"))];
-    let create: Vec<Item> = crate::menus::common("Create").into_iter().filter_map(|m| match m {
-        crate::menus::M::A(a) => Some(acmd(a)),
-        crate::menus::M::Sub(l, v) => Some(sub(l, v.into_iter().filter_map(|x| if let crate::menus::M::A(a) = x { Some(acmd(a)) } else { None }).collect())),
-        _ => None,
-    }).collect();
-    let list = vec![Some(sub("Create", create)), None, Some(cmd("Select Similar", "selectSimilar")), Some(cmd("Paste", "paste")), None, Some(it("Look Through Default", Act::DefaultCamera))];
-    app.marking = Some(menu(pos, idx, r, None, radial, list, now));
+    if let Some(t) = template {
+        let name = app.s.name_of(&t);
+        let radial = vec![("N", cmd("Complete Tool", "finishTool")), ("S", cmd("Select All", "selectAll"))];
+        let list = object_menu_list(app, &t);
+        app.marking_target = Some(t);
+        app.marking = Some(menu(pos, idx, r, Some(format!("{name}...")), radial, list, now));
+        return;
+    }
+    // Maya's no-object marking menu: Complete Tool at N, Select All at S, nothing else.
+    let radial = vec![("N", cmd("Complete Tool", "finishTool")), ("S", cmd("Select All", "selectAll"))];
+    app.marking = Some(menu(pos, idx, r, None, radial, vec![], now));
+}
+
+/// The list half of the object marking menu (Select All, materials, inputs...).
+fn object_menu_list(app: &IncaApp, t: &str) -> Vec<Option<Item>> {
+    let inputs: Vec<Item> = app.s.node(t).and_then(|n| n.mesh()).map(|m| m.history.iter().enumerate().rev().filter(|(_, h)| !h.name.contains('#') && inca_core::ops::info(&h.ty).is_some_and(|i| !i.1)).map(|(i, h)| it(&h.name, Act::History(t.to_string(), i))).collect()).unwrap_or_default();
+    let shape = app.s.node(t).and_then(|n| n.shape_name.clone()).unwrap_or("(none)".into());
+    vec![
+        Some(it("Select", Act::Select(t.to_string()))),
+        Some(cmd("Select All", "selectAll")),
+        Some(cmd("Deselect All", "deselectAll")),
+        Some(cmd("Select Hierarchy", "selectHierarchy")),
+        Some(cmd("Invert Selection", "invertSelection")),
+        None,
+        Some(sub("Assign New Material...", new_mats())),
+        Some(sub("Assign Existing Material", app.s.mats.values().map(|m| it(&m.name, Act::AssignExisting(m.name.clone()))).collect())),
+        Some(it("Material Attributes...", Act::Action("hypershade".into()))),
+        None,
+        Some(sub("Actions", ["hideSelection", "showLastHidden", "templateSel", "centerPivot", "freezeTransformations", "deleteHistory"].iter().map(|a| acmd(a)).collect())),
+        Some(sub("Inputs", inputs)),
+        Some(sub("Outputs", vec![disabled(cmd(&shape, ""))])),
+        None,
+        Some(sub("Paint", vec![it("Paint Select Tool", Act::SetTool(Tool::Paint)), cmd("Sculpt Tool", "sculptTool")])),
+        Some(disabled(cmd("Metadata", ""))),
+    ]
 }
 
 fn new_mats() -> Vec<Item> {
@@ -328,7 +345,6 @@ fn run(app: &mut IncaApp, act: Act) {
             app.inview = Some((id, i));
         }
         Act::SetTool(t) => app.set_tool(t),
-        Act::DefaultCamera => app.vps[vp].camera = ["persp", "top", "front", "side"][vp.min(3)].into(),
         Act::HypershadeAssign(id) => {
             if let Some(m) = app.s.mats.get(&id) {
                 let _ = app.run_mel("assign material", &format!("hyperShade -assign {};", m.name));
@@ -438,10 +454,19 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     let d = cur - m.pos;
     let rects: Vec<Rect> = m.radial.iter().map(|(d, i)| radial_rect(ctx, m, d, &i.label)).collect();
     let list_top = m.pos.y + 2.0 * ROW + 22.0;
+    let has_list = !m.list.is_empty() || m.title.is_some();
+    let list_h = 8.0 + m.title.as_ref().map_or(0.0, |_| 18.0) + m.list.iter().map(|i| if i.is_some() { 20.0 } else { 7.0 }).sum::<f32>();
+    let list_rect = if has_list {
+        Rect::from_min_size(pos2(m.pos.x - 85.0, list_top), vec2(170.0, list_h))
+    } else {
+        Rect::NOTHING
+    };
+    // Once the pointer is in the bottom menu (or one of its submenus), the radial
+    // gesture is over: no hot item and no gesture line, just a normal menu.
+    let in_list = has_list && (list_rect.contains(cur) || cur.y > list_top - 6.0);
     // hot radial item: under the cursor, or by direction once past the dead zone
-    let mut hot = rects.iter().position(|r| r.contains(cur));
-    let in_list_zone = cur.y > list_top - 6.0 && d.x.abs() < 120.0 && !m.list.is_empty();
-    if hot.is_none() && d.length() > 28.0 && !in_list_zone {
+    let mut hot = if in_list { None } else { rects.iter().position(|r| r.contains(cur)) };
+    if hot.is_none() && d.length() > 28.0 && !in_list {
         let ang = d.y.atan2(d.x).to_degrees();
         let best = m.radial.iter().enumerate().map(|(i, (dir, _))| {
             let a = DIRS.iter().find(|x| x.0 == *dir).unwrap().1;
@@ -522,10 +547,9 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     // the list below the radial items
     let button = m.button;
     let released = ptr.button_released(button);
-    let mut list_rect = Rect::NOTHING;
-    if !list.is_empty() || title.is_some() {
-        let h = 8.0 + title.as_ref().map_or(0.0, |_| 18.0) + list.iter().map(|i| if i.is_some() { 20.0 } else { 7.0 }).sum::<f32>();
-        let r = Rect::from_min_size(pos2(pos.x - 85.0, list_top), vec2(170.0, h));
+    let mut open_list_sub: Option<usize> = None;
+    if has_list {
+        let r = list_rect;
         p.rect_filled(r, 3.0, Color32::from_gray(0x44));
         p.rect_stroke(r, 3.0, Stroke::new(1.0, Color32::from_gray(0x2a)), egui::StrokeKind::Inside);
         let mut y = r.min.y + 4.0;
@@ -547,7 +571,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
             }
         }
         let screen = ctx.content_rect();
-        let mut open_sub: Option<(usize, Rect)> = None;
+        let mut sub_rects: Vec<Option<Rect>> = vec![None; list.len()];
         for (idx, item) in list.iter().enumerate() {
             let Some(item) = item else { continue };
             if item.sub.is_empty() {
@@ -558,15 +582,34 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
             let sh = 6.0 + item.sub.len() as f32 * 20.0;
             let left = rr.max.x + sw + 4.0 > screen.max.x;
             let sx = if left { rr.min.x - sw - 2.0 } else { rr.max.x + 2.0 };
-            let sr = Rect::from_min_size(pos2(sx, rr.min.y), vec2(sw, sh));
-            if rr.contains(cur) || sr.contains(cur) {
-                open_sub = Some((idx, sr));
+            sub_rects[idx] = Some(Rect::from_min_size(pos2(sx, rr.min.y), vec2(sw, sh)));
+        }
+        // Only the parent row opens a list submenu. Once open, moving sideways into it keeps
+        // it open; approaching another submenu from the side does not open it.
+        let mut open_sub: Option<(usize, Rect)> = None;
+        if let Some(prev) = m.list_sub {
+            if let Some(sr) = sub_rects.get(prev).copied().flatten() {
+                if sr.contains(cur) {
+                    open_sub = Some((prev, sr));
+                }
             }
         }
         for (idx, item) in list.iter().enumerate() {
             let Some(item) = item else { continue };
+            if item.sub.is_empty() || !rows[idx].is_some_and(|rr| rr.contains(cur)) {
+                continue;
+            }
+            if let Some(sr) = sub_rects[idx] {
+                open_sub = Some((idx, sr));
+                break;
+            }
+        }
+        open_list_sub = open_sub.map(|(i, _)| i);
+        for (idx, item) in list.iter().enumerate() {
+            let Some(item) = item else { continue };
             let Some(rr) = rows[idx] else { continue };
-            if rr.contains(cur) {
+            let open_parent = open_sub.is_some_and(|(oi, _)| oi == idx);
+            if rr.contains(cur) || open_parent {
                 p.rect_filled(rr, 2.0, Color32::from_rgb(0x52, 0x85, 0xa6));
             }
             let l = match item.check {
@@ -574,7 +617,16 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
                 Some(false) => format!("   {}", item.label),
                 None => item.label.clone(),
             };
-            p.text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, l, FontId::proportional(12.0), if item.enabled { Color32::WHITE } else { Color32::from_gray(0x80) });
+            let col = if item.enabled { Color32::WHITE } else { Color32::from_gray(0x80) };
+            p.text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, l, FontId::proportional(12.0), col);
+            if !item.sub.is_empty() {
+                let c = pos2(rr.max.x - 9.0, rr.center().y);
+                p.add(egui::Shape::convex_polygon(
+                    vec![pos2(c.x - 2.5, c.y - 4.0), pos2(c.x + 3.5, c.y), pos2(c.x - 2.5, c.y + 4.0)],
+                    col,
+                    Stroke::NONE,
+                ));
+            }
             if item.sub.is_empty() && rr.contains(cur) && item.enabled && (primary_click || released) {
                 picked = item.act.clone();
             }
@@ -599,11 +651,13 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
                 p.text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, l, FontId::proportional(12.0), Color32::WHITE);
             }
         }
-        list_rect = r;
     }
-    // The drag line is drawn last so it stays visible over every option.
-    p.line_segment([pos, cur], Stroke::new(1.5, Color32::from_gray(0xdd)));
-    p.circle_filled(pos, 4.0, Color32::from_gray(0xdd));
+    // The drag line is drawn last so it stays visible over every option, except when the
+    // pointer is in the bottom menu (there it behaves like a normal menu).
+    if !in_list {
+        p.line_segment([pos, cur], Stroke::new(1.5, Color32::from_gray(0xdd)));
+        p.circle_filled(pos, 4.0, Color32::from_gray(0xdd));
+    }
     let menu_open = ctx.any_popup_open();
     let quick = now - app.marking.as_ref().unwrap().opened < 0.26 && d.length() < 6.0;
     let sticky = app.marking.as_ref().unwrap().sticky;
@@ -646,6 +700,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     }
     if let Some(m) = app.marking.as_mut() {
         m.hot_radial = hot;
+        m.list_sub = open_list_sub;
     }
     if let Some(a) = picked {
         run(app, a);

@@ -68,7 +68,7 @@ pub fn status_line(app: &mut IncaApp, ui: &mut egui::Ui) {
                 app.action("uvMode");
             }
         } else {
-            for (k, i, tip) in [("curve", "olCurve", "Select curves"), ("mesh", "olMesh", "Select surfaces (polygons & NURBS)"), ("light", "olLight", "Select lights"), ("camera", "olCamera", "Select cameras"), ("locator", "olLocator", "Select locators")] {
+            for (k, i, tip) in [("curve", "olCurve", "Select curves"), ("mesh", "olMesh", "Select surfaces (polygons & NURBS)"), ("light", "olLight", "Select lights"), ("camera", "olCamera", "Select cameras"), ("locator", "olLocator", "Select locators"), ("template", "olTemplate", "Select templates")] {
                 let on = !app.sel_mask_off.contains(k);
                 if ib(ui, i, tip, on).clicked() {
                     if on {

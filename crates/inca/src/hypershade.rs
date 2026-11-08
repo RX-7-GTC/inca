@@ -325,7 +325,8 @@ fn drop_on_viewport(app: &mut IncaApp, id: &str, q: Pos2) -> bool {
     let rect = app.vps[idx].rect;
     let cam = app.vps[idx].camera.clone();
     let cv = crate::viewport::cam_view(&app.s, &cam, [rect.width(), rect.height()]);
-    let Some(obj) = crate::viewport::pick_object_if(&app.s, &app.vps[idx], &cv, q, &mut app.mesh_cache, &|_| true) else { return false };
+    let s = &app.s;
+    let Some(obj) = crate::viewport::pick_object_if(s, &app.vps[idx], &cv, q, &mut app.mesh_cache, &|id| !s.is_template(id)) else { return false };
     if app.s.node(&obj).and_then(|n| n.mesh()).is_none() {
         return false;
     }

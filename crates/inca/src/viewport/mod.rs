@@ -1574,7 +1574,7 @@ pub fn pick_object_if(s: &Scene, vp: &Viewport, cv: &CamView, pos: Pos2, mesh_ca
         if !allow(&id) {
             continue;
         }
-        if !s.is_visible(&id) || s.is_template(&id) {
+        if !s.is_visible(&id) {
             continue;
         }
         if let Some(iso) = &vp.isolate {
@@ -1819,10 +1819,10 @@ pub fn on_stroke(stroke: &[Pos2], r: f32, p: Pos2) -> bool {
 }
 
 /// Objects with a projected vertex (or icon point) satisfying `inside`.
-pub fn region_objects(s: &Scene, vp: &Viewport, cv: &CamView, inside: &dyn Fn(Pos2) -> bool, center: Option<Pos2>, mesh_cache: &mut MeshCache) -> Vec<Id> {
+pub fn region_objects(s: &Scene, vp: &Viewport, cv: &CamView, inside: &dyn Fn(Pos2) -> bool, center: Option<Pos2>, mesh_cache: &mut MeshCache, allow_templates: bool) -> Vec<Id> {
     let mut out = vec![];
     for id in s.all_dag(false) {
-        if !s.is_visible(&id) || s.is_template(&id) {
+        if !s.is_visible(&id) || (!allow_templates && s.is_template(&id)) {
             continue;
         }
         let n = s.node(&id).unwrap();

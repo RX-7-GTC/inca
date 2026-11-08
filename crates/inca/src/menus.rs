@@ -425,7 +425,11 @@ pub fn panel_bar(
     ui.horizontal_wrapped(|ui| {
         for name in titles {
             let r = if small {
-                ui.add(egui::Button::new(egui::RichText::new(*name).size(11.5)).selected(open == Some(*name)))
+                ui.scope(|ui| {
+                    menu_hover(ui);
+                    ui.add(egui::Button::new(egui::RichText::new(*name).size(11.5)).selected(open == Some(*name)))
+                })
+                .inner
             } else {
                 title_button(ui, name, open == Some(*name))
             };
@@ -451,7 +455,11 @@ fn open_title(open: Option<OpenMenu>, source: MenuSource) -> Option<&'static str
 }
 
 fn title_button(ui: &mut egui::Ui, name: &str, open: bool) -> egui::Response {
-    ui.add(egui::Button::new(name).selected(open))
+    ui.scope(|ui| {
+        menu_hover(ui);
+        ui.add(egui::Button::new(name).selected(open))
+    })
+    .inner
 }
 
 /// Maya/JS top-level menu behaviour: press a title to open it, press it again to close, and

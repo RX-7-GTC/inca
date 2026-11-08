@@ -431,7 +431,7 @@ impl IncaApp {
             space_down: None,
             select_hierarchy: false,
             last_comp_mode: CompMode::Vertex,
-            sel_mask_off: Default::default(),
+            sel_mask_off: ["template".to_string()].into_iter().collect(),
             lock_selection: false,
             snap_curve: false,
             snap_point: false,

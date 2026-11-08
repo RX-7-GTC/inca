@@ -948,7 +948,8 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
 fn pick_masked(app: &mut IncaApp, vp: &viewport::Viewport, cv: &CamView, p: Pos2) -> Option<String> {
     let s = &app.s;
     let off = &app.sel_mask_off;
-    viewport::pick_object_if(s, vp, cv, p, &mut app.mesh_cache, &|id| crate::toolbar::mask_allows_scene(s, off, id))
+    let allow_templates = !off.contains("template");
+    viewport::pick_object_if(s, vp, cv, p, &mut app.mesh_cache, &|id| (allow_templates || !s.is_template(id)) && crate::toolbar::mask_allows_scene(s, off, id))
 }
 
 /// Wheel dolly; in ortho views keep the world point under the cursor fixed (JS `dolly(cursor)`).
@@ -1075,9 +1076,10 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
         let _ = app.exec_mel(&mel, parts.len() < 200);
         return;
     }
+    let allow_templates = !app.sel_mask_off.contains("template");
     let ids = {
         let s = &app.s;
-        viewport::region_objects(s, &vp, cv, region, center, &mut app.mesh_cache)
+        viewport::region_objects(s, &vp, cv, region, center, &mut app.mesh_cache, allow_templates)
     };
     let ids = filter_picks(app, ids);
     app.select_names(&ids, if mode == SelMode::Toggle && ids.is_empty() { SelMode::Add } else { mode });
@@ -2299,6 +2301,10 @@ fn finish_drag(app: &mut IncaApp, d: GizmoDrag) {
 }
 
 fn hud(app: &mut IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
+    // The camera-name HUD can peek out under a marking menu list and look like a menu row.
+    if app.marking.is_some() {
+        return;
+    }
     let r = app.vps[idx].rect;
     let camera = app.vps[idx].camera.clone();
     let isolate = app.vps[idx].isolate.is_some();
