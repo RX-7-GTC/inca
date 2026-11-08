@@ -10,6 +10,47 @@ use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub(crate) enum RenameAction {
+    Commit(String),
+    Cancel,
+}
+
+/// Modal rename prompt: it stays above every window and blocks input to the rest of the UI,
+/// like Maya's rename dialogs.
+pub(crate) fn rename_prompt(ctx: &egui::Context, id: egui::Id, title: &str, name: &mut String, confirm: &str) -> Option<RenameAction> {
+    let mut action = None;
+    egui::Modal::new(id).backdrop_color(Color32::from_black_alpha(40)).show(ctx, |ui| {
+        ui.set_width(240.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("×").on_hover_text("Close").clicked() {
+                    action = Some(RenameAction::Cancel);
+                }
+            });
+        });
+        let field_id = id.with("name");
+        if !ctx.memory(|m| m.has_focus(field_id)) {
+            // Start with the caret at the end, even when an earlier rename left a stored caret.
+            if let Some(mut st) = egui::TextEdit::load_state(ctx, field_id) {
+                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(name.chars().count()))));
+                st.store(ctx, field_id);
+            }
+        }
+        let r = ui.add_sized([240.0, 20.0], egui::TextEdit::singleline(name).id(field_id));
+        r.request_focus();
+        ui.horizontal(|ui| {
+            if ui.button(confirm).clicked() || ((r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                action = Some(RenameAction::Commit(name.trim().to_string()));
+            }
+            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                action = Some(RenameAction::Cancel);
+            }
+        });
+    });
+    action
+}
+
 pub struct RenderJob {
     pub cancel: Arc<AtomicBool>,
     latest: Arc<Mutex<Option<(Vec<u8>, u32)>>>,
@@ -262,22 +303,12 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     app.win.about = open;
     // rename dialog
     if let Some(mut name) = app.win.rename.take() {
-        let mut keep = true;
-        egui::Window::new("Rename").collapsible(false).resizable(false).show(ctx, |ui| {
-            let r = ui.text_edit_singleline(&mut name);
-            r.request_focus();
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                    let _ = app.run_mel("rename", &format!("rename \"{}\";", name.trim()));
-                    keep = false;
-                }
-                if ui.button("Cancel").clicked() {
-                    keep = false;
-                }
-            });
-        });
-        if keep {
-            app.win.rename = Some(name);
+        match rename_prompt(ctx, egui::Id::new("win_rename"), "Rename", &mut name, "Rename") {
+            Some(RenameAction::Commit(new)) => {
+                let _ = app.run_mel("rename", &format!("rename \"{}\";", new));
+            }
+            Some(RenameAction::Cancel) => {}
+            None => app.win.rename = Some(name),
         }
     }
 }

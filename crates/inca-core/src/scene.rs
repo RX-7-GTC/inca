@@ -374,6 +374,8 @@ pub struct Scene {
     pub file: Option<std::path::PathBuf>,
     pub modified: bool,
     pub msgs: Vec<(MsgKind, String)>,
+    /// Node renames from the last command batch, consumed by the UI to fix name references.
+    pub name_changes: Vec<(String, String)>,
     pub undo_stack: Vec<Snapshot>,
     pub redo_stack: Vec<Snapshot>,
     pub undo_limit: usize,
@@ -426,6 +428,7 @@ impl Scene {
             file: None,
             modified: false,
             msgs: vec![],
+            name_changes: vec![],
             undo_stack: vec![],
             redo_stack: vec![],
             undo_limit: 100,

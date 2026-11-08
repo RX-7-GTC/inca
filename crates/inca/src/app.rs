@@ -194,6 +194,8 @@ pub struct IncaApp {
     pub gpu: Option<Gpu>,
     /// Kept so the GPU renderer can be rebuilt when MSAA changes at runtime.
     pub gpu_rs: Option<eframe::egui_wgpu::RenderState>,
+    /// Last known name of each camera node, so undo/redo can retarget viewport cameras.
+    camera_names: HashMap<String, String>,
     pub smooth_cache: HashMap<String, (u64, inca_core::mesh::PolyMesh)>,
     /// Per-node mesh statistics (verts, edges, faces, tris, uvs) cached by node revision.
     /// The edge count needs the whole edge topology, so `Scene::poly_count` on every frame is
@@ -406,6 +408,7 @@ impl IncaApp {
             pivot_mode: false,
             gpu,
             gpu_rs,
+            camera_names: HashMap::new(),
             smooth_cache: HashMap::new(),
             stats_cache: HashMap::new(),
             mesh_cache: Default::default(),
@@ -493,7 +496,48 @@ impl IncaApp {
             app.open_path(std::path::Path::new(&p));
         }
         app.s.modified = false;
+        app.sync_camera_names();
         app
+    }
+
+    pub(crate) fn reset_camera_names(&mut self) {
+        self.camera_names.clear();
+        self.sync_camera_names();
+    }
+
+    /// Retarget viewport cameras after renames and undo/redo: match the camera's previous
+    /// name to its current node name, so references follow the node through the change.
+    pub(crate) fn sync_camera_names(&mut self) {
+        let previous = std::mem::take(&mut self.camera_names);
+        let current: HashMap<String, String> = self
+            .s
+            .nodes
+            .values()
+            .filter(|n| matches!(n.shape, inca_core::scene::Shape::Camera(_)))
+            .map(|n| (n.id.clone(), n.name.clone()))
+            .collect();
+        let retarget = |name: &str| {
+            current
+                .iter()
+                .find(|(id, _)| previous.get(*id).is_some_and(|old| old == name))
+                .map(|(_, new)| new.clone())
+        };
+        for vp in &mut self.vps {
+            if current.values().any(|n| n == &vp.camera) {
+                continue;
+            }
+            if let Some(new) = retarget(&vp.camera) {
+                vp.camera = new;
+            }
+        }
+        if let Some(cam) = self.s.render.get("camera").and_then(|v| v.as_str()).map(str::to_string) {
+            if !current.values().any(|n| n == &cam) {
+                if let Some(new) = retarget(&cam) {
+                    self.s.render.insert("camera".into(), serde_json::Value::String(new));
+                }
+            }
+        }
+        self.camera_names = current;
     }
 
     // ------------------------------------------------------------ mesh statistics
@@ -601,6 +645,25 @@ impl IncaApp {
         }
         let mut host = UiHost::default();
         let r = self.mel.run(&mut self.s, &mut host, src);
+        // Keep camera references in sync when a node is renamed.
+        let name_changes = std::mem::take(&mut self.s.name_changes);
+        let had_changes = !name_changes.is_empty();
+        let undo_like = src.trim_start().starts_with("undo") || src.trim_start().starts_with("redo");
+        if had_changes {
+            for (old, new) in name_changes {
+                for vp in &mut self.vps {
+                    if vp.camera == old {
+                        vp.camera = new.clone();
+                    }
+                }
+                if self.s.render.get("camera").and_then(|v| v.as_str()) == Some(old.as_str()) {
+                    self.s.render.insert("camera".into(), serde_json::Value::String(new));
+                }
+            }
+        }
+        if undo_like || had_changes {
+            self.sync_camera_names();
+        }
         for o in self.mel.output.drain(..) {
             let _ = o;
         }
@@ -782,6 +845,7 @@ impl IncaApp {
                 self.smooth_cache.clear();
                 self.stats_cache.clear();
                 self.windows_state.hs.graph_ids = None;
+                self.reset_camera_names();
                 self.add_recent(p);
             }
             Err(e) => self.last_result = format!("// Error: {e} //"),

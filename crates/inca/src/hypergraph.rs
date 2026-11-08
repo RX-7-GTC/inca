@@ -421,34 +421,14 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     // Rename dialog for the Hypergraph (renames the box's object directly, like the JS
     // double-click rename; the generic Rename window acts on the current selection).
     if let Some((old, mut new)) = app.hg.rename.take() {
-        let mut keep = true;
-        let mut commit = false;
-        egui::Window::new("Rename").id(egui::Id::new("hg_rename")).collapsible(false).resizable(false).show(ctx, |ui| {
-            let r = ui.text_edit_singleline(&mut new);
-            r.request_focus();
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked() {
-                    commit = true;
+        match crate::windows::rename_prompt(ctx, egui::Id::new("hg_rename"), "Rename", &mut new, "Rename") {
+            Some(crate::windows::RenameAction::Commit(new)) => {
+                if !new.is_empty() && new != old {
+                    let _ = app.run_mel("rename", &format!("rename \"{old}\" \"{}\";", new.replace('"', "")));
                 }
-                if ui.button("Cancel").clicked() {
-                    keep = false;
-                }
-            });
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                keep = false;
             }
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                commit = true;
-            }
-        });
-        if commit {
-            if !new.trim().is_empty() && new.trim() != old {
-                let _ = app.run_mel("rename", &format!("rename \"{old}\" \"{}\";", new.trim().replace('"', "")));
-            }
-            keep = false;
-        }
-        if keep {
-            app.hg.rename = Some((old, new));
+            Some(crate::windows::RenameAction::Cancel) => {}
+            None => app.hg.rename = Some((old, new)),
         }
     }
     app.win.hypergraph = open;

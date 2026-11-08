@@ -355,6 +355,7 @@ pub fn rename(s: &mut Scene, id: &str, want: &str) -> String {
     }
     s.nodes.get_mut(id).unwrap().name = nn.clone();
     s.touch();
+    s.name_changes.push((old, nn.clone()));
     nn
 }
 

@@ -30,6 +30,12 @@ pub enum Act {
     HypershadeSelectUsers(String),
     HypershadeDuplicate(String),
     HypershadeRename(String),
+    HypershadeGraphNetwork(String),
+    HypershadeAddToGraph(String),
+    HypershadeAttributeEditor(String),
+    HypershadeShowNode(String),
+    HypershadeLookThrough(String),
+    HypershadeDelete(Vec<String>),
     HypershadeCreateMaterial(String),
     HypershadeCreateTexture(String),
     HypershadeFrameAll,
@@ -334,10 +340,45 @@ fn run(app: &mut IncaApp, act: Act) {
         }
         Act::HypershadeDuplicate(id) => crate::hypershade::duplicate_shading_network(app, &id),
         Act::HypershadeRename(id) => {
-            if let Some(name) = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone())) {
-                app.windows_state.hs.rename_pos = app.marking.as_ref().map(|m| m.pos);
+            if let Some(name) = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone())).or_else(|| app.s.node(&id).map(|n| n.name.clone())) {
                 app.windows_state.hs.rename = Some((id, name));
             }
+        }
+        Act::HypershadeGraphNetwork(id) => crate::hypershade::graph_node_network(app, &id),
+        Act::HypershadeAddToGraph(id) => {
+            if let Some(graph) = &mut app.windows_state.hs.graph_ids {
+                graph.insert(id);
+            }
+        }
+        Act::HypershadeAttributeEditor(id) => {
+            if app.s.mats.contains_key(&id) || app.s.texs.contains_key(&id) {
+                crate::hypershade::select_shading_node(app, &id);
+            } else {
+                app.select_names(std::slice::from_ref(&id), SelMode::Replace);
+                app.windows_state.hs_selected = Some(id);
+                app.windows_state.hs.graph_sel.clear();
+            }
+            app.show_right = true;
+            app.right_tab = crate::app::RightTab::AttributeEditor;
+        }
+        Act::HypershadeShowNode(id) => {
+            if app.s.mats.contains_key(&id) || app.s.texs.contains_key(&id) {
+                crate::hypershade::select_shading_node(app, &id);
+            } else {
+                app.select_names(std::slice::from_ref(&id), SelMode::Replace);
+                app.windows_state.hs_selected = Some(id);
+                app.windows_state.hs.graph_sel.clear();
+            }
+        }
+        Act::HypershadeLookThrough(id) => {
+            let name = app.s.name_of(&id);
+            if !name.is_empty() {
+                app.vps[vp].camera = name;
+            }
+        }
+        Act::HypershadeDelete(ids) => {
+            let ids: std::collections::HashSet<String> = ids.into_iter().collect();
+            crate::hypershade::delete_graph_nodes(app, &ids);
         }
         Act::HypershadeCreateMaterial(ty) => {
             let _ = app.run_mel("create material", &format!("shadingNode -asShader {ty};"));
