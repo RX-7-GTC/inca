@@ -117,23 +117,21 @@ impl HsState {
     }
 }
 
-/// Create a light from the Hypershade Create menu/bar and reveal it in the Lights tab.
+/// Create a light from the Hypershade Create menu/bar.
 fn create_light_node(app: &mut IncaApp, ty: &str) {
     let _ = app.run_mel("create light", &format!("{ty};"));
     if let Some(id) = app.s.nodes.keys().last().cloned().filter(|id| app.s.node(id).is_some_and(|n| matches!(n.shape, Shape::Light(_)))) {
         app.select_names(std::slice::from_ref(&id), SelMode::Replace);
         app.windows_state.hs_selected = Some(id);
-        app.windows_state.hs.tab = 2;
     }
 }
 
-/// Create a camera from the Hypershade Create menu and reveal it in the Cameras tab.
+/// Create a camera from the Hypershade Create menu.
 fn create_camera_node(app: &mut IncaApp) {
     let _ = app.run_mel("create camera", "camera;");
     if let Some(id) = app.s.nodes.keys().last().cloned().filter(|id| app.s.node(id).is_some_and(|n| matches!(n.shape, Shape::Camera(_)))) {
         app.select_names(std::slice::from_ref(&id), SelMode::Replace);
         app.windows_state.hs_selected = Some(id);
-        app.windows_state.hs.tab = 3;
     }
 }
 
@@ -455,7 +453,7 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
     out
 }
 
-fn is_graph_dag(app: &IncaApp, id: &str) -> bool {
+pub(crate) fn is_graph_dag(app: &IncaApp, id: &str) -> bool {
     app.s.node(id).is_some_and(|n| matches!(n.shape, Shape::Light(_) | Shape::Camera(_)))
 }
 
@@ -681,13 +679,25 @@ pub(crate) fn read_only(app: &IncaApp, id: &str) -> bool {
     id == app.s.default_mat || app.s.mats.get(id).is_some_and(|m| m.name == "standardSurface1")
 }
 
+/// Whether Hypershade's Edit > Delete may remove this graph node.
+fn deletable(app: &IncaApp, id: &str) -> bool {
+    let base = id.strip_prefix("sg:").unwrap_or(id);
+    if app.s.mats.contains_key(base) || app.s.texs.contains_key(base) {
+        !read_only(app, base)
+    } else {
+        app.s.node(base).is_some_and(|n| !n.startup() && matches!(n.shape, Shape::Light(_) | Shape::Camera(_)))
+    }
+}
+
 pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
     // Deleting a shading-group node deletes its material (Maya behavior).
     let ids: HashSet<String> = ids.iter().map(|id| id.strip_prefix("sg:").unwrap_or(id).to_string()).collect();
     let ids = &ids;
     let mut mats = vec![];
     let mut texs = vec![];
+    let mut dags = vec![];
     let mut blocked = vec![];
+    let mut blocked_dags = vec![];
     for id in ids {
         if let Some(m) = app.s.mats.get(id) {
             if read_only(app, id) {
@@ -697,15 +707,27 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
             }
         } else if app.s.texs.contains_key(id) {
             texs.push(id.clone());
+        } else if let Some(n) = app.s.node(id) {
+            if matches!(n.shape, Shape::Light(_) | Shape::Camera(_)) {
+                if n.startup() {
+                    blocked_dags.push(n.name.clone());
+                } else {
+                    dags.push(id.clone());
+                }
+            }
         }
     }
     for name in blocked {
         app.error(format!("file: C:/Program Files/Autodesk/Maya2020/scripts/others/hyperShadePanel.mel line 6837: Non-deletable node '{name}' cannot be deleted"));
     }
-    if mats.is_empty() && texs.is_empty() {
+    for name in blocked_dags {
+        app.warn(format!("Cannot delete the default camera '{name}'."));
+    }
+    if mats.is_empty() && texs.is_empty() && dags.is_empty() {
         return;
     }
-    app.s.checkpoint("delete shading nodes");
+    let dead_cams: Vec<String> = dags.iter().filter_map(|id| app.s.node(id).filter(|n| matches!(n.shape, Shape::Camera(_))).map(|n| n.name.clone())).collect();
+    app.s.checkpoint("delete nodes");
     for id in &mats {
         app.s.delete_material(id);
     }
@@ -717,6 +739,17 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
         if let Some(t) = app.s.texs.shift_remove(id) {
             app.s.release_name(&t.name);
         }
+    }
+    for id in &dags {
+        app.s.delete_node(id);
+    }
+    if !dead_cams.is_empty() {
+        if let Some(cam) = app.s.render.get("camera").and_then(|v| v.as_str()).map(str::to_string) {
+            if dead_cams.contains(&cam) {
+                app.s.render.insert("camera".into(), json!(""));
+            }
+        }
+        app.sync_camera_names();
     }
     app.s.touch();
     for id in ids {
@@ -892,19 +925,33 @@ fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
         }
     }
     let target = id.strip_prefix("sg:").unwrap_or(id).to_string();
+    let shading = app.s.mats.contains_key(&target) || app.s.texs.contains_key(&target);
     if selected_now {
         app.windows_state.hs.bump_z(id);
-        if app.s.mats.contains_key(&target) || app.s.texs.contains_key(&target) {
+        // select_names/select_shading_node clear the graph selection; keep the whole
+        // multi-selection for additive picks.
+        let keep = app.windows_state.hs.graph_sel.clone();
+        if shading {
             select_shading_node(app, &target);
         } else {
-            app.select_names(std::slice::from_ref(&target), SelMode::Replace);
+            let mode = if additive { SelMode::Add } else { SelMode::Replace };
+            app.select_names(std::slice::from_ref(&target), mode);
             app.windows_state.hs_selected = Some(target.clone());
-            app.windows_state.hs.graph_sel.insert(target.clone());
         }
-    } else if app.windows_state.hs_selected.as_deref() == Some(target.as_str()) {
-        app.windows_state.hs_selected = None;
-        if app.snode_sel.as_deref() == Some(target.as_str()) {
-            app.snode_sel = None;
+        app.windows_state.hs.graph_sel = keep;
+    } else {
+        if shading {
+            if app.snode_sel.as_deref() == Some(target.as_str()) {
+                app.snode_sel = None;
+            }
+        } else {
+            // Remove only this object from the scene selection.
+            let keep = app.windows_state.hs.graph_sel.clone();
+            app.select_names(std::slice::from_ref(&target), SelMode::Remove);
+            app.windows_state.hs.graph_sel = keep;
+        }
+        if app.windows_state.hs_selected.as_deref() == Some(target.as_str()) {
+            app.windows_state.hs_selected = None;
         }
     }
 }
@@ -946,14 +993,15 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             "Edit" => {
                 let lead = app.snode_sel.clone().or_else(|| app.windows_state.hs_selected.clone()).filter(|id| app.s.mats.contains_key(id) || app.s.texs.contains_key(id));
                 let mut delete_ids = app.windows_state.hs.graph_sel.clone();
-                if let Some(id) = &lead {
-                    delete_ids.insert(id.clone());
+                delete_ids.extend(app.s.sel.iter().cloned());
+                if let Some(id) = app.snode_sel.clone().or_else(|| app.windows_state.hs_selected.clone()) {
+                    delete_ids.insert(id);
                 }
                 delete_ids.retain(|id| {
                     let base = id.strip_prefix("sg:").unwrap_or(id);
-                    app.s.mats.contains_key(base) || app.s.texs.contains_key(base)
+                    app.s.mats.contains_key(base) || app.s.texs.contains_key(base) || is_graph_dag(app, base)
                 });
-                let can_delete = delete_ids.iter().any(|id| !read_only(app, id.strip_prefix("sg:").unwrap_or(id)));
+                let can_delete = delete_ids.iter().any(|id| deletable(app, id));
                 if menu_row(app, ui, can_delete, "Delete") {
                     delete_graph_nodes(app, &delete_ids);
                 }
@@ -1095,6 +1143,9 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("Create:");
         ui.add(egui::TextEdit::singleline(&mut app.windows_state.hs.create_filter).hint_text("Filter nodes...").desired_width(120.0));
+        if !app.windows_state.hs.create_filter.is_empty() && ui.small_button("×").on_hover_text("Clear filter").clicked() {
+            app.windows_state.hs.create_filter.clear();
+        }
     });
     let create_filter = app.windows_state.hs.create_filter.to_lowercase();
     ui.horizontal_wrapped(|ui| {
@@ -1142,7 +1193,13 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
         .exact_size(palette_w)
         .resizable(false)
         .show(ui, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.windows_state.hs.filter).hint_text("Search...").desired_width(ui.available_width()));
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - 26.0).max(40.0);
+                ui.add(egui::TextEdit::singleline(&mut app.windows_state.hs.filter).hint_text("Search...").desired_width(width));
+                if !app.windows_state.hs.filter.is_empty() && ui.small_button("×").on_hover_text("Clear search").clicked() {
+                    app.windows_state.hs.filter.clear();
+                }
+            });
             ui.horizontal_wrapped(|ui| {
                 for (i, label) in ["Materials", "Textures", "Lights", "Cameras", "Shading Groups"].into_iter().enumerate() {
                     ui.selectable_value(&mut app.windows_state.hs.tab, i, label);
@@ -1246,6 +1303,9 @@ fn open_palette_marking(app: &mut IncaApp, id: &str, name: &str, pos: Pos2, now:
 fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let filter = app.windows_state.hs.filter.to_lowercase();
+    let additive = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
+    // Behind the tiles: clicking the empty browser area clears the selection.
+    let bg = ui.interact(ui.clip_rect(), ui.id().with("hs_palette_bg"), Sense::click());
     let mut items: Vec<(String, String, Option<String>)> = vec![];
     match app.windows_state.hs.tab {
         0 => {
@@ -1285,7 +1345,7 @@ fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
     for row in items.chunks(cols) {
         ui.horizontal(|ui| {
             for (id, name, icon) in row {
-                let sel = app.windows_state.hs_selected.as_deref() == Some(id.as_str());
+                let sel = app.windows_state.hs.graph_sel.contains(id) || app.windows_state.hs_selected.as_deref() == Some(id.as_str()) || app.s.sel.contains(id);
                 let tex = swatch(app, &ctx, id);
                 ui.vertical(|ui| {
                     ui.set_width(56.0);
@@ -1298,16 +1358,12 @@ fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                     ui.add_sized([56.0, 14.0], egui::Label::new(RichText::new(name).size(10.0)).truncate());
                     if resp.clicked() {
-                        app.windows_state.hs.graph_sel.clear();
-                        if app.s.mats.contains_key(id) || app.s.texs.contains_key(id) {
-                            app.windows_state.hs_selected = Some(id.clone());
+                        // A plain click picks exactly that swatch; Ctrl/Shift adds or toggles.
+                        if !additive {
+                            app.windows_state.hs.graph_sel.clear();
                             app.windows_state.hs.graph_sel.insert(id.clone());
-                            select_shading_node(app, id);
-                            app.windows_state.hs.bump_z(id);
-                        } else if app.s.node(id).is_some() {
-                            app.select_names(std::slice::from_ref(id), SelMode::Replace);
-                            app.windows_state.hs_selected = Some(id.clone());
                         }
+                        select_graph_node(app, id, additive);
                     }
                     if resp.double_clicked() && app.s.mats.contains_key(id) {
                         let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
@@ -1332,6 +1388,11 @@ fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
                 });
             }
         });
+    }
+    if bg.clicked() {
+        app.windows_state.hs.graph_sel.clear();
+        app.windows_state.hs_selected = None;
+        app.select_names(&[], SelMode::Replace);
     }
     if let (Some(id), Some(q)) = (app.windows_state.hs.palette_drag.clone(), ctx.pointer_hover_pos()) {
         let name = app
@@ -1613,7 +1674,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         if !rect.intersects(r) {
             continue;
         }
-        let sel = app.windows_state.hs.graph_sel.contains(&n.id) || (n.kind == Kind::Object && app.s.sel.contains(&n.id));
+        let sel = app.windows_state.hs.graph_sel.contains(&n.id) || (matches!(n.kind, Kind::Dag | Kind::Object) && app.s.sel.contains(&n.id));
         let is_source = wire_src == Some(n.id.as_str());
         let accepts = wire.as_ref().is_none_or(|w| n.inputs.iter().enumerate().any(|(si, _)| wire_compatible(w, n, Some(si))) || wire_compatible(w, n, None));
         let inactive = wire.is_some() && !is_source && !accepts;
@@ -1853,6 +1914,11 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     if resp.clicked() {
         if let Some((i, _)) = hovered_port {
             let id = nodes[i].id.clone();
+            // Dragging a selected node keeps the group; a plain click picks only that node.
+            if !additive {
+                app.windows_state.hs.graph_sel.clear();
+                app.windows_state.hs.graph_sel.insert(id.clone());
+            }
             select_graph_node(app, &id, additive);
         } else {
             app.windows_state.hs.graph_sel.clear();
