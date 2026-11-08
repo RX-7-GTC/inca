@@ -662,7 +662,8 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
     }
     let cam = app.vps[idx].camera.clone();
     // ---- navigation (Alt + mouse, wheel)
-    if resp.hovered() && scroll != 0.0 {
+    // A wheel tick during an Alt+MMB pan is part of the same gesture, not a dolly.
+    if resp.hovered() && scroll != 0.0 && !pointer.button_down(egui::PointerButton::Middle) {
         // JS wheel: dolly(-deltaY * 0.35); dolly uses exp(-d * 0.006)
         let amount = scroll as f64 * 0.0021;
         match resp.hover_pos() {
