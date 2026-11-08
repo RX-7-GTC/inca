@@ -7,7 +7,7 @@ use crate::marking::{Act, Item, open_custom};
 use crate::theme;
 use egui::{pos2, vec2, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use inca_core::materials::{MAT_TYPES, TEX_TYPES};
-use inca_core::scene::{NodeRef, SelMode, Shape};
+use inca_core::scene::{NodeRef, SelMode, Shape, LIGHT_TYPES};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
@@ -114,6 +114,26 @@ impl HsState {
         let mut order: Vec<usize> = (0..nodes.len()).collect();
         order.sort_by_key(|&i| *self.z.get(&nodes[i].id).unwrap_or(&0));
         order
+    }
+}
+
+/// Create a light from the Hypershade Create menu/bar and reveal it in the Lights tab.
+fn create_light_node(app: &mut IncaApp, ty: &str) {
+    let _ = app.run_mel("create light", &format!("{ty};"));
+    if let Some(id) = app.s.nodes.keys().last().cloned().filter(|id| app.s.node(id).is_some_and(|n| matches!(n.shape, Shape::Light(_)))) {
+        app.select_names(std::slice::from_ref(&id), SelMode::Replace);
+        app.windows_state.hs_selected = Some(id);
+        app.windows_state.hs.tab = 2;
+    }
+}
+
+/// Create a camera from the Hypershade Create menu and reveal it in the Cameras tab.
+fn create_camera_node(app: &mut IncaApp) {
+    let _ = app.run_mel("create camera", "camera;");
+    if let Some(id) = app.s.nodes.keys().last().cloned().filter(|id| app.s.node(id).is_some_and(|n| matches!(n.shape, Shape::Camera(_)))) {
+        app.select_names(std::slice::from_ref(&id), SelMode::Replace);
+        app.windows_state.hs_selected = Some(id);
+        app.windows_state.hs.tab = 3;
     }
 }
 
@@ -998,6 +1018,16 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
+                ui.menu_button("Lights", |ui| {
+                    for (ty, label) in LIGHT_TYPES {
+                        if crate::menus::menu_item(app, ui, label) {
+                            create_light_node(app, ty);
+                        }
+                    }
+                });
+                if menu_row(app, ui, true, "Camera") {
+                    create_camera_node(app);
+                }
             }
             "Tabs" => {
                 for (i, label) in ["Materials", "Textures", "Lights", "Cameras", "Shading Groups"].into_iter().enumerate() {
@@ -1091,6 +1121,15 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                     place_new_node(app, &id, None);
                     app.windows_state.hs_selected = Some(id);
                 }
+            }
+        }
+        ui.separator();
+        for (ty, label) in LIGHT_TYPES {
+            if !create_filter.is_empty() && !label.to_lowercase().contains(&create_filter) {
+                continue;
+            }
+            if ui.small_button(*label).on_hover_text(format!("Create a {label}")).clicked() {
+                create_light_node(app, ty);
             }
         }
     });
