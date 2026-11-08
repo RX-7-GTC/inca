@@ -752,20 +752,53 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
         app.sync_camera_names();
     }
     app.s.touch();
+    // Keep hs.pos and graph membership: undo restores the nodes with the same ids, so
+    // they return to their old spot. Missing nodes are ignored while they are deleted.
     for id in ids {
-        app.windows_state.hs.pos.remove(id);
-        app.windows_state.hs.pos.remove(&format!("sg:{id}"));
         app.windows_state.hs.graph_sel.remove(id);
         app.windows_state.hs.graph_sel.remove(&format!("sg:{id}"));
-        if let Some(graph) = &mut app.windows_state.hs.graph_ids {
-            graph.remove(id);
-        }
         if app.windows_state.hs_selected.as_deref() == Some(id.as_str()) {
             app.windows_state.hs_selected = None;
         }
         if app.snode_sel.as_deref() == Some(id.as_str()) {
             app.snode_sel = None;
         }
+    }
+}
+
+/// Shading nodes not assigned to any geometry (Maya Edit > Delete Unused Nodes).
+fn unused_shading_ids(app: &IncaApp) -> HashSet<String> {
+    let mut used_mats = HashSet::new();
+    for n in app.s.nodes.values() {
+        let Some(m) = n.mesh() else { continue };
+        used_mats.insert(m.material.clone());
+        if let Some(fm) = &m.mesh.fm {
+            used_mats.extend(fm.iter().flatten().cloned());
+        }
+    }
+    let unused_mats: HashSet<String> = app
+        .s
+        .mats
+        .keys()
+        .filter(|id| !used_mats.contains(id.as_str()) && !read_only(app, id.as_str()))
+        .cloned()
+        .collect();
+    let used_texs: HashSet<String> = app
+        .s
+        .mats
+        .values()
+        .filter(|m| !unused_mats.contains(&m.id))
+        .flat_map(|m| m.maps.values().filter_map(|v| v.as_str()).map(String::from))
+        .collect();
+    let mut ids = unused_mats;
+    ids.extend(app.s.texs.keys().filter(|id| !used_texs.contains(id.as_str())).cloned());
+    ids
+}
+
+fn delete_unused_nodes(app: &mut IncaApp) {
+    let ids = unused_shading_ids(app);
+    if !ids.is_empty() {
+        delete_graph_nodes(app, &ids);
     }
 }
 
@@ -1005,6 +1038,9 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 if menu_row(app, ui, can_delete, "Delete") {
                     delete_graph_nodes(app, &delete_ids);
                 }
+                if menu_row(app, ui, true, "Delete Unused Nodes") {
+                    delete_unused_nodes(app);
+                }
                 let is_mat = lead.as_deref().is_some_and(|id| app.s.mats.contains_key(id));
                 if menu_row(app, ui, is_mat, "Duplicate Shading Network") {
                     if let Some(id) = lead.clone() {
@@ -1217,7 +1253,9 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Work Area").strong());
-            let graph_count = app.windows_state.hs.graph_ids.as_ref().map(|ids| ids.len());
+            let graph_count = app.windows_state.hs.graph_ids.as_ref().map(|ids| {
+                ids.iter().filter(|id| app.s.mats.contains_key(id.as_str()) || app.s.texs.contains_key(id.as_str()) || app.s.node(id).is_some()).count()
+            });
             if let Some(n) = graph_count {
                 ui.label(RichText::new(format!("{n} nodes")).color(theme::TEXT_DIM));
                 if ui.small_button("Show All").on_hover_text("Leave graph membership and show every shading node").clicked() {
