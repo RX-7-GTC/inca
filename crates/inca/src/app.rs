@@ -844,7 +844,7 @@ impl IncaApp {
                 self.echo(format!("file -o \"{}\";", p.display()));
                 self.smooth_cache.clear();
                 self.stats_cache.clear();
-                self.windows_state.hs.graph_ids = None;
+                self.windows_state.hs.graph_ids = Some(std::collections::HashSet::new());
                 self.reset_camera_names();
                 self.add_recent(p);
             }

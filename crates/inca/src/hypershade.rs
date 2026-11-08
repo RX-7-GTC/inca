@@ -50,7 +50,7 @@ pub struct HsState {
     pan: Vec2,
     zoom: f32,
     pub(crate) graph_sel: HashSet<String>,
-    /// Nodes explicitly in the work area. `None` = show every shading node (overview mode).
+    /// Nodes explicitly in the work area. `None` = show every graph-capable node (overview mode).
     pub(crate) graph_ids: Option<HashSet<String>>,
     /// Draw order: higher values are painted on top.
     z: HashMap<String, u64>,
@@ -81,7 +81,7 @@ impl Default for HsState {
             pan: vec2(20.0, 20.0),
             zoom: 1.0,
             graph_sel: HashSet::new(),
-            graph_ids: None,
+            graph_ids: Some(HashSet::new()),
             z: HashMap::new(),
             z_next: 0,
             overflow: 0,
@@ -348,12 +348,9 @@ fn drop_on_graph(app: &mut IncaApp, id: &str, q: Pos2) -> bool {
         return false;
     }
     if is_graph_dag(app, id) {
+        // Show All already displays every camera/light; only explicit graphs need the id.
         if let Some(graph) = &mut app.windows_state.hs.graph_ids {
             graph.insert(id.to_string());
-        } else {
-            let mut graph: HashSet<String> = app.s.mats.keys().cloned().chain(app.s.texs.keys().cloned()).collect();
-            graph.insert(id.to_string());
-            app.windows_state.hs.graph_ids = Some(graph);
         }
         let (pan, zoom) = (app.windows_state.hs.pan, app.windows_state.hs.zoom);
         let g = (q - rect.min - pan) / zoom;
@@ -434,6 +431,19 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
     if let Some(ids) = graph {
         for id in ids {
             let Some(n) = app.s.node(id) else { continue };
+            if matches!(n.shape, Shape::Light(_) | Shape::Camera(_)) {
+                out.push(GNode {
+                    id: n.id.clone(),
+                    kind: Kind::Dag,
+                    name: n.shape_name.clone().unwrap_or_else(|| n.name.clone()),
+                    inputs: vec![],
+                    outputs: vec![],
+                });
+            }
+        }
+    } else {
+        // Show All includes every graph-capable node, not only materials and textures.
+        for n in app.s.nodes.values() {
             if matches!(n.shape, Shape::Light(_) | Shape::Camera(_)) {
                 out.push(GNode {
                     id: n.id.clone(),
@@ -568,6 +578,84 @@ pub(crate) fn graph_node_network(app: &mut IncaApp, id: &str) {
     app.windows_state.hs.frame = Some(false);
 }
 
+/// Selected graph nodes, with objects mapped to their materials and shading groups to shaders.
+fn connection_seeds(app: &IncaApp) -> HashSet<String> {
+    let mut seeds = HashSet::new();
+    let mut add = |id: &str| {
+        let base = id.strip_prefix("sg:").unwrap_or(id);
+        if app.s.mats.contains_key(base) || app.s.texs.contains_key(base) || is_graph_dag(app, base) {
+            seeds.insert(base.to_string());
+        } else if let Some(m) = app.s.node(base).and_then(|n| n.mesh()) {
+            seeds.insert(m.material.clone());
+            if let Some(fm) = &m.mesh.fm {
+                seeds.extend(fm.iter().flatten().cloned());
+            }
+        }
+    };
+    for id in &app.windows_state.hs.graph_sel {
+        add(id);
+    }
+    if let Some(id) = &app.snode_sel {
+        add(id);
+    }
+    if let Some(id) = &app.windows_state.hs_selected {
+        add(id);
+    }
+    for oid in &app.s.sel {
+        for id in app.s.subtree(oid) {
+            add(&id);
+        }
+    }
+    seeds
+}
+
+/// Replace the work area with the upstream and/or downstream stream of the selection.
+fn graph_connections(app: &mut IncaApp, upstream: bool, downstream: bool) {
+    let seeds = connection_seeds(app);
+    if seeds.is_empty() {
+        app.warn("Select a node to graph its connections.");
+        return;
+    }
+    let selection = seeds.clone();
+    let mut ids = seeds.clone();
+    if upstream {
+        let mut frontier = seeds.clone();
+        while !frontier.is_empty() {
+            let mut next = HashSet::new();
+            for id in frontier {
+                let Some(m) = app.s.mats.get(&id) else { continue };
+                for t in m.maps.values().filter_map(|v| v.as_str()) {
+                    if app.s.texs.contains_key(t) && ids.insert(t.to_string()) {
+                        next.insert(t.to_string());
+                    }
+                }
+            }
+            frontier = next;
+        }
+    }
+    if downstream {
+        let mut frontier = seeds;
+        while !frontier.is_empty() {
+            let mut next = HashSet::new();
+            for id in frontier {
+                if !app.s.texs.contains_key(&id) {
+                    continue;
+                }
+                for m in app.s.mats.values() {
+                    if m.maps.values().any(|v| v.as_str() == Some(id.as_str())) && ids.insert(m.id.clone()) {
+                        next.insert(m.id.clone());
+                    }
+                }
+            }
+            frontier = next;
+        }
+    }
+    app.windows_state.hs.graph_ids = Some(ids);
+    // Re-graphing must not drop the selection; the next connection command works from it.
+    app.windows_state.hs.graph_sel = selection;
+    app.windows_state.hs.frame = Some(false);
+}
+
 fn add_selected_to_graph(app: &mut IncaApp) {
     let ids = selected_graph_ids(app);
     if ids.is_empty() {
@@ -609,10 +697,26 @@ fn default_pos(nodes: &[GNode], i: usize) -> Pos2 {
     let col = match nodes[i].kind {
         Kind::Texture => 0.0,
         Kind::Material | Kind::ShadingGroup => 220.0,
-        Kind::Dag | Kind::Object => 440.0,
+        Kind::Dag | Kind::Object => 600.0,
     };
     let y: f32 = nodes[..i].iter().filter(|n| n.kind == nodes[i].kind).map(|n| node_h(n) + 16.0).sum();
     pos2(col, y)
+}
+
+/// Move a default position down until it does not overlap an already placed node.
+fn place_avoiding(start: Pos2, nodes: &[GNode], i: usize, pos: &HashMap<String, Pos2>) -> Pos2 {
+    let size = vec2(NODE_W, node_h(&nodes[i]));
+    let mut p = start;
+    loop {
+        let r = Rect::from_min_size(p, size).expand(8.0);
+        let hit = nodes.iter().enumerate().any(|(j, n)| {
+            j != i && pos.get(&n.id).is_some_and(|q| Rect::from_min_size(*q, vec2(NODE_W, node_h(n))).expand(8.0).intersects(r))
+        });
+        if !hit {
+            return p;
+        }
+        p.y += size.y + 16.0;
+    }
 }
 
 fn frame_graph(app: &mut IncaApp, rect: Rect, selected: bool) {
@@ -1136,6 +1240,16 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                     app.windows_state.hs.graph_ids = Some(HashSet::new());
                     app.windows_state.hs.graph_sel.clear();
                 }
+                ui.separator();
+                if menu_row(app, ui, true, "Input and Output Connections") {
+                    graph_connections(app, true, true);
+                }
+                if menu_row(app, ui, true, "Input Connections") {
+                    graph_connections(app, true, false);
+                }
+                if menu_row(app, ui, true, "Output Connections") {
+                    graph_connections(app, false, true);
+                }
                 if menu_row(app, ui, in_graph, "Show All Nodes") {
                     app.windows_state.hs.graph_ids = None;
                     app.windows_state.hs.frame = Some(false);
@@ -1258,7 +1372,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             });
             if let Some(n) = graph_count {
                 ui.label(RichText::new(format!("{n} nodes")).color(theme::TEXT_DIM));
-                if ui.small_button("Show All").on_hover_text("Leave graph membership and show every shading node").clicked() {
+                if ui.small_button("Show All").on_hover_text("Leave graph membership and show every material, texture, camera, and light").clicked() {
                     app.windows_state.hs.graph_ids = None;
                     app.windows_state.hs.frame = Some(false);
                 }
@@ -1652,12 +1766,13 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     for (i, n) in nodes.iter().enumerate() {
         if !app.windows_state.hs.pos.contains_key(&n.id) {
             // Shading groups sit to the right of their material.
-            let p = n
+            let start = n
                 .id
                 .strip_prefix("sg:")
                 .and_then(|mid| app.windows_state.hs.pos.get(mid).copied())
                 .map(|m| m + vec2(NODE_W + 36.0, 0.0))
                 .unwrap_or_else(|| default_pos(&nodes, i));
+            let p = place_avoiding(start, &nodes, i, &app.windows_state.hs.pos);
             app.windows_state.hs.pos.insert(n.id.clone(), p);
         }
     }

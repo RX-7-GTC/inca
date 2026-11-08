@@ -642,7 +642,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             app.s.reset();
             app.echo("file -f -new;");
             app.smooth_cache.clear();
-            app.windows_state.hs.graph_ids = None;
+            app.windows_state.hs.graph_ids = Some(std::collections::HashSet::new());
             app.reset_camera_names();
         }
         "openScene" => {
