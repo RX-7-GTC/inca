@@ -80,6 +80,8 @@ pub struct HsState {
     pub swatch_size: usize,
     pub sort_mode: u8,
     pub sort_reverse: bool,
+    pub view_mode: u8,
+    pub attr_filter: String,
     pub create_filter: String,
     pub rename: Option<(String, String)>,
     /// Screen position where the empty marking menu was opened; new nodes go there.
@@ -116,6 +118,8 @@ impl Default for HsState {
             swatch_size: 1,
             sort_mode: 0,
             sort_reverse: false,
+            view_mode: 3,
+            attr_filter: String::new(),
             create_filter: String::new(),
             rename: None,
             create_pos: None,
@@ -599,6 +603,15 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
     let graph = app.windows_state.hs.graph_ids.as_ref();
     let sel = app.windows_state.hs_selected.clone().filter(|m| app.s.mats.contains_key(m) && graph.is_none_or(|ids| ids.contains(m)));
     let mats: Vec<&inca_core::materials::Material> = app.s.mats.values().filter(|m| graph.is_none_or(|ids| ids.contains(&m.id))).collect();
+    let mode = app.windows_state.hs.view_mode;
+    let filter = app.windows_state.hs.attr_filter.to_lowercase();
+    let port_ok = |s: &str| filter.is_empty() || s.to_lowercase().contains(&filter);
+    let texture_outputs: Vec<String> = if mode == 0 {
+        vec![]
+    } else {
+        ["outColor", "outAlpha"].iter().filter(|s| port_ok(s)).map(|s| s.to_string()).collect()
+    };
+    let material_outputs: Vec<String> = if mode == 0 || !port_ok("outColor") { vec![] } else { vec!["outColor".into()] };
     let mut out = vec![];
     for t in app.s.texs.values().filter(|t| graph.is_none_or(|ids| ids.contains(&t.id))) {
         out.push(GNode {
@@ -606,14 +619,25 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
             kind: Kind::Texture,
             name: t.name.clone(),
             inputs: vec![],
-            outputs: vec!["outColor".into(), "outAlpha".into()],
+            outputs: texture_outputs.clone(),
         });
     }
     for m in &mats {
-        let slots = inca_core::materials::mat_type(&m.ty).mappable.iter().map(|s| s.to_string()).collect();
-        out.push(GNode { id: m.id.clone(), kind: Kind::Material, name: m.name.clone(), inputs: slots, outputs: vec!["outColor".into()] });
+        let slots: Vec<String> = if mode == 0 {
+            vec![]
+        } else {
+            inca_core::materials::mat_type(&m.ty)
+                .mappable
+                .iter()
+                .filter(|s| mode != 1 || m.maps.contains_key(**s))
+                .filter(|s| port_ok(s))
+                .map(|s| s.to_string())
+                .collect()
+        };
+        out.push(GNode { id: m.id.clone(), kind: Kind::Material, name: m.name.clone(), inputs: slots, outputs: material_outputs.clone() });
         let name = if m.id == app.s.default_mat { "initialShadingGroup".into() } else { format!("{}SG", m.name) };
-        out.push(GNode { id: format!("sg:{}", m.id), kind: Kind::ShadingGroup, name, inputs: vec!["surfaceShader".into()], outputs: vec![] });
+        let sg_inputs = if mode == 0 || !port_ok("surfaceShader") { vec![] } else { vec!["surfaceShader".into()] };
+        out.push(GNode { id: format!("sg:{}", m.id), kind: Kind::ShadingGroup, name, inputs: sg_inputs, outputs: vec![] });
     }
     if let Some(ids) = graph {
         for id in ids {
@@ -643,8 +667,9 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
         }
     }
     if let Some(mid) = &sel {
+        let object_inputs = if mode == 0 || !port_ok("material") { vec![] } else { vec!["material".into()] };
         for o in users(app, mid) {
-            out.push(GNode { id: o.clone(), kind: Kind::Object, name: app.s.name_of(&o), inputs: vec!["material".into()], outputs: vec![] });
+            out.push(GNode { id: o.clone(), kind: Kind::Object, name: app.s.name_of(&o), inputs: object_inputs.clone(), outputs: vec![] });
         }
     }
     out
@@ -972,6 +997,15 @@ fn in_port_pos(n: &GNode, r: Rect, i: usize, zoom: f32) -> Pos2 {
 
 fn out_port_pos(n: &GNode, r: Rect, i: usize, zoom: f32) -> Pos2 {
     pos2(r.max.x, port_pos(n, r, i, zoom).y)
+}
+
+/// Port position when the attribute is visible; otherwise the edge of the node body.
+fn in_port_or_edge(n: &GNode, r: Rect, label: &str, zoom: f32) -> Pos2 {
+    n.inputs.iter().position(|s| s == label).map(|i| in_port_pos(n, r, i, zoom)).unwrap_or_else(|| pos2(r.min.x, r.center().y))
+}
+
+fn out_port_or_edge(n: &GNode, r: Rect, label: &str, zoom: f32) -> Pos2 {
+    n.outputs.iter().position(|s| s == label).map(|i| out_port_pos(n, r, i, zoom)).unwrap_or_else(|| pos2(r.max.x, r.center().y))
 }
 
 fn wire_compatible(w: &Wire, n: &GNode, slot: Option<usize>) -> bool {
@@ -1422,6 +1456,12 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 if crate::menus::menu_check(app, ui, app.windows_state.hs.sort_reverse, "Reverse Order") {
                     app.windows_state.hs.sort_reverse = !app.windows_state.hs.sort_reverse;
                 }
+                ui.separator();
+                for (i, label) in ["Simple", "Connected", "Full", "Custom"].iter().enumerate() {
+                    if crate::menus::menu_radio(app, ui, app.windows_state.hs.view_mode == i as u8, label) {
+                        app.windows_state.hs.view_mode = i as u8;
+                    }
+                }
             }
             "Create" => {
                 ui.menu_button("Material", |ui| {
@@ -1643,6 +1683,13 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             if ui.small_button("Connection Editor").on_hover_text("Load the selected material or texture into the Connection Editor").clicked() {
                 crate::hypergraph::open_for_hypershade(app);
+            }
+        });
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 40.0).clamp(60.0, 180.0);
+            ui.add(egui::TextEdit::singleline(&mut app.windows_state.hs.attr_filter).hint_text("Filter attributes...").desired_width(width));
+            if !app.windows_state.hs.attr_filter.is_empty() && ui.small_button("×").on_hover_text("Clear attribute filter").clicked() {
+                app.windows_state.hs.attr_filter.clear();
             }
         });
         work_area(app, ui);
@@ -2156,24 +2203,23 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     let mut wires: Vec<(ConnWire, Pos2, Pos2, Color32)> = vec![];
     for (mi, m) in nodes.iter().enumerate().filter(|(_, n)| n.kind == Kind::Material) {
         let Some(mat) = app.s.mats.get(&m.id) else { continue };
-        for (si, slot) in m.inputs.iter().enumerate() {
-            if let Some(ti) = mat.maps.get(slot).and_then(|v| v.as_str()).and_then(find) {
-                let out = if mat.map_out(slot) == "outAlpha" { 1 } else { 0 };
-                let col = if out == 1 { Color32::from_rgb(127, 208, 232) } else { Color32::from_rgb(230, 200, 90) };
-                wires.push((
-                    ConnWire::Map { tex: nodes[ti].id.clone(), mat: m.id.clone(), attr: slot.clone() },
-                    out_port_pos(&nodes[ti], rects[ti], out, zoom),
-                    in_port_pos(m, rects[mi], si, zoom),
-                    col,
-                ));
-            }
+        for (slot, tex) in &mat.maps {
+            let Some(ti) = tex.as_str().and_then(find) else { continue };
+            let out = if mat.map_out(slot) == "outAlpha" { "outAlpha" } else { "outColor" };
+            let col = if out == "outAlpha" { Color32::from_rgb(127, 208, 232) } else { Color32::from_rgb(230, 200, 90) };
+            wires.push((
+                ConnWire::Map { tex: nodes[ti].id.clone(), mat: m.id.clone(), attr: slot.clone() },
+                out_port_or_edge(&nodes[ti], rects[ti], out, zoom),
+                in_port_or_edge(m, rects[mi], slot, zoom),
+                col,
+            ));
         }
         for (oi, o) in nodes.iter().enumerate().filter(|(_, n)| n.kind == Kind::Object) {
             if users(app, &m.id).contains(&o.id) {
                 wires.push((
                     ConnWire::User { mat: m.id.clone(), obj: o.id.clone() },
-                    out_port_pos(m, rects[mi], 0, zoom),
-                    in_port_pos(o, rects[oi], 0, zoom),
+                    out_port_or_edge(m, rects[mi], "outColor", zoom),
+                    in_port_or_edge(o, rects[oi], "material", zoom),
                     Color32::from_rgb(120, 220, 120),
                 ));
             }
@@ -2181,8 +2227,8 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         if let Some(si) = find(&format!("sg:{}", m.id)) {
             wires.push((
                 ConnWire::Sg { mat: m.id.clone() },
-                out_port_pos(m, rects[mi], 0, zoom),
-                in_port_pos(&nodes[si], rects[si], 0, zoom),
+                out_port_or_edge(m, rects[mi], "outColor", zoom),
+                in_port_or_edge(&nodes[si], rects[si], "surfaceShader", zoom),
                 Color32::from_rgb(120, 220, 120),
             ));
         }
@@ -2415,13 +2461,13 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     }
     if let (Some(w), Some(q)) = (wire.clone(), pointer) {
         let src = match &w {
-            Wire::Tex(t, oi) => find(t).map(|i| out_port_pos(&nodes[i], rects[i], (*oi).min(nodes[i].outputs.len().saturating_sub(1)), zoom)),
-            Wire::Mat(t) => find(t).map(|i| out_port_pos(&nodes[i], rects[i], 0, zoom)),
+            Wire::Tex(t, oi) => find(t).map(|i| out_port_or_edge(&nodes[i], rects[i], if *oi == 1 { "outAlpha" } else { "outColor" }, zoom)),
+            Wire::Mat(t) => find(t).map(|i| out_port_or_edge(&nodes[i], rects[i], "outColor", zoom)),
         };
         if let Some(a) = src {
             let end = match drop_target {
                 Some((i, Some(slot))) => in_port_pos(&nodes[i], rects[i], slot, zoom),
-                Some((i, None)) if !wire_middle => in_port_pos(&nodes[i], rects[i], 0, zoom),
+                Some((i, None)) if !wire_middle => pos2(rects[i].min.x, rects[i].center().y),
                 _ => q,
             };
             let col = match &w {
