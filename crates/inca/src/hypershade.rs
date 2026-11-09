@@ -35,6 +35,8 @@ struct GNode {
     inputs: Vec<String>,
     /// output ports, right side
     outputs: Vec<String>,
+    /// Swatches are hidden for this node (global toolbar toggle).
+    swatches: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -113,6 +115,7 @@ pub struct HsState {
     pub sort_mode: u8,
     pub sort_reverse: bool,
     pub view_mode: u8,
+    pub show_swatches: bool,
     pub attr_filter: String,
     pub create_filter: String,
     pub rename: Option<(String, String)>,
@@ -163,6 +166,7 @@ impl Default for HsState {
             sort_mode: 0,
             sort_reverse: false,
             view_mode: 3,
+            show_swatches: true,
             attr_filter: String::new(),
             create_filter: String::new(),
             rename: None,
@@ -406,13 +410,14 @@ fn create_camera_node(app: &mut IncaApp) {
 /// Place a freshly created material or texture near `at` (screen position) or the view center,
 /// avoiding the visible nodes. Falls back to the preferred spot when the view is full.
 pub(crate) fn place_new_node(app: &mut IncaApp, id: &str, at: Option<Pos2>) {
+    let sw = if app.windows_state.hs.show_swatches { SWATCH + 6.0 } else { 0.0 };
     let (size, material) = if let Some(m) = app.s.mats.get(id) {
         let rows = inca_core::materials::mat_type(&m.ty).mappable.len() + 1;
-        let h = HEAD_H + SWATCH + 6.0 + ROW_H * rows as f32 + 4.0;
-        let sg_h = HEAD_H + SWATCH + 6.0 + ROW_H + 4.0;
+        let h = HEAD_H + sw + ROW_H * rows as f32 + 4.0;
+        let sg_h = HEAD_H + sw + ROW_H + 4.0;
         (vec2(NODE_W * 2.0 + 36.0, h.max(sg_h)), true)
     } else if app.s.texs.contains_key(id) {
-        (vec2(NODE_W, HEAD_H + SWATCH + 6.0 + ROW_H * 2.0 + 4.0), false)
+        (vec2(NODE_W, HEAD_H + sw + ROW_H * 2.0 + 4.0), false)
     } else {
         return;
     };
@@ -844,6 +849,7 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
     let sel = app.windows_state.hs_selected.clone().filter(|m| app.s.mats.contains_key(m) && graph.is_none_or(|ids| ids.contains(m)));
     let mats: Vec<&inca_core::materials::Material> = app.s.mats.values().filter(|m| graph.is_none_or(|ids| ids.contains(&m.id))).collect();
     let mode = app.windows_state.hs.view_mode;
+    let swatches = app.windows_state.hs.show_swatches;
     let filter = app.windows_state.hs.attr_filter.to_lowercase();
     let port_ok = |s: &str| filter.is_empty() || s.to_lowercase().contains(&filter);
     let texture_outputs: Vec<String> = if mode == 0 {
@@ -860,6 +866,7 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
             name: t.name.clone(),
             inputs: vec![],
             outputs: texture_outputs.clone(),
+            swatches,
         });
     }
     for m in &mats {
@@ -874,10 +881,10 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
                 .map(|s| s.to_string())
                 .collect()
         };
-        out.push(GNode { id: m.id.clone(), kind: Kind::Material, name: m.name.clone(), inputs: slots, outputs: material_outputs.clone() });
+        out.push(GNode { id: m.id.clone(), kind: Kind::Material, name: m.name.clone(), inputs: slots, outputs: material_outputs.clone(), swatches });
         let name = if m.id == app.s.default_mat { "initialShadingGroup".into() } else { format!("{}SG", m.name) };
         let sg_inputs = if mode == 0 || !port_ok("surfaceShader") { vec![] } else { vec!["surfaceShader".into()] };
-        out.push(GNode { id: format!("sg:{}", m.id), kind: Kind::ShadingGroup, name, inputs: sg_inputs, outputs: vec![] });
+        out.push(GNode { id: format!("sg:{}", m.id), kind: Kind::ShadingGroup, name, inputs: sg_inputs, outputs: vec![], swatches });
     }
     if let Some(ids) = graph {
         for id in ids {
@@ -889,6 +896,7 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
                     name: n.shape_name.clone().unwrap_or_else(|| n.name.clone()),
                     inputs: vec![],
                     outputs: vec![],
+                    swatches,
                 });
             }
         }
@@ -902,6 +910,7 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
                     name: n.shape_name.clone().unwrap_or_else(|| n.name.clone()),
                     inputs: vec![],
                     outputs: vec![],
+                    swatches,
                 });
             }
         }
@@ -909,7 +918,7 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
     if let Some(mid) = &sel {
         let object_inputs = if mode == 0 || !port_ok("material") { vec![] } else { vec!["material".into()] };
         for o in users(app, mid) {
-            out.push(GNode { id: o.clone(), kind: Kind::Object, name: app.s.name_of(&o), inputs: object_inputs.clone(), outputs: vec![] });
+            out.push(GNode { id: o.clone(), kind: Kind::Object, name: app.s.name_of(&o), inputs: object_inputs.clone(), outputs: vec![], swatches });
         }
     }
     out
@@ -1165,7 +1174,7 @@ fn remove_selected_from_graph(app: &mut IncaApp) {
 }
 
 fn port_top(n: &GNode) -> f32 {
-    HEAD_H + if n.kind == Kind::Object { 0.0 } else { SWATCH + 6.0 }
+    HEAD_H + if n.kind == Kind::Object || !n.swatches { 0.0 } else { SWATCH + 6.0 }
 }
 
 fn port_rows(n: &GNode) -> usize {
@@ -1842,6 +1851,10 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                         app.windows_state.hs.view_mode = i as u8;
                     }
                 }
+                ui.separator();
+                if crate::menus::menu_check(app, ui, app.windows_state.hs.show_swatches, "Show Swatches on Nodes") {
+                    app.windows_state.hs.show_swatches = !app.windows_state.hs.show_swatches;
+                }
             }
             "Create" => {
                 ui.menu_button("Material", |ui| {
@@ -2238,16 +2251,32 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 graph_connections(app, false, true);
             }
             ui.separator();
-            if ui.small_button("Frame All").on_hover_text("Fit the whole graph").clicked() {
+            if crate::icons::button(ui, "frameAll", "Frame all", false, 22.0).clicked() {
                 app.windows_state.hs.frame = Some(false);
             }
-            if ui.small_button("Frame Sel").on_hover_text("Fit the selected nodes").clicked() {
+            if crate::icons::button(ui, "frameSel", "Frame selection", false, 22.0).clicked() {
                 app.windows_state.hs.frame = Some(true);
             }
-            if ui.small_button("Rearrange").clicked() {
+            if crate::icons::button(ui, "grid", "Rearrange graph", false, 22.0).clicked() {
                 app.windows_state.hs.pos.clear();
                 app.windows_state.hs.frame = Some(false);
             }
+            let shown = app.windows_state.hs.show_swatches;
+            if crate::icons::button(ui, "textured", "Show swatches on graph nodes", shown, 22.0).clicked() {
+                app.windows_state.hs.show_swatches = !shown;
+            }
+            ui.separator();
+            for (i, label, tip) in [
+                (0, "Simple", "Show only node headers and connections"),
+                (1, "Connected", "Show mapped attributes only"),
+                (2, "Full", "Show every mappable attribute"),
+                (3, "Custom", "Show attributes matching the filter"),
+            ] {
+                if ui.selectable_label(app.windows_state.hs.view_mode == i, label).on_hover_text(tip).clicked() {
+                    app.windows_state.hs.view_mode = i;
+                }
+            }
+            ui.separator();
             if ui.small_button("Connection Editor").on_hover_text("Load the selected material or texture into the Connection Editor").clicked() {
                 crate::hypergraph::open_for_hypershade(app);
             }
@@ -2857,7 +2886,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             painter.rect_stroke(r, 4.0, Stroke::new(2.0, theme::HI), egui::StrokeKind::Outside);
         }
         painter.text(r.min + vec2(6.0, HEAD_H * 0.5 * zoom), egui::Align2::LEFT_CENTER, &n.name, font.clone(), if inactive { Color32::from_gray(120) } else { Color32::WHITE });
-        if n.kind != Kind::Object {
+        if n.kind != Kind::Object && n.swatches {
             let sr = Rect::from_min_size(r.min + vec2(6.0, (HEAD_H + 3.0) * zoom), vec2(SWATCH, SWATCH) * zoom);
             if let Some(t) = swatch(app, &ctx, &n.id) {
                 painter.image(t, sr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
