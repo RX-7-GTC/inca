@@ -6,7 +6,7 @@ use crate::app::IncaApp;
 use crate::marking::{Act, Item, open_custom};
 use crate::theme;
 use egui::{pos2, vec2, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2};
-use inca_core::materials::{MAT_TYPES, TEX_TYPES};
+use inca_core::materials::{Material, Texture, MAT_TYPES, TEX_TYPES};
 use inca_core::scene::{NodeRef, SelMode, Shape, LIGHT_TYPES};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -1399,6 +1399,143 @@ fn delete_unused_nodes(app: &mut IncaApp) {
     }
 }
 
+fn merged_attrs(defaults: serde_json::Value, attrs: &serde_json::Map<String, serde_json::Value>) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = match defaults {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    out.extend(attrs.iter().map(|(k, v)| (k.clone(), v.clone())));
+    out
+}
+
+fn material_attrs(m: &Material) -> serde_json::Map<String, serde_json::Value> {
+    merged_attrs((inca_core::materials::mat_type(&m.ty).defaults)(), &m.attrs)
+}
+
+fn texture_attrs(t: &Texture) -> serde_json::Map<String, serde_json::Value> {
+    merged_attrs(inca_core::materials::tex_type(&t.ty).map(|x| (x.defaults)()).unwrap_or(serde_json::Value::Null), &t.attrs)
+}
+
+/// Same material type/attributes and the same upstream texture nodes (type and attributes).
+fn same_shading_network(s: &inca_core::scene::Scene, a: &str, b: &str) -> bool {
+    let (Some(ma), Some(mb)) = (s.mats.get(a), s.mats.get(b)) else { return false };
+    if ma.ty != mb.ty || material_attrs(ma) != material_attrs(mb) {
+        return false;
+    }
+    let slots: HashSet<&String> = ma.maps.keys().chain(mb.maps.keys()).collect();
+    for slot in slots {
+        let (Some(ia), Some(ib)) = (ma.maps.get(slot).and_then(|v| v.as_str()), mb.maps.get(slot).and_then(|v| v.as_str())) else {
+            // A slot mapped on only one side (or not a texture id) is different.
+            if ma.maps.get(slot).and_then(|v| v.as_str()).is_some() || mb.maps.get(slot).and_then(|v| v.as_str()).is_some() {
+                return false;
+            }
+            continue;
+        };
+        let (Some(ta), Some(tb)) = (s.texs.get(ia), s.texs.get(ib)) else { return false };
+        if ta.ty != tb.ty || texture_attrs(ta) != texture_attrs(tb) || ma.map_out(slot) != mb.map_out(slot) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Point object and per-face material assignments from `from` to `to`.
+fn retarget_material(app: &mut IncaApp, from: &str, to: &str) {
+    for n in app.s.nodes.values_mut() {
+        if let Some(m) = n.mesh_mut() {
+            let mut changed = false;
+            if m.material == from {
+                m.material = to.to_string();
+                changed = true;
+            }
+            if let Some(fm) = &mut m.mesh.fm {
+                // A per-face override equal to the base material is stored as None.
+                let new_slot = if m.material == to { None } else { Some(to.to_string()) };
+                for slot in fm.iter_mut() {
+                    if slot.as_deref() == Some(from) {
+                        *slot = new_slot.clone();
+                        changed = true;
+                    }
+                }
+                if fm.iter().all(|x| x.is_none()) {
+                    m.mesh.fm = None;
+                }
+            }
+            if changed {
+                n.rev += 1;
+            }
+        }
+    }
+}
+
+/// Maya Edit > Delete Duplicate Shading Networks: keep the first (or startup) material
+/// in each identical group, retarget its users, and remove the rest with their textures.
+fn delete_duplicate_shading_networks(app: &mut IncaApp) {
+    let mut ids: Vec<String> = app.s.mats.keys().cloned().collect();
+    ids.sort_by_key(|id| !read_only(app, id));
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for id in ids {
+        if let Some((_, dups)) = groups.iter_mut().find(|(keep, _)| same_shading_network(&app.s, keep, &id)) {
+            dups.push(id);
+        } else {
+            groups.push((id, Vec::new()));
+        }
+    }
+    let mut retargets: Vec<(String, String)> = Vec::new();
+    let mut candidates: HashSet<String> = HashSet::new();
+    for (keep, dups) in groups {
+        for dup in dups {
+            if let Some(m) = app.s.mats.get(&dup) {
+                candidates.extend(m.maps.values().filter_map(|v| v.as_str()).map(String::from));
+            }
+            retargets.push((dup, keep.clone()));
+        }
+    }
+    if retargets.is_empty() {
+        app.echo("// No duplicate shading networks found.");
+        return;
+    }
+    let removed: Vec<String> = retargets.iter().filter_map(|(dup, _)| app.s.mats.get(dup).map(|m| m.name.clone())).collect();
+    app.s.checkpoint("delete duplicate shading networks");
+    for (dup, keep) in &retargets {
+        retarget_material(app, dup, keep);
+        app.s.delete_material(dup);
+    }
+    // Textures are shared nodes: only remove ones no remaining material references.
+    let used: HashSet<String> = app.s.mats.values().flat_map(|m| m.maps.values().filter_map(|v| v.as_str()).map(String::from)).collect();
+    let mut dead_texs = vec![];
+    for tid in candidates {
+        if !used.contains(&tid) {
+            if let Some(t) = app.s.texs.shift_remove(&tid) {
+                app.s.release_name(&t.name);
+                dead_texs.push(tid);
+            }
+        }
+    }
+    app.s.touch();
+    // Keep graph membership and positions so undo restores the nodes in place.
+    for (dup, _) in &retargets {
+        app.windows_state.hs.graph_sel.remove(dup);
+        app.windows_state.hs.graph_sel.remove(&format!("sg:{dup}"));
+        if app.windows_state.hs_selected.as_deref() == Some(dup.as_str()) {
+            app.windows_state.hs_selected = None;
+        }
+        if app.snode_sel.as_deref() == Some(dup.as_str()) {
+            app.snode_sel = None;
+        }
+    }
+    for tid in &dead_texs {
+        app.windows_state.hs.graph_sel.remove(tid);
+        if app.windows_state.hs_selected.as_deref() == Some(tid.as_str()) {
+            app.windows_state.hs_selected = None;
+        }
+        if app.snode_sel.as_deref() == Some(tid.as_str()) {
+            app.snode_sel = None;
+        }
+    }
+    app.echo(format!("// Removed duplicate shading networks: {}", removed.join(", ")));
+}
+
 fn rename_shading_node(app: &mut IncaApp, id: &str, name: &str) {
     if read_only(app, id) {
         app.error("line 1: Cannot rename a read only node.");
@@ -1637,6 +1774,9 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
                 if menu_row(app, ui, true, "Delete Unused Nodes") {
                     delete_unused_nodes(app);
+                }
+                if menu_row(app, ui, true, "Delete Duplicate Shading Networks") {
+                    delete_duplicate_shading_networks(app);
                 }
                 let is_mat = lead.as_deref().is_some_and(|id| app.s.mats.contains_key(id));
                 if menu_row(app, ui, is_mat, "Duplicate Shading Network") {
