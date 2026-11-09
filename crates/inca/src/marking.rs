@@ -89,12 +89,14 @@ pub struct Menu {
     hot_radial: Option<usize>,
     /// Index of the open bottom-list submenu. It only opens from its parent row.
     list_sub: Option<usize>,
+    /// Opened from a viewport RMB / tool menu (hides the camera-name HUD).
+    pub(crate) viewport: bool,
 }
 
 const DIRS: [(&str, f32); 8] = [("N", -90.0), ("NE", -45.0), ("E", 0.0), ("SE", 45.0), ("S", 90.0), ("SW", 135.0), ("W", 180.0), ("NW", -135.0)];
 
-fn menu(pos: Pos2, vp: usize, button: egui::PointerButton, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64) -> Menu {
-    Menu { pos, title, radial, list, vp, opened: now, button, sticky: false, hot_radial: None, list_sub: None }
+fn menu(pos: Pos2, vp: usize, button: egui::PointerButton, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64, viewport: bool) -> Menu {
+    Menu { pos, title, radial, list, vp, opened: now, button, sticky: false, hot_radial: None, list_sub: None, viewport }
 }
 
 /// RMB in a viewport: build the menu for the modifiers and what's under the cursor.
@@ -121,13 +123,13 @@ pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: eg
                 vec![Some(acmd("multiCutTool")), Some(acmd("insertEdgeLoopTool")), Some(acmd("targetWeldTool")), None, Some(acmd("centerPivot")), Some(acmd("freezeTransformations")), Some(acmd("resetTransformations"))],
             ),
         };
-        app.marking = Some(menu(pos, idx, r, None, radial, list, now));
+        app.marking = Some(menu(pos, idx, r, None, radial, list, now, true));
         return;
     }
     // Ctrl+RMB: selection conversion
     if mods.ctrl || mods.command {
         let radial = vec![("N", cmd("To Edges", "toEdges")), ("W", cmd("To Vertices", "toVertices")), ("E", cmd("To Faces", "toFaces")), ("S", cmd("Edge Loop", "selectEdgeLoop")), ("SE", cmd("Edge Ring", "selectEdgeRing")), ("SW", cmd("Border", "selectBorder")), ("NE", cmd("Grow", "growSelection")), ("NW", cmd("Shrink", "shrinkSelection"))];
-        app.marking = Some(menu(pos, idx, r, None, radial, vec![], now));
+        app.marking = Some(menu(pos, idx, r, None, radial, vec![], now, true));
         return;
     }
     let s = &app.s;
@@ -152,7 +154,7 @@ pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: eg
         let list = object_menu_list(app, &t);
         // picking from this menu works on the object under the cursor
         app.marking_target = Some(t);
-        app.marking = Some(menu(pos, idx, r, Some(format!("{name}...")), radial, list, now));
+        app.marking = Some(menu(pos, idx, r, Some(format!("{name}...")), radial, list, now, true));
         return;
     }
     if let Some(o) = under {
@@ -160,7 +162,7 @@ pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: eg
         let cam = matches!(app.s.node(&o).map(|n| &n.shape), Some(Shape::Camera(_)));
         let radial = vec![("N", it("Select", Act::Select(o.clone()))), ("E", it("Attribute Editor", Act::AttrEditor(o.clone()))), ("W", if cam { it("Look Through", Act::LookThrough(name.clone())) } else { it("Frame", Act::Frame(o.clone())) })];
         let list = vec![Some(cmd("Select All", "selectAll")), Some(cmd("Select Hierarchy", "selectHierarchy")), None, Some(acmd("hideSelection")), Some(cmd("Delete", "deleteSel"))];
-        app.marking = Some(menu(pos, idx, r, Some(format!("{name}...")), radial, list, now));
+        app.marking = Some(menu(pos, idx, r, Some(format!("{name}...")), radial, list, now, true));
         return;
     }
     if let Some(t) = template {
@@ -168,12 +170,12 @@ pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: eg
         let radial = vec![("N", cmd("Complete Tool", "finishTool")), ("S", cmd("Select All", "selectAll"))];
         let list = object_menu_list(app, &t);
         app.marking_target = Some(t);
-        app.marking = Some(menu(pos, idx, r, Some(format!("{name}...")), radial, list, now));
+        app.marking = Some(menu(pos, idx, r, Some(format!("{name}...")), radial, list, now, true));
         return;
     }
     // Maya's no-object marking menu: Complete Tool at N, Select All at S, nothing else.
     let radial = vec![("N", cmd("Complete Tool", "finishTool")), ("S", cmd("Select All", "selectAll"))];
-    app.marking = Some(menu(pos, idx, r, None, radial, vec![], now));
+    app.marking = Some(menu(pos, idx, r, None, radial, vec![], now, true));
 }
 
 /// The list half of the object marking menu (Select All, materials, inputs...).
@@ -238,7 +240,7 @@ pub fn open_tool(app: &mut IncaApp, idx: usize, tool: Tool, pos: Pos2, now: f64)
         Tool::Scale => "scaleTool",
         _ => "moveTool",
     });
-    app.marking = Some(menu(pos, idx, egui::PointerButton::Primary, Some(title), radial, list, now));
+    app.marking = Some(menu(pos, idx, egui::PointerButton::Primary, Some(title), radial, list, now, true));
 }
 
 /// Block clicks from reaching the UI under a painter-drawn marking menu.
@@ -258,7 +260,7 @@ pub fn block_pointer(app: &IncaApp, ctx: &egui::Context) {
 
 /// Open a marking menu outside a viewport (used by the Hypershade).
 pub fn open_custom(app: &mut IncaApp, pos: Pos2, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64, sticky: bool) {
-    let mut m = menu(pos, app.active_vp, egui::PointerButton::Secondary, title, radial, list, now);
+    let mut m = menu(pos, app.active_vp, egui::PointerButton::Secondary, title, radial, list, now, false);
     m.sticky = sticky;
     app.marking = Some(m);
     app.marking_target = None;

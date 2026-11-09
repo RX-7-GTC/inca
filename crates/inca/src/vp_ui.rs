@@ -2301,11 +2301,10 @@ fn finish_drag(app: &mut IncaApp, d: GizmoDrag) {
 }
 
 fn hud(app: &mut IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
-    // The camera-name HUD can peek out under a marking menu list and look like a menu row.
-    if app.marking.is_some() {
-        return;
-    }
     let r = app.vps[idx].rect;
+    // Only the viewport marking menu can sit over the camera-name HUD and make it look like
+    // a menu row. Menus opened elsewhere must not hide the viewport HUD.
+    let viewport_menu = app.marking.as_ref().is_some_and(|m| m.viewport);
     let camera = app.vps[idx].camera.clone();
     let isolate = app.vps[idx].isolate.is_some();
     let hud_on = app.vps[idx].hud;
@@ -2324,7 +2323,7 @@ fn hud(app: &mut IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
         return;
     }
     let text = Color32::from_gray(0xe8);
-    if h.cam_names {
+    if h.cam_names && !viewport_menu {
         p.text(pos2(r.center().x, r.max.y - 12.0), egui::Align2::CENTER_CENTER, &camera, egui::FontId::proportional(11.0), Color32::from_gray(0xe6));
     }
     // poly count: totals, the selected objects, selected components (JS drawHud)
