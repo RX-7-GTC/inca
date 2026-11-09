@@ -53,6 +53,38 @@ pub enum ConnWire {
     Sg { mat: String },
 }
 
+/// One work-area tab. The active tab's fields live in HsState; the others live here.
+#[derive(Clone)]
+struct WorkTab {
+    name: String,
+    pos: HashMap<String, Pos2>,
+    pan: Vec2,
+    zoom: f32,
+    graph_sel: HashSet<String>,
+    graph_ids: Option<HashSet<String>>,
+    z: HashMap<String, u64>,
+    z_next: u64,
+    overflow: u32,
+    sel_wire: Option<ConnWire>,
+}
+
+impl Default for WorkTab {
+    fn default() -> Self {
+        WorkTab {
+            name: "Work Area".into(),
+            pos: HashMap::new(),
+            pan: vec2(20.0, 20.0),
+            zoom: 1.0,
+            graph_sel: HashSet::new(),
+            graph_ids: Some(HashSet::new()),
+            z: HashMap::new(),
+            z_next: 0,
+            overflow: 0,
+            sel_wire: None,
+        }
+    }
+}
+
 pub struct HsState {
     pub(crate) pos: HashMap<String, Pos2>,
     pan: Vec2,
@@ -91,6 +123,10 @@ pub struct HsState {
     pub palette_drag_mmb: bool,
     pub graph_rect: Option<Rect>,
     pub window_rect: Option<Rect>,
+    tabs: Vec<WorkTab>,
+    active_tab: usize,
+    /// Tab index being dragged in the work-area tab bar.
+    tab_drag: Option<usize>,
 }
 
 impl Default for HsState {
@@ -127,6 +163,9 @@ impl Default for HsState {
             palette_drag_mmb: false,
             graph_rect: None,
             window_rect: None,
+            tabs: vec![WorkTab::default()],
+            active_tab: 0,
+            tab_drag: None,
         }
     }
 }
@@ -142,6 +181,109 @@ impl HsState {
         let mut order: Vec<usize> = (0..nodes.len()).collect();
         order.sort_by_key(|&i| *self.z.get(&nodes[i].id).unwrap_or(&0));
         order
+    }
+
+    fn save_active_tab(&mut self) {
+        if let Some(t) = self.tabs.get_mut(self.active_tab) {
+            t.pos = self.pos.clone();
+            t.pan = self.pan;
+            t.zoom = self.zoom;
+            t.graph_sel = self.graph_sel.clone();
+            t.graph_ids = self.graph_ids.clone();
+            t.z = self.z.clone();
+            t.z_next = self.z_next;
+            t.overflow = self.overflow;
+            t.sel_wire = self.sel_wire.clone();
+        }
+    }
+
+    fn load_tab(&mut self, i: usize) {
+        let Some(t) = self.tabs.get(i).cloned() else { return };
+        self.active_tab = i;
+        self.pos = t.pos;
+        self.pan = t.pan;
+        self.zoom = t.zoom;
+        self.graph_sel = t.graph_sel;
+        self.graph_ids = t.graph_ids;
+        self.z = t.z;
+        self.z_next = t.z_next;
+        self.overflow = t.overflow;
+        self.sel_wire = t.sel_wire;
+        // Transient gestures do not cross tab switches.
+        self.drag_start = None;
+        self.marquee = None;
+        self.marquee_base.clear();
+        self.frame = None;
+        self.wire = None;
+        self.wire_middle = false;
+        self.create_pos = None;
+        self.palette_drag = None;
+        self.palette_drag_mmb = false;
+        self.tab_drag = None;
+    }
+
+    pub(crate) fn switch_work_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() || i == self.active_tab {
+            return;
+        }
+        self.save_active_tab();
+        self.load_tab(i);
+    }
+
+    pub(crate) fn add_work_tab(&mut self) {
+        self.save_active_tab();
+        // Reuse the lowest free number so closing Graph 1 and adding again gives Graph 1.
+        let name = (1..).map(|n| format!("Graph {n}")).find(|name| !self.tabs.iter().any(|t| t.name == *name)).unwrap();
+        self.tabs.push(WorkTab { name, ..WorkTab::default() });
+        self.load_tab(self.tabs.len() - 1);
+    }
+
+    pub(crate) fn close_work_tab(&mut self, i: usize) {
+        if self.tabs.len() <= 1 || i >= self.tabs.len() {
+            return;
+        }
+        self.save_active_tab();
+        let was_active = i == self.active_tab;
+        self.tabs.remove(i);
+        if was_active {
+            self.load_tab(i.min(self.tabs.len() - 1));
+        } else if i < self.active_tab {
+            self.active_tab -= 1;
+        }
+    }
+
+    /// Reorder tabs; `to` is the insertion slot in the pre-removal tab list.
+    pub(crate) fn move_work_tab(&mut self, from: usize, to: usize) {
+        let len = self.tabs.len();
+        if from >= len {
+            return;
+        }
+        let to = to.min(len);
+        if to == from || to == from + 1 {
+            return;
+        }
+        self.save_active_tab();
+        let active = self.active_tab;
+        let tab = self.tabs.remove(from);
+        let slot = if to > from { to - 1 } else { to };
+        let new_active = if active == from {
+            slot
+        } else {
+            let mut a = if from < active { active - 1 } else { active };
+            if slot <= a {
+                a += 1;
+            }
+            a
+        };
+        self.tabs.insert(slot, tab);
+        self.active_tab = new_active;
+    }
+
+    /// A new scene starts with a single empty Work Area tab.
+    pub(crate) fn reset_work_tabs(&mut self) {
+        self.tabs = vec![WorkTab::default()];
+        self.active_tab = 0;
+        self.load_tab(0);
     }
 }
 
@@ -1648,6 +1790,98 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
         });
     // ---- work area
     egui::CentralPanel::default().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let names: Vec<String> = app.windows_state.hs.tabs.iter().map(|t| t.name.clone()).collect();
+            let active = app.windows_state.hs.active_tab;
+            let closable = names.len() > 1;
+            let mut switch = None;
+            let mut close = None;
+            let mut tab_rects = Vec::with_capacity(names.len());
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (i, name) in names.iter().enumerate() {
+                let font = egui::FontId::proportional(12.5);
+                let tw = ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), font.clone(), Color32::WHITE).size().x);
+                let w = tw + if closable { 28.0 } else { 16.0 };
+                let (r, resp) = ui.allocate_exact_size(vec2(w, 20.0), Sense::click_and_drag());
+                tab_rects.push(r);
+                let bg = if i == active {
+                    theme::HI
+                } else if resp.hovered() {
+                    Color32::from_gray(0x4d)
+                } else {
+                    Color32::from_gray(0x3f)
+                };
+                ui.painter().rect_filled(r, 3.0, bg);
+                ui.painter().text(pos2(r.min.x + 8.0, r.center().y), egui::Align2::LEFT_CENTER, name, font, if i == active { Color32::WHITE } else { theme::TEXT });
+                if closable {
+                    let xr = Rect::from_center_size(pos2(r.max.x - 11.0, r.center().y), vec2(14.0, 14.0));
+                    let xresp = ui.interact(xr, ui.id().with(("hs_tab_close", i)), Sense::click()).on_hover_text("Close tab");
+                    if xresp.hovered() {
+                        ui.painter().circle_filled(xr.center(), 7.0, Color32::from_rgba_unmultiplied(255, 255, 255, 28));
+                    }
+                    let c = xr.center();
+                    let s = 3.2;
+                    let stroke = Stroke::new(1.4, if xresp.hovered() { Color32::WHITE } else { Color32::from_gray(0xb8) });
+                    ui.painter().line_segment([c + vec2(-s, -s), c + vec2(s, s)], stroke);
+                    ui.painter().line_segment([c + vec2(s, -s), c + vec2(-s, s)], stroke);
+                    if xresp.clicked() {
+                        close = Some(i);
+                    }
+                }
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    app.windows_state.hs.tab_drag = Some(i);
+                }
+                if resp.clicked() && close.is_none() {
+                    switch = Some(i);
+                }
+            }
+            let pointer = ui.input(|i| i.pointer.hover_pos());
+            if let (Some(from), Some(p)) = (app.windows_state.hs.tab_drag, pointer) {
+                if let Some(name) = names.get(from) {
+                    let font = egui::FontId::proportional(12.5);
+                    let tw = ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), font.clone(), Color32::WHITE).size().x);
+                    let gr = Rect::from_min_size(p + vec2(12.0, 12.0), vec2(tw + 16.0, 20.0));
+                    let layer = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("hs_tab_drag_ghost")));
+                    layer.rect_filled(gr, 3.0, Color32::from_gray(0x58));
+                    layer.rect_stroke(gr, 3.0, Stroke::new(1.0, Color32::from_gray(0x8a)), egui::StrokeKind::Inside);
+                    layer.text(pos2(gr.min.x + 8.0, gr.center().y), egui::Align2::LEFT_CENTER, name, font, Color32::WHITE);
+                }
+                let x = p.x;
+                let mut slot = tab_rects.len();
+                for (i, r) in tab_rects.iter().enumerate() {
+                    if x < r.center().x {
+                        slot = i;
+                        break;
+                    }
+                }
+                // Dropping immediately before or after the dragged tab is a no-op.
+                if slot != from && slot != from + 1 {
+                    let line_x = if slot == 0 {
+                        tab_rects.first().map(|r| r.min.x - 2.0).unwrap_or(x)
+                    } else if slot >= tab_rects.len() {
+                        tab_rects.last().map(|r| r.max.x + 2.0).unwrap_or(x)
+                    } else {
+                        tab_rects[slot].min.x - 2.0
+                    };
+                    let (y0, y1) = tab_rects.first().map(|r| (r.min.y, r.max.y)).unwrap_or((ui.cursor().min.y, ui.cursor().min.y + 20.0));
+                    ui.painter().line_segment([pos2(line_x, y0), pos2(line_x, y1)], Stroke::new(2.0, Color32::WHITE));
+                }
+                if ui.input(|i| i.pointer.primary_released()) {
+                    app.windows_state.hs.move_work_tab(from, slot);
+                    app.windows_state.hs.tab_drag = None;
+                }
+            } else if app.windows_state.hs.tab_drag.is_some() && !ui.input(|i| i.pointer.primary_down()) {
+                app.windows_state.hs.tab_drag = None;
+            }
+            if ui.small_button("+").on_hover_text("New work-area tab").clicked() {
+                app.windows_state.hs.add_work_tab();
+            }
+            if let Some(i) = close {
+                app.windows_state.hs.close_work_tab(i);
+            } else if let Some(i) = switch {
+                app.windows_state.hs.switch_work_tab(i);
+            }
+        });
         ui.horizontal(|ui| {
             ui.label(RichText::new("Work Area").strong());
             let graph_count = app.windows_state.hs.graph_ids.as_ref().map(|ids| {
