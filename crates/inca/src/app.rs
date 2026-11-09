@@ -814,9 +814,9 @@ impl IncaApp {
     /// `select` command. The scene filters out non-selectable nodes; templates stay selectable.
     pub fn select_names(&mut self, ids: &[String], mode: SelMode) {
         debug_assert!(ids.iter().all(|i| self.s.nodes.contains_key(i)), "select_names expects node IDs, not names");
-        // The viewport/outliner and the Hypershade share one AE target, like Maya.
+        // The viewport/outliner take over the Attribute Editor, but the Hypershade
+        // Property Editor keeps the last shading node (Maya behavior).
         self.snode_sel = None;
-        self.windows_state.hs_selected = None;
         self.windows_state.hs.graph_sel.clear();
         let names: Vec<String> = ids.iter().map(|i| self.s.name_of(i)).collect();
         let flag = match mode {
@@ -1052,11 +1052,10 @@ impl eframe::App for IncaApp {
             self.fps_measured = if self.fps_measured > 0.0 { self.fps_measured * (1.0 - alpha) + inst * alpha } else { inst };
         }
         self.hotkeys(&ctx);
-        // One selection, like Maya: a scene selection (also set by MEL) wins over a stale
-        // Hypershade shading-node selection.
+        // A scene selection takes over the Attribute Editor, but the Hypershade
+        // Property Editor keeps the last shading node (Maya behavior).
         if self.snode_sel.is_some() && !self.s.sel.is_empty() {
             self.snode_sel = None;
-            self.windows_state.hs_selected = None;
             self.windows_state.hs.graph_sel.clear();
         }
         // constraints follow their targets live (gizmo drags, channel edits)
