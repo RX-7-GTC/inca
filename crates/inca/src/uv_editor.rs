@@ -448,7 +448,9 @@ fn image_texture(app: &mut IncaApp, ctx: &egui::Context) -> Option<egui::Texture
             return Some(tex.id());
         }
     }
-    let size = 512usize;
+    // Procedural previews use the viewport's texture size; 512² fractal terrain was
+    // too slow to regenerate on every slider change.
+    let size = if t.ty == "file" { 512 } else { inca_core::materials::VIEW_TEX_SIZE as usize };
     let px = match inca_core::materials::texture_swatch(t, size) {
         Some(p) => p,
         None => {

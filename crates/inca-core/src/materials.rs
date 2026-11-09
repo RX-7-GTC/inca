@@ -32,6 +32,10 @@ pub static TEX_TYPES: &[TexType] = &[
     TexType { ty: "ramp", label: "Ramp", defaults: || json!({ "type": "V Ramp", "colors": [[0, [1, 0, 0]], [0.5, [0, 1, 0]], [1, [0, 0, 1]]], "repeatU": 1, "repeatV": 1 }) },
     TexType { ty: "noise", label: "Noise", defaults: || json!({ "color1": [1, 1, 1], "color2": [0, 0, 0], "frequency": 8, "amplitude": 1, "repeatU": 1, "repeatV": 1 }) },
     TexType { ty: "grid", label: "Grid", defaults: || json!({ "lineColor": [1, 1, 1], "fillerColor": [0, 0, 0], "uWidth": 0.1, "vWidth": 0.1, "repeatU": 4, "repeatV": 4 }) },
+    TexType { ty: "cloth", label: "Cloth", defaults: || json!({ "uColor": [0.8, 0.75, 0.7], "vColor": [0.55, 0.5, 0.45], "gapColor": [0.15, 0.12, 0.1], "uWidth": 0.75, "vWidth": 0.75, "uWave": 0, "vWave": 0, "randomness": 0, "widthSpread": 0, "brightSpread": 0, "repeatU": 4, "repeatV": 4 }) },
+    TexType { ty: "fractal", label: "Fractal", defaults: || json!({ "amplitude": 1, "ratio": 0.707, "threshold": 0, "levelMax": 9, "frequencyRatio": 2, "bias": 0, "repeatU": 1, "repeatV": 1 }) },
+    TexType { ty: "mountain", label: "Mountain", defaults: || json!({ "snowColor": [1, 1, 1], "rockColor": [0.262, 0.102, 0], "amplitude": 1, "snowRoughness": 0.4, "rockRoughness": 0.707, "boundary": 1, "snowAltitude": 0.5, "snowDropoff": 2, "snowSlope": 0.8, "depthMax": 20, "repeatU": 1, "repeatV": 1 }) },
+    TexType { ty: "water", label: "Water", defaults: || json!({ "numberOfWaves": 8, "waveTime": 0, "waveVelocity": 1, "waveAmplitude": 0.05, "waveFrequency": 4, "subWaveFrequency": 0.125, "smoothness": 2, "windU": 1, "windV": 0, "repeatU": 1, "repeatV": 1 }) },
 ];
 
 pub fn mat_type(ty: &str) -> &'static MatType {
@@ -278,6 +282,115 @@ impl Texture {
                 }
                 Some(prev.1)
             }
+            "fractal" => {
+                let amp = a.get("amplitude").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                let ratio = a.get("ratio").and_then(|x| x.as_f64()).unwrap_or(0.707);
+                let threshold = a.get("threshold").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let level_max = a.get("levelMax").and_then(|x| x.as_f64()).unwrap_or(9.0);
+                let freq_ratio = a.get("frequencyRatio").and_then(|x| x.as_f64()).unwrap_or(2.0);
+                let bias = a.get("bias").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let n = fractal_noise(u * 4.0, v * 4.0, level_max.clamp(1.0, 12.0) as u32, ratio, freq_ratio);
+                let n = ((n - 0.5) * amp + 0.5 + bias + threshold).clamp(0.0, 1.0) as f32;
+                Some([n, n, n])
+            }
+            "mountain" => {
+                let snow = rgb(a.get("snowColor")).unwrap_or([1.0; 3]);
+                let rock = rgb(a.get("rockColor")).unwrap_or([0.262, 0.102, 0.0]);
+                let amp = a.get("amplitude").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                let snow_rough = a.get("snowRoughness").and_then(|x| x.as_f64()).unwrap_or(0.4);
+                let rock_rough = a.get("rockRoughness").and_then(|x| x.as_f64()).unwrap_or(0.707);
+                let boundary = a.get("boundary").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                let altitude = a.get("snowAltitude").and_then(|x| x.as_f64()).unwrap_or(0.5);
+                let dropoff = a.get("snowDropoff").and_then(|x| x.as_f64()).unwrap_or(2.0);
+                let slope_max = a.get("snowSlope").and_then(|x| x.as_f64()).unwrap_or(0.8);
+                let depth = a.get("depthMax").and_then(|x| x.as_f64()).unwrap_or(20.0);
+                let octaves = depth.clamp(1.0, 10.0) as u32;
+                let pattern = |x: f64, y: f64| fractal_noise(x * 3.0, y * 3.0, octaves, 0.707, 2.0);
+                // The snow slope only needs the broad shape; lower octaves are much cheaper.
+                let slope_pattern = |x: f64, y: f64| fractal_noise(x * 3.0, y * 3.0, octaves.min(4), 0.707, 2.0);
+                let h = (pattern(u, v) - 0.5) * amp + 0.5;
+                let ragged = (value_noise(u * 40.0, v * 40.0) - 0.5) * boundary * 0.25;
+                let h = (h + ragged).clamp(0.0, 1.0);
+                let e = 0.01;
+                let dx = slope_pattern(u + e, v) - slope_pattern(u - e, v);
+                let dy = slope_pattern(u, v + e) - slope_pattern(u, v - e);
+                let slope = (dx * dx + dy * dy).sqrt() * 8.0;
+                let line = 1.0 - altitude;
+                let snow_amt = smoothstep(line, line + 0.25 / dropoff.max(0.1), h) * (1.0 - (slope / slope_max.max(0.1)).clamp(0.0, 1.0));
+                let rock_b = 1.0 - rock_rough as f32 * 0.35 * value_noise(u * 50.0, v * 50.0) as f32;
+                let snow_b = 1.0 - snow_rough as f32 * 0.25 * value_noise(u * 30.0, v * 30.0) as f32;
+                let rock = [rock[0] * rock_b, rock[1] * rock_b, rock[2] * rock_b];
+                let snow = [snow[0] * snow_b, snow[1] * snow_b, snow[2] * snow_b];
+                Some(mix(rock, snow, snow_amt as f32))
+            }
+            "cloth" => {
+                let u_col = rgb(a.get("uColor")).unwrap_or([1.0; 3]);
+                let v_col = rgb(a.get("vColor")).unwrap_or([0.5; 3]);
+                let gap = rgb(a.get("gapColor")).unwrap_or([0.0; 3]);
+                let u_width = a.get("uWidth").and_then(|x| x.as_f64()).unwrap_or(0.75);
+                let v_width = a.get("vWidth").and_then(|x| x.as_f64()).unwrap_or(0.75);
+                let u_wave = a.get("uWave").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let v_wave = a.get("vWave").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let random = a.get("randomness").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let width_spread = a.get("widthSpread").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let bright_spread = a.get("brightSpread").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let ju = (value_noise(u * 9.0, v * 9.0) - 0.5) * random * 0.4;
+                let jv = (value_noise(u * 11.0 + 7.0, v * 11.0 + 7.0) - 0.5) * random * 0.4;
+                let cell_u = (u + ju).floor();
+                let cell_v = (v + jv).floor();
+                let uu = (u + ju + (v * std::f64::consts::TAU).sin() * v_wave * 0.5).rem_euclid(1.0);
+                let vv = (v + jv + (u * std::f64::consts::TAU).sin() * u_wave * 0.5).rem_euclid(1.0);
+                let uw = (u_width - width_spread * hash2(cell_v as i64, 13)).clamp(0.0, 1.0);
+                let vw = (v_width - width_spread * hash2(17, cell_u as i64)).clamp(0.0, 1.0);
+                let band = |x: f64, w: f64| {
+                    let edge = 0.04;
+                    if x < (w - edge).max(0.0) {
+                        1.0
+                    } else if x < w {
+                        ((w - x) / edge).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                };
+                let ub = band(vv, uw) as f32;
+                let vb = band(uu, vw) as f32;
+                let u_bright = 1.0 - bright_spread as f32 * value_noise(cell_u * 5.0, v * 8.0) as f32;
+                let v_bright = 1.0 - bright_spread as f32 * value_noise(u * 8.0, cell_v * 5.0) as f32;
+                let ut = mix(gap, [u_col[0] * u_bright, u_col[1] * u_bright, u_col[2] * u_bright], ub);
+                let vt = mix(gap, [v_col[0] * v_bright, v_col[1] * v_bright, v_col[2] * v_bright], vb);
+                let over_u = (cell_u as i64 + cell_v as i64).rem_euclid(2) == 0;
+                Some(if over_u {
+                    if ub > 0.0 { ut } else { vt }
+                } else if vb > 0.0 {
+                    vt
+                } else {
+                    ut
+                })
+            }
+            "water" => {
+                let count = a.get("numberOfWaves").and_then(|x| x.as_f64()).unwrap_or(8.0).clamp(0.0, 12.0) as u32;
+                let amplitude = a.get("waveAmplitude").and_then(|x| x.as_f64()).unwrap_or(0.05);
+                let frequency = a.get("waveFrequency").and_then(|x| x.as_f64()).unwrap_or(4.0);
+                let sub_frequency = a.get("subWaveFrequency").and_then(|x| x.as_f64()).unwrap_or(0.125);
+                let smoothness = a.get("smoothness").and_then(|x| x.as_f64()).unwrap_or(2.0);
+                let wind_u = a.get("windU").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                let wind_v = a.get("windV").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let time = a.get("waveTime").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let velocity = a.get("waveVelocity").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                let mut sum = 0.0;
+                let mut norm = 0.0;
+                for i in 0..count {
+                    let f = frequency * (i as f64 + 1.0);
+                    let phase = (u * wind_u + v * wind_v) * f * std::f64::consts::TAU + time * velocity * (i as f64 + 1.0);
+                    let amp = 1.0 / (i as f64 + 1.0);
+                    sum += phase.sin() * amp;
+                    norm += amp;
+                }
+                let waves = if norm > 0.0 { sum / norm } else { 0.0 };
+                let sub = ((u + v) * frequency * sub_frequency * std::f64::consts::TAU).sin() * (1.0 / (1.0 + smoothness));
+                let value = (0.5 + (waves * 0.5 + sub * 0.5) * (amplitude * 10.0)).clamp(0.0, 1.0) as f32;
+                Some([value, value, value])
+            }
             _ => None,
         }
     }
@@ -368,6 +481,25 @@ fn value_noise(x: f64, y: f64) -> f64 {
     let u = s(xf);
     let v = s(yf);
     (a + (b - a) * u) * (1.0 - v) + (c + (d - c) * u) * v
+}
+
+fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
+    let t = ((x - e0) / (e1 - e0).abs().max(1e-9)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn fractal_noise(x: f64, y: f64, octaves: u32, ratio: f64, frequency_ratio: f64) -> f64 {
+    let mut sum = 0.0;
+    let mut norm = 0.0;
+    let mut amp = 1.0;
+    let mut f = 1.0;
+    for _ in 0..octaves.clamp(1, 12) {
+        sum += value_noise(x * f, y * f) * amp;
+        norm += amp;
+        amp *= ratio.clamp(0.05, 1.0);
+        f *= frequency_ratio.clamp(1.0, 4.0);
+    }
+    sum / norm.max(1e-9)
 }
 
 /// Hypershade swatch: an RGBA image of a lit sphere with the material (and the procedural
