@@ -41,6 +41,7 @@ pub enum Act {
     HypershadeFrameSelected,
     HypershadeRearrange,
     HypershadeSelectObject(String),
+    ConnectTexture(String, String, String, Pos2),
 }
 
 #[derive(Clone)]
@@ -253,8 +254,9 @@ pub fn block_pointer(app: &IncaApp, ctx: &egui::Context) {
 }
 
 /// Open a marking menu outside a viewport (used by the Hypershade).
-pub fn open_custom(app: &mut IncaApp, pos: Pos2, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64) {
-    let m = menu(pos, app.active_vp, egui::PointerButton::Secondary, title, radial, list, now);
+pub fn open_custom(app: &mut IncaApp, pos: Pos2, title: Option<String>, radial: Vec<(&'static str, Item)>, list: Vec<Option<Item>>, now: f64, sticky: bool) {
+    let mut m = menu(pos, app.active_vp, egui::PointerButton::Secondary, title, radial, list, now);
+    m.sticky = sticky;
     app.marking = Some(m);
     app.marking_target = None;
 }
@@ -419,6 +421,10 @@ fn run(app: &mut IncaApp, act: Act) {
             app.windows_state.hs.frame = Some(false);
         }
         Act::HypershadeSelectObject(id) => app.select_names(&[id], SelMode::Replace),
+        Act::ConnectTexture(tex, mid, attr, pos) => {
+            crate::hypershade::ensure_graph_node(app, &tex, pos);
+            crate::hypershade::connect_texture(app, &tex, &mid, &attr);
+        }
     }
 }
 
@@ -453,7 +459,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     let cur = ptr.hover_pos().unwrap_or(m.pos);
     let d = cur - m.pos;
     let rects: Vec<Rect> = m.radial.iter().map(|(d, i)| radial_rect(ctx, m, d, &i.label)).collect();
-    let list_top = m.pos.y + 2.0 * ROW + 22.0;
+    let list_top = if m.radial.is_empty() { m.pos.y } else { m.pos.y + 2.0 * ROW + 22.0 };
     let has_list = !m.list.is_empty() || m.title.is_some();
     let list_h = 8.0 + m.title.as_ref().map_or(0.0, |_| 18.0) + m.list.iter().map(|i| if i.is_some() { 20.0 } else { 7.0 }).sum::<f32>();
     let list_rect = if has_list {
@@ -654,7 +660,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     }
     // The drag line is drawn last so it stays visible over every option, except when the
     // pointer is in the bottom menu (there it behaves like a normal menu).
-    if !in_list {
+    if !m.radial.is_empty() && !in_list {
         p.line_segment([pos, cur], Stroke::new(1.5, Color32::from_gray(0xdd)));
         p.circle_filled(pos, 4.0, Color32::from_gray(0xdd));
     }
