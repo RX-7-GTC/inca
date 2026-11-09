@@ -42,6 +42,9 @@ pub enum Act {
     HypershadeRearrange,
     HypershadeSelectObject(String),
     ConnectTexture(String, String, String, Pos2),
+    BreakWire(crate::hypershade::ConnWire),
+    IsolateWire(crate::hypershade::ConnWire),
+    SelectWire(crate::hypershade::ConnWire),
 }
 
 #[derive(Clone)]
@@ -425,6 +428,9 @@ fn run(app: &mut IncaApp, act: Act) {
             crate::hypershade::ensure_graph_node(app, &tex, pos);
             crate::hypershade::connect_texture(app, &tex, &mid, &attr);
         }
+        Act::BreakWire(w) => crate::hypershade::break_connection(app, &w),
+        Act::IsolateWire(w) => crate::hypershade::isolate_connection(app, &w),
+        Act::SelectWire(w) => crate::hypershade::select_connection(app, &w),
     }
 }
 

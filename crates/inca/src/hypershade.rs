@@ -45,6 +45,14 @@ enum Wire {
     Mat(String),
 }
 
+/// An existing connection line in the work area.
+#[derive(Clone, PartialEq)]
+pub enum ConnWire {
+    Map { tex: String, mat: String, attr: String },
+    User { mat: String, obj: String },
+    Sg { mat: String },
+}
+
 pub struct HsState {
     pub(crate) pos: HashMap<String, Pos2>,
     pan: Vec2,
@@ -64,6 +72,7 @@ pub struct HsState {
     wire: Option<Wire>,
     /// The current wire comes from a middle-drag node connection gesture.
     wire_middle: bool,
+    sel_wire: Option<ConnWire>,
     swatches: HashMap<String, (u64, egui::TextureHandle)>,
     pub tab: usize,
     pub filter: String,
@@ -95,6 +104,7 @@ impl Default for HsState {
             frame: None,
             wire: None,
             wire_middle: false,
+            sel_wire: None,
             swatches: HashMap::new(),
             tab: 0,
             filter: String::new(),
@@ -340,6 +350,96 @@ pub(crate) fn open_connect_menu(app: &mut IncaApp, tex: &str, mid: &str, pos: Po
         .collect();
     let title = Some(format!("{}...", m.name));
     open_custom(app, pos, title, vec![], list, now, true);
+}
+
+pub(crate) fn break_connection(app: &mut IncaApp, wire: &ConnWire) {
+    match wire {
+        ConnWire::Map { mat, attr, .. } => {
+            let Some(m) = app.s.mats.get(mat) else { return };
+            let name = m.name.clone();
+            if !m.maps.contains_key(attr) {
+                return;
+            }
+            app.s.checkpoint("break connection");
+            app.s.mats.get_mut(mat).unwrap().clear_map(attr);
+            app.s.touch();
+            app.echo(format!("disconnectAttr {name}.{attr};"));
+        }
+        // Our material assignment is not a plain attribute link; breaking these would
+        // discard face assignments, so keep them read-only for now.
+        ConnWire::User { .. } => app.warn("Cannot break a material-to-object connection."),
+        ConnWire::Sg { .. } => app.warn("Cannot break the shading group connection."),
+    }
+    app.windows_state.hs.sel_wire = None;
+}
+
+pub(crate) fn isolate_connection(app: &mut IncaApp, wire: &ConnWire) {
+    let mut ids = HashSet::new();
+    match wire {
+        ConnWire::Map { tex, mat, .. } => {
+            ids.insert(tex.clone());
+            ids.insert(mat.clone());
+            app.windows_state.hs.graph_ids = Some(ids);
+            app.windows_state.hs.graph_sel.clear();
+            app.windows_state.hs.graph_sel.insert(tex.clone());
+            app.windows_state.hs.graph_sel.insert(mat.clone());
+            select_shading_node(app, mat);
+        }
+        ConnWire::Sg { mat } => {
+            ids.insert(mat.clone());
+            app.windows_state.hs.graph_ids = Some(ids);
+            app.windows_state.hs.graph_sel.clear();
+            app.windows_state.hs.graph_sel.insert(mat.clone());
+            app.windows_state.hs.graph_sel.insert(format!("sg:{mat}"));
+            select_shading_node(app, mat);
+        }
+        ConnWire::User { mat, obj } => {
+            ids.insert(mat.clone());
+            app.windows_state.hs.graph_ids = Some(ids);
+            app.select_names(std::slice::from_ref(obj), SelMode::Replace);
+            app.windows_state.hs.graph_sel.insert(mat.clone());
+            app.windows_state.hs_selected = Some(mat.clone());
+        }
+    }
+    app.windows_state.hs.frame = Some(false);
+    app.windows_state.hs.sel_wire = None;
+}
+
+pub(crate) fn select_connection(app: &mut IncaApp, wire: &ConnWire) {
+    match wire {
+        ConnWire::Map { tex, mat, .. } => {
+            app.windows_state.hs.graph_sel.clear();
+            app.windows_state.hs.graph_sel.insert(tex.clone());
+            app.windows_state.hs.graph_sel.insert(mat.clone());
+            select_shading_node(app, mat);
+        }
+        ConnWire::Sg { mat } => {
+            app.windows_state.hs.graph_sel.clear();
+            app.windows_state.hs.graph_sel.insert(mat.clone());
+            app.windows_state.hs.graph_sel.insert(format!("sg:{mat}"));
+            select_shading_node(app, mat);
+        }
+        ConnWire::User { mat, obj } => {
+            app.select_names(std::slice::from_ref(obj), SelMode::Replace);
+            app.windows_state.hs.graph_sel.insert(mat.clone());
+            app.windows_state.hs_selected = Some(mat.clone());
+        }
+    }
+    app.windows_state.hs.sel_wire = None;
+}
+
+fn open_connection_marking(app: &mut IncaApp, wire: ConnWire, pos: Pos2, now: f64) {
+    app.windows_state.hs.sel_wire = Some(wire.clone());
+    let mut br = menu_item("Break Connection", Act::BreakWire(wire.clone()));
+    if !matches!(wire, ConnWire::Map { .. }) {
+        br.enabled = false;
+    }
+    let list = vec![
+        Some(br),
+        Some(menu_item("Isolate connected nodes", Act::IsolateWire(wire.clone()))),
+        Some(menu_item("Select connected nodes", Act::SelectWire(wire))),
+    ];
+    open_custom(app, pos, Some("Connection...".into()), vec![], list, now, true);
 }
 
 fn assign_to_object(app: &mut IncaApp, mat: &str, obj: &str) {
@@ -1491,6 +1591,17 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                     app.windows_state.hs.frame = Some(false);
                 }
             }
+            ui.separator();
+            if crate::icons::button(ui, "hsUpstream", "Input connections", false, 22.0).clicked() {
+                graph_connections(app, true, false);
+            }
+            if crate::icons::button(ui, "hsUpDownstream", "Input and output connections", false, 22.0).clicked() {
+                graph_connections(app, true, true);
+            }
+            if crate::icons::button(ui, "hsDownstream", "Output connections", false, 22.0).clicked() {
+                graph_connections(app, false, true);
+            }
+            ui.separator();
             if ui.small_button("Frame All").on_hover_text("Fit the whole graph").clicked() {
                 app.windows_state.hs.frame = Some(false);
             }
@@ -1885,6 +1996,28 @@ fn bezier(p: &egui::Painter, a: Pos2, b: Pos2, col: Color32, w: f32) {
     }
 }
 
+fn bezier_dist(a: Pos2, b: Pos2, q: Pos2) -> f32 {
+    let d = ((b.x - a.x).abs() * 0.5).max(30.0);
+    let (c1, c2) = (a + vec2(d, 0.0), b - vec2(d, 0.0));
+    let point = |t: f32| {
+        let u = 1.0 - t;
+        pos2(
+            u * u * u * a.x + 3.0 * u * u * t * c1.x + 3.0 * u * t * t * c2.x + t * t * t * b.x,
+            u * u * u * a.y + 3.0 * u * u * t * c1.y + 3.0 * u * t * t * c2.y + t * t * t * b.y,
+        )
+    };
+    let mut prev = a;
+    let mut best = f32::MAX;
+    for i in 1..=24 {
+        let p = point(i as f32 / 24.0);
+        let ab = p - prev;
+        let t = ((q - prev).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+        best = best.min((prev + ab * t).distance(q));
+        prev = p;
+    }
+    best
+}
+
 fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
@@ -1914,6 +2047,11 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         if ctx.input(|i| i.key_pressed(egui::Key::F)) {
             app.windows_state.hs.frame = Some(true);
         }
+        if app.windows_state.hs.sel_wire.is_some() && !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+            if let Some(w) = app.windows_state.hs.sel_wire.take() {
+                break_connection(app, &w);
+            }
+        }
     }
     if let Some(sel) = app.windows_state.hs.frame.take() {
         frame_graph(app, rect, sel);
@@ -1928,24 +2066,58 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     let wire = app.windows_state.hs.wire.clone();
     let wire_middle = app.windows_state.hs.wire_middle;
     let drop_target = wire.as_ref().and_then(|w| pointer.and_then(|q| graph_drop_target(w, &nodes, &rects, &order, q, zoom)));
-    // ---- wires
+    // ---- existing connections
+    let mut wires: Vec<(ConnWire, Pos2, Pos2, Color32)> = vec![];
     for (mi, m) in nodes.iter().enumerate().filter(|(_, n)| n.kind == Kind::Material) {
         let Some(mat) = app.s.mats.get(&m.id) else { continue };
         for (si, slot) in m.inputs.iter().enumerate() {
             if let Some(ti) = mat.maps.get(slot).and_then(|v| v.as_str()).and_then(find) {
                 let out = if mat.map_out(slot) == "outAlpha" { 1 } else { 0 };
                 let col = if out == 1 { Color32::from_rgb(127, 208, 232) } else { Color32::from_rgb(230, 200, 90) };
-                bezier(&painter, out_port_pos(&nodes[ti], rects[ti], out, zoom), in_port_pos(m, rects[mi], si, zoom), col, 2.0);
+                wires.push((
+                    ConnWire::Map { tex: nodes[ti].id.clone(), mat: m.id.clone(), attr: slot.clone() },
+                    out_port_pos(&nodes[ti], rects[ti], out, zoom),
+                    in_port_pos(m, rects[mi], si, zoom),
+                    col,
+                ));
             }
         }
         for (oi, o) in nodes.iter().enumerate().filter(|(_, n)| n.kind == Kind::Object) {
             if users(app, &m.id).contains(&o.id) {
-                bezier(&painter, out_port_pos(m, rects[mi], 0, zoom), in_port_pos(o, rects[oi], 0, zoom), Color32::from_rgb(120, 220, 120), 2.0);
+                wires.push((
+                    ConnWire::User { mat: m.id.clone(), obj: o.id.clone() },
+                    out_port_pos(m, rects[mi], 0, zoom),
+                    in_port_pos(o, rects[oi], 0, zoom),
+                    Color32::from_rgb(120, 220, 120),
+                ));
             }
         }
         if let Some(si) = find(&format!("sg:{}", m.id)) {
-            bezier(&painter, out_port_pos(m, rects[mi], 0, zoom), in_port_pos(&nodes[si], rects[si], 0, zoom), Color32::from_rgb(120, 220, 120), 2.0);
+            wires.push((
+                ConnWire::Sg { mat: m.id.clone() },
+                out_port_pos(m, rects[mi], 0, zoom),
+                in_port_pos(&nodes[si], rects[si], 0, zoom),
+                Color32::from_rgb(120, 220, 120),
+            ));
         }
+    }
+    let hover_wire = pointer.filter(|q| rect.contains(*q) && !rects.iter().any(|r| r.contains(*q))).and_then(|q| {
+        let mut best: Option<(f32, usize)> = None;
+        for (i, (_, a, b, _)) in wires.iter().enumerate() {
+            let d = bezier_dist(*a, *b, q);
+            if d < 6.0 && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                best = Some((d, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    });
+    if app.windows_state.hs.sel_wire.as_ref().is_some_and(|w| !wires.iter().any(|(x, _, _, _)| x == w)) {
+        app.windows_state.hs.sel_wire = None;
+    }
+    for (wi, (w, a, b, col)) in wires.iter().enumerate() {
+        let selected = app.windows_state.hs.sel_wire.as_ref() == Some(w);
+        let active = selected || hover_wire == Some(wi);
+        bezier(&painter, *a, *b, if active { Color32::WHITE } else { *col }, if active { 3.0 } else { 2.0 });
     }
     // ---- nodes
     let font = egui::FontId::proportional(11.0 * zoom.clamp(0.6, 1.4));
@@ -2258,8 +2430,16 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     }
     if resp.clicked() {
-        if let Some((i, _)) = hovered_port {
+        if let Some(wi) = hover_wire {
+            if let Some((w, _, _, _)) = wires.get(wi) {
+                app.select_names(&[], SelMode::Replace);
+                app.windows_state.hs.graph_sel.clear();
+                app.windows_state.hs_selected = None;
+                app.windows_state.hs.sel_wire = Some(w.clone());
+            }
+        } else if let Some((i, _)) = hovered_port {
             let id = nodes[i].id.clone();
+            app.windows_state.hs.sel_wire = None;
             // Dragging a selected node keeps the group; a plain click picks only that node.
             if !additive {
                 app.windows_state.hs.graph_sel.clear();
@@ -2267,6 +2447,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             select_graph_node(app, &id, additive);
         } else {
+            app.windows_state.hs.sel_wire = None;
             app.windows_state.hs.graph_sel.clear();
             app.windows_state.hs_selected = None;
             app.select_names(&[], SelMode::Replace);
@@ -2289,6 +2470,10 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
                 // still be the target of "Assign to Selection" (Maya behavior).
                 let id = nodes[i].id.strip_prefix("sg:").unwrap_or(&nodes[i].id).to_string();
                 open_node_marking(app, &id, pos, now);
+            } else if let Some(wi) = hover_wire {
+                if let Some((w, _, _, _)) = wires.get(wi) {
+                    open_connection_marking(app, w.clone(), pos, now);
+                }
             } else {
                 open_empty_marking(app, pos, now);
             }
