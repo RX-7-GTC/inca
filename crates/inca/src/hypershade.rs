@@ -76,6 +76,10 @@ pub struct HsState {
     swatches: HashMap<String, (u64, egui::TextureHandle)>,
     pub tab: usize,
     pub filter: String,
+    pub list_view: bool,
+    pub swatch_size: usize,
+    pub sort_mode: u8,
+    pub sort_reverse: bool,
     pub create_filter: String,
     pub rename: Option<(String, String)>,
     /// Screen position where the empty marking menu was opened; new nodes go there.
@@ -108,6 +112,10 @@ impl Default for HsState {
             swatches: HashMap::new(),
             tab: 0,
             filter: String::new(),
+            list_view: false,
+            swatch_size: 1,
+            sort_mode: 0,
+            sort_reverse: false,
             create_filter: String::new(),
             rename: None,
             create_pos: None,
@@ -1393,6 +1401,27 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 if menu_row(app, ui, true, "Reset Zoom") {
                     app.windows_state.hs.zoom = 1.0;
                 }
+                ui.separator();
+                if crate::menus::menu_radio(app, ui, !app.windows_state.hs.list_view, "As Icons") {
+                    app.windows_state.hs.list_view = false;
+                }
+                if crate::menus::menu_radio(app, ui, app.windows_state.hs.list_view, "As List") {
+                    app.windows_state.hs.list_view = true;
+                }
+                for (i, label) in ["Small", "Medium", "Large", "Extra Large"].iter().enumerate() {
+                    if crate::menus::menu_radio(app, ui, app.windows_state.hs.swatch_size == i, &format!("As {label} Swatches")) {
+                        app.windows_state.hs.swatch_size = i;
+                    }
+                }
+                ui.separator();
+                for (i, label) in ["By Name", "By Type", "By Time"].iter().enumerate() {
+                    if crate::menus::menu_radio(app, ui, app.windows_state.hs.sort_mode == i as u8, label) {
+                        app.windows_state.hs.sort_mode = i as u8;
+                    }
+                }
+                if crate::menus::menu_check(app, ui, app.windows_state.hs.sort_reverse, "Reverse Order") {
+                    app.windows_state.hs.sort_reverse = !app.windows_state.hs.sort_reverse;
+                }
             }
             "Create" => {
                 ui.menu_button("Material", |ui| {
@@ -1677,110 +1706,167 @@ fn open_palette_marking(app: &mut IncaApp, id: &str, name: &str, pos: Pos2, now:
     open_custom(app, pos, Some(format!("{name}...")), radial, list, now, false);
 }
 
+struct PaletteItem {
+    id: String,
+    name: String,
+    icon: Option<String>,
+    ty: String,
+    order: usize,
+}
+
+fn palette_item_interaction(app: &mut IncaApp, ctx: &egui::Context, id: &str, name: &str, resp: &egui::Response, additive: bool) {
+    if resp.clicked() {
+        // A plain click picks exactly that swatch; Ctrl/Shift adds or toggles.
+        if !additive {
+            app.windows_state.hs.graph_sel.clear();
+            app.windows_state.hs.graph_sel.insert(id.to_string());
+        }
+        select_graph_node(app, id, additive);
+    }
+    if resp.double_clicked() && app.s.mats.contains_key(id) {
+        let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
+    }
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        app.windows_state.hs.palette_drag = Some(id.to_string());
+        app.windows_state.hs.palette_drag_mmb = false;
+    }
+    if resp.drag_started_by(egui::PointerButton::Middle) {
+        app.windows_state.hs.palette_drag = Some(id.to_string());
+        app.windows_state.hs.palette_drag_mmb = true;
+    }
+    if resp.drag_stopped_by(egui::PointerButton::Primary) && !app.windows_state.hs.palette_drag_mmb {
+        if let Some(drag) = app.windows_state.hs.palette_drag.take() {
+            if let Some(q) = ctx.pointer_hover_pos() {
+                let now = ctx.input(|i| i.time);
+                handle_palette_drop(app, &drag, q, now);
+            }
+        }
+    }
+    if resp.drag_stopped_by(egui::PointerButton::Middle) && app.windows_state.hs.palette_drag_mmb {
+        if let Some(drag) = app.windows_state.hs.palette_drag.take() {
+            app.windows_state.hs.palette_drag_mmb = false;
+            if let Some(q) = ctx.pointer_hover_pos() {
+                let ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                let now = ctx.input(|i| i.time);
+                handle_palette_drop_middle(app, &drag, q, ctrl, now);
+            }
+        }
+    }
+    if app.marking.is_none() && resp.hovered() && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
+        let now = ctx.input(|i| i.time);
+        let pos = ctx.input(|i| i.pointer.interact_pos()).unwrap_or_else(|| resp.rect.center());
+        open_palette_marking(app, id, name, pos, now);
+    }
+}
+
 fn palette(app: &mut IncaApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let filter = app.windows_state.hs.filter.to_lowercase();
     let additive = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
     // Behind the tiles: clicking the empty browser area clears the selection.
     let bg = ui.interact(ui.clip_rect(), ui.id().with("hs_palette_bg"), Sense::click());
-    let mut items: Vec<(String, String, Option<String>)> = vec![];
+    let mut items: Vec<PaletteItem> = vec![];
     match app.windows_state.hs.tab {
         0 => {
-            for m in app.s.mats.values() {
-                items.push((m.id.clone(), m.name.clone(), None));
+            for (order, m) in app.s.mats.values().enumerate() {
+                items.push(PaletteItem { id: m.id.clone(), name: m.name.clone(), icon: None, ty: m.ty.clone(), order });
             }
         }
         1 => {
-            for t in app.s.texs.values() {
-                items.push((t.id.clone(), t.name.clone(), None));
+            for (order, t) in app.s.texs.values().enumerate() {
+                items.push(PaletteItem { id: t.id.clone(), name: t.name.clone(), icon: None, ty: t.ty.clone(), order });
             }
         }
         2 => {
-            for n in app.s.nodes.values() {
+            for (order, n) in app.s.nodes.values().enumerate() {
                 if let Shape::Light(l) = &n.shape {
-                    items.push((n.id.clone(), n.shape_name.clone().unwrap_or_else(|| n.name.clone()), Some(l.ty.clone())));
+                    items.push(PaletteItem { id: n.id.clone(), name: n.shape_name.clone().unwrap_or_else(|| n.name.clone()), icon: Some(l.ty.clone()), ty: l.ty.clone(), order });
                 }
             }
         }
         3 => {
-            for n in app.s.nodes.values() {
+            for (order, n) in app.s.nodes.values().enumerate() {
                 if matches!(n.shape, Shape::Camera(_)) {
-                    items.push((n.id.clone(), n.shape_name.clone().unwrap_or_else(|| n.name.clone()), Some("camera".into())));
+                    items.push(PaletteItem { id: n.id.clone(), name: n.shape_name.clone().unwrap_or_else(|| n.name.clone()), icon: Some("camera".into()), ty: "camera".into(), order });
                 }
             }
         }
         _ => {
-            for m in app.s.mats.values() {
+            for (order, m) in app.s.mats.values().enumerate() {
                 let label = if m.id == app.s.default_mat { "initialShadingGroup".to_string() } else { format!("{}SG", m.name) };
-                items.push((m.id.clone(), label, None));
+                items.push(PaletteItem { id: m.id.clone(), name: label, icon: None, ty: m.ty.clone(), order });
             }
         }
     }
-    items.retain(|(_, label, _)| filter.is_empty() || label.to_lowercase().contains(&filter));
-    // Fixed-width grid: wrap by whole tiles instead of relying on label widths.
-    let cols = (((ui.available_width() + 4.0) / 60.0).floor() as usize).max(1);
-    for row in items.chunks(cols) {
-        ui.horizontal(|ui| {
-            for (id, name, icon) in row {
-                let sel = app.windows_state.hs.graph_sel.contains(id) || app.windows_state.hs_selected.as_deref() == Some(id.as_str()) || app.s.sel.contains(id);
-                let tex = swatch(app, &ctx, id);
-                ui.vertical(|ui| {
-                    ui.set_width(56.0);
-                    let (r, resp) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::click_and_drag());
-                    ui.painter().rect_filled(r, 2.0, if sel { theme::HI } else { theme::BG_DARK });
-                    if let Some(t) = tex {
-                        ui.painter().image(t, r.shrink(3.0), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                    } else if let Some(icon) = icon {
-                        crate::icons::paint(ui, r.shrink(6.0), icon, Color32::WHITE);
-                    }
-                    ui.add_sized([56.0, 14.0], egui::Label::new(RichText::new(name).size(10.0)).truncate());
-                    if resp.clicked() {
-                        // A plain click picks exactly that swatch; Ctrl/Shift adds or toggles.
-                        if !additive {
-                            app.windows_state.hs.graph_sel.clear();
-                            app.windows_state.hs.graph_sel.insert(id.clone());
-                        }
-                        select_graph_node(app, id, additive);
-                    }
-                    if resp.double_clicked() && app.s.mats.contains_key(id) {
-                        let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
-                    }
-                    if resp.drag_started_by(egui::PointerButton::Primary) {
-                        app.windows_state.hs.palette_drag = Some(id.clone());
-                        app.windows_state.hs.palette_drag_mmb = false;
-                    }
-                    if resp.drag_started_by(egui::PointerButton::Middle) {
-                        app.windows_state.hs.palette_drag = Some(id.clone());
-                        app.windows_state.hs.palette_drag_mmb = true;
-                    }
-                    if resp.drag_stopped_by(egui::PointerButton::Primary) && !app.windows_state.hs.palette_drag_mmb {
-                        if let Some(drag) = app.windows_state.hs.palette_drag.take() {
-                            if let Some(q) = ctx.pointer_hover_pos() {
-                                let now = ctx.input(|i| i.time);
-                                handle_palette_drop(app, &drag, q, now);
-                            }
-                        }
-                    }
-                    if resp.drag_stopped_by(egui::PointerButton::Middle) && app.windows_state.hs.palette_drag_mmb {
-                        if let Some(drag) = app.windows_state.hs.palette_drag.take() {
-                            app.windows_state.hs.palette_drag_mmb = false;
-                            if let Some(q) = ctx.pointer_hover_pos() {
-                                let ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
-                                let now = ctx.input(|i| i.time);
-                                handle_palette_drop_middle(app, &drag, q, ctrl, now);
-                            }
-                        }
-                    }
-                    if app.marking.is_none() && resp.hovered() && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
-                        let now = ctx.input(|i| i.time);
-                        let pos = ctx.input(|i| i.pointer.interact_pos()).unwrap_or(r.center());
-                        open_palette_marking(app, id, name, pos, now);
-                    }
-                    let hint = if icon.is_some() { "click to select, drag into the work area" } else { "click to edit, drag to assign/connect" };
-                    resp.on_hover_text(format!("{name} — {hint}"));
-                });
+    items.retain(|i| filter.is_empty() || i.name.to_lowercase().contains(&filter));
+    let (sort_mode, reverse) = (app.windows_state.hs.sort_mode, app.windows_state.hs.sort_reverse);
+    match sort_mode {
+        0 => items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        1 => items.sort_by(|a, b| a.ty.to_lowercase().cmp(&b.ty.to_lowercase()).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))),
+        _ => items.sort_by_key(|i| i.order),
+    }
+    if reverse {
+        items.reverse();
+    }
+    if app.windows_state.hs.list_view {
+        for item in &items {
+            let sel = app.windows_state.hs.graph_sel.contains(&item.id) || app.windows_state.hs_selected.as_deref() == Some(item.id.as_str()) || app.s.sel.contains(&item.id);
+            let tex = swatch(app, &ctx, &item.id);
+            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click_and_drag());
+            let bgc = if sel {
+                Some(theme::HI)
+            } else if resp.hovered() {
+                Some(Color32::from_gray(0x4d))
+            } else {
+                None
+            };
+            if let Some(c) = bgc {
+                ui.painter().rect_filled(r, 2.0, c);
             }
-        });
+            let ir = Rect::from_min_size(r.min + vec2(2.0, 3.0), vec2(16.0, 16.0));
+            if let Some(t) = tex {
+                ui.painter().image(t, ir, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            } else if let Some(icon) = &item.icon {
+                crate::icons::paint(ui, ir, icon, Color32::WHITE);
+            }
+            ui.painter().text(pos2(r.min.x + 24.0, r.center().y), egui::Align2::LEFT_CENTER, &item.name, egui::FontId::proportional(11.5), if sel { Color32::WHITE } else { theme::TEXT });
+            palette_item_interaction(app, &ctx, &item.id, &item.name, &resp, additive);
+            let hint = if item.icon.is_some() { "click to select, drag into the work area" } else { "click to edit, drag to assign/connect" };
+            resp.on_hover_text(format!("{} — {hint}", item.name));
+        }
+    } else {
+        let size: f32 = [36.0, 52.0, 68.0, 84.0][app.windows_state.hs.swatch_size.min(3)];
+        let tile_w = (size + 10.0).max(46.0);
+        let cols = (((ui.available_width() + 4.0) / (tile_w + 4.0)).floor() as usize).max(1);
+        for row in items.chunks(cols) {
+            ui.horizontal(|ui| {
+                for item in row {
+                    let sel = app.windows_state.hs.graph_sel.contains(&item.id) || app.windows_state.hs_selected.as_deref() == Some(item.id.as_str()) || app.s.sel.contains(&item.id);
+                    let tex = swatch(app, &ctx, &item.id);
+                    ui.vertical(|ui| {
+                        ui.set_width(tile_w);
+                        let (r, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());
+                        let bgc = if sel {
+                            theme::HI
+                        } else if resp.hovered() {
+                            Color32::from_gray(0x4d)
+                        } else {
+                            theme::BG_DARK
+                        };
+                        ui.painter().rect_filled(r, 2.0, bgc);
+                        if let Some(t) = tex {
+                            ui.painter().image(t, r.shrink(3.0), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                        } else if let Some(icon) = &item.icon {
+                            crate::icons::paint(ui, r.shrink((size * 0.12).max(4.0)), icon, Color32::WHITE);
+                        }
+                        ui.add_sized([tile_w, 14.0], egui::Label::new(RichText::new(&item.name).size(10.0).color(if sel { Color32::WHITE } else { theme::TEXT })).truncate());
+                        palette_item_interaction(app, &ctx, &item.id, &item.name, &resp, additive);
+                        let hint = if item.icon.is_some() { "click to select, drag into the work area" } else { "click to edit, drag to assign/connect" };
+                        resp.on_hover_text(format!("{} — {hint}", item.name));
+                    });
+                }
+            });
+        }
     }
     if bg.clicked() {
         app.windows_state.hs.graph_sel.clear();
