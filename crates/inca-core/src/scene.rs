@@ -160,6 +160,9 @@ pub struct Node {
     pub selectable: bool,
     /// per-object x-ray (Attribute Editor > Render Stats)
     pub xray: bool,
+    /// Maya's Use Outliner Color / Outliner Color attributes.
+    pub use_outliner_color: bool,
+    pub outliner_color: [f32; 3],
     pub locks: Map<String, Value>,
     pub shape_name: Option<String>,
     pub extra: Value,
@@ -588,6 +591,8 @@ impl Scene {
             template: false,
             selectable: true,
             xray: false,
+            use_outliner_color: false,
+            outliner_color: [1.0, 1.0, 1.0],
             locks: Map::new(),
             shape_name,
             extra: Value::Null,
@@ -1335,6 +1340,8 @@ impl Scene {
                     "visibility" => return Some(json!(if n.visible { 1 } else { 0 })),
                     "template" => return Some(json!(if n.template { 1 } else { 0 })),
                     "xray" => return Some(json!(if n.xray { 1 } else { 0 })),
+                    "useOutlinerColor" => return Some(json!(if n.use_outliner_color { 1 } else { 0 })),
+                    "outlinerColor" => return Some(json!(n.outliner_color)),
                     "rotateOrder" => return Some(json!(n.xf.ro)),
                     _ => {}
                 }
@@ -1401,6 +1408,11 @@ impl Scene {
                         "visibility" => n.visible = f.unwrap_or(1.0) != 0.0,
                         "template" => n.template = f.unwrap_or(0.0) != 0.0,
                         "xray" => n.xray = f.unwrap_or(0.0) != 0.0,
+                        "useOutlinerColor" => n.use_outliner_color = f.unwrap_or(0.0) != 0.0,
+                        "outlinerColor" => {
+                            let Some(c) = crate::params::value_vec3(&v) else { return false };
+                            n.outliner_color = c.to_array().map(|x| x as f32);
+                        }
                         "rotateOrder" => {
                             n.xf.ro = match &v {
                                 Value::Number(k) => crate::math::ROTATE_ORDERS.get(k.as_u64().unwrap_or(0) as usize).copied().unwrap_or("xyz").to_string(),
@@ -1884,7 +1896,8 @@ impl Scene {
         let mut d = json!({
             "id": n.id, "name": n.name, "kind": n.kind, "parent": n.parent,
             "t": n.xf.t, "r": n.xf.r, "s": n.xf.s, "ro": n.xf.ro, "p": n.xf.p, "pt": n.xf.pt,
-            "visible": n.visible, "layer": n.layer, "template": n.template, "selectable": n.selectable, "xray": n.xray, "locks": n.locks,
+            "visible": n.visible, "layer": n.layer, "template": n.template, "selectable": n.selectable, "xray": n.xray,
+            "useOutlinerColor": n.use_outliner_color, "outlinerColor": n.outliner_color, "locks": n.locks,
             "shapeName": n.shape_name, "extra": n.extra,
         });
         let o = d.as_object_mut().unwrap();
@@ -1997,6 +2010,8 @@ impl Scene {
         n.template = d["template"].as_bool().unwrap_or(false);
         n.selectable = d["selectable"].as_bool().unwrap_or(true);
         n.xray = d["xray"].as_bool().unwrap_or(false);
+        n.use_outliner_color = d["useOutlinerColor"].as_bool().unwrap_or(false);
+        n.outliner_color = serde_json::from_value(d["outlinerColor"].clone()).unwrap_or([1.0; 3]);
         n.locks = d["locks"].as_object().cloned().unwrap_or_default();
         n.extra = d["extra"].clone();
         // duplicated/imported nodes get new ids, so published targets would be stale

@@ -29,6 +29,8 @@ pub struct PanelState {
     pub quit_confirm: bool,
     /// a channel drag is in progress (one undo step per drag)
     pub editing: bool,
+    /// Outliner Color picker drag: one undo step from press to release.
+    outliner_color_editing: bool,
     /// Channel Box channel names picked for the MMB virtual slider (and whether it is armed)
     pub cb_sel: Vec<String>,
     /// the picked channels themselves: rows' targets, attribute, whole-number?, range
@@ -82,11 +84,13 @@ pub struct OutlinerOpts {
     pub dag_only: bool,
     pub sort_alpha: bool,
     pub materials: bool,
+    #[serde(default)]
+    pub ignore_outliner_color: bool,
 }
 
 impl Default for OutlinerOpts {
     fn default() -> Self {
-        OutlinerOpts { shapes: false, sets: true, dag_only: false, sort_alpha: false, materials: false }
+        OutlinerOpts { shapes: false, sets: true, dag_only: false, sort_alpha: false, materials: false, ignore_outliner_color: false }
     }
 }
 
@@ -128,6 +132,9 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
             ui.separator();
             if menu_check(app, ui, o.sort_alpha, "Sort Alphabetical") {
                 o.sort_alpha = !o.sort_alpha;
+            }
+            if menu_check(app, ui, o.ignore_outliner_color, "Ignore 'Use Outliner Color'") {
+                o.ignore_outliner_color = !o.ignore_outliner_color;
             }
             app.panels.ol = o;
         }
@@ -251,6 +258,13 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
     let name = n.name.clone();
     let icon = kind_icon(n);
     let startup = n.startup();
+    let template = app.s.is_templated_display(id);
+    let custom_color = if n.use_outliner_color && !app.panels.ol.ignore_outliner_color {
+        let c = n.outliner_color;
+        Some(Color32::from_rgb((c[0].clamp(0.0, 1.0) * 255.0) as u8, (c[1].clamp(0.0, 1.0) * 255.0) as u8, (c[2].clamp(0.0, 1.0) * 255.0) as u8))
+    } else {
+        None
+    };
     let shape_name = n.shape_name.clone().filter(|_| app.panels.ol.shapes);
     let mut kids = n.children.clone();
     if app.panels.ol.sort_alpha {
@@ -303,6 +317,10 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
     crate::icons::paint(ui, egui::Rect::from_min_size(egui::pos2(x0 + 12.0, r.center().y - 7.5), egui::vec2(15.0, 15.0)), icon, Color32::from_white_alpha(dim));
     let col = if selected {
         Color32::WHITE
+    } else if let Some(c) = custom_color {
+        c
+    } else if template {
+        Color32::from_rgb(224, 160, 64)
     } else if child_sel {
         Color32::from_rgb(0x9f, 0xd7, 0xff)
     } else if startup {
@@ -310,7 +328,7 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
     } else {
         theme::TEXT
     };
-    let col = if hidden { col.gamma_multiply(0.55) } else { col };
+    let col = if hidden && !selected { Color32::from_gray(0x7a) } else { col };
     let name_pos = egui::pos2(x0 + 32.0, r.center().y);
     let renaming = app.panels.renaming.as_ref().is_some_and(|(rid, _)| rid == id);
     if renaming {
@@ -330,7 +348,7 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
     } else {
         ui.painter().text(name_pos, egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(12.0), col);
     }
-    let resp = if n_template(app, id) { resp.on_hover_text(format!("{name} (template)")) } else { resp };
+    let resp = if template { resp.on_hover_text(format!("{name} (template)")) } else { resp };
     let m = ui.input(|i| i.modifiers);
     let on_exp = resp.interact_pointer_pos().is_some_and(|p| exp_rect.contains(p));
     if resp.clicked() && on_exp && has_kids {
@@ -424,10 +442,6 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
             outliner_row(app, ui, &k, depth + 1, filter, rows);
         }
     }
-}
-
-fn n_template(app: &IncaApp, id: &str) -> bool {
-    app.s.is_template(id)
 }
 
 // ------------------------------------------------------------------ right panel
@@ -1851,6 +1865,32 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
             if theme::fold(ui, "Display") {
                 channel_row(app, ui, &targets, "visibility", "Visibility", ChanKind::Bool, None, None);
                 channel_row(app, ui, &targets, "template", "Template", ChanKind::Bool, None, None);
+                let mut use_outliner_color = app.s.node(id).map(|n| n.use_outliner_color).unwrap_or(false);
+                if ui.checkbox(&mut use_outliner_color, "Use Outliner Color").changed() {
+                    app.s.checkpoint("outliner color");
+                    if let Some(n) = app.s.nodes.get_mut(id) {
+                        n.use_outliner_color = use_outliner_color;
+                    }
+                    app.s.touch();
+                }
+                let mut outliner_color = app.s.node(id).map(|n| n.outliner_color).unwrap_or([1.0; 3]);
+                ui.horizontal(|ui| {
+                    ui.label("Outliner Color");
+                    let changed = ui.color_edit_button_rgb(&mut outliner_color).changed();
+                    if changed {
+                        if !app.panels.outliner_color_editing {
+                            app.s.checkpoint("outliner color");
+                            app.panels.outliner_color_editing = true;
+                        }
+                        if let Some(n) = app.s.nodes.get_mut(id) {
+                            n.outliner_color = outliner_color;
+                        }
+                        app.s.touch();
+                    }
+                    if app.panels.outliner_color_editing && !ui.input(|i| i.pointer.primary_down()) {
+                        app.panels.outliner_color_editing = false;
+                    }
+                });
                 let layer = app.s.node(id).and_then(|n| n.layer.clone()).and_then(|l| app.s.layers.iter().find(|x| x.id == l).map(|x| x.name.clone())).unwrap_or_else(|| "defaultLayer".into());
                 ui.horizontal(|ui| {
                     ui.label("Display Layer");
