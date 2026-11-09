@@ -1980,6 +1980,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 continue;
             }
             if ui.small_button(t.label).on_hover_text(format!("Create a {} material", t.label)).clicked() {
+                ui.ctx().memory_mut(|m| m.stop_text_input());
                 let _ = app.run_mel("create material", &format!("shadingNode -asShader {};", t.ty));
                 if let Some(id) = app.s.mats.keys().last().cloned() {
                     place_new_node(app, &id, None);
@@ -1993,6 +1994,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 continue;
             }
             if ui.small_button(t.label).on_hover_text(format!("Create a {} texture", t.label)).clicked() {
+                ui.ctx().memory_mut(|m| m.stop_text_input());
                 let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {};", t.ty));
                 if let Some(id) = app.s.texs.keys().last().cloned() {
                     place_new_node(app, &id, None);
@@ -2366,6 +2368,9 @@ struct PaletteItem {
 
 fn palette_item_interaction(app: &mut IncaApp, ctx: &egui::Context, id: &str, name: &str, resp: &egui::Response, additive: bool) {
     if resp.clicked() {
+        // Picking a node ends text editing in the search/create fields, so Del/Ctrl+Z
+        // act on the graph instead of the field.
+        ctx.memory_mut(|m| m.stop_text_input());
         // A plain click picks exactly that swatch; Ctrl/Shift adds or toggles.
         if !additive {
             app.windows_state.hs.graph_sel.clear();
@@ -3165,6 +3170,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     }
     if resp.clicked() {
+        ctx.memory_mut(|m| m.stop_text_input());
         if let Some(wi) = hover_wire {
             if let Some((w, _, _, _)) = wires.get(wi) {
                 app.select_names(&[], SelMode::Replace);
