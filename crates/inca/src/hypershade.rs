@@ -127,6 +127,14 @@ pub struct HsState {
     active_tab: usize,
     /// Tab index being dragged in the work-area tab bar.
     tab_drag: Option<usize>,
+    tab_rename: Option<(usize, String)>,
+    /// Closed tabs, most recently closed last. Each entry keeps its old tab-bar slot.
+    closed_tabs: Vec<(usize, WorkTab)>,
+    /// Tab to bring into view once, after adding, switching, or restoring.
+    tab_scroll: Option<usize>,
+    /// Last measured tab-strip scroll offset and limit, for drag auto-scroll bounds.
+    tab_scroll_off: f32,
+    tab_scroll_max: f32,
 }
 
 impl Default for HsState {
@@ -166,6 +174,11 @@ impl Default for HsState {
             tabs: vec![WorkTab::default()],
             active_tab: 0,
             tab_drag: None,
+            tab_rename: None,
+            closed_tabs: Vec::new(),
+            tab_scroll: None,
+            tab_scroll_off: 0.0,
+            tab_scroll_max: 0.0,
         }
     }
 }
@@ -209,6 +222,7 @@ impl HsState {
         self.z_next = t.z_next;
         self.overflow = t.overflow;
         self.sel_wire = t.sel_wire;
+        self.tab_scroll = Some(i);
         // Transient gestures do not cross tab switches.
         self.drag_start = None;
         self.marquee = None;
@@ -232,6 +246,8 @@ impl HsState {
 
     pub(crate) fn add_work_tab(&mut self) {
         self.save_active_tab();
+        // A fresh tab starts a fresh layout; restoring old closed tabs now would clutter it.
+        self.closed_tabs.clear();
         // Reuse the lowest free number so closing Graph 1 and adding again gives Graph 1.
         let name = (1..).map(|n| format!("Graph {n}")).find(|name| !self.tabs.iter().any(|t| t.name == *name)).unwrap();
         self.tabs.push(WorkTab { name, ..WorkTab::default() });
@@ -244,11 +260,88 @@ impl HsState {
         }
         self.save_active_tab();
         let was_active = i == self.active_tab;
-        self.tabs.remove(i);
+        let tab = self.tabs.remove(i);
+        self.closed_tabs.push((i, tab));
+        self.tab_rename = None;
         if was_active {
             self.load_tab(i.min(self.tabs.len() - 1));
         } else if i < self.active_tab {
             self.active_tab -= 1;
+        }
+    }
+
+    /// A name not used by any other tab, numbered when needed.
+    fn unique_tab_name(&self, base: &str, except: Option<usize>) -> String {
+        let taken = |s: &str| self.tabs.iter().enumerate().any(|(i, t)| Some(i) != except && t.name == s);
+        if !taken(base) {
+            return base.to_string();
+        }
+        (2..).map(|n| format!("{base} {n}")).find(|s| !taken(s)).unwrap()
+    }
+
+    pub(crate) fn begin_tab_rename(&mut self, i: usize) {
+        if let Some(t) = self.tabs.get(i) {
+            self.tab_rename = Some((i, t.name.clone()));
+        }
+    }
+
+    pub(crate) fn rename_work_tab(&mut self, i: usize, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || i >= self.tabs.len() {
+            return;
+        }
+        let name = self.unique_tab_name(name, Some(i));
+        if let Some(t) = self.tabs.get_mut(i) {
+            t.name = name;
+        }
+    }
+
+    pub(crate) fn duplicate_work_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        self.save_active_tab();
+        let mut tab = self.tabs[i].clone();
+        tab.name = self.unique_tab_name(&format!("{} copy", tab.name), None);
+        self.tabs.insert(i + 1, tab);
+        self.load_tab(i + 1);
+    }
+
+    /// Reopen the most recently closed tab at its old slot.
+    fn restore_one_tab(&mut self) -> Option<usize> {
+        let (i, mut tab) = self.closed_tabs.pop()?;
+        tab.name = self.unique_tab_name(&tab.name, None);
+        let i = i.min(self.tabs.len());
+        self.tabs.insert(i, tab);
+        Some(i)
+    }
+
+    pub(crate) fn restore_work_tab(&mut self) {
+        if self.closed_tabs.is_empty() {
+            return;
+        }
+        self.save_active_tab();
+        if let Some(i) = self.restore_one_tab() {
+            self.load_tab(i);
+        }
+    }
+
+    pub(crate) fn restore_all_work_tabs(&mut self) {
+        if self.closed_tabs.is_empty() {
+            return;
+        }
+        self.save_active_tab();
+        // Newest first keeps each tab's old slot valid as older ones go back in.
+        let mut newest = self.restore_one_tab();
+        while let Some(i) = self.restore_one_tab() {
+            if let Some(n) = newest.as_mut() {
+                if i <= *n {
+                    *n += 1;
+                }
+            }
+        }
+        if let Some(i) = newest {
+            self.load_tab(i);
         }
     }
 
@@ -283,6 +376,11 @@ impl HsState {
     pub(crate) fn reset_work_tabs(&mut self) {
         self.tabs = vec![WorkTab::default()];
         self.active_tab = 0;
+        self.tab_rename = None;
+        self.closed_tabs.clear();
+        self.tab_scroll = None;
+        self.tab_scroll_off = 0.0;
+        self.tab_scroll_max = 0.0;
         self.load_tab(0);
     }
 }
@@ -1790,50 +1888,115 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
         });
     // ---- work area
     egui::CentralPanel::default().show(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_top(|ui| {
             let names: Vec<String> = app.windows_state.hs.tabs.iter().map(|t| t.name.clone()).collect();
             let active = app.windows_state.hs.active_tab;
             let closable = names.len() > 1;
             let mut switch = None;
             let mut close = None;
+            let mut rename = None;
+            let mut duplicate = None;
             let mut tab_rects = Vec::with_capacity(names.len());
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (i, name) in names.iter().enumerate() {
-                let font = egui::FontId::proportional(12.5);
-                let tw = ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), font.clone(), Color32::WHITE).size().x);
-                let w = tw + if closable { 28.0 } else { 16.0 };
-                let (r, resp) = ui.allocate_exact_size(vec2(w, 20.0), Sense::click_and_drag());
-                tab_rects.push(r);
-                let bg = if i == active {
-                    theme::HI
-                } else if resp.hovered() {
-                    Color32::from_gray(0x4d)
-                } else {
-                    Color32::from_gray(0x3f)
-                };
-                ui.painter().rect_filled(r, 3.0, bg);
-                ui.painter().text(pos2(r.min.x + 8.0, r.center().y), egui::Align2::LEFT_CENTER, name, font, if i == active { Color32::WHITE } else { theme::TEXT });
-                if closable {
-                    let xr = Rect::from_center_size(pos2(r.max.x - 11.0, r.center().y), vec2(14.0, 14.0));
-                    let xresp = ui.interact(xr, ui.id().with(("hs_tab_close", i)), Sense::click()).on_hover_text("Close tab");
-                    if xresp.hovered() {
-                        ui.painter().circle_filled(xr.center(), 7.0, Color32::from_rgba_unmultiplied(255, 255, 255, 28));
+            let scroll_w = (ui.available_width() - 64.0).max(80.0);
+            let scroll_to = app.windows_state.hs.tab_scroll;
+            // A solid bar reserves a strip below the tabs instead of floating over them.
+            let mut scroll_style = egui::style::ScrollStyle::solid();
+            scroll_style.foreground_color = true;
+            scroll_style.bar_width = 5.0;
+            scroll_style.bar_inner_margin = 6.0;
+            scroll_style.bar_outer_margin = 4.0;
+            ui.spacing_mut().scroll = scroll_style;
+            // Keep the strip always reserved so the tab bar does not grow when the bar appears.
+            let scrolled = egui::ScrollArea::horizontal()
+                .id_salt("hs_tabs_scroll")
+                .max_width(scroll_w)
+                .max_height(35.0)
+                .auto_shrink([true, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (i, name) in names.iter().enumerate() {
+                        let font = egui::FontId::proportional(12.5);
+                        let tw = ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), font.clone(), Color32::WHITE).size().x);
+                        let w = tw + if closable { 28.0 } else { 16.0 };
+                        let (r, resp) = ui.allocate_exact_size(vec2(w, 20.0), Sense::click_and_drag());
+                        tab_rects.push(r);
+                        if scroll_to == Some(i) {
+                            ui.scroll_to_rect(r, None);
+                        }
+                        let bg = if i == active {
+                            theme::HI
+                        } else if resp.hovered() {
+                            Color32::from_gray(0x4d)
+                        } else {
+                            Color32::from_gray(0x3f)
+                        };
+                        ui.painter().rect_filled(r, 3.0, bg);
+                        ui.painter().text(pos2(r.min.x + 8.0, r.center().y), egui::Align2::LEFT_CENTER, name, font, if i == active { Color32::WHITE } else { theme::TEXT });
+                        if closable {
+                            let xr = Rect::from_center_size(pos2(r.max.x - 11.0, r.center().y), vec2(14.0, 14.0));
+                            let xresp = ui.interact(xr, ui.id().with(("hs_tab_close", i)), Sense::click()).on_hover_text("Close tab");
+                            if xresp.hovered() {
+                                ui.painter().circle_filled(xr.center(), 7.0, Color32::from_rgba_unmultiplied(255, 255, 255, 28));
+                            }
+                            let c = xr.center();
+                            let s = 3.2;
+                            let stroke = Stroke::new(1.4, if xresp.hovered() { Color32::WHITE } else { Color32::from_gray(0xb8) });
+                            ui.painter().line_segment([c + vec2(-s, -s), c + vec2(s, s)], stroke);
+                            ui.painter().line_segment([c + vec2(s, -s), c + vec2(-s, s)], stroke);
+                            if xresp.clicked() {
+                                close = Some(i);
+                            }
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Rename Tab...").clicked() {
+                                rename = Some(i);
+                                ui.close();
+                            }
+                            if ui.button("Duplicate Tab").clicked() {
+                                duplicate = Some(i);
+                                ui.close();
+                            }
+                            if closable && ui.button("Close Tab").clicked() {
+                                close = Some(i);
+                                ui.close();
+                            }
+                        });
+                        if resp.drag_started_by(egui::PointerButton::Primary) {
+                            app.windows_state.hs.tab_drag = Some(i);
+                        }
+                        if resp.double_clicked() && close.is_none() {
+                            switch = Some(i);
+                            rename = Some(i);
+                        } else if resp.clicked() && close.is_none() {
+                            switch = Some(i);
+                        }
                     }
-                    let c = xr.center();
-                    let s = 3.2;
-                    let stroke = Stroke::new(1.4, if xresp.hovered() { Color32::WHITE } else { Color32::from_gray(0xb8) });
-                    ui.painter().line_segment([c + vec2(-s, -s), c + vec2(s, s)], stroke);
-                    ui.painter().line_segment([c + vec2(s, -s), c + vec2(-s, s)], stroke);
-                    if xresp.clicked() {
-                        close = Some(i);
+                    // Drag-reorder auto-scroll: nudge the strip while the pointer sits near an edge.
+                    // Only scroll when there is room, or the animation clamps and jitters at the ends.
+                    if app.windows_state.hs.tab_drag.is_some() {
+                        let can_left = app.windows_state.hs.tab_scroll_off > 0.5;
+                        let can_right = app.windows_state.hs.tab_scroll_off < app.windows_state.hs.tab_scroll_max - 0.5;
+                        if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+                            let clip = ui.clip_rect();
+                            if p.y >= clip.min.y && p.y <= clip.max.y {
+                                if p.x < clip.min.x + 20.0 {
+                                    if can_left {
+                                        ui.scroll_with_delta(vec2(8.0, 0.0));
+                                        ui.ctx().request_repaint();
+                                    }
+                                } else if p.x > clip.max.x - 20.0 && can_right {
+                                    ui.scroll_with_delta(vec2(-8.0, 0.0));
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        }
                     }
-                }
-                if resp.drag_started_by(egui::PointerButton::Primary) {
-                    app.windows_state.hs.tab_drag = Some(i);
-                }
-                if resp.clicked() && close.is_none() {
-                    switch = Some(i);
-                }
+                });
+            let tab_clip = scrolled.inner_rect;
+            app.windows_state.hs.tab_scroll_off = scrolled.state.offset.x;
+            app.windows_state.hs.tab_scroll_max = (scrolled.content_size.x - scrolled.inner_rect.width()).max(0.0);
+            if scroll_to.is_some() {
+                app.windows_state.hs.tab_scroll = None;
             }
             let pointer = ui.input(|i| i.pointer.hover_pos());
             if let (Some(from), Some(p)) = (app.windows_state.hs.tab_drag, pointer) {
@@ -1863,8 +2026,10 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                     } else {
                         tab_rects[slot].min.x - 2.0
                     };
+                    // Keep the line inside the strip; the first and last slots sit on the edges.
+                    let line_x = line_x.clamp(tab_clip.min.x + 1.0, tab_clip.max.x - 1.0);
                     let (y0, y1) = tab_rects.first().map(|r| (r.min.y, r.max.y)).unwrap_or((ui.cursor().min.y, ui.cursor().min.y + 20.0));
-                    ui.painter().line_segment([pos2(line_x, y0), pos2(line_x, y1)], Stroke::new(2.0, Color32::WHITE));
+                    ui.painter().with_clip_rect(tab_clip).line_segment([pos2(line_x, y0), pos2(line_x, y1)], Stroke::new(2.0, Color32::WHITE));
                 }
                 if ui.input(|i| i.pointer.primary_released()) {
                     app.windows_state.hs.move_work_tab(from, slot);
@@ -1876,10 +2041,38 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             if ui.small_button("+").on_hover_text("New work-area tab").clicked() {
                 app.windows_state.hs.add_work_tab();
             }
+            let closed_count = app.windows_state.hs.closed_tabs.len();
+            let tip = if closed_count > 1 {
+                format!("Restore last closed tab ({closed_count} closed)")
+            } else {
+                "Restore last closed tab".to_string()
+            };
+            let restore_resp = crate::icons::button_ex(ui, "undo", &tip, false, 20.0, 16.0, closed_count > 0);
+            let mut restore_all = false;
+            restore_resp.context_menu(|ui| {
+                if ui.button("Restore All Closed Tabs").clicked() {
+                    restore_all = true;
+                    ui.close();
+                }
+            });
+            if restore_resp.clicked() {
+                app.windows_state.hs.restore_work_tab();
+            }
+            if restore_all {
+                app.windows_state.hs.restore_all_work_tabs();
+            }
             if let Some(i) = close {
                 app.windows_state.hs.close_work_tab(i);
-            } else if let Some(i) = switch {
-                app.windows_state.hs.switch_work_tab(i);
+            } else if let Some(i) = duplicate {
+                app.windows_state.hs.duplicate_work_tab(i);
+            } else {
+                if let Some(i) = switch {
+                    app.windows_state.hs.switch_work_tab(i);
+                }
+                if let Some(i) = rename {
+                    app.windows_state.hs.switch_work_tab(i);
+                    app.windows_state.hs.begin_tab_rename(i);
+                }
             }
         });
         ui.horizontal(|ui| {
@@ -1933,6 +2126,13 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             Some(crate::windows::RenameAction::Commit(name)) => rename_shading_node(app, &id, &name),
             Some(crate::windows::RenameAction::Cancel) => {}
             None => app.windows_state.hs.rename = Some((id, name)),
+        }
+    }
+    if let Some((i, mut name)) = app.windows_state.hs.tab_rename.take() {
+        match crate::windows::rename_prompt(ui.ctx(), egui::Id::new("hs_tab_rename"), "Rename Tab", &mut name, "Rename") {
+            Some(crate::windows::RenameAction::Commit(name)) => app.windows_state.hs.rename_work_tab(i, &name),
+            Some(crate::windows::RenameAction::Cancel) => {}
+            None => app.windows_state.hs.tab_rename = Some((i, name)),
         }
     }
 }
