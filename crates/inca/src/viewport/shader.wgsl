@@ -122,6 +122,7 @@ fn fs_bg(i: BgOut) -> @location(0) vec4<f32> {
 // ---------------------------------------------------------------- meshes
 @group(2) @binding(0) var tex_array: texture_2d_array<f32>;
 @group(2) @binding(1) var tex_samp: sampler;
+@group(2) @binding(5) var bump_array: texture_2d_array<f32>;
 // sky dome equirect (mip 0 = background, mips are unused for now), its diffuse irradiance,
 // and a repeat-u/clamp-v linear sampler
 @group(2) @binding(2) var sky_tex: texture_2d<f32>;
@@ -438,7 +439,7 @@ fn ibl_sheen_brdf(n: vec3<f32>, v: vec3<f32>, rough: f32) -> f32 {
 // three.js `bumpmap_pars_fragment`: perturb the normal from the screen-space derivative of the
 // height map. Explicit LOD sampling keeps this valid when only some faces have a bump map.
 fn bump_height(uv: vec2<f32>, layer: i32, alpha: bool) -> f32 {
-    let t = textureSampleLevel(tex_array, tex_samp, uv, layer, 0.0);
+    let t = textureSampleLevel(bump_array, tex_samp, uv, layer, 0.0);
     return select(t.r, t.a, alpha);
 }
 
@@ -456,7 +457,13 @@ fn bump_normal(n_in: vec3<f32>, world: vec3<f32>, uv: vec2<f32>, layer: i32, sca
     let r1 = cross(sy, n);
     let r2 = cross(n, sx);
     let det = dot(sx, r1);
-    let grad = sign(det) * (dhdx * r1 + dhdy * r2);
+    var grad = sign(det) * (dhdx * r1 + dhdy * r2);
+    // Clamp extreme slopes so an overdriven bump cannot invert the normal into black bands.
+    let cap = abs(det) * 0.95;
+    let g = length(grad);
+    if g > cap {
+        grad = grad * (cap / max(g, 1e-8));
+    }
     return normalize(abs(det) * n - grad);
 }
 

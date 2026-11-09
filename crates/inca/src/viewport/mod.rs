@@ -869,6 +869,15 @@ fn ensure_texture(g: &mut crate::viewport::gpu::Gpu, s: &Scene, t: &inca_core::m
     g.texture_layer(&t.id, h.finish(), || inca_core::materials::viewport_texture_pixels(t, project.as_deref()))
 }
 
+/// Upload the linear 16-bit height version of a bump texture to its own GPU array.
+fn ensure_bump(g: &mut crate::viewport::gpu::Gpu, s: &Scene, t: &inca_core::materials::Texture, layer: u32) {
+    let mut h = DefaultHasher::new();
+    t.ty.hash(&mut h);
+    serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
+    let project = s.project.clone();
+    g.bump_texture_layer(&t.id, layer, h.finish(), || inca_core::materials::viewport_bump_pixels(t, project.as_deref()));
+}
+
 fn texture_slot<'a>(g: &mut crate::viewport::gpu::Gpu, s: &'a Scene, mat: &inca_core::materials::Material, slot: &str) -> Option<(&'a inca_core::materials::Texture, u32, bool)> {
     let tid = mat.maps.get(slot)?.as_str()?;
     let t = s.texs.get(tid)?;
@@ -908,6 +917,13 @@ fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::sc
                 texture_slot(g, s, mat, "bump"),
             ),
         };
+        // Maya: bump 0 means no bump, not three.js' "bumpScale defaults to 1".
+        let bump_amount = mat.attrs.get("bump").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+        if bump_amount > 0.0 {
+            if let Some((t, layer, _)) = bump {
+                ensure_bump(g, s, t, layer);
+            }
+        }
         let mut alpha_src = 0u8;
         let mut take = |bit: u8, s: Option<(&inca_core::materials::Texture, u32, bool)>| -> Option<u32> {
             let (_, layer, alpha) = s?;
@@ -923,15 +939,16 @@ fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::sc
         mt.emission = take(3, emission_slot);
         mt.alpha = take(4, alpha);
         mt.specular = take(5, spec);
-        mt.bump = take(6, bump);
+        mt.bump = if bump_amount > 0.0 { take(6, bump) } else { None };
         mt.alpha_src = alpha_src;
         mt.uv_xf = [color, rough, metal, emission_slot, alpha, spec, bump].map(|s| UvXf::from_texture(s.map(|(t, _, _)| t)));
         mt.tint = tex_tint(mat);
         if mat.ty == "standardSurface" {
             mt.emission_scale = mat.attrs.get("emission").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0001) as f32;
         }
-        let bump_amount = mat.attrs.get("bump").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        mt.bump_scale = if bump_amount == 0.0 { 1.0 } else { bump_amount as f32 };
+        // Maya's bump depth 1 is a gentle normal offset; the raw height-map derivative
+        // used by the shader is much stronger, so map 1 -> 0.1.
+        mt.bump_scale = bump_amount as f32 * 0.1;
         out.insert(mid.clone(), mt);
     }
     out

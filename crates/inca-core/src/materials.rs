@@ -13,10 +13,10 @@ pub struct MatType {
 }
 
 pub static MAT_TYPES: &[MatType] = &[
-    MatType { ty: "lambert", label: "Lambert", defaults: || json!({ "color": [0.5, 0.5, 0.5], "transparency": [0, 0, 0], "ambientColor": [0, 0, 0], "incandescence": [0, 0, 0], "diffuse": 0.8, "bump": 0 }), mappable: &["color", "transparency", "incandescence", "bump"] },
-    MatType { ty: "blinn", label: "Blinn", defaults: || json!({ "color": [0.5, 0.5, 0.5], "transparency": [0, 0, 0], "ambientColor": [0, 0, 0], "incandescence": [0, 0, 0], "diffuse": 0.8, "eccentricity": 0.3, "specularRollOff": 0.7, "specularColor": [0.5, 0.5, 0.5], "reflectivity": 0.5, "bump": 0 }), mappable: &["color", "transparency", "incandescence", "specularColor", "bump"] },
-    MatType { ty: "phong", label: "Phong", defaults: || json!({ "color": [0.5, 0.5, 0.5], "transparency": [0, 0, 0], "ambientColor": [0, 0, 0], "incandescence": [0, 0, 0], "diffuse": 0.8, "cosinePower": 20, "specularColor": [0.5, 0.5, 0.5], "reflectivity": 0.5, "bump": 0 }), mappable: &["color", "transparency", "incandescence", "specularColor", "bump"] },
-    MatType { ty: "standardSurface", label: "Standard Surface", defaults: || json!({ "base": 0.8, "baseColor": [0.8, 0.8, 0.8], "diffuseRoughness": 0, "metalness": 0, "specular": 1, "specularColor": [1, 1, 1], "specularRoughness": 0.2, "specularIOR": 1.5, "transmission": 0, "transmissionColor": [1, 1, 1], "coat": 0, "coatRoughness": 0.1, "sheen": 0, "sheenColor": [1, 1, 1], "emission": 0, "emissionColor": [1, 1, 1], "opacity": [1, 1, 1], "thinWalled": false, "bump": 0 }), mappable: &["baseColor", "specularRoughness", "metalness", "emissionColor", "opacity", "bump"] },
+    MatType { ty: "lambert", label: "Lambert", defaults: || json!({ "color": [0.5, 0.5, 0.5], "transparency": [0, 0, 0], "ambientColor": [0, 0, 0], "incandescence": [0, 0, 0], "diffuse": 0.8, "bump": 1 }), mappable: &["color", "transparency", "incandescence", "bump"] },
+    MatType { ty: "blinn", label: "Blinn", defaults: || json!({ "color": [0.5, 0.5, 0.5], "transparency": [0, 0, 0], "ambientColor": [0, 0, 0], "incandescence": [0, 0, 0], "diffuse": 0.8, "eccentricity": 0.3, "specularRollOff": 0.7, "specularColor": [0.5, 0.5, 0.5], "reflectivity": 0.5, "bump": 1 }), mappable: &["color", "transparency", "incandescence", "specularColor", "bump"] },
+    MatType { ty: "phong", label: "Phong", defaults: || json!({ "color": [0.5, 0.5, 0.5], "transparency": [0, 0, 0], "ambientColor": [0, 0, 0], "incandescence": [0, 0, 0], "diffuse": 0.8, "cosinePower": 20, "specularColor": [0.5, 0.5, 0.5], "reflectivity": 0.5, "bump": 1 }), mappable: &["color", "transparency", "incandescence", "specularColor", "bump"] },
+    MatType { ty: "standardSurface", label: "Standard Surface", defaults: || json!({ "base": 0.8, "baseColor": [0.8, 0.8, 0.8], "diffuseRoughness": 0, "metalness": 0, "specular": 1, "specularColor": [1, 1, 1], "specularRoughness": 0.2, "specularIOR": 1.5, "transmission": 0, "transmissionColor": [1, 1, 1], "coat": 0, "coatRoughness": 0.1, "sheen": 0, "sheenColor": [1, 1, 1], "emission": 0, "emissionColor": [1, 1, 1], "opacity": [1, 1, 1], "thinWalled": false, "bump": 1 }), mappable: &["baseColor", "specularRoughness", "metalness", "emissionColor", "opacity", "bump"] },
     MatType { ty: "surfaceShader", label: "Surface Shader", defaults: || json!({ "outColor": [0.5, 0.5, 0.5], "outTransparency": [0, 0, 0] }), mappable: &["outColor"] },
 ];
 
@@ -36,6 +36,8 @@ pub static TEX_TYPES: &[TexType] = &[
     TexType { ty: "fractal", label: "Fractal", defaults: || json!({ "amplitude": 1, "ratio": 0.707, "threshold": 0, "levelMax": 9, "frequencyRatio": 2, "bias": 0, "repeatU": 1, "repeatV": 1 }) },
     TexType { ty: "mountain", label: "Mountain", defaults: || json!({ "snowColor": [1, 1, 1], "rockColor": [0.262, 0.102, 0], "amplitude": 1, "snowRoughness": 0.4, "rockRoughness": 0.707, "boundary": 1, "snowAltitude": 0.5, "snowDropoff": 2, "snowSlope": 0.8, "depthMax": 20, "repeatU": 1, "repeatV": 1 }) },
     TexType { ty: "water", label: "Water", defaults: || json!({ "numberOfWaves": 8, "waveTime": 0, "waveVelocity": 1, "waveAmplitude": 0.05, "waveFrequency": 4, "subWaveFrequency": 0.125, "smoothness": 2, "windU": 1, "windV": 0, "repeatU": 1, "repeatV": 1 }) },
+    TexType { ty: "bulge", label: "Bulge", defaults: || json!({ "uWidth": 0.1, "vWidth": 0.1, "repeatU": 1, "repeatV": 1 }) },
+    TexType { ty: "ocean", label: "Ocean", defaults: || json!({ "colorMode": "Wave Height", "numFrequencies": 3, "waveLengthMin": 0.3, "waveLengthMax": 4, "waveHeight": 0.5, "waveTurbulence": 0, "wavePeaking": 0, "waveDirSpread": 0.2, "windU": 1, "windV": 0, "scale": 10, "time": 0, "observerSpeed": 0, "foamThreshold": 0.51, "foamEmission": 0, "repeatU": 1, "repeatV": 1 }) },
 ];
 
 pub fn mat_type(ty: &str) -> &'static MatType {
@@ -391,6 +393,71 @@ impl Texture {
                 let value = (0.5 + (waves * 0.5 + sub * 0.5) * (amplitude * 10.0)).clamp(0.0, 1.0) as f32;
                 Some([value, value, value])
             }
+            "bulge" => {
+                let uw = a.get("uWidth").and_then(|x| x.as_f64()).unwrap_or(0.1).clamp(0.0, 0.49);
+                let vw = a.get("vWidth").and_then(|x| x.as_f64()).unwrap_or(0.1).clamp(0.0, 0.49);
+                let x = u.fract();
+                let y = v.fract();
+                let inner_u = 1.0 - 2.0 * uw;
+                let inner_v = 1.0 - 2.0 * vw;
+                let dx = if inner_u > 1e-4 { ((x - uw) / inner_u).clamp(0.0, 1.0) * 2.0 - 1.0 } else { 0.0 };
+                let dy = if inner_v > 1e-4 { ((y - vw) / inner_v).clamp(0.0, 1.0) * 2.0 - 1.0 } else { 0.0 };
+                let b = (1.0 - dx * dx - dy * dy).max(0.0).sqrt() as f32;
+                Some([b, b, b])
+            }
+            "ocean" => {
+                let mode = a.get("colorMode").and_then(|v| v.as_str()).unwrap_or("Wave Height");
+                let count = a.get("numFrequencies").and_then(|x| x.as_f64()).unwrap_or(3.0).clamp(1.0, 12.0) as u32;
+                let wl_a = a.get("waveLengthMin").and_then(|x| x.as_f64()).unwrap_or(0.3);
+                let wl_b = a.get("waveLengthMax").and_then(|x| x.as_f64()).unwrap_or(4.0);
+                let (wl_min, wl_max) = (wl_a.min(wl_b).max(0.01), wl_a.max(wl_b).max(0.01));
+                let wave_height = a.get("waveHeight").and_then(|x| x.as_f64()).unwrap_or(0.5);
+                let turbulence = a.get("waveTurbulence").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let peaking = a.get("wavePeaking").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let spread = a.get("waveDirSpread").and_then(|x| x.as_f64()).unwrap_or(0.2);
+                let wind_u = a.get("windU").and_then(|x| x.as_f64()).unwrap_or(1.0);
+                let wind_v = a.get("windV").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let scale = a.get("scale").and_then(|x| x.as_f64()).unwrap_or(10.0).max(0.01);
+                let time = a.get("time").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let observer = a.get("observerSpeed").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let foam_threshold = a.get("foamThreshold").and_then(|x| x.as_f64()).unwrap_or(0.51).clamp(0.0, 0.99);
+                let foam_emission = a.get("foamEmission").and_then(|x| x.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0);
+                let wind_angle = wind_v.atan2(wind_u);
+                let mut sum = 0.0;
+                let mut norm = 0.0;
+                for i in 0..count {
+                    let t = if count == 1 { 0.5 } else { i as f64 / (count - 1) as f64 };
+                    let wavelength = wl_min + (wl_max - wl_min) * t;
+                    let angle = wind_angle + (hash2(i as i64, 7) - 0.5) * spread * std::f64::consts::PI;
+                    let k = (std::f64::consts::TAU / wavelength * (scale / 10.0)).min(64.0);
+                    let speed = (wavelength / wl_max).sqrt();
+                    let drift = (1.0 - observer.clamp(0.0, 1.0)).max(0.0);
+                    let phase = (u * angle.cos() + v * angle.sin()) * k - time * speed * (i as f64 + 1.0) * drift;
+                    let rough = (value_noise(u * 6.0 + i as f64 * 7.0, v * 6.0) - 0.5) * turbulence * std::f64::consts::TAU;
+                    let amp = 1.0 / (1.0 + i as f64 * 0.6);
+                    sum += (phase + rough).sin() * amp * (1.0 + peaking * 0.5);
+                    norm += amp;
+                }
+                let height = (0.5 + if norm > 0.0 { sum / norm } else { 0.0 } * wave_height).clamp(0.0, 1.0);
+                let foam = smoothstep(foam_threshold, (foam_threshold + 0.15).min(1.0), height) * (foam_emission * 4.0).min(1.0);
+                let color = match mode {
+                    "Foam" => {
+                        let f = foam as f32;
+                        [f, f, f]
+                    }
+                    "Wave Height and Foam" => {
+                        let deep = [0.02, 0.10, 0.18];
+                        let crest = [0.22, 0.48, 0.62];
+                        let c = mix(deep, crest, height as f32);
+                        mix(c, [1.0; 3], foam as f32)
+                    }
+                    _ => {
+                        let g = height as f32;
+                        [g, g, g]
+                    }
+                };
+                Some(color)
+            }
             _ => None,
         }
     }
@@ -463,6 +530,91 @@ pub fn viewport_texture_pixels(t: &Texture, project: Option<&str>) -> Option<Vec
         }
     }
     Some(out)
+}
+
+/// Linear RGBA height pixels for the viewport's 16-bit bump array. A 16-bit height map
+/// avoids the visible contour steps an 8-bit colour texture produces in bump shading.
+pub fn viewport_bump_pixels(t: &Texture, project: Option<&str>) -> Option<Vec<f32>> {
+    let size = VIEW_TEX_SIZE;
+    let mut out = if t.ty == "file" {
+        let name = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("");
+        let p = std::path::Path::new(name);
+        let path = if name.is_empty() {
+            None
+        } else if p.is_absolute() {
+            Some(p.to_path_buf())
+        } else {
+            Some(project.map(|pr| std::path::Path::new(pr).join(p)).unwrap_or_else(|| p.to_path_buf()))
+        };
+        let img = path.and_then(|p| image::open(p).ok())?.to_rgba8();
+        let img = image::imageops::resize(&img, size, size, image::imageops::FilterType::Triangle);
+        let raw = t.attrs.get("colorSpace").and_then(|v| v.as_str()) == Some("Raw");
+        let lin = |v: u8| {
+            let x = v as f32 / 255.0;
+            if raw {
+                x
+            } else if x <= 0.04045 {
+                x / 12.92
+            } else {
+                ((x + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let mut out = Vec::with_capacity((size * size * 4) as usize);
+        for px in img.pixels() {
+            out.extend_from_slice(&[lin(px[0]), lin(px[1]), lin(px[2]), px[3] as f32 / 255.0]);
+        }
+        out
+    } else {
+        let mut out = Vec::with_capacity((size * size * 4) as usize);
+        for y in 0..size {
+            for x in 0..size {
+                // Match `viewport_texture_pixels` row order exactly, so bump is not mirrored.
+                let c = t.sample((x as f64 + 0.5) / size as f64, (y as f64 + 0.5) / size as f64).unwrap_or([0.5; 3]);
+                out.extend_from_slice(&[c[0], c[1], c[2], 1.0]);
+            }
+        }
+        out
+    };
+    normalize_bump_pixels(&mut out, size);
+    Some(out)
+}
+
+/// Keep bump gradients sane. Displacement-style procedural heights (Ocean/Water) can have
+/// slopes many times steeper than a normal bump map; scaling those down avoids black,
+/// inverted bump normals while leaving gentle maps untouched.
+fn normalize_bump_pixels(out: &mut [f32], size: u32) {
+    let n = size as usize;
+    if n < 2 || out.len() != n * n * 4 {
+        return;
+    }
+    let channel_scale = |out: &[f32], channel: usize| {
+        let at = |x: usize, y: usize| out[(y * n + x) * 4 + channel] as f64;
+        let mut sum = 0.0;
+        let mut count = 1.0;
+        for y in 0..n {
+            for x in 0..n {
+                let xp = (x + 1) % n;
+                let xm = (x + n - 1) % n;
+                let yp = (y + 1) % n;
+                let ym = (y + n - 1) % n;
+                let du = (at(xp, y) - at(xm, y)).abs() * 0.5 * n as f64;
+                let dv = (at(x, yp) - at(x, ym)).abs() * 0.5 * n as f64;
+                sum += du + dv;
+                count += 2.0;
+            }
+        }
+        let avg = sum / count;
+        (1.5 / avg.max(1e-6)).clamp(0.02, 1.0) as f32
+    };
+    let rs = channel_scale(out, 0);
+    let as_ = channel_scale(out, 3);
+    if (rs - 1.0).abs() < 1e-4 && (as_ - 1.0).abs() < 1e-4 {
+        return;
+    }
+    for px in out.chunks_mut(4) {
+        px[0] *= rs;
+        px[3] *= as_;
+    }
 }
 
 fn hash2(x: i64, y: i64) -> f64 {

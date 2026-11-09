@@ -381,6 +381,11 @@ pub struct Gpu {
     tex_view: wgpu::TextureView,
     tex_sampler: wgpu::Sampler,
     tex_bg: wgpu::BindGroup,
+    /// 16-bit linear height array for bump shading (the colour array is 8-bit sRGB).
+    bump_array: wgpu::Texture,
+    bump_view: wgpu::TextureView,
+    /// texture id -> attributes hash of the bump pixels currently in the layer
+    bump_hashes: HashMap<String, u64>,
     /// texture id -> array layer
     tex_layers: HashMap<String, u32>,
     /// texture id -> attributes hash of the pixels currently in the layer
@@ -488,6 +493,12 @@ impl Gpu {
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
+                    count: None,
+                },
             ],
         });
         let tex_array = device.create_texture(&wgpu::TextureDescriptor {
@@ -501,6 +512,17 @@ impl Gpu {
             view_formats: &[],
         });
         let tex_view = tex_array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let bump_array = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("material bump textures"),
+            size: wgpu::Extent3d { width: inca_core::materials::VIEW_TEX_SIZE, height: inca_core::materials::VIEW_TEX_SIZE, depth_or_array_layers: TEX_LAYERS },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bump_view = bump_array.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
         let tex_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("material sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -548,6 +570,7 @@ impl Gpu {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&sky_white_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&sky_white_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&sky_samp) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&bump_view) },
             ],
         });
         // group 3: the shadow depth array sampled by the mesh shader
@@ -678,6 +701,9 @@ impl Gpu {
             tex_view,
             tex_sampler,
             tex_bg,
+            bump_array,
+            bump_view,
+            bump_hashes: HashMap::new(),
             tex_layers: HashMap::new(),
             tex_hashes: HashMap::new(),
             shadow_bgl,
@@ -748,6 +774,26 @@ impl Gpu {
         self.tex_hashes.insert(key.to_string(), hash);
         self.write_texture_layer(layer, &px);
         Some(layer)
+    }
+
+    /// Upload a linear RGBA height layer for bump shading. No mips: the bump shader samples LOD 0.
+    pub fn bump_texture_layer(&mut self, key: &str, layer: u32, hash: u64, pixels: impl FnOnce() -> Option<Vec<f32>>) {
+        if self.bump_hashes.get(key) == Some(&hash) {
+            return;
+        }
+        let Some(px) = pixels() else { return };
+        let size = inca_core::materials::VIEW_TEX_SIZE;
+        if px.len() != (size * size * 4) as usize {
+            return;
+        }
+        let half: Vec<u16> = px.iter().map(|v| half::f16::from_f32(*v).to_bits()).collect();
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.bump_array, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&half),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 8), rows_per_image: Some(size) },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
+        self.bump_hashes.insert(key.to_string(), hash);
     }
 
     fn write_texture_layer(&self, layer: u32, px: &[u8]) {
@@ -867,6 +913,7 @@ impl Gpu {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&irr_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sky_samp) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.bump_view) },
             ],
         });
         self.tex_bg = bg;
