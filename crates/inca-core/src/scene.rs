@@ -350,6 +350,8 @@ pub enum NodeRef {
 pub struct Snapshot {
     pub label: String,
     pub data: Value,
+    /// Only the selection/mode/hilite fields need restoring; the scene itself is unchanged.
+    pub selection_only: bool,
 }
 
 pub struct Scene {
@@ -1816,10 +1818,6 @@ impl Scene {
 
     pub fn set_comp_mode(&mut self, m: Option<CompMode>) {
         match (self.comp_mode, m) {
-            // JS `Sel.setMode`: switching between component types converts the selection
-            (Some(prev), Some(to)) if prev != to => {
-                crate::selection::convert(self, to);
-            }
             (None, Some(to)) => {
                 // entering component mode: the selected meshes and curves become the hilite
                 let cand: Vec<Id> = self
@@ -1847,6 +1845,8 @@ impl Scene {
                 self.rev += 1;
             }
             _ => {
+                // Maya stores vertex, edge and face selections separately; switching modes
+                // restores that mode's previous set and never converts implicitly.
                 self.comp_mode = m;
                 self.rev += 1;
             }
@@ -1857,7 +1857,38 @@ impl Scene {
         self.comp.get(id).cloned().unwrap_or_default()
     }
 
-    /// Component selection converted to vertex indices. Curve CVs count as vertices
+    /// Clear the active component mode's selection, leaving the other modes stored.
+    pub fn clear_active_comp(&mut self, id: &str) {
+        let empty = if let Some(c) = self.comp.get_mut(id) {
+            match self.comp_mode {
+                Some(CompMode::Vertex) => c.v.clear(),
+                Some(CompMode::Edge) => c.e.clear(),
+                Some(CompMode::Face) => c.f.clear(),
+                None => {}
+            }
+            c.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            self.comp.remove(id);
+        }
+    }
+
+    /// The selection of the active component mode only.
+    pub fn comp_sel_active(&self, id: &str) -> CompSel {
+        let c = self.comp_sel(id);
+        let mut out = CompSel::default();
+        match self.comp_mode {
+            Some(CompMode::Vertex) => out.v = c.v,
+            Some(CompMode::Edge) => out.e = c.e,
+            Some(CompMode::Face) => out.f = c.f,
+            None => {}
+        }
+        out
+    }
+
+    /// Vertices of the active component selection. Curve CVs count as vertices
     /// (`o.inca.curve.cvs` in the JS `Sel.vertsOf`).
     pub fn comp_verts(&self, id: &str) -> Vec<u32> {
         let Some(n) = self.nodes.get(id) else { return vec![] };
@@ -1866,14 +1897,34 @@ impl Scene {
         }
         let Some(pm) = n.mesh().map(|m| &m.mesh) else { return vec![] };
         let c = self.comp_sel(id);
-        let mut s: BTreeSet<u32> = c.v.clone();
-        for (a, b) in &c.e {
-            s.insert(*a);
-            s.insert(*b);
-        }
-        for &f in &c.f {
-            if let Some(face) = pm.f.get(f) {
-                s.extend(face.iter().copied());
+        let mut s: BTreeSet<u32> = BTreeSet::new();
+        // Object mode has no active components; keep the old union for tools that inspect it.
+        match self.comp_mode {
+            Some(CompMode::Vertex) => s.extend(c.v.iter().copied()),
+            Some(CompMode::Edge) => {
+                for (a, b) in &c.e {
+                    s.insert(*a);
+                    s.insert(*b);
+                }
+            }
+            Some(CompMode::Face) => {
+                for &f in &c.f {
+                    if let Some(face) = pm.f.get(f) {
+                        s.extend(face.iter().copied());
+                    }
+                }
+            }
+            None => {
+                s.extend(c.v.iter().copied());
+                for (a, b) in &c.e {
+                    s.insert(*a);
+                    s.insert(*b);
+                }
+                for &f in &c.f {
+                    if let Some(face) = pm.f.get(f) {
+                        s.extend(face.iter().copied());
+                    }
+                }
             }
         }
         s.into_iter().filter(|&v| (v as usize) < pm.v.len()).collect()
@@ -1882,6 +1933,15 @@ impl Scene {
     // ------------------------------------------------------------ undo
     /// Snapshot data for undo: the scene plus the JS `Undo.snapshot` extras (component mode,
     /// the hilite list and the component selections), so undoing an edit keeps component mode.
+    fn selection_data(&self) -> Value {
+        let comp: serde_json::Map<String, Value> = self.comp.iter().map(|(id, c)| (id.clone(), json!({ "v": c.v, "e": c.e, "f": c.f }))).collect();
+        json!({
+            "sel": self.sel,
+            "compMode": self.comp_mode,
+            "hilite": self.hilite,
+            "compSel": Value::Object(comp),
+        })
+    }
     fn snapshot_data(&self) -> Value {
         let mut d = self.serialize();
         let o = d.as_object_mut().unwrap();
@@ -1891,27 +1951,58 @@ impl Scene {
         o.insert("compSel".into(), Value::Object(comp));
         d
     }
-    pub fn checkpoint(&mut self, label: &str) {
-        let data = self.snapshot_data();
-        self.undo_stack.push(Snapshot { label: label.into(), data });
+    fn push_undo(&mut self, label: &str, data: Value, selection_only: bool) {
+        self.undo_stack.push(Snapshot { label: label.into(), data, selection_only });
         if self.undo_stack.len() > self.undo_limit {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
     }
+    pub fn checkpoint(&mut self, label: &str) {
+        let data = self.snapshot_data();
+        self.push_undo(label, data, false);
+    }
+    /// Selection gestures only store the selection state, so clicking in a heavy scene does not
+    /// serialize every mesh. The scene itself is unchanged by these steps.
+    pub fn checkpoint_selection(&mut self, label: &str) {
+        let data = self.selection_data();
+        self.push_undo(label, data, true);
+    }
     pub fn undo(&mut self) -> Option<String> {
         let s = self.undo_stack.pop()?;
-        let cur = self.snapshot_data();
-        self.redo_stack.push(Snapshot { label: s.label.clone(), data: cur });
-        self.restore(&s.data);
+        let cur = if s.selection_only { self.selection_data() } else { self.snapshot_data() };
+        self.redo_stack.push(Snapshot { label: s.label.clone(), data: cur, selection_only: s.selection_only });
+        if s.selection_only {
+            self.restore_selection(&s.data);
+        } else {
+            self.restore(&s.data);
+        }
         Some(s.label)
     }
     pub fn redo(&mut self) -> Option<String> {
         let s = self.redo_stack.pop()?;
-        let cur = self.snapshot_data();
-        self.undo_stack.push(Snapshot { label: s.label.clone(), data: cur });
-        self.restore(&s.data);
+        let cur = if s.selection_only { self.selection_data() } else { self.snapshot_data() };
+        self.undo_stack.push(Snapshot { label: s.label.clone(), data: cur, selection_only: s.selection_only });
+        if s.selection_only {
+            self.restore_selection(&s.data);
+        } else {
+            self.restore(&s.data);
+        }
         Some(s.label)
+    }
+    fn restore_selection(&mut self, d: &Value) {
+        if let Some(sel) = d.get("sel").and_then(|v| v.as_array()) {
+            self.sel = sel.iter().filter_map(|v| v.as_str().map(String::from)).filter(|id| self.nodes.contains_key(id)).collect();
+        }
+        self.comp_mode = d.get("compMode").and_then(|v| serde_json::from_value(v.clone()).ok()).flatten();
+        if let Some(h) = d.get("hilite").and_then(|v| v.as_array()) {
+            self.hilite = h.iter().filter_map(|v| v.as_str().map(String::from)).filter(|id| self.nodes.contains_key(id)).collect();
+        }
+        if let Some(cs) = d.get("compSel") {
+            self.comp = serde_json::from_value::<HashMap<Id, CompSel>>(cs.clone()).unwrap_or_default();
+            self.comp.retain(|id, _| self.nodes.contains_key(id));
+        }
+        self.rev += 1;
     }
     fn restore(&mut self, d: &Value) {
         let (file, project) = (self.file.clone(), self.project.clone());
@@ -2607,6 +2698,26 @@ mod tests {
         s.set_comp_mode(None);
         assert!(s.hilite().is_empty());
         assert_eq!(s.sel, vec![l, a, b]);
+    }
+
+    #[test]
+    fn selection_only_undo_keeps_geometry() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        s.select(std::slice::from_ref(&id), crate::scene::SelMode::Replace);
+        s.set_comp_mode(Some(CompMode::Face));
+        s.comp.insert(id.clone(), CompSel { f: [0].into_iter().collect(), ..Default::default() });
+        s.checkpoint_selection("select");
+        s.set_comp_mode(Some(CompMode::Edge));
+        s.comp.remove(&id);
+        assert_eq!(s.comp_mode, Some(CompMode::Edge));
+        s.undo().unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Face));
+        assert_eq!(s.comp_sel(&id).f.iter().copied().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(s.node(&id).unwrap().mesh().unwrap().mesh.f.len(), 6);
+        s.redo().unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Edge));
+        assert!(s.comp_sel(&id).is_empty());
     }
 
     #[test]

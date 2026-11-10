@@ -672,6 +672,7 @@ fn graph(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                 }
+                app.s.checkpoint_selection("select");
                 app.select_names(&ids, if shift { SelMode::Toggle } else { SelMode::Replace });
             }
         }
@@ -682,6 +683,7 @@ fn graph(app: &mut IncaApp, ui: &mut egui::Ui) {
                 if app.hg.connections {
                     app.hg.active_key = Some(boxes[i].key.clone());
                 }
+                app.s.checkpoint_selection("select");
                 app.select_names(std::slice::from_ref(&o), if shift { SelMode::Toggle } else { SelMode::Replace });
                 if app.hg.connections && !boxes[i].key.starts_with("xf:") {
                     // history / shape nodes: show them in the Attribute Editor
@@ -695,7 +697,8 @@ fn graph(app: &mut IncaApp, ui: &mut egui::Ui) {
                     app.hg.active_key = Some(mid.clone());
                     crate::hypershade::select_shading_node(app, &mid);
                     app.win.hypershade = true;
-                } else if !shift {
+                } else if !shift && !app.s.sel.is_empty() {
+                    app.s.checkpoint_selection("select");
                     app.select_names(&[], SelMode::Replace);
                 }
             }

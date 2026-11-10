@@ -286,6 +286,8 @@ fn run(app: &mut IncaApp, act: Act) {
         Act::Select(o) => {
             if app.s.comp_mode.is_some() {
                 app.set_comp_mode(None);
+            } else {
+                app.s.checkpoint_selection("select");
             }
             app.select_names(&[o], SelMode::Replace);
         }
@@ -293,7 +295,10 @@ fn run(app: &mut IncaApp, act: Act) {
             app.select_names(&[o], SelMode::Replace);
             app.action("attributeEditor");
         }
-        Act::LookThrough(c) => app.vps[vp].camera = c,
+        Act::LookThrough(c) => {
+            app.push_view_change(vp);
+            app.vps[vp].camera = c;
+        }
         Act::Frame(o) => {
             app.select_names(&[o], SelMode::Replace);
             app.active_vp = vp;
@@ -395,6 +400,7 @@ fn run(app: &mut IncaApp, act: Act) {
         Act::HypershadeLookThrough(id) => {
             let name = app.s.name_of(&id);
             if !name.is_empty() {
+                app.push_view_change(vp);
                 app.vps[vp].camera = name;
             }
         }
@@ -428,7 +434,10 @@ fn run(app: &mut IncaApp, act: Act) {
             app.windows_state.hs.pos.clear();
             app.windows_state.hs.frame = Some(false);
         }
-        Act::HypershadeSelectObject(id) => app.select_names(&[id], SelMode::Replace),
+        Act::HypershadeSelectObject(id) => {
+            app.s.checkpoint_selection("select");
+            app.select_names(&[id], SelMode::Replace);
+        }
         Act::ConnectTexture(tex, mid, attr, pos) => {
             crate::hypershade::ensure_graph_node(app, &tex, pos);
             crate::hypershade::connect_texture(app, &tex, &mid, &attr);

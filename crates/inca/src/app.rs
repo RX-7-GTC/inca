@@ -152,14 +152,27 @@ impl Host for UiHost {
     }
 }
 
+#[derive(Clone)]
+struct ViewState {
+    id: String,
+    name: String,
+    xf: inca_core::scene::Xform,
+    cam: inca_core::scene::CamShape,
+}
+
 pub struct IncaApp {
     pub s: Scene,
     pub mel: Interp,
     pub tool: Tool,
     pub last_tool: Tool,
     pub layout: Layout,
+    /// Multi-pane layout to restore when the maximized view is toggled back.
+    pub(crate) layout_before: Layout,
     pub active_vp: usize,
     pub vps: Vec<Viewport>,
+    /// Per-viewport camera history for Maya's Undo/Redo View Change (Alt+Z / Alt+Y).
+    view_undo: [Vec<ViewState>; 4],
+    view_redo: [Vec<ViewState>; 4],
     /// global backface culling (JS `App.backfaceCulling`), mirrored into every viewport
     pub backface: bool,
     pub menu_set: MenuSet,
@@ -381,8 +394,11 @@ impl IncaApp {
             tool: Tool::Select,
             last_tool: Tool::Move,
             layout: Layout::Single,
+            layout_before: Layout::Four,
             active_vp: 0,
             vps: vec![Viewport::new("persp"), Viewport::new("top"), Viewport::new("front"), Viewport::new("side")],
+        view_undo: std::array::from_fn(|_| Vec::new()),
+        view_redo: std::array::from_fn(|_| Vec::new()),
             backface: false,
             menu_set: crate::prefs::default_menu_set(&prefs),
             win: Windows::default(),
@@ -507,6 +523,112 @@ impl IncaApp {
 
     /// Retarget viewport cameras after renames and undo/redo: match the camera's previous
     /// name to its current node name, so references follow the node through the change.
+    fn view_state(&self, idx: usize) -> Option<ViewState> {
+        let Some(id) = self.s.find(&self.vps.get(idx)?.camera) else { return None };
+        let n = self.s.node(&id)?;
+        let inca_core::scene::Shape::Camera(cam) = &n.shape else { return None };
+        Some(ViewState { id: n.id.clone(), name: n.name.clone(), xf: n.xf.clone(), cam: cam.clone() })
+    }
+
+    /// Record the view before a navigation/frame/default-view change.
+    pub fn push_view_change(&mut self, idx: usize) {
+        let Some(state) = self.view_state(idx) else { return };
+        let undo = &mut self.view_undo[idx.min(3)];
+        undo.push(state);
+        if undo.len() > 100 {
+            undo.remove(0);
+        }
+        self.view_redo[idx.min(3)].clear();
+    }
+
+    pub fn clear_view_history(&mut self) {
+        for v in &mut self.view_undo {
+            v.clear();
+        }
+        for v in &mut self.view_redo {
+            v.clear();
+        }
+    }
+
+    pub fn can_undo_view(&self, idx: usize) -> bool {
+        self.view_undo.get(idx.min(3)).is_some_and(|v| !v.is_empty())
+    }
+
+    pub fn can_redo_view(&self, idx: usize) -> bool {
+        self.view_redo.get(idx.min(3)).is_some_and(|v| !v.is_empty())
+    }
+
+    pub fn undo_view(&mut self, idx: usize) -> bool {
+        let idx = idx.min(3);
+        let Some(state) = self.view_undo[idx].pop() else { return false };
+        if let Some(cur) = self.view_state(idx) {
+            self.view_redo[idx].push(cur);
+        }
+        self.apply_view_state(idx, &state);
+        true
+    }
+
+    pub fn redo_view(&mut self, idx: usize) -> bool {
+        let idx = idx.min(3);
+        let Some(state) = self.view_redo[idx].pop() else { return false };
+        if let Some(cur) = self.view_state(idx) {
+            self.view_undo[idx].push(cur);
+        }
+        self.apply_view_state(idx, &state);
+        true
+    }
+
+    fn apply_view_state(&mut self, idx: usize, state: &ViewState) {
+        let id = self.s.node(&state.id).map(|n| n.id.clone()).or_else(|| self.s.find(&state.name));
+        let Some(id) = id else { return };
+        if let Some(n) = self.s.nodes.get_mut(&id) {
+            n.xf = state.xf.clone();
+            if let inca_core::scene::Shape::Camera(c) = &mut n.shape {
+                *c = state.cam.clone();
+            }
+            self.vps[idx].camera = n.name.clone();
+            self.s.rev += 1;
+        }
+    }
+
+    /// Camera/view state used by the viewports. Undo restores scene nodes, but navigation is not
+    /// an undoable command in Maya, so these values are reapplied after an undo/redo.
+    pub(crate) fn view_cameras(&self) -> Vec<(String, inca_core::scene::Xform, inca_core::scene::CamShape)> {
+        let mut out: Vec<(String, inca_core::scene::Xform, inca_core::scene::CamShape)> = vec![];
+        for vp in &self.vps {
+            let Some(id) = self.s.find(&vp.camera) else { continue };
+            if out.iter().any(|(seen, _, _)| seen == &id) {
+                continue;
+            }
+            let Some(n) = self.s.node(&id) else { continue };
+            if let inca_core::scene::Shape::Camera(c) = &n.shape {
+                out.push((n.id.clone(), n.xf.clone(), c.clone()));
+            }
+        }
+        out
+    }
+
+    pub(crate) fn restore_view_cameras(&mut self, cameras: Vec<(String, inca_core::scene::Xform, inca_core::scene::CamShape)>) {
+        let mut changed = false;
+        for (id, xf, cam) in cameras {
+            if let Some(n) = self.s.nodes.get_mut(&id) {
+                if n.xf != xf {
+                    n.xf = xf;
+                    changed = true;
+                }
+                if let inca_core::scene::Shape::Camera(c) = &mut n.shape {
+                    if *c != cam {
+                        *c = cam;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.s.rev += 1;
+        }
+    }
+
     pub(crate) fn sync_camera_names(&mut self) {
         let previous = std::mem::take(&mut self.camera_names);
         let current: HashMap<String, String> = self
@@ -643,12 +765,16 @@ impl IncaApp {
                 self.script_log.push((MsgKind::Echo, line.to_string()));
             }
         }
+        let undo_like = src.trim_start().starts_with("undo") || src.trim_start().starts_with("redo");
+        let cameras = undo_like.then(|| self.view_cameras());
         let mut host = UiHost::default();
         let r = self.mel.run(&mut self.s, &mut host, src);
+        if let Some(cameras) = cameras {
+            self.restore_view_cameras(cameras);
+        }
         // Keep camera references in sync when a node is renamed.
         let name_changes = std::mem::take(&mut self.s.name_changes);
         let had_changes = !name_changes.is_empty();
-        let undo_like = src.trim_start().starts_with("undo") || src.trim_start().starts_with("redo");
         if had_changes {
             for (old, new) in name_changes {
                 for vp in &mut self.vps {
@@ -798,6 +924,10 @@ impl IncaApp {
 
     pub fn set_comp_mode(&mut self, m: Option<CompMode>) {
         self.uv_mode = false;
+        if self.s.comp_mode == m {
+            return;
+        }
+        self.s.checkpoint("selection mode");
         if let Some(c) = m {
             self.last_comp_mode = c;
         }
@@ -846,6 +976,7 @@ impl IncaApp {
                 self.stats_cache.clear();
                 self.windows_state.hs.reset_work_tabs();
                 self.reset_camera_names();
+                self.clear_view_history();
                 self.add_recent(p);
             }
             Err(e) => self.last_result = format!("// Error: {e} //"),

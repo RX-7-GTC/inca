@@ -188,7 +188,8 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         // empty space: click deselects, drop unparents
         let (_, zone) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ui.available_height().max(40.0)), egui::Sense::click());
-        if zone.clicked() {
+        if zone.clicked() && !app.s.sel.is_empty() {
+            app.s.checkpoint_selection("select");
             app.select_names(&[], SelMode::Replace);
         }
         if let Some(ids) = zone.dnd_release_payload::<Vec<String>>() {
@@ -364,6 +365,7 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
         }
     } else if resp.clicked() {
         app.panels.ol_active = true;
+        app.s.checkpoint_selection("select");
         let anchor = app.panels.ol_anchor.clone().filter(|a| app.panels.ol_rows.contains(a));
         if m.shift && !startup && anchor.is_some() {
             let a = app.panels.ol_rows.iter().position(|x| Some(x) == anchor.as_ref()).unwrap();

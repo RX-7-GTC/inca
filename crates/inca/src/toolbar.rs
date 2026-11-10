@@ -168,7 +168,10 @@ fn do_input(app: &mut IncaApp, mode: usize, txt: &str) {
         }
         "Select" => {
             let ids: Vec<String> = app.s.all_dag(false).into_iter().filter(|i| inca_core::mel::glob_match(txt, &app.s.name_of(i))).collect();
-            app.select_names(&ids, SelMode::Replace);
+            if !ids.is_empty() || !app.s.sel.is_empty() {
+                app.s.checkpoint_selection("select");
+                app.select_names(&ids, SelMode::Replace);
+            }
         }
         m => {
             let v: Vec<f64> = txt.split([' ', ',']).filter(|s| !s.is_empty()).filter_map(|s| s.parse().ok()).collect();
@@ -643,7 +646,10 @@ pub fn tool_box(app: &mut IncaApp, ui: &mut egui::Ui) {
                         app.layout = Layout::Single;
                         app.active_vp = 0;
                     }
-                    1 => app.layout = Layout::Four,
+                    1 => {
+                        app.layout = Layout::Four;
+                        app.layout_before = Layout::Four;
+                    }
                     2 => {
                         app.layout = Layout::Single;
                         app.active_vp = 0;

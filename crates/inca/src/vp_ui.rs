@@ -209,6 +209,15 @@ pub fn viewports(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame
             vec![(0, r(0.0, 0.0, full.height())), (1, r(1.0, 0.0, h)), (2, r(1.0, 1.0, h))]
         }
     };
+    // Maya's active panel follows the mouse in a multi-pane layout, so Space maximizes the
+    // viewport under the cursor instead of the last clicked one.
+    if app.layout != Layout::Single && !ui.ctx().input(|i| i.pointer.any_down()) && app.marking.is_none() {
+        if let Some(p) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+            if let Some(&(idx, _)) = panes.iter().find(|(_, r)| r.contains(p)) {
+                app.active_vp = idx;
+            }
+        }
+    }
     ui.allocate_rect(full, Sense::hover());
     for (idx, rect) in panes {
         pane(app, ui, frame, idx, rect);
@@ -315,13 +324,28 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         if menu_item(app, ui, "Select Camera") {
             select_camera(app, idx);
         }
-        if menu_item(app, ui, "Default View") {
+        let r = ui.add_enabled(app.can_undo_view(idx), egui::Button::new("Undo View Change").shortcut_text("Alt+Z"));
+        if activated(app, ui, &r) {
+            app.active_vp = idx;
+            app.undo_view(idx);
+        }
+        let r = ui.add_enabled(app.can_redo_view(idx), egui::Button::new("Redo View Change").shortcut_text("Alt+Y"));
+        if activated(app, ui, &r) {
+            app.active_vp = idx;
+            app.redo_view(idx);
+        }
+        let r = ui.add(egui::Button::new("Default View").shortcut_text("Alt+Home"));
+        if activated(app, ui, &r) {
+            app.active_vp = idx;
+            app.push_view_change(idx);
             viewport::default_view(&mut app.s, &cam);
         }
         if menu_item(app, ui, "Look at Selection") {
             // JS `lookAtSelection` unions the selected objects' bounding boxes, not components
             let b = viewport::selected_objects_bbox(&app.s);
             if !b.is_empty() {
+                app.active_vp = idx;
+                app.push_view_change(idx);
                 viewport::look_at(&mut app.s, &cam, b.center());
             }
         }
@@ -496,6 +520,7 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         ui.menu_button("Perspective", |ui| {
             for (c, _) in cams.iter().filter(|c| !c.1) {
                 if menu_check(app, ui, app.vps[idx].camera == *c, c) {
+                    app.push_view_change(idx);
                     app.vps[idx].camera = c.clone();
                 }
             }
@@ -503,21 +528,26 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
             if menu_item(app, ui, "New") {
                 let before: HashSet<String> = app.s.nodes.keys().cloned().collect();
                 app.action("createCamera");
-                if let Some(n) = app.s.nodes.values().find(|n| !before.contains(&n.id) && matches!(n.shape, Shape::Camera(_))) {
-                    app.vps[idx].camera = n.name.clone();
+                if let Some(name) = app.s.nodes.values().find(|n| !before.contains(&n.id) && matches!(n.shape, Shape::Camera(_))).map(|n| n.name.clone()) {
+                    app.push_view_change(idx);
+                    app.vps[idx].camera = name;
                 }
             }
         });
         ui.menu_button("Orthographic", |ui| {
             for (c, _) in cams.iter().filter(|c| c.1) {
                 if menu_check(app, ui, app.vps[idx].camera == *c, c) {
+                    app.push_view_change(idx);
                     app.vps[idx].camera = c.clone();
                 }
             }
         });
         if menu_item(app, ui, "Look Through Selected") {
             match app.s.sel.iter().find(|i| matches!(app.s.node(i).map(|n| &n.shape), Some(Shape::Camera(_)))).cloned() {
-                Some(c) => app.vps[idx].camera = app.s.name_of(&c),
+                Some(c) => {
+                    app.push_view_change(idx);
+                    app.vps[idx].camera = app.s.name_of(&c);
+                }
                 None => app.last_result = "Warning: Select a camera".into(),
             }
         }
@@ -534,6 +564,9 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
                 if menu_check(app, ui, app.layout == lay, l) {
                     app.active_vp = idx;
                     app.layout = lay;
+                    if lay != Layout::Single {
+                        app.layout_before = lay;
+                    }
                 }
             }
         });
@@ -573,6 +606,8 @@ fn panel_toolbar(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
     }
     if ib(ui, "bookmark", "Default view", false) {
         let c = app.vps[idx].camera.clone();
+        app.active_vp = idx;
+        app.push_view_change(idx);
         viewport::default_view(&mut app.s, &c);
     }
     separator(ui);
@@ -677,6 +712,8 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
     if resp.hovered() && scroll != 0.0 && !pointer.button_down(egui::PointerButton::Middle) {
         // JS wheel: dolly(-deltaY * 0.35); dolly uses exp(-d * 0.006)
         let amount = scroll as f64 * 0.0021;
+        app.active_vp = idx;
+        app.push_view_change(idx);
         match resp.hover_pos() {
             Some(c) => dolly_at(app, idx, cv, c, amount),
             None => viewport::dolly(&mut app.s, &cam, amount),
@@ -693,6 +730,8 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
         } else {
             NavMode::Tumble
         };
+        app.active_vp = idx;
+        app.push_view_change(idx);
         app.vp_state.nav = Some((idx, mode));
     }
     if let Some((v, mode)) = app.vp_state.nav {
@@ -769,6 +808,7 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
         ui.ctx().set_cursor_image(Some(select_cursor(mode)));
     }
     if resp.drag_started_by(egui::PointerButton::Primary) && tab_down && !app.lock_selection {
+        app.s.checkpoint_selection("select");
         app.vp_state.tab_drag = Some((HashSet::new(), resp.interact_pointer_pos().map(|p| p - resp.drag_delta())));
     }
     if let Some((mut seen, last)) = app.vp_state.tab_drag.clone() {
@@ -796,6 +836,9 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
             app.vp_state.tab_drag = Some((seen.clone(), Some(p)));
         }
         if resp.drag_stopped() || !pointer.primary_down() {
+            if seen.is_empty() {
+                app.s.undo_stack.pop();
+            }
             app.vp_state.tab_drag = None;
         }
         return;
@@ -804,6 +847,7 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
         // a Tab click toggles the item under the pointer, keeping the rest of the selection
         if let Some(p) = resp.interact_pointer_pos() {
             if let Some(n) = pick_name(app, idx, cv, p) {
+                app.s.checkpoint_selection("select");
                 let verb = if item_selected(app, &n) { "-d" } else { "-add" };
                 let _ = app.exec_mel(&format!("select {verb} {n};"), false);
             }
@@ -885,10 +929,13 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
             let mut handled = false;
             if mods.shift && app.s.comp_mode == Some(inca_core::scene::CompMode::Face) && !app.lock_selection {
                 if let Some((id, f)) = pick_face(app, idx, cv, p) {
+                    app.s.checkpoint_selection("select");
                     if inca_core::selection::add_face_loop(&mut app.s, &id, f) {
                         let faces: Vec<String> = app.s.comp_sel(&id).f.iter().map(|f| format!("{}.f[{f}]", app.s.name_of(&id))).collect();
                         app.echo(format!("select -r {};", faces.join(" ")));
                         handled = true;
+                    } else {
+                        app.s.undo_stack.pop();
                     }
                 }
             }
@@ -978,6 +1025,7 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
                     SelMode::Toggle => "-tgl",
                     SelMode::Remove => "-d",
                 };
+                app.s.checkpoint_selection("select");
                 if mode == SelMode::Toggle {
                     // toggle a single component
                     let cs = app.s.comp.entry(id.clone()).or_default();
@@ -996,6 +1044,7 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
                 // appends it to the selection, but never drops the previous selection
                 if let Some(o) = pick_masked(app, &vp, cv, p) {
                     if !hil.contains(&o) {
+                        app.s.checkpoint_selection("select");
                         if mode == SelMode::Replace {
                             app.s.set_hilite(std::slice::from_ref(&o));
                         } else {
@@ -1009,10 +1058,14 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
                     }
                 }
                 if mode == SelMode::Replace {
-                    for id in hil {
-                        app.s.comp.remove(&id);
+                    let any = hil.iter().any(|id| !app.s.comp_sel_active(id).is_empty());
+                    if any {
+                        app.s.checkpoint_selection("select");
+                        for id in hil {
+                            app.s.clear_active_comp(&id);
+                        }
+                        app.s.rev += 1;
                     }
-                    app.s.rev += 1;
                 }
             }
         }
@@ -1020,9 +1073,13 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
     }
     let hit = pick_masked(app, &vp, cv, p).and_then(|h| filter_picks(app, vec![h]).pop());
     match hit {
-        Some(id) => app.select_names(&[id], mode),
+        Some(id) => {
+            app.s.checkpoint_selection("select");
+            app.select_names(&[id], mode);
+        }
         None => {
-            if mode == SelMode::Replace {
+            if mode == SelMode::Replace && !app.s.sel.is_empty() {
+                app.s.checkpoint_selection("select");
                 app.select_names(&[], SelMode::Replace);
             }
         }
@@ -1175,6 +1232,7 @@ fn double_click(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, shift: boo
             let has_selected_face = !app.s.comp_sel(&id).f.is_empty();
             if !shift || !has_selected_face {
                 let name = app.s.name_of(&id);
+                app.s.checkpoint_selection("select");
                 let _ = app.exec_mel(&format!("select -r {name}.f[*];"), true);
             }
         }
@@ -1213,6 +1271,7 @@ fn double_click(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, shift: boo
     if parts.is_empty() {
         return;
     }
+    app.s.checkpoint_selection("select");
     let _ = app.exec_mel(&format!("select {} {};", if shift { "-add" } else { "-r" }, parts.join(" ")), true);
 }
 
@@ -1313,9 +1372,10 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
             _ => "-add",
         };
         if parts.is_empty() {
-            if mode == SelMode::Replace {
+            if mode == SelMode::Replace && app.s.hilite().iter().any(|id| !app.s.comp_sel_active(id).is_empty()) {
+                app.s.checkpoint_selection("select");
                 for id in app.s.hilite() {
-                    app.s.comp.remove(&id);
+                    app.s.clear_active_comp(&id);
                 }
                 app.s.rev += 1;
             }
@@ -1323,6 +1383,7 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
         }
         // keep the echo short for big selections
         let mel = format!("select {flag} {};", parts.join(" "));
+        app.s.checkpoint_selection("select");
         let _ = app.exec_mel(&mel, parts.len() < 200);
         return;
     }
@@ -1332,6 +1393,9 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
         viewport::region_objects(s, &vp, cv, region, center, &mut app.mesh_cache, allow_templates)
     };
     let ids = filter_picks(app, ids);
+    if !ids.is_empty() || (mode == SelMode::Replace && !app.s.sel.is_empty()) {
+        app.s.checkpoint_selection("select");
+    }
     app.select_names(&ids, if mode == SelMode::Toggle && ids.is_empty() { SelMode::Add } else { mode });
 }
 
@@ -2579,7 +2643,7 @@ fn hud(app: &mut IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
         let hil = app.s.hilite();
         let mut comp = [0usize; 3];
         for id in &hil {
-            let cs = app.s.comp_sel(id);
+            let cs = app.s.comp_sel_active(id);
             comp[0] += cs.v.len();
             comp[1] += cs.e.len();
             comp[2] += cs.f.len();

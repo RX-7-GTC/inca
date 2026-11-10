@@ -111,6 +111,7 @@ pub const CORE_COMMANDS: &[&str] = &[
     "matchTransform", "addAttr", "deleteAttr", "polyChamferVtx", "polyConnectComponents", "polyCollapseEdge", "polyCollapseFacet", "polyToCurve", "polyCleanup", "closeCurve", "openCurve",
     "distanceDimension", "instance", "connectionInfo", "python", "echo", "particle", "connectDynamic", "deleteRigidBody", "ikHandle", "insertJoint", "mirrorJoint", "cluster", "softMod", "lattice", "blendShape", "poleVectorConstraint", "setDrivenKeyframe", "pathAnimation", "removeConstraints", "deleteDeformers",
     "hikCreateSkeleton", "hikCreateCharacter", "hikCreateControlRig", "hikDeleteControlRig", "hikDeleteCharacter", "hikSetSource", "hikSetSlot", "hikBake", "hikListCharacters",
+"ConvertSelectionToVertices", "ConvertSelectionToEdges", "ConvertSelectionToFaces",
 ];
 
 pub fn exists(name: &str) -> bool {
@@ -222,19 +223,26 @@ pub fn component_names(s: &Scene, id: &str) -> Vec<String> {
         return out;
     }
     let Some(m) = n.mesh() else { return vec![] };
-    for r in ranges(c.v.iter().map(|&x| x as usize).collect()) {
-        out.push(format!("{}.vtx[{r}]", n.name));
-    }
-    if !c.e.is_empty() {
-        let topo = m.mesh.topo();
-        let mut es: Vec<usize> = c.e.iter().filter_map(|&(a, b)| topo.edge(a, b)).collect();
-        es.sort();
-        for r in ranges(es) {
-            out.push(format!("{}.e[{r}]", n.name));
+    match s.comp_mode {
+        Some(CompMode::Vertex) => {
+            for r in ranges(c.v.iter().map(|&x| x as usize).collect()) {
+                out.push(format!("{}.vtx[{r}]", n.name));
+            }
         }
-    }
-    for r in ranges(c.f.iter().copied().collect()) {
-        out.push(format!("{}.f[{r}]", n.name));
+        Some(CompMode::Edge) => {
+            let topo = m.mesh.topo();
+            let mut es: Vec<usize> = c.e.iter().filter_map(|&(a, b)| topo.edge(a, b)).collect();
+            es.sort();
+            for r in ranges(es) {
+                out.push(format!("{}.e[{r}]", n.name));
+            }
+        }
+        Some(CompMode::Face) => {
+            for r in ranges(c.f.iter().copied().collect()) {
+                out.push(format!("{}.f[{r}]", n.name));
+            }
+        }
+        None => {}
     }
     out
 }
@@ -249,7 +257,7 @@ fn op_faces(s: &Scene, a: &Args, id: &str, all_if_none: bool) -> Vec<usize> {
             }
         }
     }
-    if v.is_empty() {
+    if v.is_empty() && s.comp_mode == Some(CompMode::Face) {
         v = s.comp_sel(id).f.iter().copied().collect();
     }
     if v.is_empty() && all_if_none {
@@ -267,7 +275,7 @@ fn op_edges(s: &Scene, a: &Args, id: &str) -> Vec<(u32, u32)> {
             }
         }
     }
-    if v.is_empty() {
+    if v.is_empty() && s.comp_mode == Some(CompMode::Edge) {
         v = s.comp_sel(id).e.iter().copied().collect();
     }
     v
@@ -2413,6 +2421,15 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             }
             Ok(Val::None)
         }
+        "ConvertSelectionToVertices" | "ConvertSelectionToEdges" | "ConvertSelectionToFaces" => {
+            let to = match name {
+                "ConvertSelectionToVertices" => CompMode::Vertex,
+                "ConvertSelectionToEdges" => CompMode::Edge,
+                _ => CompMode::Face,
+            };
+            crate::selection::convert(s, to);
+            Ok(Val::None)
+        }
         "createDisplayLayer" => {
             let nm = a.s(&["n", "name"]).unwrap_or("layer1".into());
             let id = s.new_id("l");
@@ -2670,9 +2687,11 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
             let clear: &[Id] = if same { &old_hilite } else { &owners };
             for id in clear {
                 if let Some(c) = s.comp.get_mut(id) {
-                    c.v.clear();
-                    c.e.clear();
-                    c.f.clear();
+                    match kind {
+                        CompMode::Vertex => c.v.clear(),
+                        CompMode::Edge => c.e.clear(),
+                        CompMode::Face => c.f.clear(),
+                    }
                 }
             }
         }
@@ -2737,7 +2756,7 @@ fn ls(s: &Scene, a: &Args) -> Result<Val, String> {
     if a.has(&["sl", "selection"]) {
         let mut out = vec![];
         for id in &s.sel {
-            if s.comp_mode.is_some() && !s.comp_sel(id).is_empty() {
+            if s.comp_mode.is_some() && !s.comp_sel_active(id).is_empty() {
                 out.extend(component_names(s, id));
             } else {
                 out.push(nm(id));
@@ -3217,6 +3236,27 @@ mod tests {
 
         mel(&mut s, "container -e -unpublishName pubTx asset1;").unwrap();
         assert!(mel(&mut s, "getAttr asset1.pubTx;").is_err());
+    }
+
+    #[test]
+    fn selecting_an_edge_keeps_the_face_selection() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n c; select -r c.f[0];").unwrap();
+        let id = s.find("c").unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Face));
+        assert_eq!(s.comp_sel(&id).f.len(), 1);
+        // switching to an edge keeps the face set stored
+        mel(&mut s, "select -r c.e[0];").unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Edge));
+        assert_eq!(s.comp_sel(&id).e.len(), 1);
+        assert_eq!(s.comp_sel(&id).f.len(), 1);
+        s.set_comp_mode(Some(CompMode::Face));
+        assert_eq!(component_names(&s, &id), vec!["c.f[0]".to_string()]);
+        // explicit conversion replaces the edge set, not the face set
+        mel(&mut s, "ConvertSelectionToEdges;").unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Edge));
+        assert_eq!(s.comp_sel(&id).f.len(), 1);
+        assert!(!s.comp_sel(&id).e.is_empty());
     }
 }
 

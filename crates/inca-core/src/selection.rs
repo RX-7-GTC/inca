@@ -1,66 +1,88 @@
 //! Component selection helpers: grow/shrink, conversion, edge loops/rings, borders.
 
 use crate::mesh::{edge_loop, edge_ring, epair, PolyMesh, Topo};
-use crate::scene::{CompMode, CompSel, Scene};
+use crate::scene::{CompMode, Scene};
 use std::collections::BTreeSet;
 
-/// Convert the component selection of every hilited mesh to another mode.
+/// Explicit Maya Convert Selection: convert the active mode's selection to `to` on every
+/// hilited mesh. The other modes' stored selections are left untouched.
 pub fn convert(s: &mut Scene, to: CompMode) {
+    let from = s.comp_mode;
     for id in s.hilite() {
         let Some(pm) = s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.clone()) else { continue };
         let c = s.comp_sel(&id);
-        let topo = pm.topo();
-        let verts: BTreeSet<u32> = s.comp_verts(&id).into_iter().collect();
-        let mut out = CompSel::default();
+        let mut out = c.clone();
         match to {
-            CompMode::Vertex => out.v = verts,
+            CompMode::Vertex => {
+                out.v = match from {
+                    Some(CompMode::Edge) => c.e.iter().flat_map(|&(a, b)| [a, b]).collect(),
+                    Some(CompMode::Face) => c.f.iter().flat_map(|&f| pm.f.get(f).into_iter().flatten().copied()).collect(),
+                    _ => c.v.clone(),
+                };
+            }
             CompMode::Edge => {
-                if !c.f.is_empty() {
-                    for &f in &c.f {
-                        let face = &pm.f[f];
-                        for i in 0..face.len() {
-                            out.e.insert(epair(face[i], face[(i + 1) % face.len()]));
-                        }
-                    }
-                } else {
-                    for &(a, b) in &topo.edges {
-                        if verts.contains(&a) && verts.contains(&b) {
-                            out.e.insert((a, b));
-                        }
-                    }
-                    // JS `convertComp`: vertices with no complete edge select their incident edges
-                    if out.e.is_empty() {
-                        for &(a, b) in &topo.edges {
-                            if verts.contains(&a) || verts.contains(&b) {
-                                out.e.insert((a, b));
+                out.e = match from {
+                    Some(CompMode::Face) => {
+                        let mut e = BTreeSet::new();
+                        for &f in &c.f {
+                            let Some(face) = pm.f.get(f) else { continue };
+                            for i in 0..face.len() {
+                                e.insert(epair(face[i], face[(i + 1) % face.len()]));
                             }
                         }
+                        e
                     }
-                }
+                    Some(CompMode::Vertex) => {
+                        let topo = pm.topo();
+                        let mut e = BTreeSet::new();
+                        for &(a, b) in &topo.edges {
+                            if c.v.contains(&a) && c.v.contains(&b) {
+                                e.insert((a, b));
+                            }
+                        }
+                        // JS `convertComp`: vertices with no complete edge select their incident edges
+                        if e.is_empty() {
+                            for &(a, b) in &topo.edges {
+                                if c.v.contains(&a) || c.v.contains(&b) {
+                                    e.insert((a, b));
+                                }
+                            }
+                        }
+                        e
+                    }
+                    _ => c.e.clone(),
+                };
             }
             CompMode::Face => {
-                if !c.e.is_empty() {
-                    // JS: the faces of the selected edges
-                    for (fi, f) in pm.f.iter().enumerate() {
-                        if (0..f.len()).any(|i| c.e.contains(&epair(f[i], f[(i + 1) % f.len()]))) {
-                            out.f.insert(fi);
-                        }
-                    }
-                } else {
-                    for (fi, f) in pm.f.iter().enumerate() {
-                        if f.iter().all(|v| verts.contains(v)) {
-                            out.f.insert(fi);
-                        }
-                    }
-                    // JS fallback: a lone vertex selects the faces it belongs to
-                    if out.f.is_empty() {
-                        for (fi, f) in pm.f.iter().enumerate() {
-                            if f.iter().any(|v| verts.contains(v)) {
-                                out.f.insert(fi);
+                out.f = match from {
+                    Some(CompMode::Edge) => {
+                        let mut f = BTreeSet::new();
+                        for (fi, face) in pm.f.iter().enumerate() {
+                            if (0..face.len()).any(|i| c.e.contains(&epair(face[i], face[(i + 1) % face.len()]))) {
+                                f.insert(fi);
                             }
                         }
+                        f
                     }
-                }
+                    Some(CompMode::Vertex) => {
+                        let mut f = BTreeSet::new();
+                        for (fi, face) in pm.f.iter().enumerate() {
+                            if face.iter().all(|v| c.v.contains(v)) {
+                                f.insert(fi);
+                            }
+                        }
+                        // JS fallback: a lone vertex selects the faces it belongs to
+                        if f.is_empty() {
+                            for (fi, face) in pm.f.iter().enumerate() {
+                                if face.iter().any(|v| c.v.contains(v)) {
+                                    f.insert(fi);
+                                }
+                            }
+                        }
+                        f
+                    }
+                    _ => c.f.clone(),
+                };
             }
         }
         s.comp.insert(id, out);
@@ -240,7 +262,9 @@ pub fn border(s: &mut Scene) {
         let Some(pm) = s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.clone()) else { continue };
         let topo = pm.topo();
         let e: BTreeSet<(u32, u32)> = topo.edges.iter().enumerate().filter(|(i, _)| topo.edge_faces[*i].len() == 1).map(|(_, e)| *e).collect();
-        s.comp.insert(id, CompSel { e, ..Default::default() });
+        let mut out = s.comp_sel(&id);
+        out.e = e;
+        s.comp.insert(id, out);
     }
     s.comp_mode = Some(CompMode::Edge);
     s.rev += 1;
@@ -254,13 +278,14 @@ pub fn all_components(s: &mut Scene, invert: bool) {
         if let Some(len) = s.node(&id).and_then(|n| n.curve()).map(|c| c.cvs.len()) {
             // curves only have CVs; `e[*]` / `f[*]` in the JS would be empty too
             if mode == CompMode::Vertex {
-                let v = (0..len as u32).filter(|v| !invert || !c.v.contains(v)).collect();
-                s.comp.insert(id, CompSel { v, ..Default::default() });
+                let mut out = c.clone();
+                out.v = (0..len as u32).filter(|v| !invert || !c.v.contains(v)).collect();
+                s.comp.insert(id, out);
             }
             continue;
         }
         let Some(pm) = s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.clone()) else { continue };
-        let mut out = CompSel::default();
+        let mut out = c.clone();
         match mode {
             CompMode::Vertex => out.v = (0..pm.v.len() as u32).filter(|v| !invert || !c.v.contains(v)).collect(),
             CompMode::Face => out.f = (0..pm.f.len()).filter(|f| !invert || !c.f.contains(f)).collect(),
@@ -275,6 +300,7 @@ pub fn all_components(s: &mut Scene, invert: bool) {
 mod tests {
     use super::*;
     use crate::params::Params;
+    use crate::scene::CompSel;
 
     #[test]
     fn loop_and_convert() {
@@ -295,27 +321,63 @@ mod tests {
     }
 
     #[test]
-    fn set_comp_mode_converts_and_keeps_the_selection() {
+    fn component_modes_keep_separate_selections() {
         let mut s = Scene::new();
         let id = s.create_mesh("polyCube", &Params::new(), None);
         s.select(std::slice::from_ref(&id), crate::scene::SelMode::Replace);
-        s.set_comp_mode(Some(CompMode::Vertex));
-        let face0 = s.node(&id).unwrap().mesh().unwrap().mesh.f[0].clone();
-        s.comp.insert(id.clone(), CompSel { v: face0.iter().copied().collect(), ..Default::default() });
-        // switching component types converts (JS `Sel.setMode`), it does not drop the selection
+        s.set_comp_mode(Some(CompMode::Face));
+        s.comp.insert(id.clone(), CompSel { f: [0].into_iter().collect(), ..Default::default() });
+        // switching to edges loads the edge set (empty); the face set stays stored
+        s.set_comp_mode(Some(CompMode::Edge));
+        assert!(s.comp_sel(&id).e.is_empty());
+        assert_eq!(s.comp_sel(&id).f.iter().copied().collect::<Vec<_>>(), vec![0]);
+        assert!(s.comp_verts(&id).is_empty());
+        // selecting an edge preserves the face set
+        let e = s.node(&id).unwrap().mesh().unwrap().mesh.topo().edges[0];
+        let mut st = s.comp_sel(&id);
+        st.e.insert(e);
+        s.comp.insert(id.clone(), st);
         s.set_comp_mode(Some(CompMode::Face));
         assert_eq!(s.comp_sel(&id).f.iter().copied().collect::<Vec<_>>(), vec![0]);
-        // the per-object component sets survive a trip through object mode
+        assert_eq!(s.comp_sel(&id).e.len(), 1);
+        // explicit Convert Selection updates only the target mode
+        convert(&mut s, CompMode::Edge);
+        assert_eq!(s.comp_mode, Some(CompMode::Edge));
+        assert!(!s.comp_sel(&id).e.is_empty());
+        assert_eq!(s.comp_sel(&id).f.iter().copied().collect::<Vec<_>>(), vec![0]);
+        // object mode preserves all three sets
         s.set_comp_mode(None);
         assert!(s.comp_mode.is_none());
         assert!(!s.comp_sel(&id).f.is_empty());
-        s.set_comp_mode(Some(CompMode::Face));
-        assert_eq!(s.comp_sel(&id).f.iter().copied().collect::<Vec<_>>(), vec![0]);
-        // a lone vertex converts to the faces around it (JS fallback)
+        assert!(!s.comp_sel(&id).e.is_empty());
+    }
+
+    #[test]
+    fn clearing_the_active_mode_keeps_the_other_modes() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        s.select(std::slice::from_ref(&id), crate::scene::SelMode::Replace);
+        let e = s.node(&id).unwrap().mesh().unwrap().mesh.topo().edges[0];
+        s.comp.insert(id.clone(), CompSel { v: [0, 1].into_iter().collect(), e: [e].into_iter().collect(), f: [0].into_iter().collect() });
         s.set_comp_mode(Some(CompMode::Vertex));
-        s.comp.insert(id.clone(), CompSel { v: [face0[0]].into_iter().collect(), ..Default::default() });
+        s.clear_active_comp(&id);
+        assert!(s.comp_sel(&id).v.is_empty());
+        assert_eq!(s.comp_sel(&id).e.len(), 1);
+        assert_eq!(s.comp_sel(&id).f.len(), 1);
+    }
+
+    #[test]
+    fn select_all_preserves_other_component_modes() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        s.select(std::slice::from_ref(&id), crate::scene::SelMode::Replace);
         s.set_comp_mode(Some(CompMode::Face));
-        assert!(s.comp_sel(&id).f.len() >= 1);
+        s.comp.insert(id.clone(), CompSel { f: [0].into_iter().collect(), ..Default::default() });
+        s.set_comp_mode(Some(CompMode::Edge));
+        all_components(&mut s, false);
+        let edges = s.node(&id).unwrap().mesh().unwrap().mesh.topo().edges.len();
+        assert_eq!(s.comp_sel(&id).e.len(), edges);
+        assert_eq!(s.comp_sel(&id).f.iter().copied().collect::<Vec<_>>(), vec![0]);
     }
 
     #[test]
