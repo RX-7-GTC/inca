@@ -21,6 +21,8 @@ enum Kind {
     Texture,
     Material,
     ShadingGroup,
+    /// place2dTexture utility node.
+    Place2D,
     /// Camera or light shape shown as a standalone graph node.
     Dag,
     Object,
@@ -45,6 +47,8 @@ enum Wire {
     Tex(String, usize),
     /// material -> object or shading group
     Mat(String),
+    /// place2dTexture outUV -> texture.uvCoord
+    Place(String),
 }
 
 /// An existing connection line in the work area.
@@ -53,6 +57,7 @@ pub enum ConnWire {
     Map { tex: String, mat: String, attr: String },
     User { mat: String, obj: String },
     Sg { mat: String },
+    Place { place: String, tex: String },
 }
 
 /// One work-area tab. The active tab's fields live in HsState; the others live here.
@@ -407,10 +412,24 @@ fn create_camera_node(app: &mut IncaApp) {
     }
 }
 
+/// Create a standalone place2dTexture utility from the Create bar or a marking menu.
+pub(crate) fn create_place_node(app: &mut IncaApp, at: Option<Pos2>) {
+    let before = app.s.places.len();
+    let _ = app.run_mel("create place2dTexture", "shadingNode -asUtility place2dTexture;");
+    if app.s.places.len() > before {
+        if let Some(id) = app.s.places.keys().last().cloned() {
+            place_new_node(app, &id, at);
+            select_graph_node(app, &id, false);
+        }
+    }
+}
+
 /// Place a freshly created material or texture near `at` (screen position) or the view center,
 /// avoiding the visible nodes. Falls back to the preferred spot when the view is full.
 pub(crate) fn place_new_node(app: &mut IncaApp, id: &str, at: Option<Pos2>) {
     let sw = if app.windows_state.hs.show_swatches { SWATCH + 6.0 } else { 0.0 };
+    // A texture's place node sits immediately to its left, so both slots must be free.
+    let place_offset = app.s.texs.get(id).and_then(|t| t.place.as_deref()).map(|_| vec2(-(NODE_W + 36.0), 0.0));
     let (size, material) = if let Some(m) = app.s.mats.get(id) {
         let rows = inca_core::materials::mat_type(&m.ty).mappable.len() + 1;
         let h = HEAD_H + sw + ROW_H * rows as f32 + 4.0;
@@ -418,6 +437,8 @@ pub(crate) fn place_new_node(app: &mut IncaApp, id: &str, at: Option<Pos2>) {
         (vec2(NODE_W * 2.0 + 36.0, h.max(sg_h)), true)
     } else if app.s.texs.contains_key(id) {
         (vec2(NODE_W, HEAD_H + sw + ROW_H * 2.0 + 4.0), false)
+    } else if app.s.places.contains_key(id) {
+        (vec2(NODE_W, HEAD_H + ROW_H * 2.0 + 4.0), false)
     } else {
         return;
     };
@@ -440,7 +461,8 @@ pub(crate) fn place_new_node(app: &mut IncaApp, id: &str, at: Option<Pos2>) {
     };
     let lo = (-pan) / zoom;
     let hi = (rect.size() - pan) / zoom;
-    let (min_x, max_x) = (lo.x, (hi.x - size.x).max(lo.x));
+    let min_x = place_offset.map_or(lo.x, |d| lo.x.max(lo.x - d.x));
+    let (min_x, max_x) = (min_x, (hi.x - size.x).max(min_x));
     let (min_y, max_y) = (lo.y, (hi.y - size.y).max(lo.y));
     let preferred = if let Some(q) = at {
         let g = to_graph(q);
@@ -450,7 +472,10 @@ pub(crate) fn place_new_node(app: &mut IncaApp, id: &str, at: Option<Pos2>) {
         pos2(v.x - size.x * 0.5, v.y - size.y * 0.5)
     };
     let preferred = pos2(preferred.x.clamp(min_x, max_x), preferred.y.clamp(min_y, max_y));
-    let hits = |p: Pos2| occupied.iter().any(|r| r.intersects(Rect::from_min_size(p, size)));
+    let hits = |p: Pos2| {
+        occupied.iter().any(|r| r.intersects(Rect::from_min_size(p, size)))
+            || place_offset.is_some_and(|d| occupied.iter().any(|r| r.intersects(Rect::from_min_size(p + d, size))))
+    };
     let mut best: Option<(f32, Pos2)> = (!hits(preferred)).then_some((0.0, preferred));
     if best.is_none() {
         let step = 24.0;
@@ -502,21 +527,28 @@ fn hash_of<T: std::hash::Hash>(t: &T) -> u64 {
 fn swatch(app: &mut IncaApp, ctx: &egui::Context, id: &str) -> Option<egui::TextureId> {
     let (key, px) = if let Some(m) = app.s.mats.get(id) {
         let tex = m.maps.get(m.color_attr()).and_then(|t| t.as_str()).and_then(|t| app.s.texs.get(t));
-        let key = hash_of(&(serde_json::to_string(&m.attrs).unwrap_or_default(), &m.ty, tex.map(|t| serde_json::to_string(&t.attrs).unwrap_or_default())));
+        let place = tex.and_then(|t| app.s.place_of(t));
+        let key = hash_of(&(
+            serde_json::to_string(&m.attrs).unwrap_or_default(),
+            &m.ty,
+            tex.map(|t| serde_json::to_string(&t.attrs).unwrap_or_default()),
+            place.map(|p| serde_json::to_string(&p.attrs).unwrap_or_default()),
+        ));
         if let Some((k, t)) = app.windows_state.hs.swatches.get(id) {
             if *k == key {
                 return Some(t.id());
             }
         }
-        (key, inca_core::materials::swatch(m, tex, 64))
+        (key, inca_core::materials::swatch(m, tex, place.map(|p| &p.attrs), 64))
     } else if let Some(t) = app.s.texs.get(id) {
-        let key = hash_of(&serde_json::to_string(&t.attrs).unwrap_or_default());
+        let place = app.s.place_of(t);
+        let key = hash_of(&(serde_json::to_string(&t.attrs).unwrap_or_default(), place.map(|p| serde_json::to_string(&p.attrs).unwrap_or_default())));
         if let Some((k, h)) = app.windows_state.hs.swatches.get(id) {
             if *k == key {
                 return Some(h.id());
             }
         }
-        let px = match inca_core::materials::texture_swatch(t, 64) {
+        let px = match inca_core::materials::texture_swatch(t, place.map(|p| &p.attrs), 64) {
             Some(p) => p,
             None => file_swatch(t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or(""), 64),
         };
@@ -542,6 +574,59 @@ fn file_swatch(path: &str, size: u32) -> Vec<u8> {
 /// Objects (meshes) that use a material.
 fn users(app: &IncaApp, mid: &str) -> Vec<String> {
     app.s.nodes.values().filter(|n| n.mesh().is_some_and(|m| m.material == mid || m.mesh.fm.as_ref().is_some_and(|fm| fm.iter().flatten().any(|x| x == mid)))).map(|n| n.id.clone()).collect()
+}
+
+/// The work-area nodes reachable from `id` along wires, in the requested direction.
+fn graph_tree(app: &IncaApp, nodes: &[GNode], id: &str, downstream: bool) -> HashSet<String> {
+    let present = |x: &str| nodes.iter().any(|n| n.id == x);
+    let mut edges: Vec<(String, String)> = vec![];
+    for n in nodes {
+        match n.kind {
+            Kind::Place2D => {
+                for t in app.s.texs.values().filter(|t| t.place.as_deref() == Some(n.id.as_str())) {
+                    if present(&t.id) {
+                        edges.push((n.id.clone(), t.id.clone()));
+                    }
+                }
+            }
+            Kind::Texture => {
+                for m in app.s.mats.values().filter(|m| m.maps.values().any(|v| v.as_str() == Some(n.id.as_str()))) {
+                    if present(&m.id) {
+                        edges.push((n.id.clone(), m.id.clone()));
+                    }
+                }
+            }
+            Kind::Material => {
+                let sg = format!("sg:{}", n.id);
+                if present(&sg) {
+                    edges.push((n.id.clone(), sg));
+                }
+                for o in nodes.iter().filter(|o| o.kind == Kind::Object) {
+                    if users(app, &n.id).contains(&o.id) {
+                        edges.push((n.id.clone(), o.id.clone()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut seen = HashSet::from([id.to_string()]);
+    let mut queue = vec![id.to_string()];
+    while let Some(cur) = queue.pop() {
+        for (from, to) in &edges {
+            let next = if downstream {
+                (from == &cur).then_some(to)
+            } else {
+                (to == &cur).then_some(from)
+            };
+            if let Some(next) = next {
+                if seen.insert(next.clone()) {
+                    queue.push(next.clone());
+                }
+            }
+        }
+    }
+    seen
 }
 
 fn select_dragged(app: &mut IncaApp, id: &str) {
@@ -609,6 +694,13 @@ pub(crate) fn open_connect_menu(app: &mut IncaApp, tex: &str, mid: &str, pos: Po
     open_custom(app, pos, title, vec![], list, now, true);
 }
 
+/// Breaking a place link keeps the utility node, so it can be reconnected.
+fn keep_place_visible(app: &mut IncaApp, place: &str) {
+    if let Some(graph) = &mut app.windows_state.hs.graph_ids {
+        graph.insert(place.to_string());
+    }
+}
+
 pub(crate) fn break_connection(app: &mut IncaApp, wire: &ConnWire) {
     match wire {
         ConnWire::Map { mat, attr, .. } => {
@@ -626,6 +718,16 @@ pub(crate) fn break_connection(app: &mut IncaApp, wire: &ConnWire) {
         // discard face assignments, so keep them read-only for now.
         ConnWire::User { .. } => app.warn("Cannot break a material-to-object connection."),
         ConnWire::Sg { .. } => app.warn("Cannot break the shading group connection."),
+        ConnWire::Place { place, tex } => {
+            app.s.checkpoint("disconnect place2dTexture");
+            if let Some(t) = app.s.texs.get_mut(tex) {
+                if t.place.as_deref() == Some(place.as_str()) {
+                    t.place = None;
+                }
+            }
+            keep_place_visible(app, place);
+            app.s.touch();
+        }
     }
     app.windows_state.hs.sel_wire = None;
 }
@@ -657,6 +759,15 @@ pub(crate) fn isolate_connection(app: &mut IncaApp, wire: &ConnWire) {
             app.windows_state.hs.graph_sel.insert(mat.clone());
             app.windows_state.hs_selected = Some(mat.clone());
         }
+        ConnWire::Place { place, tex } => {
+            ids.insert(place.clone());
+            ids.insert(tex.clone());
+            app.windows_state.hs.graph_ids = Some(ids);
+            app.windows_state.hs.graph_sel.clear();
+            app.windows_state.hs.graph_sel.insert(place.clone());
+            app.windows_state.hs.graph_sel.insert(tex.clone());
+            app.windows_state.hs_selected = Some(place.clone());
+        }
     }
     app.windows_state.hs.frame = Some(false);
     app.windows_state.hs.sel_wire = None;
@@ -681,6 +792,12 @@ pub(crate) fn select_connection(app: &mut IncaApp, wire: &ConnWire) {
             app.windows_state.hs.graph_sel.insert(mat.clone());
             app.windows_state.hs_selected = Some(mat.clone());
         }
+        ConnWire::Place { place, tex } => {
+            app.windows_state.hs.graph_sel.clear();
+            app.windows_state.hs.graph_sel.insert(place.clone());
+            app.windows_state.hs.graph_sel.insert(tex.clone());
+            app.windows_state.hs_selected = Some(place.clone());
+        }
     }
     app.windows_state.hs.sel_wire = None;
 }
@@ -688,7 +805,7 @@ pub(crate) fn select_connection(app: &mut IncaApp, wire: &ConnWire) {
 fn open_connection_marking(app: &mut IncaApp, wire: ConnWire, pos: Pos2, now: f64) {
     app.windows_state.hs.sel_wire = Some(wire.clone());
     let mut br = menu_item("Break Connection", Act::BreakWire(wire.clone()));
-    if !matches!(wire, ConnWire::Map { .. }) {
+    if !matches!(wire, ConnWire::Map { .. } | ConnWire::Place { .. }) {
         br.enabled = false;
     }
     let list = vec![
@@ -859,15 +976,42 @@ fn graph_nodes(app: &IncaApp) -> Vec<GNode> {
     };
     let material_outputs: Vec<String> = if mode == 0 || !port_ok("outColor") { vec![] } else { vec!["outColor".into()] };
     let mut out = vec![];
+    let mut seen_places = HashSet::new();
     for t in app.s.texs.values().filter(|t| graph.is_none_or(|ids| ids.contains(&t.id))) {
+        if let Some(p) = t.place.as_ref().and_then(|p| app.s.places.get(p)) {
+            if seen_places.insert(p.id.clone()) {
+                out.push(GNode {
+                    id: p.id.clone(),
+                    kind: Kind::Place2D,
+                    name: p.name.clone(),
+                    inputs: vec!["uvCoord".into()],
+                    outputs: vec!["outUV".into()],
+                    swatches: false,
+                });
+            }
+        }
         out.push(GNode {
             id: t.id.clone(),
             kind: Kind::Texture,
             name: t.name.clone(),
-            inputs: vec![],
+            inputs: vec!["uvCoord".into()],
             outputs: texture_outputs.clone(),
             swatches,
         });
+    }
+    // Disconnected place nodes stay in the graph so they can be reconnected.
+    if let Some(ids) = graph {
+        for p in ids.iter().filter_map(|id| app.s.places.get(id)) {
+            if seen_places.insert(p.id.clone()) {
+                out.push(GNode { id: p.id.clone(), kind: Kind::Place2D, name: p.name.clone(), inputs: vec!["uvCoord".into()], outputs: vec!["outUV".into()], swatches: false });
+            }
+        }
+    } else {
+        for p in app.s.places.values() {
+            if seen_places.insert(p.id.clone()) {
+                out.push(GNode { id: p.id.clone(), kind: Kind::Place2D, name: p.name.clone(), inputs: vec!["uvCoord".into()], outputs: vec!["outUV".into()], swatches: false });
+            }
+        }
     }
     for m in &mats {
         let slots: Vec<String> = if mode == 0 {
@@ -933,13 +1077,13 @@ fn selected_graph_ids(app: &IncaApp) -> HashSet<String> {
     let mut ids = HashSet::new();
     for id in &app.windows_state.hs.graph_sel {
         let base = id.strip_prefix("sg:").unwrap_or(id);
-        if app.s.mats.contains_key(base) || app.s.texs.contains_key(base) || is_graph_dag(app, base) {
+        if app.s.mats.contains_key(base) || app.s.texs.contains_key(base) || app.s.places.contains_key(base) || is_graph_dag(app, base) {
             ids.insert(base.to_string());
         }
     }
     if ids.is_empty() {
         if let Some(id) = app.snode_sel.as_ref().or(app.windows_state.hs_selected.as_ref()) {
-            if app.s.mats.contains_key(id) || app.s.texs.contains_key(id) || is_graph_dag(app, id) {
+            if app.s.mats.contains_key(id) || app.s.texs.contains_key(id) || app.s.places.contains_key(id) || is_graph_dag(app, id) {
                 ids.insert(id.clone());
             }
         }
@@ -1188,6 +1332,7 @@ fn node_h(n: &GNode) -> f32 {
 /// Default column layout: textures, materials, shading groups, objects.
 fn default_pos(nodes: &[GNode], i: usize) -> Pos2 {
     let col = match nodes[i].kind {
+        Kind::Place2D => -220.0,
         Kind::Texture => 0.0,
         Kind::Material | Kind::ShadingGroup => 220.0,
         Kind::Dag | Kind::Object => 600.0,
@@ -1261,6 +1406,7 @@ fn wire_compatible(w: &Wire, n: &GNode, slot: Option<usize>) -> bool {
     match w {
         Wire::Tex(..) => n.kind == Kind::Material,
         Wire::Mat(_) => matches!(n.kind, Kind::Object | Kind::ShadingGroup) && (slot.is_none() || slot == Some(0)),
+        Wire::Place(_) => n.kind == Kind::Texture && slot.is_none_or(|si| n.inputs.get(si).is_some_and(|p| p == "uvCoord")),
     }
 }
 
@@ -1290,6 +1436,8 @@ fn deletable(app: &IncaApp, id: &str) -> bool {
     let base = id.strip_prefix("sg:").unwrap_or(id);
     if app.s.mats.contains_key(base) || app.s.texs.contains_key(base) {
         !read_only(app, base)
+    } else if app.s.places.contains_key(base) {
+        true
     } else {
         app.s.node(base).is_some_and(|n| !n.startup() && matches!(n.shape, Shape::Light(_) | Shape::Camera(_)))
     }
@@ -1301,6 +1449,7 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
     let ids = &ids;
     let mut mats = vec![];
     let mut texs = vec![];
+    let mut places = vec![];
     let mut dags = vec![];
     let mut blocked = vec![];
     let mut blocked_dags = vec![];
@@ -1313,6 +1462,8 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
             }
         } else if app.s.texs.contains_key(id) {
             texs.push(id.clone());
+        } else if app.s.places.contains_key(id) {
+            places.push(id.clone());
         } else if let Some(n) = app.s.node(id) {
             if matches!(n.shape, Shape::Light(_) | Shape::Camera(_)) {
                 if n.startup() {
@@ -1329,7 +1480,7 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
     for name in blocked_dags {
         app.warn(format!("Cannot delete the default camera '{name}'."));
     }
-    if mats.is_empty() && texs.is_empty() && dags.is_empty() {
+    if mats.is_empty() && texs.is_empty() && places.is_empty() && dags.is_empty() {
         return;
     }
     let dead_cams: Vec<String> = dags.iter().filter_map(|id| app.s.node(id).filter(|n| matches!(n.shape, Shape::Camera(_))).map(|n| n.name.clone())).collect();
@@ -1342,8 +1493,16 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
             m.maps.retain(|_, v| v.as_str() != Some(id.as_str()));
             m.map_outs.retain(|slot, _| m.maps.contains_key(slot));
         }
-        if let Some(t) = app.s.texs.shift_remove(id) {
-            app.s.release_name(&t.name);
+        app.s.delete_texture(id);
+    }
+    for id in &places {
+        for t in app.s.texs.values_mut() {
+            if t.place.as_deref() == Some(id.as_str()) {
+                t.place = None;
+            }
+        }
+        if let Some(p) = app.s.places.shift_remove(id) {
+            app.s.release_name(&p.name);
         }
     }
     for id in &dags {
@@ -1514,11 +1673,9 @@ fn delete_duplicate_shading_networks(app: &mut IncaApp) {
     let used: HashSet<String> = app.s.mats.values().flat_map(|m| m.maps.values().filter_map(|v| v.as_str()).map(String::from)).collect();
     let mut dead_texs = vec![];
     for tid in candidates {
-        if !used.contains(&tid) {
-            if let Some(t) = app.s.texs.shift_remove(&tid) {
-                app.s.release_name(&t.name);
-                dead_texs.push(tid);
-            }
+        if !used.contains(&tid) && app.s.texs.contains_key(&tid) {
+            app.s.delete_texture(&tid);
+            dead_texs.push(tid);
         }
     }
     app.s.touch();
@@ -1604,9 +1761,15 @@ pub(crate) fn duplicate_shading_network(app: &mut IncaApp, mid: &str) {
             continue;
         }
         let Some(t) = app.s.texs.get(tid).cloned() else { continue };
+        let place_attrs = t.place.as_ref().and_then(|p| app.s.places.get(p)).map(|p| p.attrs.clone());
         let nid = app.s.create_texture(&t.ty, Some(&t.name));
         if let Some(nt) = app.s.texs.get_mut(&nid) {
             nt.attrs = t.attrs;
+        }
+        if let Some(attrs) = place_attrs {
+            if let Some(p) = app.s.texs.get(&nid).and_then(|t| t.place.clone()).and_then(|p| app.s.places.get_mut(&p)) {
+                p.attrs = attrs;
+            }
         }
         remap.insert(tid.to_string(), nid);
     }
@@ -1642,6 +1805,7 @@ fn open_node_marking(app: &mut IncaApp, id: &str, pos: Pos2, now: f64) {
         .get(id)
         .map(|m| m.name.clone())
         .or_else(|| app.s.texs.get(id).map(|t| t.name.clone()))
+        .or_else(|| app.s.places.get(id).map(|p| p.name.clone()))
         .or_else(|| {
             app.s.node(id).map(|n| match n.shape {
                 Shape::Light(_) | Shape::Camera(_) => n.shape_name.clone().unwrap_or_else(|| n.name.clone()),
@@ -1662,6 +1826,10 @@ fn open_node_marking(app: &mut IncaApp, id: &str, pos: Pos2, now: f64) {
         radial.push(("N", menu_item("Rename...", Act::HypershadeRename(id.into()))));
         radial.push(("E", menu_item("Frame Selected", Act::HypershadeFrameSelected)));
         radial.push(("W", menu_item("Frame All", Act::HypershadeFrameAll)));
+    } else if app.s.places.contains_key(id) {
+        radial.push(("N", menu_item("Frame Selected", Act::HypershadeFrameSelected)));
+        radial.push(("E", menu_item("Frame All", Act::HypershadeFrameAll)));
+        list.push(Some(menu_item("Delete", Act::HypershadeDelete(vec![id.into()]))));
     } else if app.s.node(id).is_some() {
         radial.push(("N", menu_item("Select", Act::HypershadeSelectObject(id.into()))));
         radial.push(("E", menu_item("Frame Selected", Act::HypershadeFrameSelected)));
@@ -1677,6 +1845,7 @@ fn open_empty_marking(app: &mut IncaApp, pos: Pos2, now: f64) {
     let radial = vec![
         ("N", menu_sub("Create Material", mats)),
         ("E", menu_sub("Create Texture", texs)),
+        ("SE", menu_sub("Create Utility", vec![menu_item("Place 2D Texture", Act::HypershadeCreatePlace)])),
         ("S", menu_item("Frame All", Act::HypershadeFrameAll)),
         ("W", menu_item("Rearrange", Act::HypershadeRearrange)),
     ];
@@ -1702,6 +1871,7 @@ fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
     }
     let target = id.strip_prefix("sg:").unwrap_or(id).to_string();
     let shading = app.s.mats.contains_key(&target) || app.s.texs.contains_key(&target);
+    let place = app.s.places.contains_key(&target);
     if selected_now {
         app.windows_state.hs.bump_z(id);
         // select_names/select_shading_node clear the graph selection; keep the whole
@@ -1709,6 +1879,12 @@ fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
         let keep = app.windows_state.hs.graph_sel.clone();
         if shading {
             select_shading_node(app, &target);
+        } else if place {
+            app.snode_sel = None;
+            app.s.select(&[], SelMode::Replace);
+            app.windows_state.hs_selected = Some(target.clone());
+            app.panels.ae_tab = 0;
+            app.panels.ae_locked = None;
         } else {
             let mode = if additive { SelMode::Add } else { SelMode::Replace };
             app.select_names(std::slice::from_ref(&target), mode);
@@ -1720,7 +1896,7 @@ fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
             if app.snode_sel.as_deref() == Some(target.as_str()) {
                 app.snode_sel = None;
             }
-        } else {
+        } else if !place {
             // Remove only this object from the scene selection.
             let keep = app.windows_state.hs.graph_sel.clone();
             app.select_names(std::slice::from_ref(&target), SelMode::Remove);
@@ -1775,7 +1951,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
                 delete_ids.retain(|id| {
                     let base = id.strip_prefix("sg:").unwrap_or(id);
-                    app.s.mats.contains_key(base) || app.s.texs.contains_key(base) || is_graph_dag(app, base)
+                    app.s.mats.contains_key(base) || app.s.texs.contains_key(base) || app.s.places.contains_key(base) || is_graph_dag(app, base)
                 });
                 let can_delete = delete_ids.iter().any(|id| deletable(app, id));
                 if menu_row(app, ui, can_delete, "Delete") {
@@ -1863,7 +2039,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                             let _ = app.run_mel("create material", &format!("shadingNode -asShader {};", t.ty));
                             if let Some(id) = app.s.mats.keys().last().cloned() {
                                 place_new_node(app, &id, None);
-                                app.windows_state.hs_selected = Some(id);
+                                select_graph_node(app, &id, false);
                             }
                         }
                     }
@@ -1874,9 +2050,14 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                             let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {};", t.ty));
                             if let Some(id) = app.s.texs.keys().last().cloned() {
                                 place_new_node(app, &id, None);
-                                app.windows_state.hs_selected = Some(id);
+                                select_graph_node(app, &id, false);
                             }
                         }
+                    }
+                });
+                ui.menu_button("Utility", |ui| {
+                    if crate::menus::menu_item(app, ui, "Place 2D Texture") {
+                        create_place_node(app, None);
                     }
                 });
                 ui.menu_button("Lights", |ui| {
@@ -1984,7 +2165,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 let _ = app.run_mel("create material", &format!("shadingNode -asShader {};", t.ty));
                 if let Some(id) = app.s.mats.keys().last().cloned() {
                     place_new_node(app, &id, None);
-                    app.windows_state.hs_selected = Some(id);
+                    select_graph_node(app, &id, false);
                 }
             }
         }
@@ -1998,8 +2179,15 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {};", t.ty));
                 if let Some(id) = app.s.texs.keys().last().cloned() {
                     place_new_node(app, &id, None);
-                    app.windows_state.hs_selected = Some(id);
+                    select_graph_node(app, &id, false);
                 }
+            }
+        }
+        ui.separator();
+        if create_filter.is_empty() || "place 2d texture".contains(&create_filter) {
+            if ui.small_button("Place 2D Texture").on_hover_text("Create a place2dTexture utility").clicked() {
+                ui.ctx().memory_mut(|m| m.stop_text_input());
+                create_place_node(app, None);
             }
         }
         ui.separator();
@@ -2009,6 +2197,12 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             if ui.small_button(*label).on_hover_text(format!("Create a {label}")).clicked() {
                 create_light_node(app, ty);
+            }
+        }
+        ui.separator();
+        if create_filter.is_empty() || "camera".contains(&create_filter) {
+            if ui.small_button("Camera").on_hover_text("Create a camera").clicked() {
+                create_camera_node(app);
             }
         }
     });
@@ -2595,6 +2789,8 @@ fn property_header(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
     } else if let Some(t) = app.s.texs.get(id) {
         let label = inca_core::materials::tex_type(&t.ty).map(|x| x.label).unwrap_or(&t.ty).to_string();
         (t.name.clone(), label, texture_icon(&t.ty).to_string(), true)
+    } else if let Some(p) = app.s.places.get(id) {
+        (p.name.clone(), "place2dTexture".into(), "hypershade".into(), false)
     } else if let Some(n) = app.s.node(id) {
         let (ty, icon) = match &n.shape {
             Shape::Light(l) => (l.ty.clone(), l.ty.clone()),
@@ -2682,8 +2878,7 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
                 m.maps.retain(|_, v| v.as_str() != Some(id.as_str()));
                 m.map_outs.retain(|slot, _| m.maps.contains_key(slot));
             }
-            app.s.texs.shift_remove(&id);
-            app.s.touch();
+            app.s.delete_texture(&id);
             app.windows_state.hs_selected = None;
             app.snode_sel = None;
         }
@@ -2699,6 +2894,8 @@ fn properties(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             }
         }
+    } else if app.s.places.contains_key(&id) {
+        crate::panels::place_fields_editor(app, ui, &id);
     } else if let Some(n) = app.s.node(&id) {
         let keys: Vec<String> = match &n.shape {
             Shape::Light(l) => l.attrs.keys().cloned().collect(),
@@ -2768,6 +2965,9 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     let nodes = graph_nodes(app);
     // positions (graph space) -> screen
     for (i, n) in nodes.iter().enumerate() {
+        if n.kind == Kind::Place2D {
+            continue;
+        }
         if !app.windows_state.hs.pos.contains_key(&n.id) {
             // Shading groups sit to the right of their material.
             let start = n
@@ -2776,6 +2976,33 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
                 .and_then(|mid| app.windows_state.hs.pos.get(mid).copied())
                 .map(|m| m + vec2(NODE_W + 36.0, 0.0))
                 .unwrap_or_else(|| default_pos(&nodes, i));
+            let p = place_avoiding(start, &nodes, i, &app.windows_state.hs.pos);
+            app.windows_state.hs.pos.insert(n.id.clone(), p);
+        }
+    }
+    // place2dTexture nodes sit immediately to the left of their texture.
+    for (i, n) in nodes.iter().enumerate() {
+        if n.kind != Kind::Place2D {
+            continue;
+        }
+        let existing = app.windows_state.hs.pos.get(&n.id).copied();
+        // The old default placed them in the far-left column; move those once.
+        let auto = existing.is_none_or(|p| (p.x + 220.0).abs() < 0.5);
+        if !auto {
+            continue;
+        }
+        let owner_pos = app
+            .s
+            .texs
+            .values()
+            .find(|t| t.place.as_deref() == Some(n.id.as_str()))
+            .and_then(|t| app.windows_state.hs.pos.get(&t.id).copied());
+        if let Some(tp) = owner_pos {
+            let start = tp + vec2(-(NODE_W + 36.0), 0.0);
+            let p = place_avoiding(start, &nodes, i, &app.windows_state.hs.pos);
+            app.windows_state.hs.pos.insert(n.id.clone(), p);
+        } else if existing.is_none() {
+            let start = default_pos(&nodes, i);
             let p = place_avoiding(start, &nodes, i, &app.windows_state.hs.pos);
             app.windows_state.hs.pos.insert(n.id.clone(), p);
         }
@@ -2841,6 +3068,16 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             ));
         }
     }
+    for (ti, t) in nodes.iter().enumerate().filter(|(_, n)| n.kind == Kind::Texture) {
+        let Some(place) = app.s.texs.get(&t.id).and_then(|t| t.place.clone()) else { continue };
+        let Some(pi) = find(&place) else { continue };
+        wires.push((
+            ConnWire::Place { place, tex: t.id.clone() },
+            out_port_or_edge(&nodes[pi], rects[pi], "outUV", zoom),
+            in_port_or_edge(t, rects[ti], "uvCoord", zoom),
+            Color32::from_rgb(230, 170, 70),
+        ));
+    }
     let hover_wire = pointer.filter(|q| rect.contains(*q) && !rects.iter().any(|r| r.contains(*q))).and_then(|q| {
         let mut best: Option<(f32, usize)> = None;
         for (i, (_, a, b, _)) in wires.iter().enumerate() {
@@ -2862,7 +3099,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     // ---- nodes
     let font = egui::FontId::proportional(11.0 * zoom.clamp(0.6, 1.4));
     let wire_src = wire.as_ref().map(|w| match w {
-        Wire::Tex(t, _) | Wire::Mat(t) => t.as_str(),
+        Wire::Tex(t, _) | Wire::Mat(t) | Wire::Place(t) => t.as_str(),
     });
     let mut hovered_port: Option<(usize, Option<usize>)> = None; // (node, input index or None = body)
     for &i in &order {
@@ -2876,21 +3113,42 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         let accepts = wire.as_ref().is_none_or(|w| n.inputs.iter().enumerate().any(|(si, _)| wire_compatible(w, n, Some(si))) || wire_compatible(w, n, None));
         let inactive = wire.is_some() && !is_source && !accepts;
         let target_node = drop_target.is_some_and(|(ti, _)| ti == i);
-        let head = match n.kind {
-            Kind::Texture => Color32::from_rgb(120, 90, 50),
-            Kind::Material => Color32::from_rgb(60, 95, 130),
-            Kind::ShadingGroup => Color32::from_rgb(79, 91, 69),
-            Kind::Dag | Kind::Object => Color32::from_rgb(70, 110, 70),
+        // Maya-style: the name floats above a rounded, type-coloured body.
+        let (fill, border) = match n.kind {
+            Kind::Texture => (Color32::from_rgb(78, 78, 78), Color32::from_rgb(120, 120, 120)),
+            Kind::Material => (Color32::from_rgb(90, 90, 90), Color32::from_rgb(138, 138, 138)),
+            Kind::ShadingGroup => (Color32::from_rgb(38, 58, 132), Color32::from_rgb(92, 122, 200)),
+            Kind::Place2D => (Color32::from_rgb(86, 64, 140), Color32::from_rgb(134, 106, 190)),
+            Kind::Dag | Kind::Object => (Color32::from_rgb(56, 92, 64), Color32::from_rgb(104, 152, 112)),
         };
-        let head = if inactive { head.gamma_multiply(0.45) } else { head };
-        painter.rect_filled(r, 4.0, if inactive { Color32::from_rgb(44, 44, 44) } else { Color32::from_rgb(58, 58, 58) });
-        painter.rect_filled(Rect::from_min_size(r.min, vec2(r.width(), HEAD_H * zoom)), 4.0, head);
+        let (fill, border) = if inactive {
+            (fill.gamma_multiply(0.55), border.gamma_multiply(0.45))
+        } else {
+            (fill, border)
+        };
+        let body = Rect::from_min_max(r.min + vec2(0.0, HEAD_H * zoom), r.max);
+        painter.rect_filled(body, 5.0, fill);
+        painter.rect_stroke(body, 5.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
         if target_node {
-            painter.rect_stroke(r, 4.0, Stroke::new(2.0, Color32::from_rgb(255, 230, 80)), egui::StrokeKind::Outside);
+            painter.rect_stroke(body, 5.0, Stroke::new(2.0, Color32::from_rgb(255, 230, 80)), egui::StrokeKind::Outside);
         } else if sel {
-            painter.rect_stroke(r, 4.0, Stroke::new(2.0, theme::HI), egui::StrokeKind::Outside);
+            // Maya uses green for selection; red is reserved for the solo indicator.
+            painter.rect_stroke(body, 5.0, Stroke::new(2.0, Color32::from_rgb(80, 200, 90)), egui::StrokeKind::Outside);
         }
-        painter.text(r.min + vec2(6.0, HEAD_H * 0.5 * zoom), egui::Align2::LEFT_CENTER, &n.name, font.clone(), if inactive { Color32::from_gray(120) } else { Color32::WHITE });
+        let title_col = if inactive {
+            Color32::from_gray(120)
+        } else if sel {
+            Color32::from_rgb(90, 210, 100)
+        } else {
+            Color32::from_rgb(225, 225, 225)
+        };
+        painter.text(
+            r.min + vec2(6.0, HEAD_H * 0.5 * zoom),
+            egui::Align2::LEFT_CENTER,
+            &n.name,
+            font.clone(),
+            title_col,
+        );
         if n.kind != Kind::Object && n.swatches {
             let sr = Rect::from_min_size(r.min + vec2(6.0, (HEAD_H + 3.0) * zoom), vec2(SWATCH, SWATCH) * zoom);
             if let Some(t) = swatch(app, &ctx, &n.id) {
@@ -2934,14 +3192,23 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             } else {
                 Color32::from_gray(150)
             };
-            painter.circle_filled(p, if target { 5.5 * zoom } else { 4.0 * zoom }, col);
-            painter.text(p + vec2(8.0 * zoom, 0.0), egui::Align2::LEFT_CENTER, inca_core::ops::nice_name(slot), font.clone(), if wire.is_some() && !compatible { Color32::from_gray(80) } else { theme::TEXT_DIM });
+            let rad = if target { 5.5 * zoom } else { 4.5 * zoom };
+            painter.circle_filled(p, rad, col);
+            painter.circle_stroke(p, rad, Stroke::new(1.0, Color32::from_rgb(28, 28, 28)));
+            painter.text(
+                p + vec2(8.0 * zoom, 0.0),
+                egui::Align2::LEFT_CENTER,
+                inca_core::ops::nice_name(slot),
+                font.clone(),
+                if wire.is_some() && !compatible { Color32::from_gray(80) } else { Color32::from_rgb(215, 215, 215) },
+            );
         }
         for (oi, port) in n.outputs.iter().enumerate() {
             let p = out_port_pos(n, r, oi, zoom);
             let source_out = match &wire {
                 Some(Wire::Tex(t, wi)) => *t == n.id && *wi == oi,
                 Some(Wire::Mat(t)) => *t == n.id && oi == 0,
+                Some(Wire::Place(t)) => *t == n.id && oi == 0,
                 None => false,
             };
             let alpha = port == "outAlpha";
@@ -2952,8 +3219,16 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             } else {
                 Color32::from_rgb(230, 200, 90)
             };
-            painter.circle_filled(p, if source_out { 5.5 * zoom } else { 4.5 * zoom }, col);
-            painter.text(p - vec2(8.0 * zoom, 0.0), egui::Align2::RIGHT_CENTER, inca_core::ops::nice_name(port), font.clone(), if wire.is_some() && !source_out { Color32::from_gray(80) } else { theme::TEXT_DIM });
+            let rad = if source_out { 5.5 * zoom } else { 4.5 * zoom };
+            painter.circle_filled(p, rad, col);
+            painter.circle_stroke(p, rad, Stroke::new(1.0, Color32::from_rgb(28, 28, 28)));
+            painter.text(
+                p - vec2(8.0 * zoom, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                inca_core::ops::nice_name(port),
+                font.clone(),
+                if wire.is_some() && !source_out { Color32::from_gray(80) } else { Color32::from_rgb(215, 215, 215) },
+            );
         }
     }
     // Hit-test back-to-front so the node drawn on top (later in the list) wins.
@@ -2988,12 +3263,24 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
                 app.windows_state.hs.wire = match n.kind {
                     Kind::Texture => Some(Wire::Tex(n.id.clone(), oi)),
                     Kind::Material => Some(Wire::Mat(n.id.clone())),
+                    Kind::Place2D if oi == 0 => Some(Wire::Place(n.id.clone())),
                     _ => None,
                 };
             } else if let Some((i, si)) = in_hit {
                 let mid = nodes[i].id.clone();
                 let attr = nodes[i].inputs[si].clone();
-                if let Some(tex) = app.s.mats.get(&mid).and_then(|m| m.maps.get(&attr)).and_then(|v| v.as_str()).map(String::from) {
+                if nodes[i].kind == Kind::Texture && attr == "uvCoord" {
+                    if let Some(place) = app.s.texs.get(&mid).and_then(|t| t.place.clone()) {
+                        app.s.checkpoint("disconnect place2dTexture");
+                        if let Some(t) = app.s.texs.get_mut(&mid) {
+                            t.place = None;
+                        }
+                        keep_place_visible(app, &place);
+                        app.s.touch();
+                        // Pick the cable up from the place node so it can be dropped elsewhere.
+                        app.windows_state.hs.wire = Some(Wire::Place(place));
+                    }
+                } else if let Some(tex) = app.s.mats.get(&mid).and_then(|m| m.maps.get(&attr)).and_then(|v| v.as_str()).map(String::from) {
                     let out = if app.s.mats[&mid].map_out(&attr) == "outAlpha" { 1 } else { 0 };
                     app.s.checkpoint("disconnect texture");
                     app.s.mats.get_mut(&mid).unwrap().clear_map(&attr);
@@ -3003,7 +3290,22 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             } else if let Some(i) = order.iter().rev().copied().find(|&i| rects[i].contains(p)) {
                 let id = nodes[i].id.clone();
-                select_graph_node(app, &id, additive);
+                // Houdini-style tree drag: Shift takes the upstream nodes, Ctrl the downstream ones.
+                let tree = ctx.input(|i| {
+                    if i.modifiers.shift {
+                        Some(false)
+                    } else if i.modifiers.ctrl || i.modifiers.command {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(downstream) = tree {
+                    select_graph_node(app, &id, false);
+                    app.windows_state.hs.graph_sel = graph_tree(app, &nodes, &id, downstream);
+                } else {
+                    select_graph_node(app, &id, additive);
+                }
                 // Raise the whole dragged selection, with the grabbed node on top.
                 let selected: Vec<String> = app.windows_state.hs.graph_sel.iter().cloned().collect();
                 for sid in &selected {
@@ -3071,6 +3373,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         let src = match &w {
             Wire::Tex(t, oi) => find(t).map(|i| out_port_or_edge(&nodes[i], rects[i], if *oi == 1 { "outAlpha" } else { "outColor" }, zoom)),
             Wire::Mat(t) => find(t).map(|i| out_port_or_edge(&nodes[i], rects[i], "outColor", zoom)),
+            Wire::Place(t) => find(t).map(|i| out_port_or_edge(&nodes[i], rects[i], "outUV", zoom)),
         };
         if let Some(a) = src {
             let end = match drop_target {
@@ -3080,6 +3383,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             };
             let col = match &w {
                 Wire::Tex(_, 1) => Color32::from_rgb(127, 208, 232),
+                Wire::Place(_) => Color32::from_rgb(230, 170, 70),
                 _ => Color32::from_rgb(255, 230, 120),
             };
             bezier(&painter, a, end, col, 1.5);
@@ -3103,6 +3407,18 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
                 (Wire::Mat(m), Some((ni, _))) if nodes[ni].kind == Kind::Object => {
                     let name = app.s.mats[&m].name.clone();
                     let _ = app.run_mel("assign material", &format!("select -r {}; hyperShade -assign {name};", nodes[ni].name));
+                }
+                (Wire::Place(p), Some((ni, _))) if nodes[ni].kind == Kind::Texture => {
+                    let tex = nodes[ni].id.clone();
+                    let old = app.s.texs.get(&tex).and_then(|t| t.place.clone());
+                    app.s.checkpoint("connect place2dTexture");
+                    if let Some(t) = app.s.texs.get_mut(&tex) {
+                        t.place = Some(p.clone());
+                    }
+                    if let Some(old) = old.filter(|o| *o != p) {
+                        keep_place_visible(app, &old);
+                    }
+                    app.s.touch();
                 }
                 (Wire::Mat(m), Some((ni, _))) if nodes[ni].kind == Kind::ShadingGroup => {
                     let target = nodes[ni].id.strip_prefix("sg:").unwrap_or("").to_string();
@@ -3133,12 +3449,14 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         app.windows_state.hs.drag_start = None;
         if app.windows_state.hs.marquee.take().is_some() {
-            app.windows_state.hs_selected = order
+            let lead = order
                 .iter()
                 .rev()
                 .copied()
                 .find(|&i| app.windows_state.hs.graph_sel.contains(&nodes[i].id))
                 .map(|i| nodes[i].id.strip_prefix("sg:").unwrap_or(&nodes[i].id).to_string());
+            app.windows_state.hs_selected = lead.clone();
+            app.snode_sel = lead.filter(|id| app.s.mats.contains_key(id) || app.s.texs.contains_key(id));
             app.windows_state.hs.marquee_base.clear();
         }
     }
@@ -3225,7 +3543,11 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         if let Some((i, Some(si))) = hovered_port {
             let mid = nodes[i].id.clone();
             let attr = nodes[i].inputs[si].clone();
-            if app.s.mats.get(&mid).is_some_and(|m| m.maps.contains_key(&attr)) {
+            if nodes[i].kind == Kind::Texture && attr == "uvCoord" {
+                if let Some(place) = app.s.texs.get(&mid).and_then(|t| t.place.clone()) {
+                    break_connection(app, &ConnWire::Place { place, tex: mid.clone() });
+                }
+            } else if app.s.mats.get(&mid).is_some_and(|m| m.maps.contains_key(&attr)) {
                 app.s.checkpoint("disconnect texture");
                 app.s.mats.get_mut(&mid).unwrap().clear_map(&attr);
                 app.s.touch();

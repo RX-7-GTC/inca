@@ -190,19 +190,18 @@ struct Mat {
 
 #[derive(Clone)]
 enum TexSampler {
-    Proc(crate::materials::Texture),
-    Image { w: u32, h: u32, px: std::sync::Arc<Vec<[f32; 3]>>, repeat: (f64, f64), offset: (f64, f64), rot: f64 },
+    Proc { tex: crate::materials::Texture, place: Option<crate::materials::Place2D> },
+    Image { w: u32, h: u32, px: std::sync::Arc<Vec<[f32; 3]>>, place: Option<crate::materials::Place2D> },
 }
 
 impl TexSampler {
     fn sample(&self, uv: DVec2) -> Option<[f32; 3]> {
         match self {
-            TexSampler::Proc(t) => t.sample(uv.x, uv.y),
-            TexSampler::Image { w, h, px, repeat, offset, rot } => {
-                // the same three.js `setUvTransform` matrix as the viewport `UvXf`
-                let t = uv_transform(uv, *repeat, *offset, *rot);
-                let u = t.x.rem_euclid(1.0);
-                let v = (1.0 - t.y.rem_euclid(1.0)).clamp(0.0, 0.9999);
+            TexSampler::Proc { tex, place } => tex.sample(place.as_ref().map(|p| &p.attrs), uv.x, uv.y),
+            TexSampler::Image { w, h, px, place } => {
+                let (u, v) = crate::materials::place_uv(place.as_ref().map(|p| &p.attrs), uv.x, uv.y);
+                let u = u.rem_euclid(1.0);
+                let v = (1.0 - v.rem_euclid(1.0)).clamp(0.0, 0.9999);
                 let x = ((u * *w as f64) as u32).min(w - 1);
                 let y = ((v * *h as f64) as u32).min(h - 1);
                 px.get((y * w + x) as usize).copied()
@@ -212,6 +211,7 @@ impl TexSampler {
 }
 
 /// three.js `Matrix3.setUvTransform` with its default (0, 0) centre.
+#[allow(dead_code)]
 fn uv_transform(uv: DVec2, repeat: (f64, f64), offset: (f64, f64), rot: f64) -> DVec2 {
     let (s, c) = rot.sin_cos();
     DVec2::new(repeat.0 * (c * uv.x + s * uv.y) + offset.0, repeat.1 * (-s * uv.x + c * uv.y) + offset.1)
@@ -274,10 +274,12 @@ impl RenderScene {
                 if t.ty == "file" {
                     let path = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let raw = t.attrs.get("colorSpace").and_then(|v| v.as_str()) == Some("Raw");
-                    let r = (t.attrs.get("repeatU").and_then(|v| v.as_f64()).unwrap_or(1.0), t.attrs.get("repeatV").and_then(|v| v.as_f64()).unwrap_or(1.0));
-                    let o = (t.attrs.get("offsetU").and_then(|v| v.as_f64()).unwrap_or(0.0), t.attrs.get("offsetV").and_then(|v| v.as_f64()).unwrap_or(0.0));
-                    let rot = t.attrs.get("rotateUV").and_then(|v| v.as_f64()).unwrap_or(0.0).to_radians();
-                    let key = format!("{path}|{raw}|{r:?}|{o:?}|{rot}");
+                    let place = s.place_of(t);
+                    let key = format!(
+                        "{path}|{raw}|{}|{}",
+                        serde_json::to_string(&t.attrs).unwrap_or_default(),
+                        place.map(|p| serde_json::to_string(&p.attrs).unwrap_or_default()).unwrap_or_default()
+                    );
                     if let Some(c) = image_cache.get(&key) {
                         return Some(c.clone());
                     }
@@ -303,11 +305,11 @@ impl RenderScene {
                         }
                     };
                     let px: Vec<[f32; 3]> = img.pixels().map(|p| [decode(p[0]), decode(p[1]), decode(p[2])]).collect();
-                    let ts = TexSampler::Image { w, h, px: std::sync::Arc::new(px), repeat: r, offset: o, rot };
+                    let ts = TexSampler::Image { w, h, px: std::sync::Arc::new(px), place: place.cloned() };
                     image_cache.insert(key, ts.clone());
                     Some(ts)
                 } else {
-                    Some(TexSampler::Proc(t.clone()))
+                    Some(TexSampler::Proc { tex: t.clone(), place: s.place_of(t).cloned() })
                 }
             });
             mats.push(Mat { pbr, tex });

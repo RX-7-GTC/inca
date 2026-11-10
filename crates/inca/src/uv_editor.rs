@@ -439,9 +439,10 @@ fn image_texture(app: &mut IncaApp, ctx: &egui::Context) -> Option<egui::Texture
     let m = app.s.mats.get(&mid)?;
     let tid = m.maps.get(m.color_attr())?.as_str()?;
     let t = app.s.texs.get(tid)?;
+    let place = app.s.place_of(t);
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (tid, serde_json::to_string(&t.attrs).unwrap_or_default()).hash(&mut h);
+    (tid, serde_json::to_string(&t.attrs).unwrap_or_default(), place.map(|p| serde_json::to_string(&p.attrs).unwrap_or_default())).hash(&mut h);
     let key = h.finish();
     if let Some((k, tex)) = &app.uv_editor.image_tex {
         if *k == key {
@@ -450,14 +451,18 @@ fn image_texture(app: &mut IncaApp, ctx: &egui::Context) -> Option<egui::Texture
     }
     // Procedural previews use the viewport's texture size; 512² fractal terrain was
     // too slow to regenerate on every slider change.
-    let size = if t.ty == "file" { 512 } else { inca_core::materials::VIEW_TEX_SIZE as usize };
-    let px = match inca_core::materials::texture_swatch(t, size) {
-        Some(p) => p,
-        None => {
-            let path = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("");
-            let img = image::open(path).ok()?.to_rgba8();
-            image::imageops::resize(&img, size as u32, size as u32, image::imageops::FilterType::Triangle).into_raw()
+    let size = inca_core::materials::VIEW_TEX_SIZE as usize;
+    let px = if t.ty == "file" {
+        // The viewport image is GPU-oriented (v=0 at the bottom); flip it for display.
+        let src = inca_core::materials::viewport_texture_pixels(t, place.map(|p| &p.attrs), app.s.project.as_deref())?;
+        let row = size * 4;
+        let mut flipped = vec![0u8; src.len()];
+        for y in 0..size {
+            flipped[y * row..(y + 1) * row].copy_from_slice(&src[(size - 1 - y) * row..(size - y) * row]);
         }
+        flipped
+    } else {
+        inca_core::materials::texture_swatch(t, place.map(|p| &p.attrs), size)?
     };
     let tex = ctx.load_texture("uvImage", egui::ColorImage::from_rgba_unmultiplied([size, size], &px), egui::TextureOptions::LINEAR);
     let tid = tex.id();

@@ -27,17 +27,17 @@ pub struct TexType {
 }
 
 pub static TEX_TYPES: &[TexType] = &[
-    TexType { ty: "file", label: "File", defaults: || json!({ "fileTextureName": "", "repeatU": 1, "repeatV": 1, "offsetU": 0, "offsetV": 0, "rotateUV": 0, "colorSpace": "sRGB" }) },
-    TexType { ty: "checker", label: "Checker", defaults: || json!({ "color1": [1, 1, 1], "color2": [0, 0, 0], "repeatU": 4, "repeatV": 4, "contrast": 1 }) },
-    TexType { ty: "ramp", label: "Ramp", defaults: || json!({ "type": "V Ramp", "colors": [[0, [1, 0, 0]], [0.5, [0, 1, 0]], [1, [0, 0, 1]]], "repeatU": 1, "repeatV": 1 }) },
-    TexType { ty: "noise", label: "Noise", defaults: || json!({ "color1": [1, 1, 1], "color2": [0, 0, 0], "frequency": 8, "amplitude": 1, "repeatU": 1, "repeatV": 1 }) },
-    TexType { ty: "grid", label: "Grid", defaults: || json!({ "lineColor": [1, 1, 1], "fillerColor": [0, 0, 0], "uWidth": 0.1, "vWidth": 0.1, "repeatU": 4, "repeatV": 4 }) },
-    TexType { ty: "cloth", label: "Cloth", defaults: || json!({ "uColor": [0.8, 0.75, 0.7], "vColor": [0.55, 0.5, 0.45], "gapColor": [0.15, 0.12, 0.1], "uWidth": 0.75, "vWidth": 0.75, "uWave": 0, "vWave": 0, "randomness": 0, "widthSpread": 0, "brightSpread": 0, "repeatU": 4, "repeatV": 4 }) },
-    TexType { ty: "fractal", label: "Fractal", defaults: || json!({ "amplitude": 1, "ratio": 0.707, "threshold": 0, "levelMax": 9, "frequencyRatio": 2, "bias": 0, "repeatU": 1, "repeatV": 1 }) },
-    TexType { ty: "mountain", label: "Mountain", defaults: || json!({ "snowColor": [1, 1, 1], "rockColor": [0.262, 0.102, 0], "amplitude": 1, "snowRoughness": 0.4, "rockRoughness": 0.707, "boundary": 1, "snowAltitude": 0.5, "snowDropoff": 2, "snowSlope": 0.8, "depthMax": 20, "repeatU": 1, "repeatV": 1 }) },
-    TexType { ty: "water", label: "Water", defaults: || json!({ "numberOfWaves": 8, "waveTime": 0, "waveVelocity": 1, "waveAmplitude": 0.05, "waveFrequency": 4, "subWaveFrequency": 0.125, "smoothness": 2, "windU": 1, "windV": 0, "repeatU": 1, "repeatV": 1 }) },
-    TexType { ty: "bulge", label: "Bulge", defaults: || json!({ "uWidth": 0.1, "vWidth": 0.1, "repeatU": 1, "repeatV": 1 }) },
-    TexType { ty: "ocean", label: "Ocean", defaults: || json!({ "colorMode": "Wave Height", "numFrequencies": 3, "waveLengthMin": 0.3, "waveLengthMax": 4, "waveHeight": 0.5, "waveTurbulence": 0, "wavePeaking": 0, "waveDirSpread": 0.2, "windU": 1, "windV": 0, "scale": 10, "time": 0, "observerSpeed": 0, "foamThreshold": 0.51, "foamEmission": 0, "repeatU": 1, "repeatV": 1 }) },
+    TexType { ty: "file", label: "File", defaults: || json!({ "fileTextureName": "", "colorSpace": "sRGB" }) },
+    TexType { ty: "checker", label: "Checker", defaults: || json!({ "color1": [1, 1, 1], "color2": [0, 0, 0], "contrast": 1 }) },
+    TexType { ty: "ramp", label: "Ramp", defaults: || json!({ "type": "V Ramp", "colors": [[0, [1, 0, 0]], [0.5, [0, 1, 0]], [1, [0, 0, 1]]] }) },
+    TexType { ty: "noise", label: "Noise", defaults: || json!({ "color1": [1, 1, 1], "color2": [0, 0, 0], "frequency": 8, "amplitude": 1 }) },
+    TexType { ty: "grid", label: "Grid", defaults: || json!({ "lineColor": [1, 1, 1], "fillerColor": [0, 0, 0], "uWidth": 0.1, "vWidth": 0.1 }) },
+    TexType { ty: "cloth", label: "Cloth", defaults: || json!({ "uColor": [0.8, 0.75, 0.7], "vColor": [0.55, 0.5, 0.45], "gapColor": [0.15, 0.12, 0.1], "uWidth": 0.75, "vWidth": 0.75, "uWave": 0, "vWave": 0, "randomness": 0, "widthSpread": 0, "brightSpread": 0 }) },
+    TexType { ty: "fractal", label: "Fractal", defaults: || json!({ "amplitude": 1, "ratio": 0.707, "threshold": 0, "levelMax": 9, "frequencyRatio": 2, "bias": 0 }) },
+    TexType { ty: "mountain", label: "Mountain", defaults: || json!({ "snowColor": [1, 1, 1], "rockColor": [0.262, 0.102, 0], "amplitude": 1, "snowRoughness": 0.4, "rockRoughness": 0.707, "boundary": 1, "snowAltitude": 0.5, "snowDropoff": 2, "snowSlope": 0.8, "depthMax": 20 }) },
+    TexType { ty: "water", label: "Water", defaults: || json!({ "numberOfWaves": 8, "waveTime": 0, "waveVelocity": 1, "waveAmplitude": 0.05, "waveFrequency": 4, "subWaveFrequency": 0.125, "smoothness": 2, "windU": 1, "windV": 0 }) },
+    TexType { ty: "bulge", label: "Bulge", defaults: || json!({ "uWidth": 0.1, "vWidth": 0.1 }) },
+    TexType { ty: "ocean", label: "Ocean", defaults: || json!({ "colorMode": "Wave Height", "numFrequencies": 3, "waveLengthMin": 0.3, "waveLengthMax": 4, "waveHeight": 0.5, "waveTurbulence": 0, "wavePeaking": 0, "waveDirSpread": 0.2, "windU": 1, "windV": 0, "scale": 10, "time": 0, "observerSpeed": 0, "foamThreshold": 0.51, "foamEmission": 0 }) },
 ];
 
 pub fn mat_type(ty: &str) -> &'static MatType {
@@ -71,6 +71,18 @@ pub struct Texture {
     pub ty: String,
     #[serde(default)]
     pub attrs: Params,
+    /// Connected place2dTexture utility node id.
+    #[serde(default)]
+    pub place: Option<String>,
+}
+
+/// Maya's place2dTexture utility node: shared placement for one 2D texture.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Place2D {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub attrs: Params,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -78,6 +90,8 @@ pub struct Texture {
 pub struct ShadingData {
     pub mats: Vec<Material>,
     pub texs: Vec<Texture>,
+    #[serde(default)]
+    pub places: Vec<Place2D>,
     pub default_mat_id: Option<String>,
 }
 
@@ -88,9 +102,30 @@ pub fn defaults_for(ty: &str) -> Params {
     }
 }
 pub fn tex_defaults_for(ty: &str) -> Params {
-    match tex_type(ty).map(|t| (t.defaults)()) {
+    let p = match tex_type(ty).map(|t| (t.defaults)()) {
         Some(Value::Object(m)) => m,
         _ => Params::new(),
+    };
+    p
+}
+
+/// Maya's shared 2D placement attributes (normally on place2dTexture).
+pub fn add_placement_defaults(p: &mut Params) {
+    for (k, v) in [
+        ("coverageU", json!(1.0)),
+        ("coverageV", json!(1.0)),
+        ("translateFrameU", json!(0.0)),
+        ("translateFrameV", json!(0.0)),
+        ("rotateFrame", json!(0.0)),
+        ("mirrorU", json!(false)),
+        ("mirrorV", json!(false)),
+        ("wrapU", json!("Repeat")),
+        ("wrapV", json!("Repeat")),
+        ("stagger", json!(false)),
+        ("noiseU", json!(0.0)),
+        ("noiseV", json!(0.0)),
+    ] {
+        p.entry(k.to_string()).or_insert(v);
     }
 }
 
@@ -233,13 +268,120 @@ impl Material {
     }
 }
 
+impl Place2D {
+    pub fn new(id: String, name: String, texture_type: &str) -> Self {
+        let mut attrs = Params::new();
+        add_placement_defaults(&mut attrs);
+        // Preserve the old default tiling of the checker/grid/cloth textures.
+        let repeat = if matches!(texture_type, "checker" | "grid" | "cloth") { 4.0 } else { 1.0 };
+        attrs.insert("repeatU".into(), json!(repeat));
+        attrs.insert("repeatV".into(), json!(repeat));
+        Place2D { id, name, attrs }
+    }
+}
+
+/// Placement attributes that older scenes stored directly on the texture node.
+pub const PLACEMENT_KEYS: &[&str] = &[
+    "coverageU", "coverageV", "translateFrameU", "translateFrameV", "rotateFrame",
+    "mirrorU", "mirrorV", "wrapU", "wrapV", "repeatU", "repeatV", "offsetU", "offsetV",
+    "rotateUV", "stagger", "noiseU", "noiseV",
+];
+
+/// Move legacy placement attrs off a texture node into its place2dTexture attrs.
+pub fn take_placement_attrs(tex_attrs: &mut Params) -> Params {
+    let mut out = Params::new();
+    for k in PLACEMENT_KEYS {
+        if let Some(v) = tex_attrs.remove(*k) {
+            out.insert((*k).to_string(), v);
+        }
+    }
+    out
+}
+
+/// Map output UV to source UV through a place2dTexture node's controls.
+pub fn place_uv(a: Option<&Params>, u: f64, v: f64) -> (f64, f64) {
+    let val = |k: &str| a.and_then(|a| a.get(k));
+    let f = |k: &str, d: f64| val(k).and_then(|x| x.as_f64()).unwrap_or(d);
+    let flag = |k: &str| val(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    let mode = |k: &str| val(k).and_then(|x| x.as_str()).unwrap_or("Repeat");
+    let rotate = |x: f64, y: f64, deg: f64| {
+        if deg == 0.0 {
+            (x, y)
+        } else {
+            let (s, c) = (-deg).to_radians().sin_cos();
+            (x * c - y * s, x * s + y * c)
+        }
+    };
+    let mut u = u;
+    let mut v = v;
+    let frame_rot = f("rotateFrame", 0.0);
+    if frame_rot != 0.0 {
+        let (x, y) = rotate(u - 0.5, v - 0.5, frame_rot);
+        u = x + 0.5;
+        v = y + 0.5;
+    }
+    let cu = f("coverageU", 1.0).clamp(0.001, 1.0);
+    let cv = f("coverageV", 1.0).clamp(0.001, 1.0);
+    u = 0.5 + (u - 0.5) / cu;
+    v = 0.5 + (v - 0.5) / cv;
+    u += f("translateFrameU", 0.0);
+    v += f("translateFrameV", 0.0);
+    let uv_rot = f("rotateUV", 0.0);
+    if uv_rot != 0.0 {
+        let (x, y) = rotate(u - 0.5, v - 0.5, uv_rot);
+        u = x + 0.5;
+        v = y + 0.5;
+    }
+    u = u * f("repeatU", 1.0) + f("offsetU", 0.0);
+    v = v * f("repeatV", 1.0) + f("offsetV", 0.0);
+    if flag("stagger") && (v.floor() as i64).rem_euclid(2) == 1 {
+        u += 0.5;
+    }
+    if flag("mirrorU") {
+        let cell = u.floor();
+        if (cell as i64).rem_euclid(2) == 1 {
+            u = cell + 1.0 - (u - cell);
+        }
+    }
+    if flag("mirrorV") {
+        let cell = v.floor();
+        if (cell as i64).rem_euclid(2) == 1 {
+            v = cell + 1.0 - (v - cell);
+        }
+    }
+    let wrap = |x: f64, mode: &str| match mode {
+        "Clamp" => x.clamp(0.0, 1.0),
+        "Mirror" => {
+            let t = x.rem_euclid(2.0);
+            if t > 1.0 { 2.0 - t } else { t }
+        }
+        _ => x.rem_euclid(1.0),
+    };
+    let wu = mode("wrapU");
+    let wv = mode("wrapV");
+    // Repeat keeps the unwrapped cell coordinates so Checker/Cloth keep tiling;
+    // Clamp and Mirror genuinely change the lookup domain.
+    if wu != "Repeat" {
+        u = wrap(u, wu);
+    }
+    if wv != "Repeat" {
+        v = wrap(v, wv);
+    }
+    let nu = f("noiseU", 0.0);
+    let nv = f("noiseV", 0.0);
+    if nu > 0.0 || nv > 0.0 {
+        let cell = (u.floor() * 7.0 + v.floor() * 13.0) as i64;
+        u += (hash2(cell, cell + 17) - 0.5) * nu;
+        v += (hash2(cell + 3, cell + 29) - 0.5) * nv;
+    }
+    (u, v)
+}
+
 impl Texture {
     /// Evaluate procedural textures at uv; file textures return None (handled by the caller with the image).
-    pub fn sample(&self, u: f64, v: f64) -> Option<[f32; 3]> {
+    pub fn sample(&self, place: Option<&Params>, u: f64, v: f64) -> Option<[f32; 3]> {
         let a = &self.attrs;
-        let ru = a.get("repeatU").and_then(|x| x.as_f64()).unwrap_or(1.0);
-        let rv = a.get("repeatV").and_then(|x| x.as_f64()).unwrap_or(1.0);
-        let (u, v) = (u * ru, v * rv);
+        let (u, v) = place_uv(place, u, v);
         let mix = |c1: [f32; 3], c2: [f32; 3], t: f32| [c1[0] + (c2[0] - c1[0]) * t, c1[1] + (c2[1] - c1[1]) * t, c1[2] + (c2[2] - c1[2]) * t];
         match self.ty.as_str() {
             "checker" => {
@@ -472,10 +614,35 @@ fn srgb_byte(x: f32) -> u8 {
     (s * 255.0 + 0.5) as u8
 }
 
+/// Bilinear sample of a top-down RGBA image at a bottom-up (v=0 at bottom) texture coordinate.
+fn sample_image(img: &image::RgbaImage, u: f64, v: f64) -> [u8; 4] {
+    let w = img.width() as f64;
+    let h = img.height() as f64;
+    let x = u.rem_euclid(1.0) * w - 0.5;
+    let y = (1.0 - v.rem_euclid(1.0)) * h - 0.5;
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
+    let at = |xx: i64, yy: i64| {
+        let xx = xx.clamp(0, img.width() as i64 - 1) as u32;
+        let yy = yy.clamp(0, img.height() as i64 - 1) as u32;
+        img.get_pixel(xx, yy).0
+    };
+    let mut out = [0u8; 4];
+    for c in 0..4 {
+        let a = at(x0 as i64, y0 as i64)[c] as f32;
+        let b = at(x0 as i64 + 1, y0 as i64)[c] as f32;
+        let d = at(x0 as i64, y0 as i64 + 1)[c] as f32;
+        let e = at(x0 as i64 + 1, y0 as i64 + 1)[c] as f32;
+        let top = a + (b - a) * fx;
+        let bot = d + (e - d) * fx;
+        out[c] = (top + (bot - top) * fy).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
 /// RGBA8 sRGB pixels for the viewport: procedural textures rendered at `VIEW_TEX_SIZE²`
-/// (the JS `proceduralCanvas`), file textures resized to the same size. The image is flipped
-/// vertically so texture v=0 reads the bottom row like three.js `flipY`.
-pub fn viewport_texture_pixels(t: &Texture, project: Option<&str>) -> Option<Vec<u8>> {
+/// (the JS `proceduralCanvas`), file textures sampled through the shared 2D placement.
+pub fn viewport_texture_pixels(t: &Texture, place: Option<&Params>, project: Option<&str>) -> Option<Vec<u8>> {
     let size = VIEW_TEX_SIZE;
     if t.ty == "file" {
         let name = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("");
@@ -491,19 +658,24 @@ pub fn viewport_texture_pixels(t: &Texture, project: Option<&str>) -> Option<Vec
         return match img {
             Some(img) => {
                 let img = img.to_rgba8();
-                let mut img = image::imageops::resize(&img, size, size, image::imageops::FilterType::Triangle);
-                // `colorSpace: Raw` (JS `THREE.NoColorSpace`): the stored bytes are linear,
-                // but the texture array is sRGB, so pre-encode them to keep the sampled
-                // values linear.
-                if t.attrs.get("colorSpace").and_then(|v| v.as_str()) == Some("Raw") {
-                    for c in img.chunks_mut(4) {
-                        for b in &mut c[..3] {
-                            let v = *b as f32 / 255.0;
-                            *b = srgb_byte(v);
+                let raw = t.attrs.get("colorSpace").and_then(|v| v.as_str()) == Some("Raw");
+                let mut out = vec![255u8; (size * size * 4) as usize];
+                for y in 0..size {
+                    for x in 0..size {
+                        let u = (x as f64 + 0.5) / size as f64;
+                        let v = (y as f64 + 0.5) / size as f64;
+                        let (su, sv) = place_uv(place, u, v);
+                        let px = sample_image(&img, su, sv);
+                        let k = ((y * size + x) * 4) as usize;
+                        for c in 0..3 {
+                            // `colorSpace: Raw` (JS `THREE.NoColorSpace`) bytes are linear;
+                            // pre-encode them for the sRGB texture array.
+                            out[k + c] = if raw { srgb_byte(px[c] as f32 / 255.0) } else { px[c] };
                         }
+                        out[k + 3] = px[3];
                     }
                 }
-                Some(image::imageops::flip_vertical(&img).into_raw())
+                Some(out)
             }
             // JS `solidCanvas([0.5, 0.5, 0.5])` while a file texture is missing
             None => {
@@ -522,7 +694,7 @@ pub fn viewport_texture_pixels(t: &Texture, project: Option<&str>) -> Option<Vec
         for x in 0..size {
             let u = (x as f64 + 0.5) / size as f64;
             let v = (y as f64 + 0.5) / size as f64;
-            let c = t.sample(u, v).unwrap_or([0.5, 0.5, 0.5]);
+            let c = t.sample(place, u, v).unwrap_or([0.5, 0.5, 0.5]);
             let k = ((y * size + x) * 4) as usize;
             out[k] = srgb_byte(c[0]);
             out[k + 1] = srgb_byte(c[1]);
@@ -534,7 +706,7 @@ pub fn viewport_texture_pixels(t: &Texture, project: Option<&str>) -> Option<Vec
 
 /// Linear RGBA height pixels for the viewport's 16-bit bump array. A 16-bit height map
 /// avoids the visible contour steps an 8-bit colour texture produces in bump shading.
-pub fn viewport_bump_pixels(t: &Texture, project: Option<&str>) -> Option<Vec<f32>> {
+pub fn viewport_bump_pixels(t: &Texture, place: Option<&Params>, project: Option<&str>) -> Option<Vec<f32>> {
     let size = VIEW_TEX_SIZE;
     let mut out = if t.ty == "file" {
         let name = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("");
@@ -547,7 +719,6 @@ pub fn viewport_bump_pixels(t: &Texture, project: Option<&str>) -> Option<Vec<f3
             Some(project.map(|pr| std::path::Path::new(pr).join(p)).unwrap_or_else(|| p.to_path_buf()))
         };
         let img = path.and_then(|p| image::open(p).ok())?.to_rgba8();
-        let img = image::imageops::resize(&img, size, size, image::imageops::FilterType::Triangle);
         let raw = t.attrs.get("colorSpace").and_then(|v| v.as_str()) == Some("Raw");
         let lin = |v: u8| {
             let x = v as f32 / 255.0;
@@ -560,8 +731,14 @@ pub fn viewport_bump_pixels(t: &Texture, project: Option<&str>) -> Option<Vec<f3
             }
         };
         let mut out = Vec::with_capacity((size * size * 4) as usize);
-        for px in img.pixels() {
-            out.extend_from_slice(&[lin(px[0]), lin(px[1]), lin(px[2]), px[3] as f32 / 255.0]);
+        for y in 0..size {
+            for x in 0..size {
+                let u = (x as f64 + 0.5) / size as f64;
+                let v = (y as f64 + 0.5) / size as f64;
+                let (su, sv) = place_uv(place, u, v);
+                let px = sample_image(&img, su, sv);
+                out.extend_from_slice(&[lin(px[0]), lin(px[1]), lin(px[2]), px[3] as f32 / 255.0]);
+            }
         }
         out
     } else {
@@ -569,7 +746,7 @@ pub fn viewport_bump_pixels(t: &Texture, project: Option<&str>) -> Option<Vec<f3
         for y in 0..size {
             for x in 0..size {
                 // Match `viewport_texture_pixels` row order exactly, so bump is not mirrored.
-                let c = t.sample((x as f64 + 0.5) / size as f64, (y as f64 + 0.5) / size as f64).unwrap_or([0.5; 3]);
+                let c = t.sample(place, (x as f64 + 0.5) / size as f64, (y as f64 + 0.5) / size as f64).unwrap_or([0.5; 3]);
                 out.extend_from_slice(&[c[0], c[1], c[2], 1.0]);
             }
         }
@@ -656,7 +833,7 @@ fn fractal_noise(x: f64, y: f64, octaves: u32, ratio: f64, frequency_ratio: f64)
 
 /// Hypershade swatch: an RGBA image of a lit sphere with the material (and the procedural
 /// texture on its colour slot, if any) over a dark checker background.
-pub fn swatch(m: &Material, color_tex: Option<&Texture>, size: usize) -> Vec<u8> {
+pub fn swatch(m: &Material, color_tex: Option<&Texture>, place: Option<&Params>, size: usize) -> Vec<u8> {
     let p = m.pbr();
     let light = glam::Vec3::new(-0.5, 0.6, 0.65).normalize();
     let fill = glam::Vec3::new(0.7, -0.2, 0.4).normalize();
@@ -678,7 +855,7 @@ pub fn swatch(m: &Material, color_tex: Option<&Texture>, size: usize) -> Vec<u8>
             if let Some(t) = color_tex {
                 let su = 0.5 + n.x.atan2(n.z) / std::f32::consts::TAU;
                 let sv = 0.5 + n.y.asin() / std::f32::consts::PI;
-                if let Some(c) = t.sample(su as f64, sv as f64) {
+                if let Some(c) = t.sample(place, su as f64, sv as f64) {
                     base = c;
                 }
             }
@@ -699,11 +876,11 @@ pub fn swatch(m: &Material, color_tex: Option<&Texture>, size: usize) -> Vec<u8>
 }
 
 /// Flat texture swatch (procedural textures; None for file textures).
-pub fn texture_swatch(t: &Texture, size: usize) -> Option<Vec<u8>> {
+pub fn texture_swatch(t: &Texture, place: Option<&Params>, size: usize) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(size * size * 4);
     for y in 0..size {
         for x in 0..size {
-            let c = t.sample((x as f64 + 0.5) / size as f64, 1.0 - (y as f64 + 0.5) / size as f64)?;
+            let c = t.sample(place, (x as f64 + 0.5) / size as f64, 1.0 - (y as f64 + 0.5) / size as f64)?;
             out.extend(c.iter().map(|v| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8));
             out.push(255);
         }
@@ -765,8 +942,9 @@ mod tests {
 
     #[test]
     fn viewport_texture_pixels_render_procedural_patterns() {
-        let t = Texture { id: "t1".into(), name: "checker1".into(), ty: "checker".into(), attrs: tex_defaults_for("checker") };
-        let px = viewport_texture_pixels(&t, None).unwrap();
+        let t = Texture { id: "t1".into(), name: "checker1".into(), ty: "checker".into(), attrs: tex_defaults_for("checker"), place: None };
+        let place = Place2D::new("p1".into(), "place2dTexture1".into(), "checker");
+        let px = viewport_texture_pixels(&t, Some(&place.attrs), None).unwrap();
         assert_eq!(px.len(), (VIEW_TEX_SIZE * VIEW_TEX_SIZE * 4) as usize);
         let at = |x: u32, y: u32| {
             let k = ((y * VIEW_TEX_SIZE + x) * 4) as usize;
@@ -785,12 +963,12 @@ mod tests {
         let mut attrs = tex_defaults_for("file");
         attrs.insert("fileTextureName".into(), serde_json::json!(path.display().to_string()));
         attrs.insert("colorSpace".into(), serde_json::json!("sRGB"));
-        let srgb = Texture { id: "t3".into(), name: "file1".into(), ty: "file".into(), attrs: attrs.clone() };
-        let px = viewport_texture_pixels(&srgb, None).unwrap();
+        let srgb = Texture { id: "t3".into(), name: "file1".into(), ty: "file".into(), attrs: attrs.clone(), place: None };
+        let px = viewport_texture_pixels(&srgb, None, None).unwrap();
         assert_eq!(&px[..3], &[128, 64, 32], "sRGB bytes pass through unchanged");
         attrs.insert("colorSpace".into(), serde_json::json!("Raw"));
-        let raw = Texture { id: "t4".into(), name: "file1".into(), ty: "file".into(), attrs };
-        let px = viewport_texture_pixels(&raw, None).unwrap();
+        let raw = Texture { id: "t4".into(), name: "file1".into(), ty: "file".into(), attrs, place: None };
+        let px = viewport_texture_pixels(&raw, None, None).unwrap();
         // the raw byte 128 must sample as linear 128/255 after the GPU's sRGB decode
         assert_eq!(px[0], srgb_byte(128.0 / 255.0));
         assert_eq!(px[1], srgb_byte(64.0 / 255.0));
@@ -801,8 +979,8 @@ mod tests {
     fn missing_file_textures_fall_back_to_grey() {
         let mut attrs = Params::new();
         attrs.insert("fileTextureName".into(), serde_json::json!("definitely-missing.png"));
-        let t = Texture { id: "t2".into(), name: "file1".into(), ty: "file".into(), attrs };
-        let px = viewport_texture_pixels(&t, None).unwrap();
+        let t = Texture { id: "t2".into(), name: "file1".into(), ty: "file".into(), attrs, place: None };
+        let px = viewport_texture_pixels(&t, None, None).unwrap();
         assert_eq!(&px[..4], &[128, 128, 128, 255]);
     }
 }

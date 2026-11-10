@@ -37,6 +37,7 @@ pub enum Act {
     HypershadeDelete(Vec<String>),
     HypershadeCreateMaterial(String),
     HypershadeCreateTexture(String),
+    HypershadeCreatePlace,
     HypershadeFrameAll,
     HypershadeFrameSelected,
     HypershadeRearrange,
@@ -416,6 +417,10 @@ fn run(app: &mut IncaApp, act: Act) {
                 crate::hypershade::place_new_node(app, &id, at);
                 app.windows_state.hs_selected = Some(id);
             }
+        }
+        Act::HypershadeCreatePlace => {
+            let at = app.windows_state.hs.create_pos.take();
+            crate::hypershade::create_place_node(app, at);
         }
         Act::HypershadeFrameAll => app.windows_state.hs.frame = Some(false),
         Act::HypershadeFrameSelected => app.windows_state.hs.frame = Some(true),

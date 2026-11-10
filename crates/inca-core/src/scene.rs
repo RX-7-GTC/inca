@@ -3,7 +3,7 @@
 
 use crate::anim::{Anim, AnimCurve};
 use crate::curves::Curve;
-use crate::materials::{Material, ShadingData, Texture};
+use crate::materials::{Material, Place2D, ShadingData, Texture};
 use crate::math::*;
 use crate::mesh::{OpOut, PolyMesh};
 use crate::ops::{self, OpCtx};
@@ -343,6 +343,7 @@ pub enum NodeRef {
     History(Id, usize),
     Material(Id),
     Texture(Id),
+    Place2D(Id),
 }
 
 #[derive(Clone)]
@@ -357,6 +358,7 @@ pub struct Scene {
     pub names: HashSet<String>,
     pub mats: IndexMap<Id, Material>,
     pub texs: IndexMap<Id, Texture>,
+    pub places: IndexMap<Id, Place2D>,
     pub default_mat: Id,
     pub layers: Vec<Layer>,
     pub anim: Anim,
@@ -414,6 +416,7 @@ impl Scene {
             names: HashSet::new(),
             mats: IndexMap::new(),
             texs: IndexMap::new(),
+            places: IndexMap::new(),
             default_mat: String::new(),
             layers: vec![],
             anim: Anim::default(),
@@ -508,9 +511,41 @@ impl Scene {
     pub fn create_texture(&mut self, ty: &str, name: Option<&str>) -> Id {
         let id = self.new_id("x");
         let name = self.unique_name(name.unwrap_or(&format!("{ty}1")));
-        self.texs.insert(id.clone(), Texture { id: id.clone(), name, ty: ty.into(), attrs: crate::materials::tex_defaults_for(ty) });
+        let place = self.new_id("p");
+        let place_name = self.unique_name("place2dTexture1");
+        self.places.insert(place.clone(), Place2D::new(place.clone(), place_name, ty));
+        self.texs.insert(id.clone(), Texture { id: id.clone(), name, ty: ty.into(), attrs: crate::materials::tex_defaults_for(ty), place: Some(place) });
         self.touch();
         id
+    }
+
+    /// Standalone place2dTexture utility (not owned by a texture yet).
+    pub fn create_place(&mut self, name: Option<&str>) -> Id {
+        let id = self.new_id("p");
+        let name = self.unique_name(name.unwrap_or("place2dTexture1"));
+        self.places.insert(id.clone(), Place2D::new(id.clone(), name, ""));
+        self.touch();
+        id
+    }
+
+    pub fn place_of(&self, t: &Texture) -> Option<&Place2D> {
+        t.place.as_ref().and_then(|p| self.places.get(p))
+    }
+
+    pub fn place_attrs_of(&self, t: &Texture) -> Option<&Params> {
+        self.place_of(t).map(|p| &p.attrs)
+    }
+
+    pub fn delete_texture(&mut self, id: &str) {
+        if let Some(t) = self.texs.shift_remove(id) {
+            self.release_name(&t.name);
+            if let Some(pid) = t.place {
+                if let Some(p) = self.places.shift_remove(&pid) {
+                    self.release_name(&p.name);
+                }
+            }
+        }
+        self.touch();
     }
     pub fn assign_material(&mut self, node: &str, mat: &str, faces: Option<&[usize]>) {
         let def = self.default_mat.clone();
@@ -714,7 +749,10 @@ impl Scene {
         if let Some(m) = self.mats.values().find(|m| m.name == name) {
             return Some(NodeRef::Material(m.id.clone()));
         }
-        self.texs.values().find(|t| t.name == name).map(|t| NodeRef::Texture(t.id.clone()))
+        if let Some(t) = self.texs.values().find(|t| t.name == name) {
+            return Some(NodeRef::Texture(t.id.clone()));
+        }
+        self.places.values().find(|p| p.name == name).map(|p| NodeRef::Place2D(p.id.clone()))
     }
 
     pub fn ref_name(&self, r: &NodeRef) -> String {
@@ -723,6 +761,7 @@ impl Scene {
             NodeRef::History(id, i) => self.nodes.get(id).and_then(|n| n.mesh()).and_then(|m| m.history.get(*i)).map(|h| h.name.clone()).unwrap_or_default(),
             NodeRef::Material(id) => self.mats.get(id).map(|m| m.name.clone()).unwrap_or_default(),
             NodeRef::Texture(id) => self.texs.get(id).map(|m| m.name.clone()).unwrap_or_default(),
+            NodeRef::Place2D(id) => self.places.get(id).map(|p| p.name.clone()).unwrap_or_default(),
         }
     }
 
@@ -1371,6 +1410,7 @@ impl Scene {
             }
             NodeRef::Material(id) => get_compound(&self.mats.get(id)?.attrs, attr),
             NodeRef::Texture(id) => get_compound(&self.texs.get(id)?.attrs, attr),
+            NodeRef::Place2D(id) => get_compound(&self.places.get(id)?.attrs, attr),
         }
     }
 
@@ -1469,6 +1509,11 @@ impl Scene {
             }
             NodeRef::Texture(id) => {
                 let ok = self.texs.get_mut(id).is_some_and(|m| set_compound(&mut m.attrs, attr, v));
+                self.touch();
+                ok
+            }
+            NodeRef::Place2D(id) => {
+                let ok = self.places.get_mut(id).is_some_and(|p| set_compound(&mut p.attrs, attr, v));
                 self.touch();
                 ok
             }
@@ -1688,6 +1733,9 @@ impl Scene {
         if self.texs.contains_key(id) {
             return Some(NodeRef::Texture(id.into()));
         }
+        if self.places.contains_key(id) {
+            return Some(NodeRef::Place2D(id.into()));
+        }
         self.history_ref_by_id(id)
     }
     fn history_ref_by_id(&self, hid: &str) -> Option<NodeRef> {
@@ -1700,7 +1748,7 @@ impl Scene {
     }
     pub fn ref_id(&self, r: &NodeRef) -> Id {
         match r {
-            NodeRef::Dag(i) | NodeRef::Material(i) | NodeRef::Texture(i) => i.clone(),
+            NodeRef::Dag(i) | NodeRef::Material(i) | NodeRef::Texture(i) | NodeRef::Place2D(i) => i.clone(),
             NodeRef::History(n, i) => self.nodes.get(n).and_then(|n| n.mesh()).and_then(|m| m.history.get(*i)).map(|h| h.id.clone()).unwrap_or_default(),
         }
     }
@@ -2040,7 +2088,7 @@ impl Scene {
             "version": self.version,
             "idCounter": self.id_counter,
             "nodes": nodes,
-            "shading": ShadingData { mats: self.mats.values().cloned().collect(), texs: self.texs.values().cloned().collect(), default_mat_id: Some(self.default_mat.clone()) },
+            "shading": ShadingData { mats: self.mats.values().cloned().collect(), texs: self.texs.values().cloned().collect(), places: self.places.values().cloned().collect(), default_mat_id: Some(self.default_mat.clone()) },
             "layers": self.layers,
             "anim": self.anim.serialize(),
             "conns": self.conns,
@@ -2059,6 +2107,7 @@ impl Scene {
         self.names.clear();
         self.mats.clear();
         self.texs.clear();
+        self.places.clear();
         self.layers.clear();
         self.anim = Anim::default();
         self.conns.clear();
@@ -2079,7 +2128,25 @@ impl Scene {
         self.clear();
         self.id_counter = self.id_counter.max(data["idCounter"].as_u64().unwrap_or(1));
         let shading: ShadingData = serde_json::from_value(data["shading"].clone()).unwrap_or_default();
-        for t in shading.texs {
+        for mut p in shading.places {
+            crate::materials::add_placement_defaults(&mut p.attrs);
+            self.names.insert(p.name.clone());
+            self.places.insert(p.id.clone(), p);
+        }
+        for mut t in shading.texs {
+            let legacy = crate::materials::take_placement_attrs(&mut t.attrs);
+            let pid = t.place.clone().filter(|id| self.places.contains_key(id)).unwrap_or_else(|| {
+                let id = self.new_id("p");
+                let name = self.unique_name("place2dTexture1");
+                self.places.insert(id.clone(), Place2D::new(id.clone(), name, &t.ty));
+                id
+            });
+            if let Some(p) = self.places.get_mut(&pid) {
+                for (k, v) in legacy {
+                    p.attrs.insert(k, v);
+                }
+            }
+            t.place = Some(pid);
             self.names.insert(t.name.clone());
             self.texs.insert(t.id.clone(), t);
         }

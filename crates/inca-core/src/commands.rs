@@ -790,6 +790,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                         NodeRef::Material(id) => ("material", id.clone()),
                         NodeRef::Texture(id) => ("texture", id.clone()),
                         NodeRef::History(..) => return Err("container: publishing history attributes is not supported".into()),
+                        NodeRef::Place2D(..) => return Err("container: publishing place2dTexture attributes is not supported".into()),
                     };
                     if node == cid {
                         return Err("container: cannot publish a container's own attribute".into());
@@ -882,6 +883,10 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "shadingNode" | "createNode" => {
             let ty = a.strings().first().cloned().ok_or("shadingNode: missing type")?;
             let nm = a.s(&["n", "name"]);
+            if ty == "place2dTexture" {
+                let id = s.create_place(nm.as_deref());
+                return Ok(Val::Str(s.places[&id].name.clone()));
+            }
             if crate::materials::MAT_TYPES.iter().any(|m| m.ty == ty) {
                 let id = s.create_material(&ty, nm.as_deref());
                 return Ok(Val::Str(s.mats[&id].name.clone()));
@@ -1026,6 +1031,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 Some(NodeRef::History(id, i)) => s.node(&id).unwrap().mesh().unwrap().history[i].ty.clone(),
                 Some(NodeRef::Material(id)) => s.mats[&id].ty.clone(),
                 Some(NodeRef::Texture(id)) => s.texs[&id].ty.clone(),
+                Some(NodeRef::Place2D(_)) => "place2dTexture".into(),
                 None => return Err(format!("No object matches name: {n}")),
             }))
         }

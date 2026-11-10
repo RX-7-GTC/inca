@@ -1541,6 +1541,7 @@ pub fn material_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, t
 pub fn texture_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, ty: &str) {
     let r = NodeRef::Texture(id.to_string());
     let Some(t) = app.s.texs.get(id).cloned() else { return };
+    let place = t.place.clone();
     let mut specs = vec![];
     for k in t.attrs.keys() {
         let spec = match k.as_str() {
@@ -1557,11 +1558,6 @@ pub fn texture_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, ty:
             "gapColor" => cspec("gapColor", "Gap Color"),
             "snowColor" => cspec("snowColor", "Snow Color"),
             "rockColor" => cspec("rockColor", "Rock Color"),
-            "repeatU" => fspec("repeatU", "Repeat U", 0.0, 16.0),
-            "repeatV" => fspec("repeatV", "Repeat V", 0.0, 16.0),
-            "offsetU" => fspec("offsetU", "Offset U", -1.0, 1.0),
-            "offsetV" => fspec("offsetV", "Offset V", -1.0, 1.0),
-            "rotateUV" => fspec("rotateUV", "Rotate UV", 0.0, 360.0),
             "contrast" => fspec("contrast", "Contrast", 0.0, 2.0),
             "frequency" => fspec("frequency", "Frequency", 0.0, 32.0),
             "amplitude" => fspec("amplitude", "Amplitude", 0.0, 2.0),
@@ -1611,9 +1607,40 @@ pub fn texture_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, ty:
     }
     theme::section_header(ui, "Attributes");
     field_grid(app, ui, &r, &specs);
+    if let Some(pid) = place {
+        place_fields_editor(app, ui, &pid);
+    }
     if ty == "ramp" {
         ramp_editor(app, ui, &r);
     }
+}
+
+/// place2dTexture controls, shown both from its texture and when the node is selected.
+pub fn place_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
+    let placement = vec![
+        fspec("coverageU", "Coverage U", 0.01, 1.0),
+        fspec("coverageV", "Coverage V", 0.01, 1.0),
+        fspec("translateFrameU", "Translate Frame U", -1.0, 1.0),
+        fspec("translateFrameV", "Translate Frame V", -1.0, 1.0),
+        fspec("rotateFrame", "Rotate Frame", 0.0, 360.0),
+        bspec("mirrorU", "Mirror U"),
+        bspec("mirrorV", "Mirror V"),
+        espec("wrapU", "Wrap U", &["Repeat", "Clamp", "Mirror"]),
+        espec("wrapV", "Wrap V", &["Repeat", "Clamp", "Mirror"]),
+        fspec("repeatU", "Repeat U", 0.0, 16.0),
+        fspec("repeatV", "Repeat V", 0.0, 16.0),
+        fspec("offsetU", "Offset U", -1.0, 1.0),
+        fspec("offsetV", "Offset V", -1.0, 1.0),
+        fspec("rotateUV", "Rotate UV", 0.0, 360.0),
+        bspec("stagger", "Stagger"),
+        fspec("noiseU", "Noise U", 0.0, 1.0),
+        fspec("noiseV", "Noise V", 0.0, 1.0),
+    ];
+    theme::section_header(ui, "2D Texture Placement");
+    if let Some(p) = app.s.places.get(id) {
+        ui.label(RichText::new(&p.name).color(theme::TEXT_DIM));
+    }
+    field_grid(app, ui, &NodeRef::Place2D(id.to_string()), &placement);
 }
 
 /// Attribute Editor tabs for a node: transform, shape, history nodes, material.
@@ -1976,6 +2003,7 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
                 }
             }
         }
+        NodeRef::Place2D(pid) => place_fields_editor(app, ui, pid),
         NodeRef::Material(mid) => crate::windows::material_editor(app, ui, mid, true),
         NodeRef::Texture(tid) => {
             let ty = app.s.texs.get(tid).map(|t| t.ty.clone()).unwrap_or_default();

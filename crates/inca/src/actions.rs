@@ -423,15 +423,19 @@ fn motion_path_mel(app: &IncaApp) -> Option<String> {
 /// Graph-capable nodes selected in the Hypershade/Hypergraph, normalized to their actual ids.
 fn hypershade_selection(app: &IncaApp) -> std::collections::HashSet<String> {
     let mut ids = app.windows_state.hs.graph_sel.clone();
-    if let Some(id) = &app.snode_sel {
-        ids.insert(id.clone());
-    }
-    if let Some(id) = &app.windows_state.hs_selected {
-        ids.insert(id.clone());
+    // The work-area selection is authoritative; the AE/browser lead only supplies
+    // a target when nothing is selected in the graph or the scene.
+    if ids.is_empty() && app.s.sel.is_empty() {
+        if let Some(id) = &app.snode_sel {
+            ids.insert(id.clone());
+        }
+        if let Some(id) = &app.windows_state.hs_selected {
+            ids.insert(id.clone());
+        }
     }
     ids.retain(|id| {
         let base = id.strip_prefix("sg:").unwrap_or(id);
-        app.s.mats.contains_key(base) || app.s.texs.contains_key(base) || crate::hypershade::is_graph_dag(app, base)
+        app.s.mats.contains_key(base) || app.s.texs.contains_key(base) || app.s.places.contains_key(base) || crate::hypershade::is_graph_dag(app, base)
     });
     ids
 }

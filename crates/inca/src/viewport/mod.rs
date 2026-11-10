@@ -809,22 +809,10 @@ impl Default for UvXf {
 }
 
 impl UvXf {
-    /// JS `getThreeTexture`: only File textures carry repeat / offset / rotateUV; procedural
-    /// textures bake their repeat into the generated image and keep the identity transform.
-    pub fn from_texture(t: Option<&inca_core::materials::Texture>) -> Self {
-        let Some(t) = t else { return UvXf::default() };
-        if t.ty != "file" {
-            return UvXf::default();
-        }
-        let a = &t.attrs;
-        let f = |k: &str, d: f64| a.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
-        // JS `a.repeatU || 1`: zero or missing means one repeat
-        let sx = f("repeatU", 1.0);
-        let sy = f("repeatV", 1.0);
-        let (sx, sy) = (if sx == 0.0 { 1.0 } else { sx }, if sy == 0.0 { 1.0 } else { sy });
-        let (tx, ty) = (f("offsetU", 0.0), f("offsetV", 0.0));
-        let (s, c) = f("rotateUV", 0.0).to_radians().sin_cos();
-        UvXf { m: [c * sx, s * sx, -s * sy, c * sy], t: [tx, ty] }
+    /// All 2D placement (repeat/offset/coverage/mirror/wrap/...) is baked into the
+    /// 256² texture array by `materials::Texture::placed_uv`.
+    pub fn from_texture(_t: Option<&inca_core::materials::Texture>) -> Self {
+        UvXf::default()
     }
 
     pub fn uv(&self, uv: [f32; 2]) -> [f32; 2] {
@@ -865,8 +853,12 @@ fn ensure_texture(g: &mut crate::viewport::gpu::Gpu, s: &Scene, t: &inca_core::m
     let mut h = DefaultHasher::new();
     t.ty.hash(&mut h);
     serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
+    if let Some(p) = s.place_of(t) {
+        serde_json::to_string(&p.attrs).unwrap_or_default().hash(&mut h);
+    }
     let project = s.project.clone();
-    g.texture_layer(&t.id, h.finish(), || inca_core::materials::viewport_texture_pixels(t, project.as_deref()))
+    let place = s.place_of(t).map(|p| p.attrs.clone());
+    g.texture_layer(&t.id, h.finish(), || inca_core::materials::viewport_texture_pixels(t, place.as_ref(), project.as_deref()))
 }
 
 /// Upload the linear 16-bit height version of a bump texture to its own GPU array.
@@ -874,8 +866,12 @@ fn ensure_bump(g: &mut crate::viewport::gpu::Gpu, s: &Scene, t: &inca_core::mate
     let mut h = DefaultHasher::new();
     t.ty.hash(&mut h);
     serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
+    if let Some(p) = s.place_of(t) {
+        serde_json::to_string(&p.attrs).unwrap_or_default().hash(&mut h);
+    }
     let project = s.project.clone();
-    g.bump_texture_layer(&t.id, layer, h.finish(), || inca_core::materials::viewport_bump_pixels(t, project.as_deref()));
+    let place = s.place_of(t).map(|p| p.attrs.clone());
+    g.bump_texture_layer(&t.id, layer, h.finish(), || inca_core::materials::viewport_bump_pixels(t, place.as_ref(), project.as_deref()));
 }
 
 fn texture_slot<'a>(g: &mut crate::viewport::gpu::Gpu, s: &'a Scene, mat: &inca_core::materials::Material, slot: &str) -> Option<(&'a inca_core::materials::Texture, u32, bool)> {
@@ -1005,6 +1001,9 @@ pub fn mesh_key(s: &Scene, id: &str, divisions: u32) -> u64 {
                         t.ty.hash(&mut h);
                         mat.map_out(slot).hash(&mut h);
                         serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
+                        if let Some(p) = s.place_of(t) {
+                            serde_json::to_string(&p.attrs).unwrap_or_default().hash(&mut h);
+                        }
                     }
                 }
             }
