@@ -148,7 +148,7 @@ pub fn apply(app: &mut IncaApp, ctx: &egui::Context) {
     }
     let delay = if p.tooltips { 0.5 } else { f32::INFINITY };
     if ctx.global_style().interaction.tooltip_delay != delay {
-        ctx.global_style_mut(|s| s.interaction.tooltip_delay = delay);
+        ctx.all_styles_mut(|s| s.interaction.tooltip_delay = delay);
     }
     for v in app.vps.iter_mut() {
         // the JS grid divides the length into `divisions` lines; `spacing` only feeds snapping
