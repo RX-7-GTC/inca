@@ -2481,11 +2481,12 @@ pub fn falloff_color(w: f64) -> Color32 {
 
 /// Component dots are drawn by the GPU (`build_draws`); this adds only the preselection
 /// highlight, which is at most one component.
-pub fn draw_component_overlay(s: &Scene, vp: &Viewport, cv: &CamView, painter: &egui::Painter, hover: Option<(&str, &Comp)>) {
-    let Some((id, c)) = hover else { return };
+pub fn draw_component_overlay(s: &Scene, vp: &Viewport, cv: &CamView, painter: &egui::Painter, hover: Option<(&str, &Comp, bool)>) {
+    let Some((id, c, selected)) = hover else { return };
     let Some(n) = s.node(id) else { return };
     let wm = s.world_matrix(id);
-    let red = Color32::from_rgb(255, 42, 42);
+    // Maya: red when hovering something that will be added, green when it is already selected.
+    let color = if selected { Color32::from_rgb(64, 230, 90) } else { Color32::from_rgb(255, 42, 42) };
     // curve CVs are the curve's vertices (the JS hover point uses `curve.cvs`)
     let pr = |v: u32| {
         let p = match n.curve() {
@@ -2498,20 +2499,20 @@ pub fn draw_component_overlay(s: &Scene, vp: &Viewport, cv: &CamView, painter: &
         Comp::V(v) => {
             if let Some(q) = pr(*v) {
                 // the JS hover point is 9 px, square, always on top
-                painter.rect_filled(Rect::from_center_size(q, egui::vec2(9.0, 9.0)), 0.0, red);
+                painter.rect_filled(Rect::from_center_size(q, egui::vec2(9.0, 9.0)), 0.0, color);
             }
         }
         Comp::E(a, b) => {
             if let (Some(qa), Some(qb)) = (pr(*a), pr(*b)) {
-                painter.line_segment([qa, qb], egui::Stroke::new(2.0, red));
+                painter.line_segment([qa, qb], egui::Stroke::new(2.0, color));
             }
         }
         Comp::F(f) => {
             let Some(pm) = n.mesh().map(|m| &m.mesh) else { return };
-            // the JS hover face is a translucent red fill (0.35, no outline)
+            // the JS hover face is a translucent fill (0.35, no outline)
             let pts: Vec<Pos2> = pm.f[*f].iter().filter_map(|&v| pr(v)).collect();
             if pts.len() >= 3 {
-                painter.add(egui::Shape::convex_polygon(pts, Color32::from_rgba_unmultiplied(255, 42, 42, 89), egui::Stroke::NONE));
+                painter.add(egui::Shape::convex_polygon(pts, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 89), egui::Stroke::NONE));
             }
         }
     }

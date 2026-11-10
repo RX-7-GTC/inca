@@ -20,6 +20,13 @@ pub enum NavMode {
     Dolly,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SelectCursor {
+    Neutral,
+    Add,
+    Remove,
+}
+
 /// A Shift+MMB / Shift+LMB drag waiting for enough movement to choose an axis (JS `middleDrag` auto mode).
 #[derive(Clone, Copy)]
 pub struct AutoDrag {
@@ -62,8 +69,8 @@ pub struct VpState {
     pub arc_anchor: Option<DVec3>,
     /// Inputs of the last rendered 3D image per viewport, so UI-only repaints can reuse it.
     pub render_keys: [Option<u64>; 4],
-    /// Tab+drag select in progress: what it has picked so far, and whether it deselects
-    pub tab_drag: Option<(Vec<String>, bool, Option<Pos2>)>,
+    /// Tab+drag select in progress: the components it has already toggled, and the last point
+    pub tab_drag: Option<(HashSet<String>, Option<Pos2>)>,
 }
 
 impl Default for VpState {
@@ -278,7 +285,8 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
     crate::anim_extras::overlay(app, &cv, img_rect, &painter);
     let hover = if app.vp_state.drag.is_none() && app.tool.is_select() && app.prefs.preselect { resp.hover_pos() } else { None };
     let hover_comp = hover.and_then(|h| hover_pick(app, ui.ctx(), idx, &cv, h));
-    viewport::draw_component_overlay(&app.s, &app.vps[idx], &cv, &painter, hover_comp.as_ref().map(|(id, c)| (id.as_str(), c)));
+    let hover_selected = hover_comp.as_ref().is_some_and(|(id, c)| comp_is_selected(app, id, c));
+    viewport::draw_component_overlay(&app.s, &app.vps[idx], &cv, &painter, hover_comp.as_ref().map(|(id, c)| (id.as_str(), c, hover_selected)));
     viewport::draw_curve_components(&app.s, &app.vps[idx], &cv, &painter);
     viewport::draw_gate(&app.s, &app.vps[idx], &painter);
     mesh_overlays(app, &cv, img_rect, &painter);
@@ -748,43 +756,57 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
             ui.memory_mut(|m| m.surrender_focus(f));
         }
     }
-    // ---- Tab+drag: select whatever the pointer passes over (Ctrl deselects)
-    if resp.drag_started_by(egui::PointerButton::Primary) && ui.input(|i| i.key_down(egui::Key::Tab)) && !app.lock_selection {
-        let remove = (mods.ctrl || mods.command) && !mods.shift;
-        if sel_mode(mods) == SelMode::Replace {
-            if app.s.comp_mode.is_some() {
-                for id in app.s.hilite() {
-                    app.s.comp.remove(&id);
-                }
-                app.s.rev += 1;
-            } else {
-                app.s.select(&[], SelMode::Replace);
-            }
-        }
-        app.vp_state.tab_drag = Some((vec![], remove, resp.interact_pointer_pos().map(|p| p - resp.drag_delta())));
+    // ---- Tab: a toggle-select tool. Hold Tab and hover/drag; the cursor shows + or - for the
+    // item under it, and each item is toggled once without clearing the existing selection.
+    let tab_down = ui.input(|i| i.key_down(egui::Key::Tab));
+    if tab_down && (resp.hovered() || app.vp_state.tab_drag.is_some()) && !app.lock_selection {
+        let mode = pointer
+            .interact_pos()
+            .filter(|p| app.vps[idx].rect.contains(*p))
+            .and_then(|p| pick_name(app, idx, cv, p))
+            .map(|n| if item_selected(app, &n) { SelectCursor::Remove } else { SelectCursor::Add })
+            .unwrap_or(SelectCursor::Neutral);
+        ui.ctx().set_cursor_image(Some(select_cursor(mode)));
     }
-    if let Some((mut picked, remove, last)) = app.vp_state.tab_drag.clone() {
+    if resp.drag_started_by(egui::PointerButton::Primary) && tab_down && !app.lock_selection {
+        app.vp_state.tab_drag = Some((HashSet::new(), resp.interact_pointer_pos().map(|p| p - resp.drag_delta())));
+    }
+    if let Some((mut seen, last)) = app.vp_state.tab_drag.clone() {
         if let Some(p) = pointer.interact_pos() {
             // everything under the path since the last frame, not just the current point
             let from = last.unwrap_or(p);
             let steps = (from.distance(p) / 4.0).ceil().max(1.0) as usize;
-            let mut new = vec![];
+            let (mut add, mut remove) = (vec![], vec![]);
             for k in 0..=steps {
-                if let Some(n) = pick_name(app, idx, cv, from.lerp(p, k as f32 / steps as f32)).filter(|n| !picked.contains(n)) {
-                    picked.push(n.clone());
-                    new.push(n);
+                if let Some(n) = pick_name(app, idx, cv, from.lerp(p, k as f32 / steps as f32)).filter(|n| !seen.contains(n)) {
+                    seen.insert(n.clone());
+                    if item_selected(app, &n) {
+                        remove.push(n);
+                    } else {
+                        add.push(n);
+                    }
                 }
             }
-            if !new.is_empty() {
-                let _ = app.exec_mel(&format!("select {} {};", if remove { "-d" } else { "-add" }, new.join(" ")), false);
+            if !add.is_empty() {
+                let _ = app.exec_mel(&format!("select -add {};", add.join(" ")), false);
             }
-            app.vp_state.tab_drag = Some((picked.clone(), remove, Some(p)));
+            if !remove.is_empty() {
+                let _ = app.exec_mel(&format!("select -d {};", remove.join(" ")), false);
+            }
+            app.vp_state.tab_drag = Some((seen.clone(), Some(p)));
         }
         if resp.drag_stopped() || !pointer.primary_down() {
-            if !picked.is_empty() {
-                app.echo(format!("select {} {};", if remove { "-d" } else { "-add" }, picked.join(" ")));
-            }
             app.vp_state.tab_drag = None;
+        }
+        return;
+    }
+    if tab_down && resp.clicked_by(egui::PointerButton::Primary) && !app.lock_selection {
+        // a Tab click toggles the item under the pointer, keeping the rest of the selection
+        if let Some(p) = resp.interact_pointer_pos() {
+            if let Some(n) = pick_name(app, idx, cv, p) {
+                let verb = if item_selected(app, &n) { "-d" } else { "-add" };
+                let _ = app.exec_mel(&format!("select {verb} {n};"), false);
+            }
         }
         return;
     }
@@ -1034,6 +1056,83 @@ fn dolly_at(app: &mut IncaApp, idx: usize, cv: &CamView, cursor: Pos2, amount: f
     }
 }
 
+fn cursor_ring(x: f32, y: f32, cx: f32, cy: f32, r: f32, w: f32) -> bool {
+    (((x - cx).powi(2) + (y - cy).powi(2)).sqrt() - r).abs() <= w * 0.5
+}
+
+fn cursor_disc(x: f32, y: f32, cx: f32, cy: f32, r: f32) -> bool {
+    (x - cx).powi(2) + (y - cy).powi(2) <= r * r
+}
+
+fn cursor_segment(x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, w: f32) -> bool {
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let t = (((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy).max(1e-6)).clamp(0.0, 1.0);
+    let (px, py) = (x0 + dx * t, y0 + dy * t);
+    (x - px).powi(2) + (y - py).powi(2) <= (w * 0.5).powi(2)
+}
+
+/// Maya's Tab+drag selection cursor: a bullseye plus a plus (add) or minus (subtract).
+fn cursor_shape(x: f32, y: f32, mode: SelectCursor, outline: bool) -> bool {
+    let (cx, cy) = (11.0, 16.0);
+    let (bx, by) = (25.0, 9.0);
+    let (arm, tw) = (3.2, if outline { 3.2 } else { 1.8 });
+    let (outer, inner, dot) = if outline { (3.6, 3.0, 2.2) } else { (2.0, 1.6, 1.3) };
+    let badge = mode == SelectCursor::Add || mode == SelectCursor::Remove;
+    let vertical = mode == SelectCursor::Add;
+    cursor_ring(x, y, cx, cy, 7.2, outer)
+        || cursor_ring(x, y, cx, cy, 4.0, inner)
+        || cursor_disc(x, y, cx, cy, dot)
+        || (badge && cursor_segment(x, y, bx - arm, by, bx + arm, by, tw))
+        || (vertical && cursor_segment(x, y, bx, by - arm, bx, by + arm, tw))
+}
+
+fn build_select_cursor(mode: SelectCursor) -> egui::CustomCursorImage {
+    const N: usize = 32;
+    const SS: usize = 4;
+    let mut rgba = vec![0u8; N * N * 4];
+    for y in 0..N {
+        for x in 0..N {
+            let (mut r, mut g, mut b, mut a) = (0.0, 0.0, 0.0, 0.0);
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
+                    let (cr, cg, cb, ca) = if cursor_shape(px, py, mode, false) {
+                        (0.96, 0.96, 0.96, 1.0)
+                    } else if cursor_shape(px, py, mode, true) {
+                        (0.08, 0.08, 0.08, 1.0)
+                    } else {
+                        (0.0, 0.0, 0.0, 0.0)
+                    };
+                    r += cr * ca;
+                    g += cg * ca;
+                    b += cb * ca;
+                    a += ca;
+                }
+            }
+            let i = (y * N + x) * 4;
+            if a > 0.0 {
+                rgba[i] = (r / a * 255.0) as u8;
+                rgba[i + 1] = (g / a * 255.0) as u8;
+                rgba[i + 2] = (b / a * 255.0) as u8;
+                rgba[i + 3] = (a / (SS * SS) as f32 * 255.0) as u8;
+            }
+        }
+    }
+    egui::CustomCursorImage { rgba: rgba.into(), size: [N as u16, N as u16], hotspot: [11, 16] }
+}
+
+fn select_cursor(mode: SelectCursor) -> egui::CustomCursorImage {
+    static CURSORS: std::sync::OnceLock<[egui::CustomCursorImage; 3]> = std::sync::OnceLock::new();
+    let cursors = CURSORS.get_or_init(|| [build_select_cursor(SelectCursor::Neutral), build_select_cursor(SelectCursor::Add), build_select_cursor(SelectCursor::Remove)]);
+    cursors[match mode {
+        SelectCursor::Neutral => 0,
+        SelectCursor::Add => 1,
+        SelectCursor::Remove => 2,
+    }]
+    .clone()
+}
+
 /// Face under the cursor, considering hilited and selected meshes (never curves).
 fn pick_face(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2) -> Option<(String, usize)> {
     let vp = app.vps[idx].clone();
@@ -1152,6 +1251,37 @@ fn pick_name(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2) -> Option<Str
             })
         }),
         None => pick_masked(app, &vp, cv, p).and_then(|h| filter_picks(app, vec![h]).pop()).map(|id| app.s.name_of(&id)),
+    }
+}
+
+fn comp_is_selected(app: &IncaApp, id: &str, c: &Comp) -> bool {
+    let sel = app.s.comp_sel(id);
+    match c {
+        Comp::V(v) => sel.v.contains(v),
+        Comp::E(a, b) => sel.e.contains(&epair(*a, *b)),
+        Comp::F(f) => sel.f.contains(f),
+    }
+}
+
+/// Is the MEL component/object name currently selected?
+fn item_selected(app: &IncaApp, name: &str) -> bool {
+    let Some((obj, rest)) = name.split_once('.') else {
+        return app.s.find(name).is_some_and(|id| app.s.sel.contains(&id));
+    };
+    let Some(id) = app.s.find(obj) else { return false };
+    let Some((kind, index)) = rest.split_once('[') else { return false };
+    let Ok(index) = index.trim_end_matches(']').parse::<usize>() else { return false };
+    let sel = app.s.comp_sel(&id);
+    match kind {
+        "f" => sel.f.contains(&index),
+        "vtx" | "cv" => sel.v.contains(&(index as u32)),
+        "e" => app
+            .s
+            .node(&id)
+            .and_then(|n| n.mesh())
+            .and_then(|m| m.mesh.topo().edges.get(index).copied())
+            .is_some_and(|(a, b)| sel.e.contains(&epair(a, b))),
+        _ => false,
     }
 }
 
