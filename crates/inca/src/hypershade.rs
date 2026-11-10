@@ -1475,7 +1475,7 @@ pub(crate) fn delete_graph_nodes(app: &mut IncaApp, ids: &HashSet<String>) {
         }
     }
     for name in blocked {
-        app.error(format!("file: C:/Program Files/Autodesk/Maya2020/scripts/others/hyperShadePanel.mel line 6837: Non-deletable node '{name}' cannot be deleted"));
+        app.error(format!("Non-deletable node '{name}' cannot be deleted."));
     }
     for name in blocked_dags {
         app.warn(format!("Cannot delete the default camera '{name}'."));

@@ -103,4 +103,13 @@ packages and publishes them on the [Releases page](https://github.com/v3ai/inca/
 The `.inca` scene format is the same JSON format the earlier Electron versions (up to 0.1.12) used,
 so old scenes open in this version.
 
-MIT licensed. Built with egui, wgpu, glam, rapier3d, boolmesh, rhai and other Rust crates.
+## License
+
+MIT. See [LICENSE](LICENSE) for the full text. Third-party notices are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Maya and Autodesk are trademarks or registered trademarks of Autodesk, Inc.
+Blender is a trademark of the Blender Foundation. Inca is not affiliated with,
+endorsed by, or sponsored by Autodesk or the Blender Foundation.
+
+Built with egui, wgpu, glam, rapier3d, boolmesh, rhai and other Rust crates.
