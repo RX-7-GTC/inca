@@ -979,6 +979,100 @@ pub fn edge_ring_faces(pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> (Vec<(u32,
     (ring, faces)
 }
 
+/// Path from `start` to `end` along the edge ring, both inclusive. None when they are not on
+/// the same ring.
+pub fn edge_ring_path(pm: &PolyMesh, topo: &Topo, start: (u32, u32), end: (u32, u32)) -> Option<Vec<(u32, u32)>> {
+    let start = epair(start.0, start.1);
+    let end = epair(end.0, end.1);
+    if start == end {
+        return Some(vec![start]);
+    }
+    let ring: Vec<(u32, u32)> = edge_ring(pm, topo, start.0, start.1).into_iter().map(|(a, b)| epair(a, b)).collect();
+    let si = ring.iter().position(|e| *e == start)?;
+    let ei = ring.iter().position(|e| *e == end)?;
+    let forward = |lo: usize, hi: usize| -> Vec<(u32, u32)> { ring[lo..=hi].to_vec() };
+    let slice = if si <= ei { forward(si, ei) } else { forward(ei, si).into_iter().rev().collect() };
+    // On a closed ring the other arc is the complement; pick the shorter one.
+    let first = topo.edge(ring[0].0, ring[0].1);
+    let last = topo.edge(ring[ring.len() - 1].0, ring[ring.len() - 1].1);
+    let closed = ring.len() > 2 && matches!((first, last), (Some(a), Some(b)) if topo.edge_faces[a].iter().any(|f| topo.edge_faces[b].contains(f)));
+    if !closed {
+        return Some(slice);
+    }
+    let other: Vec<(u32, u32)> = if si <= ei {
+        ring[..=si].iter().rev().chain(ring[ei..].iter().rev()).copied().collect()
+    } else {
+        ring[si..].iter().chain(ring[..=ei].iter()).copied().collect()
+    };
+    Some(if other.len() < slice.len() { other } else { slice })
+}
+
+/// One step along an edge loop from p -> c. Borders follow the rim; interior edges need a
+/// 4-valent vertex and continue through the edge that shares no face with the current one.
+fn loop_step(topo: &Topo, p: u32, c: u32) -> Option<u32> {
+    let ce = topo.edge(p, c)?;
+    if topo.edge_faces[ce].len() == 1 {
+        let mut borders = topo.vert_edges[c as usize]
+            .iter()
+            .filter(|&&e| topo.edge_faces[e].len() == 1)
+            .map(|&e| {
+                let (x, y) = topo.edges[e];
+                if x == c { y } else { x }
+            })
+            .filter(|&n| n != p);
+        let n = borders.next()?;
+        return borders.next().is_none().then_some(n);
+    }
+    if topo.vert_edges[c as usize].len() != 4 {
+        return None;
+    }
+    let cf: HashSet<usize> = topo.edge_faces[ce].iter().copied().collect();
+    let mut nxt = None;
+    for &e in &topo.vert_edges[c as usize] {
+        let (x, y) = topo.edges[e];
+        if e == ce {
+            continue;
+        }
+        if topo.edge_faces[e].iter().all(|f| !cf.contains(f)) {
+            nxt = Some(if x == c { y } else { x });
+        }
+    }
+    nxt
+}
+
+/// Path from `start` to `end` along the edge loop, both inclusive. None when they are not on
+/// the same loop.
+pub fn edge_loop_path(topo: &Topo, start: (u32, u32), end: (u32, u32)) -> Option<Vec<(u32, u32)>> {
+    let start = epair(start.0, start.1);
+    let end = epair(end.0, end.1);
+    if start == end {
+        return Some(vec![start]);
+    }
+    let mut best: Option<Vec<(u32, u32)>> = None;
+    for (from, to) in [(start.0, start.1), (start.1, start.0)] {
+        let mut path = vec![start];
+        let mut seen: HashSet<(u32, u32)> = path.iter().copied().collect();
+        let (mut p, mut c) = (from, to);
+        loop {
+            let Some(n) = loop_step(topo, p, c) else { break };
+            let e = epair(c, n);
+            if !seen.insert(e) {
+                break;
+            }
+            path.push(e);
+            if e == end {
+                if best.as_ref().is_none_or(|b| path.len() < b.len()) {
+                    best = Some(path);
+                }
+                break;
+            }
+            p = c;
+            c = n;
+        }
+    }
+    best
+}
+
 /// Edge loop through the edge (a,b): continue through 4-valent vertices.
 pub fn edge_loop(_pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> Vec<(u32, u32)> {
     let mut out = vec![epair(a, b)];
@@ -1994,6 +2088,25 @@ mod tests {
     }
 
     #[test]
+    fn partial_edge_ring_between_two_edges() {
+        let c = cube();
+        let topo = c.topo();
+        let (a, b) = topo.edges[0];
+        let ring = edge_ring(&c, &topo, a, b);
+        let start = epair(a, b);
+        let end = epair(ring.last().unwrap().0, ring.last().unwrap().1);
+        let path = edge_ring_path(&c, &topo, start, end).unwrap();
+        assert_eq!(path.first(), Some(&start));
+        assert_eq!(path.last(), Some(&end));
+        assert!(path.len() >= 2);
+        // the shorter arc between neighbouring ring edges is just the two of them
+        let si = ring.iter().position(|e| epair(e.0, e.1) == start).unwrap();
+        let next = ring[(si + 1) % ring.len()];
+        let short = edge_ring_path(&c, &topo, start, epair(next.0, next.1)).unwrap();
+        assert_eq!(short.len(), 2);
+    }
+
+    #[test]
     fn delete_and_fill() {
         let c = cube();
         let d = op_delete_faces(&c, &[0]);
@@ -2058,5 +2171,11 @@ mod border_loop_tests {
         let l = edge_loop(&pm, &topo, a, b);
         assert_eq!(l.len(), 20, "the full 20-edge rim");
         assert!(l.iter().all(|&(x, y)| topo.edge(x, y).is_some_and(|e| topo.edge_faces[e].len() == 1)));
+        let path = edge_loop_path(&topo, l[0], l[10]).unwrap();
+        assert_eq!(path.first(), Some(&l[0]));
+        assert_eq!(path.last(), Some(&l[10]));
+        assert_eq!(path.len(), 11);
+        // a closed loop takes the shorter arc, not the long way around
+        assert_eq!(edge_loop_path(&topo, l[0], l[2]).unwrap().len(), 3);
     }
 }

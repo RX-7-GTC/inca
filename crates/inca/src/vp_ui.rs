@@ -862,22 +862,7 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
         if let Some(p) = resp.interact_pointer_pos() {
             let mut handled = false;
             if mods.shift && app.s.comp_mode == Some(inca_core::scene::CompMode::Face) && !app.lock_selection {
-                let vp = app.vps[idx].clone();
-                // the face picker also looks at selected meshes, like double_click's face branch
-                let mut ids: Vec<String> = app.s.hilite();
-                ids.retain(|id| app.s.node(id).is_some_and(|n| n.mesh().is_some()));
-                for id in &app.s.sel {
-                    if !ids.contains(id) && app.s.node(id).is_some_and(|n| n.mesh().is_some()) {
-                        ids.push(id.clone());
-                    }
-                }
-                let hit = ids.into_iter().find_map(|id| {
-                    match viewport::pick_component_hit(&app.s, &vp, cv, &id, inca_core::scene::CompMode::Face, p, &mut app.mesh_cache).map(|h| h.comp) {
-                        Some(Comp::F(f)) => Some((id, f)),
-                        _ => None,
-                    }
-                });
-                if let Some((id, f)) = hit {
+                if let Some((id, f)) = pick_face(app, idx, cv, p) {
                     if inca_core::selection::add_face_loop(&mut app.s, &id, f) {
                         let faces: Vec<String> = app.s.comp_sel(&id).f.iter().map(|f| format!("{}.f[{f}]", app.s.name_of(&id))).collect();
                         app.echo(format!("select -r {};", faces.join(" ")));
@@ -1049,8 +1034,26 @@ fn dolly_at(app: &mut IncaApp, idx: usize, cv: &CamView, cursor: Pos2, amount: f
     }
 }
 
-/// JS `onDbl`: double-clicking an edge selects its loop, a face selects the faces of the
-/// edge ring under the cursor, and an object opens Tool Settings.
+/// Face under the cursor, considering hilited and selected meshes (never curves).
+fn pick_face(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2) -> Option<(String, usize)> {
+    let vp = app.vps[idx].clone();
+    let mut ids: Vec<String> = app.s.hilite();
+    ids.retain(|id| app.s.node(id).is_some_and(|n| n.mesh().is_some()));
+    for id in &app.s.sel {
+        if !ids.contains(id) && app.s.node(id).is_some_and(|n| n.mesh().is_some()) {
+            ids.push(id.clone());
+        }
+    }
+    ids.into_iter().find_map(|id| {
+        match viewport::pick_component_hit(&app.s, &vp, cv, &id, CompMode::Face, p, &mut app.mesh_cache).map(|h| h.comp) {
+            Some(Comp::F(f)) => Some((id, f)),
+            _ => None,
+        }
+    })
+}
+
+/// JS `onDbl`: double-clicking an edge selects its loop, double-clicking a face selects all
+/// of the object's faces, and an object opens Tool Settings.
 fn double_click(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, shift: bool) {
     if app.lock_selection {
         return;
@@ -1067,30 +1070,51 @@ fn double_click(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, shift: boo
     if mode == CompMode::Vertex {
         return;
     }
-    let mut ids = app.s.hilite();
     if mode == CompMode::Face {
-        // the JS `forTool` picker uses hilited plus selected meshes (never curves)
-        ids.retain(|id| app.s.node(id).is_some_and(|n| n.mesh().is_some()));
-        for id in &app.s.sel {
-            if !ids.contains(id) && app.s.node(id).is_some_and(|n| n.mesh().is_some()) {
-                ids.push(id.clone());
+        // Maya: double-clicking a face selects the whole object's faces; face loops are Shift+dbl.
+        if let Some((id, _)) = pick_face(app, idx, cv, p) {
+            let has_selected_face = !app.s.comp_sel(&id).f.is_empty();
+            if !shift || !has_selected_face {
+                let name = app.s.name_of(&id);
+                let _ = app.exec_mel(&format!("select -r {name}.f[*];"), true);
             }
         }
+        return;
     }
+    let ids = app.s.hilite();
     let Some((id, Comp::E(a, b))) = viewport::pick_best_component(&app.s, &vp, cv, &ids, CompMode::Edge, p, &mut app.mesh_cache) else { return };
     let topo = app.mesh_cache.topo(&app.s, &id);
     let Some(pm) = app.s.node(&id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return };
     let Some(topo) = topo else { return };
     let name = app.s.name_of(&id);
-    let list: Vec<String> = if mode == CompMode::Edge {
-        inca_core::mesh::edge_loop(pm, &topo, a, b).iter().filter_map(|&(x, y)| topo.edge(x, y)).map(|i| i.to_string()).collect()
-    } else {
-        inca_core::mesh::edge_ring_faces(pm, &topo, a, b).1.iter().map(|f| f.to_string()).collect()
-    };
-    if list.is_empty() {
+    let clicked = inca_core::mesh::epair(a, b);
+    let selected: Vec<(u32, u32)> = app.s.comp_sel(&id).e.iter().copied().filter(|&e| e != clicked).collect();
+    let mut path: Vec<(u32, u32)> = vec![];
+    if shift {
+        // Shift+double-click another edge: the shortest partial loop/ring between the two edges.
+        let mut best: Option<Vec<(u32, u32)>> = None;
+        for &se in &selected {
+            for p in [inca_core::mesh::edge_loop_path(&topo, clicked, se), inca_core::mesh::edge_ring_path(pm, &topo, clicked, se)] {
+                if let Some(p) = p {
+                    if best.as_ref().is_none_or(|b| p.len() < b.len()) {
+                        best = Some(p);
+                    }
+                }
+            }
+        }
+        if let Some(p) = best {
+            path = p;
+        }
+    }
+    if path.is_empty() && !(shift && !selected.is_empty()) {
+        path = inca_core::mesh::edge_loop(pm, &topo, a, b).into_iter().map(|(x, y)| inca_core::mesh::epair(x, y)).collect();
+    }
+    // one argument per component: the MEL parser does not accept `name.e[0,1,2]`
+    let parts: Vec<String> = path.iter().filter_map(|&(x, y)| topo.edge(x, y)).map(|i| format!("{name}.e[{i}]")).collect();
+    if parts.is_empty() {
         return;
     }
-    let _ = app.exec_mel(&format!("select {} {name}.{}[{}];", if shift { "-add" } else { "-r" }, if mode == CompMode::Edge { "e" } else { "f" }, list.join(",")), true);
+    let _ = app.exec_mel(&format!("select {} {};", if shift { "-add" } else { "-r" }, parts.join(" ")), true);
 }
 
 /// Status line settings applied to picked objects: masks, hierarchy mode and the lock.
@@ -1120,8 +1144,9 @@ fn pick_name(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2) -> Option<Str
         Some(cm) => app.s.hilite().into_iter().find_map(|id| {
             let c = viewport::pick_component_hit(&app.s, &vp, cv, &id, cm, p, &mut app.mesh_cache)?.comp;
             let name = app.s.name_of(&id);
+            let is_curve = app.s.node(&id).is_some_and(|n| n.curve().is_some());
             Some(match c {
-                Comp::V(v) => format!("{name}.vtx[{v}]"),
+                Comp::V(v) => format!("{name}.{}[{v}]", if is_curve { "cv" } else { "vtx" }),
                 Comp::E(a, b) => format!("{name}.e[{}]", app.s.node(&id)?.mesh()?.mesh.topo().edge(a, b)?),
                 Comp::F(f) => format!("{name}.f[{f}]"),
             })
