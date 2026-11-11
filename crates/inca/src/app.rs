@@ -280,6 +280,8 @@ pub struct IncaApp {
     pub uv_mode: bool,
     /// user hotkeys (Hotkey Editor)
     pub keymap: crate::hotkey_editor::Keymap,
+    pub keymaps: Vec<crate::hotkey_editor::KeymapSet>,
+    pub active_keymap: usize,
     pub hk: crate::hotkey_editor::HkState,
     pub ce: crate::component_editor::CeState,
     pub prefs: crate::prefs::Prefs,
@@ -388,6 +390,18 @@ impl IncaApp {
             (None, None) => None,
             (script, shot) => Some(TestRun { script: script.and_then(|p| std::fs::read_to_string(p).ok()), shot: shot.map(Into::into), frame: 0, requested: false }),
         };
+        let disk_keymaps = crate::hotkey_editor::load_keymaps_file();
+        let mut keymaps: Vec<crate::hotkey_editor::KeymapSet> = disk_keymaps.as_ref().map(|f| f.sets.clone()).unwrap_or_else(|| cc.storage.and_then(|s| eframe::get_value(s, "keymaps")).unwrap_or_default());
+        let mut active_keymap: usize = disk_keymaps.as_ref().map(|f| f.active).unwrap_or_else(|| cc.storage.and_then(|s| eframe::get_value(s, "activeKeymap")).unwrap_or(0));
+        let legacy_keymap: crate::hotkey_editor::Keymap = cc.storage.and_then(|s| eframe::get_value(s, "keymap")).unwrap_or_default();
+        if disk_keymaps.is_none() && keymaps.is_empty() && !legacy_keymap.is_empty() {
+            keymaps.push(crate::hotkey_editor::KeymapSet { name: "Custom".into(), map: legacy_keymap });
+            active_keymap = 1;
+        }
+        if active_keymap > keymaps.len() {
+            active_keymap = 0;
+        }
+        let keymap: crate::hotkey_editor::Keymap = if active_keymap == 0 { Default::default() } else { keymaps[active_keymap - 1].map.clone() };
         let mut app = IncaApp {
             s: Scene::new(),
             mel: Interp::new(),
@@ -477,7 +491,9 @@ impl IncaApp {
             type_text: "Inca".into(),
             inview_offset: egui::Vec2::ZERO,
             uv_mode: false,
-            keymap: cc.storage.and_then(|s| eframe::get_value(s, "keymap")).unwrap_or_default(),
+            keymap,
+            keymaps,
+            active_keymap,
             hk: Default::default(),
             ce: Default::default(),
             prefs,
@@ -1024,6 +1040,10 @@ impl IncaApp {
         if ctx.egui_wants_keyboard_input() || crate::uv_editor::wants_keys(self, ctx) {
             return;
         }
+        // The Hotkey Editor owns the next key press while assigning a shortcut.
+        if self.win.hotkeys && self.hk.capturing {
+            return;
+        }
         let events = ctx.input(|i| i.events.clone());
         let now = ctx.input(|i| i.time);
         for e in &events {
@@ -1129,6 +1149,10 @@ impl IncaApp {
 
 impl eframe::App for IncaApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // Test runs must not overwrite the user's real preferences and keymaps.
+        if self.test.is_some() {
+            return;
+        }
         eframe::set_value(storage, "recent", &self.recent);
         eframe::set_value(storage, "shelves", &self.shelves);
         eframe::set_value(storage, "workspace", &self.workspace);
@@ -1142,7 +1166,15 @@ impl eframe::App for IncaApp {
         eframe::set_value(storage, "softSelect", &self.soft);
         eframe::set_value(storage, "manipSize", &self.manip_size);
         eframe::set_value(storage, "options", &self.options);
+        if self.active_keymap > 0 && self.active_keymap <= self.keymaps.len() {
+            self.keymaps[self.active_keymap - 1].map = self.keymap.clone();
+        }
+        eframe::set_value(storage, "keymaps", &self.keymaps);
+        eframe::set_value(storage, "activeKeymap", &self.active_keymap);
         eframe::set_value(storage, "keymap", &self.keymap);
+        if let Err(e) = crate::hotkey_editor::save_keymaps_file(self) {
+            eprintln!("Failed to save keymaps.json: {e}");
+        }
         eframe::set_value(storage, "prefs", &self.prefs);
         if let Some(p) = &self.s.project {
             eframe::set_value(storage, "lastProject", p);
