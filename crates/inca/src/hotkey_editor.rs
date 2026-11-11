@@ -61,15 +61,22 @@ pub struct Pending {
     pub chord: String,
     pub action: String,
     pub existing: String,
+    pub existing_release: bool,
+    pub release: bool,
 }
 
 #[derive(Default)]
 pub struct HkState {
     pub filter: String,
     pub category: String,
+    /// filter/category as of the last frame, for resetting the command list scroll
+    pub filter_seen: String,
+    pub category_seen: String,
     pub selected: Option<String>,
     /// waiting for the next key press to bind to `selected`
     pub capturing: bool,
+    /// assign the next hotkey to key release instead of key press
+    pub release: bool,
     pub layer_ctrl: bool,
     pub layer_alt: bool,
     pub layer_shift: bool,
@@ -137,43 +144,135 @@ fn chord_pref(c: &str) -> (usize, bool, bool, bool) {
 }
 
 /// The action for a key press: a user binding first, then the Maya default unless it was removed.
+/// A chord bound to release is taken, so its default press action is suppressed too.
 pub fn resolve(app: &IncaApp, key: Key, m: Modifiers) -> Option<String> {
     if let Some(a) = app.keymap.get(&chord(key, m)) {
-        return Some(a.clone());
+        let (id, release) = split_action(a);
+        return (!release).then(|| id.to_string());
     }
     let a = crate::actions::hotkey(key, m, app)?;
     (!app.keymap.contains_key(&format!("unbind:{a}"))).then(|| a.to_string())
 }
 
-fn bound_action(app: &IncaApp, c: &str) -> Option<String> {
-    if let Some(a) = app.keymap.get(c) {
-        return Some(a.clone());
-    }
-    crate::actions::ACTIONS.iter().find(|(id, _, hk)| *hk == c && !app.keymap.contains_key(&format!("unbind:{id}"))).map(|(id, _, _)| id.to_string())
+/// The action a key should run when released, if it was bound on release.
+pub fn release_action(app: &IncaApp, key: Key, m: Modifiers) -> Option<String> {
+    app.keymap.get(&chord(key, m)).and_then(|a| a.strip_prefix("release:").map(str::to_string))
 }
 
-/// The chords that run an action: user bindings plus its default (unless that chord was rebound).
-pub fn chords_for(app: &IncaApp, id: &str) -> Vec<String> {
-    let mut out: Vec<String> = app.keymap.iter().filter(|(c, a)| *a == id && !c.starts_with("unbind:")).map(|(c, _)| c.clone()).collect();
+fn split_action(a: &str) -> (&str, bool) {
+    match a.strip_prefix("release:") {
+        Some(id) => (id, true),
+        None => (a, false),
+    }
+}
+
+fn action_value(id: &str, release: bool) -> String {
+    if release { format!("release:{id}") } else { id.to_string() }
+}
+
+fn bound_action(app: &IncaApp, c: &str) -> Option<(String, bool)> {
+    if let Some(a) = app.keymap.get(c) {
+        let (id, release) = split_action(a);
+        return Some((id.to_string(), release));
+    }
+    crate::actions::ACTIONS.iter().find(|(id, _, hk)| *hk == c && !app.keymap.contains_key(&format!("unbind:{id}"))).map(|(id, _, _)| (id.to_string(), false))
+}
+
+/// Every binding for an action, with its direction (press vs release). Includes the default
+/// press hotkey unless that chord was rebound or the default was switched off.
+fn binding_chords(app: &IncaApp, id: &str) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = app
+        .keymap
+        .iter()
+        .filter(|(c, _)| !c.starts_with("unbind:"))
+        .filter_map(|(c, a)| {
+            let (action, release) = split_action(a);
+            (action == id).then(|| (c.clone(), release))
+        })
+        .collect();
     let def = crate::actions::hotkey_label(id);
-    if !def.is_empty() && !app.keymap.contains_key(&format!("unbind:{id}")) && app.keymap.get(def).map_or(true, |a| a == id) {
-        out.push(def.to_string());
+    if !def.is_empty() && !app.keymap.contains_key(&format!("unbind:{id}")) && !app.keymap.contains_key(def) {
+        out.push((def.to_string(), false));
     }
     out.sort();
     out.dedup();
     out
 }
 
-fn binding_map(app: &IncaApp) -> BTreeMap<String, String> {
+fn binding_text_from(bindings: &[(String, bool)]) -> String {
+    bindings.iter().map(|(c, release)| if *release { format!("{c} (release)") } else { c.clone() }).collect::<Vec<_>>().join(", ")
+}
+
+fn binding_text(app: &IncaApp, id: &str) -> String {
+    binding_text_from(&binding_chords(app, id))
+}
+
+/// The key part of a binding, ignoring modifiers: "Ctrl+Shift+K" -> "K", "Insert / hold D" -> "D".
+fn binding_key(c: &str) -> &str {
+    c.rsplit(|ch: char| ch == '+' || ch.is_whitespace()).find(|s| !s.is_empty()).unwrap_or(c)
+}
+
+/// Does any word in the text start with `q`? "Quad Draw" matches "d"; "Target Weld" does not.
+fn starts_word(text: &str, q: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric()).any(|w| w.to_lowercase().starts_with(q))
+}
+
+/// Lower is a better search match. Hotkey matches rank above command-name matches so typing
+/// "D" surfaces the command bound to D instead of every command containing the letter.
+fn search_rank(q: &str, id: &str, label: &str, cat: &str, bindings: &[(String, bool)]) -> Option<u8> {
+    if q.is_empty() {
+        return Some(0);
+    }
+    if bindings.iter().any(|(c, _)| c.eq_ignore_ascii_case(q)) {
+        return Some(1);
+    }
+    // A plain key (no modifiers) is more specific than Ctrl+D etc.
+    if bindings.iter().any(|(c, _)| !c.contains('+') && binding_key(c).eq_ignore_ascii_case(q)) {
+        return Some(2);
+    }
+    if bindings.iter().any(|(c, _)| binding_key(c).eq_ignore_ascii_case(q)) {
+        return Some(3);
+    }
+    if bindings.iter().any(|(c, _)| c.to_lowercase().contains(q)) {
+        return Some(4);
+    }
+    let label = label.to_lowercase();
+    if starts_word(&label, q) {
+        return Some(5);
+    }
+    // One-letter searches must match a word start, otherwise "D" matches every "Weld"/"Edge".
+    if q.chars().count() == 1 {
+        return None;
+    }
+    if label.contains(q) {
+        return Some(6);
+    }
+    if id.to_lowercase().contains(q) {
+        return Some(7);
+    }
+    if cat.to_lowercase().contains(q) {
+        return Some(8);
+    }
+    None
+}
+
+/// The chords that run an action on press (menus and shortcut columns). Release-only bindings
+/// are deliberately omitted; the Hotkey Editor shows them with their direction.
+pub fn chords_for(app: &IncaApp, id: &str) -> Vec<String> {
+    binding_chords(app, id).into_iter().filter(|(_, release)| !release).map(|(c, _)| c).collect()
+}
+
+fn binding_map(app: &IncaApp) -> BTreeMap<String, (String, bool)> {
     let mut map = BTreeMap::new();
     for (id, _, hk) in crate::actions::ACTIONS {
         if !hk.is_empty() && !app.keymap.contains_key(&format!("unbind:{id}")) {
-            map.insert((*hk).to_string(), (*id).to_string());
+            map.insert((*hk).to_string(), ((*id).to_string(), false));
         }
     }
     for (c, a) in &app.keymap {
         if !c.starts_with("unbind:") {
-            map.insert(c.clone(), a.clone());
+            let (id, release) = split_action(a);
+            map.insert(c.clone(), (id.to_string(), release));
         }
     }
     map
@@ -260,32 +359,33 @@ fn command_description(id: &str) -> Option<String> {
 }
 
 fn start_capture(app: &mut IncaApp) {
-    if app.active_keymap == 0 {
-        app.hk.status = "Inca Default is read-only. Create a new hotkey set to edit shortcuts.".into();
-        return;
-    }
+    ensure_editable_set(app);
     if app.hk.selected.is_some() && !app.hk.capturing {
         app.hk.capturing = true;
         app.hk.pending = None;
         app.hk.restore_confirm = false;
-        app.hk.status = "Press a key combination for the selected command… (Esc cancels)".into();
+        app.hk.status = if app.hk.release {
+            "Press a key combination for the selected command (on release)… (Esc cancels)".into()
+        } else {
+            "Press a key combination for the selected command… (Esc cancels)".into()
+        };
     }
 }
 
-fn assign_key(app: &mut IncaApp, c: &str, id: &str) {
-    app.keymap.insert(c.to_string(), id.to_string());
+fn assign_key(app: &mut IncaApp, c: &str, id: &str, release: bool) {
+    app.keymap.insert(c.to_string(), action_value(id, release));
 }
 
 fn override_pending(app: &mut IncaApp) {
     let Some(p) = app.hk.pending.take() else { return };
-    if app.keymap.get(&p.chord).is_some_and(|a| a == &p.existing) {
+    if app.keymap.get(&p.chord).is_some_and(|a| split_action(a).0 == p.existing) {
         app.keymap.remove(&p.chord);
     }
-    if crate::actions::hotkey_label(&p.existing) == p.chord {
+    if !p.existing_release && crate::actions::hotkey_label(&p.existing) == p.chord {
         app.keymap.insert(format!("unbind:{}", p.existing), p.existing.clone());
     }
-    assign_key(app, &p.chord, &p.action);
-    app.hk.status = format!("Assigned {} to {}.", p.chord, command_label(&p.action));
+    assign_key(app, &p.chord, &p.action, p.release);
+    app.hk.status = format!("Assigned {}{} to {}.", p.chord, if p.release { " (release)" } else { "" }, command_label(&p.action));
 }
 
 fn remove_hotkeys(app: &mut IncaApp) {
@@ -293,7 +393,7 @@ fn remove_hotkeys(app: &mut IncaApp) {
         return;
     }
     let Some(id) = app.hk.selected.clone() else { return };
-    app.keymap.retain(|_, a| a != &id);
+    app.keymap.retain(|_, a| split_action(a).0 != id);
     if !crate::actions::hotkey_label(&id).is_empty() {
         app.keymap.insert(format!("unbind:{id}"), id.clone());
     }
@@ -335,16 +435,16 @@ fn clear_modifier_layers(app: &mut IncaApp) {
 }
 
 fn focus_command(app: &mut IncaApp, id: &str) {
-    let chords = chords_for(app, id);
+    let chords = binding_chords(app, id);
     if chords.is_empty() {
         clear_modifier_layers(app);
         return;
     }
     let current = (app.hk.layer_ctrl, app.hk.layer_shift, app.hk.layer_alt);
-    if chords.iter().any(|c| chord_layer(c) == current) {
+    if chords.iter().any(|(c, _)| chord_layer(c) == current) {
         return;
     }
-    if let Some(best) = chords.iter().min_by_key(|c| chord_pref(c.as_str())) {
+    if let Some((best, _)) = chords.iter().min_by_key(|(c, _)| chord_pref(c.as_str())) {
         if app.hk.restore_layers.is_none() {
             app.hk.restore_layers = Some(current);
         }
@@ -376,6 +476,16 @@ fn create_set(app: &mut IncaApp, name: String, map: Keymap) {
     app.hk.status = format!("Created hotkey set \"{name}\".");
 }
 
+/// The default set is read-only; the first edit creates a custom set from the defaults so the
+/// user does not hit a dead end.
+fn ensure_editable_set(app: &mut IncaApp) {
+    if app.active_keymap > 0 && app.active_keymap <= app.keymaps.len() {
+        return;
+    }
+    let name = unique_set_name(app, "Custom 1");
+    create_set(app, name, Keymap::new());
+}
+
 fn rename_set(app: &mut IncaApp, name: String) {
     if app.active_keymap == 0 || app.active_keymap > app.keymaps.len() {
         return;
@@ -397,24 +507,25 @@ fn delete_set(app: &mut IncaApp) {
     app.hk.status = format!("Deleted hotkey set \"{name}\". Using Inca Default.");
 }
 
-fn submit_chord(app: &mut IncaApp, c: String, id: String) {
-    if app.active_keymap == 0 {
-        app.hk.capturing = false;
-        app.hk.status = "Inca Default is read-only. Create a new hotkey set to edit shortcuts.".into();
-        return;
-    }
+fn submit_chord(app: &mut IncaApp, c: String, id: String, release: bool) {
+    ensure_editable_set(app);
     app.hk.capturing = false;
+    let dir = if release { " (release)" } else { "" };
     match bound_action(app, &c) {
-        Some(existing) if existing == id => {
-            app.hk.status = format!("{c} is already assigned to this command.");
+        Some((existing, existing_release)) if existing == id => {
+            app.hk.status = if existing_release == release {
+                format!("{c}{dir} is already assigned to this command.")
+            } else {
+                format!("{c} is already assigned to this command on {}.", if existing_release { "release" } else { "press" })
+            };
         }
-        Some(existing) => {
-            app.hk.status = format!("{c} is assigned to {}.", command_label(&existing));
-            app.hk.pending = Some(Pending { chord: c, action: id, existing });
+        Some((existing, existing_release)) => {
+            app.hk.status = format!("{c} is assigned to {}{}.", command_label(&existing), if existing_release { " (release)" } else { "" });
+            app.hk.pending = Some(Pending { chord: c, action: id, existing, existing_release, release });
         }
         None => {
-            assign_key(app, &c, &id);
-            app.hk.status = format!("Assigned {c} to {}.", command_label(&id));
+            assign_key(app, &c, &id, release);
+            app.hk.status = format!("Assigned {c}{dir} to {}.", command_label(&id));
         }
     }
 }
@@ -443,7 +554,8 @@ fn capture(app: &mut IncaApp, ctx: &egui::Context) {
         app.hk.capturing = false;
         return;
     };
-    submit_chord(app, chord(key, m), id);
+    let release = app.hk.release;
+    submit_chord(app, chord(key, m), id, release);
 }
 
 #[derive(Clone)]
@@ -575,7 +687,7 @@ fn paint_key(
     rect: Rect,
     spec: &KeySpec,
     unit: f32,
-    bindings: &BTreeMap<String, String>,
+    bindings: &BTreeMap<String, (String, bool)>,
     selected_chords: &HashSet<String>,
     layers: (bool, bool, bool),
     hover: Option<Pos2>,
@@ -589,7 +701,7 @@ fn paint_key(
         bindings.iter()
             .filter(|(c, _)| c.rsplit('+').next() == Some(spec.key.as_str()))
             .min_by_key(|(c, _)| chord_pref(c))
-            .map(|(c, a)| (c.clone(), a.clone()))
+            .map(|(c, (a, release))| (c.clone(), a.clone(), *release))
     } else {
         None
     };
@@ -643,10 +755,10 @@ fn paint_key(
             format!("{} modifier layer", m)
         } else if spec.key.is_empty() {
             format!("{}", spec.label)
-        } else if let Some(a) = &bound {
-            format!("{combo}  ->  {}", command_label(a))
-        } else if let Some((c, a)) = &hint {
-            format!("{c}  ->  {}  (other modifier layer)", command_label(a))
+        } else if let Some((a, release)) = &bound {
+            format!("{combo}  ->  {}{}", command_label(a), if *release { "  (on release)" } else { "" })
+        } else if let Some((c, a, release)) = &hint {
+            format!("{c}  ->  {}{}  (other modifier layer)", command_label(a), if *release { "  (on release)" } else { "" })
         } else {
             format!("{combo}  —  no command assigned")
         };
@@ -654,9 +766,9 @@ fn paint_key(
     if click.is_some_and(|p| rect.contains(p)) {
         if let Some(m) = spec.modifier {
             *clicked = Some(KeyClick::Modifier(m));
-        } else if let Some(a) = bound {
+        } else if let Some((a, _)) = bound {
             *clicked = Some(KeyClick::Action(a));
-        } else if let Some((c, a)) = &hint {
+        } else if let Some((c, a, _)) = &hint {
             *clicked = Some(KeyClick::Hint { action: a.clone(), chord: c.clone() });
         }
     }
@@ -666,11 +778,11 @@ fn keyboard(app: &mut IncaApp, ui: &mut egui::Ui) -> String {
     let mut bindings = binding_map(app);
     // The keyboard follows the category filter, like the command list.
     if !app.hk.category.is_empty() {
-        bindings.retain(|_, action| category_of(action) == app.hk.category);
+        bindings.retain(|_, (action, _)| category_of(action) == app.hk.category);
     }
     let selected_chords: HashSet<String> = app.hk.selected.as_ref()
         .filter(|id| app.hk.category.is_empty() || category_of(id) == app.hk.category)
-        .map(|id| chords_for(app, id).into_iter().collect())
+        .map(|id| binding_chords(app, id).into_iter().map(|(c, _)| c).collect())
         .unwrap_or_default();
     let (main, nav) = keyboard_rows();
     let unit = ((ui.available_width() - 12.0) / 19.2).clamp(18.0, 46.0);
@@ -747,7 +859,8 @@ fn keyboard(app: &mut IncaApp, ui: &mut egui::Ui) -> String {
             app.hk.selected = Some((*action).clone());
             app.hk.pending = None;
             app.hk.status.clear();
-            submit_chord(app, layer_chord(&key, ctrl, shift, alt), (*action).clone());
+            let release = app.hk.release;
+            submit_chord(app, layer_chord(&key, ctrl, shift, alt), (*action).clone(), release);
         }
     }
     if let Some(click) = clicked {
@@ -821,8 +934,8 @@ fn legend(ui: &mut egui::Ui) {
 fn command_details(app: &IncaApp, ui: &mut egui::Ui) {
     ui.label(RichText::new("Drag a command from the list onto a key to assign it.").color(theme::TEXT_DIM));
     let Some(id) = &app.hk.selected else { return };
-    let keys = chords_for(app, id);
-    ui.label(RichText::new(if keys.is_empty() { "No hotkey assigned".to_string() } else { format!("Hotkey: {}", keys.join(", ")) }).monospace().color(if keys.is_empty() { theme::TEXT_DIM } else { Color32::from_rgb(0x9f, 0xc6, 0xe0) }));
+    let keys = binding_text(app, id);
+    ui.label(RichText::new(if keys.is_empty() { "No hotkey assigned".to_string() } else { format!("Hotkey: {keys}") }).monospace().color(if keys.is_empty() { theme::TEXT_DIM } else { Color32::from_rgb(0x9f, 0xc6, 0xe0) }));
     ui.label(RichText::new(category_of(id)).color(theme::TEXT_DIM));
     if let Some(desc) = command_description(id) {
         ui.label(RichText::new(desc).color(theme::TEXT_DIM));
@@ -885,7 +998,8 @@ fn known_keymap(map: Keymap) -> (Keymap, usize) {
     let map = map
         .into_iter()
         .filter(|(_, action)| {
-            let id = action.strip_prefix("unbind:").unwrap_or(action);
+            let id = action.strip_prefix("release:").unwrap_or(action);
+            let id = id.strip_prefix("unbind:").unwrap_or(id);
             let known = crate::actions::available(id);
             if !known {
                 dropped += 1;
@@ -963,13 +1077,26 @@ fn export_keymap_file(app: &mut IncaApp) {
     }
 }
 
+fn paint_lock(painter: &egui::Painter, at: Pos2, color: Color32) {
+    let body = Rect::from_min_size(at, vec2(9.0, 6.0));
+    painter.rect_filled(body, 1.0, color);
+    let c = pos2(at.x + 4.5, at.y);
+    let pts: Vec<Pos2> = (0..=8)
+        .map(|i| {
+            let a = std::f32::consts::PI + std::f32::consts::PI * (i as f32 / 8.0);
+            pos2(c.x + 3.0 * a.cos(), c.y + 3.0 * a.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, Stroke::new(1.2, color)));
+}
+
 fn keymap_bar(app: &mut IncaApp, ui: &mut egui::Ui) {
     let editable = app.active_keymap > 0 && app.active_keymap <= app.keymaps.len();
     ui.horizontal_wrapped(|ui| {
         ui.label("Hotkey set:");
         let selected = if editable { app.keymaps[app.active_keymap - 1].name.clone() } else { "Inca Default".to_string() };
         let sets: Vec<(usize, String)> = app.keymaps.iter().enumerate().map(|(i, s)| (i + 1, s.name.clone())).collect();
-        egui::ComboBox::from_id_salt("hk_set").width(190.0).selected_text(selected).show_ui(ui, |ui| {
+        let combo = egui::ComboBox::from_id_salt("hk_set").width(190.0).selected_text(selected.clone()).show_ui(ui, |ui| {
             if ui.selectable_label(app.active_keymap == 0, "Inca Default").clicked() {
                 activate_set(app, 0);
             }
@@ -979,6 +1106,14 @@ fn keymap_bar(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             }
         });
+        if !editable {
+            // A padlock next to the read-only default set's name.
+            let r = combo.response.rect;
+            let text = ui.painter().layout_no_wrap(selected, egui::TextStyle::Button.resolve(ui.style()), theme::TEXT);
+            let x = r.left() + ui.spacing().button_padding.x + text.size().x + 5.0;
+            paint_lock(ui.painter(), pos2(x, r.center().y - 1.0), theme::TEXT_DIM);
+            combo.response.on_hover_text("Inca Default is read-only");
+        }
         if ui.button("New...").on_hover_text("Create a set from Inca Default shortcuts").clicked() {
             app.hk.naming = Some(NameMode::New);
             app.hk.name_buf = format!("Custom {}", app.keymaps.len() + 1);
@@ -1062,7 +1197,7 @@ fn keymap_bar(app: &mut IncaApp, ui: &mut egui::Ui) {
                 app.hk.delete_confirm = false;
             }
         } else if !editable {
-            ui.label(RichText::new("Inca Default is read-only — create a new set to edit shortcuts.").color(theme::TEXT_DIM));
+            ui.label(RichText::new("Inca Default is read-only — assigning a hotkey creates a new set.").color(theme::TEXT_DIM));
         }
     });
     ui.separator();
@@ -1088,13 +1223,10 @@ fn left_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
     });
 }
 
-fn command_row(ui: &mut egui::Ui, id: &str, label: &str, keys: &str, sel: bool, editable: bool) -> egui::Response {
+fn command_row(ui: &mut egui::Ui, id: &str, label: &str, keys: &str, sel: bool) -> egui::Response {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-    let sense = if editable { Sense::click_and_drag() } else { Sense::click() };
-    let resp = ui.interact(rect, ui.make_persistent_id(("hk_cmd", id)), sense);
-    if editable {
-        resp.dnd_set_drag_payload(id.to_string());
-    }
+    let resp = ui.interact(rect, ui.make_persistent_id(("hk_cmd", id)), Sense::click_and_drag());
+    resp.dnd_set_drag_payload(id.to_string());
     if resp.dragged() {
         if let Some(p) = ui.ctx().pointer_interact_pos() {
             let layer = LayerId::new(Order::Tooltip, egui::Id::new("hk_cmd_ghost"));
@@ -1154,39 +1286,49 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
         });
     });
     ui.separator();
+    let reset_scroll = app.hk.filter != app.hk.filter_seen || app.hk.category != app.hk.category_seen;
+    app.hk.filter_seen = app.hk.filter.clone();
+    app.hk.category_seen = app.hk.category.clone();
     let q = app.hk.filter.trim().to_lowercase();
     let cat_filter = app.hk.category.clone();
-    let mut groups: BTreeMap<&'static str, Vec<(&'static str, String, String)>> = BTreeMap::new();
+    let mut groups: BTreeMap<&'static str, Vec<(&'static str, String, String, u8)>> = BTreeMap::new();
     for (id, label) in &commands {
         let cat = category_of(id);
         if !cat_filter.is_empty() && cat != cat_filter {
             continue;
         }
-        let keys = chords_for(app, id);
-        let hit = q.is_empty() || label.to_lowercase().contains(&q) || id.to_lowercase().contains(&q) || cat.to_lowercase().contains(&q) || keys.iter().any(|k| k.to_lowercase().contains(&q));
-        if !hit {
+        let bindings = binding_chords(app, id);
+        let Some(rank) = search_rank(&q, id, label, cat, &bindings) else {
             continue;
-        }
-        groups.entry(cat).or_default().push((id, label.clone(), keys.join(", ")));
+        };
+        groups.entry(cat).or_default().push((id, label.clone(), binding_text_from(&bindings), rank));
     }
-    let mut groups: Vec<(&'static str, Vec<(&'static str, String, String)>)> = groups.into_iter().collect();
-    groups.sort_by(|(a, _), (b, _)| category_rank(a).cmp(&category_rank(b)).then(a.cmp(b)));
-    let list_h = (ui.available_height() - 54.0).max(120.0);
-    egui::ScrollArea::vertical().id_salt("hk_command_list").auto_shrink([false, false]).max_height(list_h).show(ui, |ui| {
+    let mut groups: Vec<(&'static str, Vec<(&'static str, String, String, u8)>)> = groups.into_iter().collect();
+    groups.sort_by(|(a, ai), (b, bi)| {
+        let ra = ai.iter().map(|x| x.3).min().unwrap_or(0);
+        let rb = bi.iter().map(|x| x.3).min().unwrap_or(0);
+        ra.cmp(&rb).then(category_rank(a).cmp(&category_rank(b))).then(a.cmp(b))
+    });
+    let list_h = (ui.available_height() - 78.0).max(120.0);
+    let mut list = egui::ScrollArea::vertical().id_salt("hk_command_list").auto_shrink([false, false]).max_height(list_h);
+    if reset_scroll {
+        list = list.vertical_scroll_offset(0.0);
+    }
+    list.show(ui, |ui| {
         // Keep the floating scrollbar off the shortcut column.
         egui::Frame::NONE.inner_margin(egui::Margin { right: 20, ..Default::default() }).show(ui, |ui| {
             for (cat, mut items) in groups {
-                items.sort_by(|a, b| a.1.cmp(&b.1));
-                let reveal_here = app.hk.reveal && items.iter().any(|(id, _, _)| app.hk.selected.as_deref() == Some(*id));
+                items.sort_by(|a, b| a.3.cmp(&b.3).then(a.1.cmp(&b.1)));
+                let reveal_here = app.hk.reveal && items.iter().any(|(id, _, _, _)| app.hk.selected.as_deref() == Some(*id));
                 let header = format!("{} ({})", cat, items.len());
                 egui::CollapsingHeader::new(RichText::new(header).strong())
                     .id_salt(("hk_cat", cat))
                     .default_open(true)
                     .open(reveal_here.then_some(true))
                     .show(ui, |ui| {
-                        for (id, label, keys) in items {
+                        for (id, label, keys, _) in items {
                             let sel = app.hk.selected.as_deref() == Some(id);
-                            let resp = command_row(ui, id, &label, &keys, sel, editable).on_hover_text(id);
+                            let resp = command_row(ui, id, &label, &keys, sel).on_hover_text(id);
                             if resp.double_clicked() {
                                 app.hk.selected = Some(id.to_string());
                                 app.hk.pending = None;
@@ -1215,10 +1357,21 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
     ui.separator();
     let selected = app.hk.selected.clone();
     let has_sel = selected.is_some();
-    let has_keys = selected.as_ref().is_some_and(|id| !chords_for(app, id).is_empty());
+    let has_keys = selected.as_ref().is_some_and(|id| !binding_chords(app, id).is_empty());
+    ui.horizontal(|ui| {
+        let mut release = app.hk.release;
+        if ui
+            .add_enabled(!app.hk.capturing && app.hk.pending.is_none(), egui::Checkbox::new(&mut release, "On Release"))
+            .on_hover_text("Run the command when the key is released instead of pressed")
+            .changed()
+        {
+            app.hk.release = release;
+        }
+        ui.label(RichText::new("run on key-up").color(theme::TEXT_DIM).size(11.0));
+    });
     ui.horizontal(|ui| {
         let txt = if app.hk.capturing { "Press a key… (Esc cancels)" } else { "Assign New Hotkey" };
-        if ui.add_enabled(has_sel && editable, egui::Button::new(txt)).clicked() {
+        if ui.add_enabled(has_sel, egui::Button::new(txt)).clicked() {
             if app.hk.capturing {
                 app.hk.capturing = false;
                 app.hk.status = "Assignment cancelled.".into();
@@ -1240,7 +1393,8 @@ fn status_bar(app: &mut IncaApp, ui: &mut egui::Ui) {
     ui.separator();
     if let Some(p) = app.hk.pending.clone() {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} is assigned to {}.", p.chord, command_label(&p.existing))).color(Color32::from_rgb(0xe6, 0xc5, 0x4a)));
+            let dir = if p.existing_release { " (release)" } else { "" };
+            ui.label(RichText::new(format!("{} is assigned to {}{dir}.", p.chord, command_label(&p.existing))).color(Color32::from_rgb(0xe6, 0xc5, 0x4a)));
             if ui.button("Override").clicked() {
                 override_pending(app);
             }
@@ -1324,16 +1478,52 @@ mod tests {
     }
 
     #[test]
+    fn one_letter_search_matches_word_starts_only() {
+        assert!(starts_word("Quad Draw", "d"));
+        assert!(starts_word("Duplicate", "d"));
+        assert!(starts_word("Decrease Manipulator Size", "d"));
+        assert!(!starts_word("Target Weld", "d"));
+        assert!(!starts_word("Insert Edge Loop Tool", "d"));
+        assert!(search_rank("d", "targetWeld", "Target Weld", "Tools", &[]).is_none());
+        assert!(search_rank("d", "quadDraw", "Quad Draw", "Tools", &[]).is_some());
+    }
+
+    #[test]
+    fn hotkey_search_prefers_plain_keys() {
+        assert_eq!(binding_key("Ctrl+Shift+K"), "K");
+        assert_eq!(binding_key("Insert / hold D"), "D");
+        let plain_d = vec![("Insert / hold D".to_string(), false)];
+        let ctrl_d = vec![("Ctrl+D".to_string(), false)];
+        let plain = search_rank("d", "pivotEdit", "Edit Pivot", "Tools", &plain_d).unwrap();
+        let modified = search_rank("d", "duplicate", "Duplicate", "Edit", &ctrl_d).unwrap();
+        assert!(plain < modified, "plain D should rank above Ctrl+D");
+    }
+
+    #[test]
+    fn release_bindings_round_trip() {
+        assert_eq!(split_action("copy"), ("copy", false));
+        assert_eq!(split_action("release:copy"), ("copy", true));
+        for release in [false, true] {
+            let value = action_value("copy", release);
+            assert_eq!(split_action(&value), ("copy", release));
+        }
+    }
+
+    #[test]
     fn import_drops_unknown_command_ids() {
         let mut map = Keymap::new();
         map.insert("Ctrl+C".into(), "copy".into());
         map.insert("Ctrl+X".into(), "notARealAction".into());
+        map.insert("Ctrl+R".into(), "release:repeatLast".into());
+        map.insert("Ctrl+Y".into(), "release:notARealAction".into());
         map.insert("unbind:copy".into(), "copy".into());
         let (map, dropped) = known_keymap(map);
-        assert_eq!(dropped, 1);
+        assert_eq!(dropped, 2);
         assert!(map.contains_key("Ctrl+C"));
         assert!(map.contains_key("unbind:copy"));
+        assert_eq!(map.get("Ctrl+R").map(String::as_str), Some("release:repeatLast"));
         assert!(!map.contains_key("Ctrl+X"));
+        assert!(!map.contains_key("Ctrl+Y"));
     }
 }
 

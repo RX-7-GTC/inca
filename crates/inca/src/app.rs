@@ -308,6 +308,8 @@ pub struct IncaApp {
     pub bg_mode: usize,
     /// Space: tap toggles the layout, hold shows the hotbox
     pub space_down: Option<f64>,
+    /// On Release bindings waiting for their key to come up
+    pub release_keys: std::collections::HashMap<egui::Key, String>,
     pub hotbox: Option<egui::Pos2>,
     /// top-level menu currently open (main menu bar or hotbox)
     pub open_menu: Option<crate::menus::OpenMenu>,
@@ -459,6 +461,7 @@ impl IncaApp {
             }),
             shelf_edit: (0, None),
             space_down: None,
+            release_keys: Default::default(),
             select_hierarchy: false,
             last_comp_mode: CompMode::Vertex,
             sel_mask_off: ["template".to_string()].into_iter().collect(),
@@ -1074,10 +1077,21 @@ impl IncaApp {
             ctx.request_repaint();
         }
         for e in events {
-            if let egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } = e {
-                if let Some(a) = crate::hotkey_editor::resolve(self, key, modifiers) {
-                    self.action(&a);
+            match e {
+                egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } => {
+                    if let Some(a) = crate::hotkey_editor::resolve(self, key, modifiers) {
+                        self.action(&a);
+                    }
+                    if let Some(a) = crate::hotkey_editor::release_action(self, key, modifiers) {
+                        self.release_keys.insert(key, a);
+                    }
                 }
+                egui::Event::Key { key, pressed: false, repeat: false, .. } => {
+                    if let Some(a) = self.release_keys.remove(&key) {
+                        self.action(&a);
+                    }
+                }
+                _ => {}
             }
         }
     }
