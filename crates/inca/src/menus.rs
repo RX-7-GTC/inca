@@ -250,6 +250,12 @@ pub fn submenu_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     button
 }
 
+fn paint_option_box(ui: &egui::Ui, rect: egui::Rect, hovered: bool) {
+    let box_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 10.0));
+    let color = if hovered { egui::Color32::WHITE } else { egui::Color32::from_gray(0xc8) };
+    ui.painter().rect_stroke(box_rect, 1.0, egui::Stroke::new(1.0, color), egui::StrokeKind::Inside);
+}
+
 fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
     menu_hover(ui);
     for it in list {
@@ -260,24 +266,39 @@ fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                 if let Some(c) = checked {
                     text = format!("{} {text}", if c { "✔" } else { "  " });
                 }
-                let b = egui::Button::new(text).shortcut_text(crate::hotkey_editor::chords_for(app, id).first().cloned().unwrap_or_default());
-                if crate::options::has_box(id) {
+                let has_box = crate::options::has_box(id);
+                let keys = crate::hotkey_editor::chords_for(app, id).first().cloned().unwrap_or_default();
+                let b = if has_box {
+                    egui::Button::new(text)
+                        .shortcut_text(keys)
+                        .right_text(egui::Atom::custom(egui::Id::new(("options_space", id)), egui::vec2(18.0, 0.0)))
+                } else {
+                    egui::Button::new(text).shortcut_text(keys)
+                };
+                if has_box {
                     // the option box opens the command's options dialog
                     let mut opened = false;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        let main = ui.add(b);
-                        highlight_under_press(ui, &main);
-                        if main.clicked() || released_here(ui, &main) {
-                            menu_pick(app, ui, id);
-                            ui.close();
-                        }
-                        let opt = crate::icons::button_ex(ui, "optionBox", "Options", false, 16.0, 12.0, true);
-                        highlight_under_press(ui, &opt);
-                        if opt.clicked() || released_here(ui, &opt) {
-                            opened = true;
-                        }
-                    });
+                    let main = ui.add(b);
+                    highlight_under_press(ui, &main);
+                    let opt_rect = egui::Rect::from_center_size(egui::pos2(main.rect.right() - 8.0, main.rect.center().y), egui::vec2(16.0, 16.0));
+                    let opt = ui.interact(opt_rect, main.id.with("option_box"), egui::Sense::click()).on_hover_text("Options");
+                    highlight_under_press(ui, &opt);
+                    let opt_hovered = opt.hovered();
+                    let opt_clicked = opt.clicked() || released_here(ui, &opt);
+                    let col_rect = egui::Rect::from_min_max(egui::pos2(opt_rect.left(), main.rect.top()), egui::pos2(main.rect.right(), main.rect.bottom()));
+                    if opt_hovered {
+                        main.clone().highlight();
+                        ui.painter().rect_filled(col_rect, 3.0, crate::theme::HI);
+                    } else {
+                        ui.painter().rect_filled(col_rect, 0.0, ui.visuals().window_fill());
+                    }
+                    paint_option_box(ui, opt_rect, opt_hovered);
+                    if opt_clicked {
+                        opened = true;
+                    } else if main.clicked() || released_here(ui, &main) {
+                        menu_pick(app, ui, id);
+                        ui.close();
+                    }
                     if opened {
                         crate::options::open(app, id);
                         app.open_menu = None;
