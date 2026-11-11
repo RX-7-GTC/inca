@@ -669,6 +669,12 @@ fn show_menu_popup_ui(
     if response.ctx.input(|i| i.pointer.is_moving()) {
         response.ctx.request_repaint_after(std::time::Duration::from_millis(30));
     }
+    // A right-click while a menu is open can also start a viewport marking menu. Close this
+    // menu and clear egui's submenu state so it cannot get stuck waiting for a primary click.
+    if response.ctx.input(|i| i.pointer.secondary_clicked()) {
+        app.open_menu = None;
+        response.ctx.data_mut(|data| data.remove_by_type::<egui::menu::MenuState>());
+    }
     // Menus are Foreground layers, so this Middle shield sits below every menu popup but above
     // the application panels. It catches clicks that would otherwise fall through the empty
     // space between a menu and its submenu, while leaving the menu items themselves untouched.
