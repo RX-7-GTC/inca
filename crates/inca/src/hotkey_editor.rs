@@ -880,6 +880,22 @@ fn save_keymaps_now(app: &mut IncaApp) {
     }
 }
 
+fn known_keymap(map: Keymap) -> (Keymap, usize) {
+    let mut dropped = 0;
+    let map = map
+        .into_iter()
+        .filter(|(_, action)| {
+            let id = action.strip_prefix("unbind:").unwrap_or(action);
+            let known = crate::actions::available(id);
+            if !known {
+                dropped += 1;
+            }
+            known
+        })
+        .collect();
+    (map, dropped)
+}
+
 fn import_keymap_file(app: &mut IncaApp) {
     let Some(path) = rfd::FileDialog::new().add_filter("Inca hotkeys", &["json"]).pick_file() else { return };
     let text = match std::fs::read_to_string(&path) {
@@ -906,12 +922,20 @@ fn import_keymap_file(app: &mut IncaApp) {
     }
     let count = sets.len();
     let mut last = String::new();
+    let mut dropped = 0;
     for set in sets {
         let name = unique_set_name(app, &set.name);
         last = name.clone();
-        create_set(app, name, set.map);
+        let (map, lost) = known_keymap(set.map);
+        dropped += lost;
+        create_set(app, name, map);
     }
-    app.hk.status = if count == 1 { format!("Imported \"{last}\".") } else { format!("Imported {count} hotkey sets.") };
+    app.hk.status = match (count, dropped) {
+        (1, 0) => format!("Imported \"{last}\"."),
+        (1, n) => format!("Imported \"{last}\"; skipped {n} unknown command(s)."),
+        (n, 0) => format!("Imported {n} hotkey sets."),
+        (n, dropped) => format!("Imported {n} hotkey sets; skipped {dropped} unknown command(s)."),
+    };
 }
 
 fn export_keymap_file(app: &mut IncaApp) {
@@ -1297,6 +1321,19 @@ mod tests {
         assert_eq!(command_label("pointLight"), "Point Light");
         assert_eq!(command_description("polyCube").as_deref(), Some("Creates a polygon cube."));
         assert_eq!(command_description("pointLight").as_deref(), Some("Creates a point light."));
+    }
+
+    #[test]
+    fn import_drops_unknown_command_ids() {
+        let mut map = Keymap::new();
+        map.insert("Ctrl+C".into(), "copy".into());
+        map.insert("Ctrl+X".into(), "notARealAction".into());
+        map.insert("unbind:copy".into(), "copy".into());
+        let (map, dropped) = known_keymap(map);
+        assert_eq!(dropped, 1);
+        assert!(map.contains_key("Ctrl+C"));
+        assert!(map.contains_key("unbind:copy"));
+        assert!(!map.contains_key("Ctrl+X"));
     }
 }
 
