@@ -2,7 +2,7 @@
 
 use crate::actions::label;
 use crate::app::{IncaApp, MenuSet};
-use egui::{pos2, Rect, Sense};
+use egui::{Align, Frame, InnerResponse, Layout, PointerButton, Popup, PopupCloseBehavior, RectAlign, Response, Ui, UiKind, UiStackInfo, Vec2};
 use inca_core::primitives::GEN_INFO;
 use inca_core::scene::LIGHT_TYPES;
 
@@ -239,7 +239,18 @@ pub(crate) fn menu_hover(ui: &mut egui::Ui) {
     v.hovered.weak_bg_fill = crate::theme::HI;
 }
 
-pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
+pub fn submenu_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    // One extra pixel of right padding moves only the arrow; the row label shifts by the same
+    // negligible amount. Atom spacers are unsuitable here because egui inserts item spacing
+    // between separate atoms.
+    let old = ui.style().spacing.button_padding;
+    ui.style_mut().spacing.button_padding.x += 2.0;
+    let button = ui.add(egui::Button::new(label).right_text(egui::menu::SubMenuButton::RIGHT_ARROW));
+    ui.style_mut().spacing.button_padding = old;
+    button
+}
+
+fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
     menu_hover(ui);
     for it in list {
         match it {
@@ -282,26 +293,9 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                 }
             }
             Sub(l, v) => {
-                let (button, popup) = egui::menu::SubMenuButton::new(*l).ui(ui, |ui| items(app, ui, v));
-                if let Some(popup) = popup {
-                    // egui leaves a few pixels between a menu and its submenu. Fill that gap
-                    // with an invisible click catcher so clicks can't fall through behind it.
-                    let popup_rect = popup.response.rect;
-                    let gap = if popup_rect.left() >= button.rect.right() {
-                        Rect::from_min_max(pos2(button.rect.right(), popup_rect.top()), pos2(popup_rect.left(), popup_rect.bottom()))
-                    } else if popup_rect.right() <= button.rect.left() {
-                        Rect::from_min_max(pos2(popup_rect.right(), popup_rect.top()), pos2(button.rect.left(), popup_rect.bottom()))
-                    } else {
-                        Rect::NOTHING
-                    };
-                    if gap.width() > 0.0 {
-                        egui::Area::new(popup.response.id.with("gap_bridge"))
-                            .order(egui::Order::Foreground)
-                            .fixed_pos(gap.min)
-                            .show(ui.ctx(), |ui| {
-                                let _ = ui.allocate_exact_size(gap.size(), Sense::click());
-                            });
-                    }
+                let button = submenu_button(ui, l);
+                if submenu_show(ui, &button, |ui| items(app, ui, v)).is_some() {
+                    button.highlight();
                 }
             }
             Sep => {
@@ -311,46 +305,149 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                 ui.add_enabled(false, egui::Button::new(format!("{l} (planned)")));
             }
             Dyn(l) => {
-                ui.menu_button(*l, |ui| match *l {
-                    "Workspaces" => crate::workspace::menu(app, ui),
-                    "Recent Files" | "Recent Projects" => {
-                        let files = *l == "Recent Files";
-                        let list = if files { app.recent.clone() } else { app.recent_projects.clone() };
-                        if list.is_empty() {
-                            ui.add_enabled(false, egui::Button::new("(none)"));
-                        }
-                        for r in list {
-                            let resp = ui.button(&r);
-                            highlight_under_press(ui, &resp);
-                            if resp.clicked() || released_here(ui, &resp) {
-                                if files {
-                                    app.open_path(std::path::Path::new(&r));
-                                } else {
-                                    crate::project::set_project(app, &r, false);
-                                }
-                                app.open_menu = None;
-                                ui.close();
-                            }
-                        }
-                    }
-                    "Assign Existing Material" => {
-                        let mats: Vec<(String, String)> = app.s.mats.values().map(|m| (m.id.clone(), m.name.clone())).collect();
-                        for (_, name) in mats {
-                            let resp = ui.button(&name);
-                            highlight_under_press(ui, &resp);
-                            if resp.clicked() || released_here(ui, &resp) {
-                                let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
-                                app.open_menu = None;
-                                ui.close();
-                            }
-                        }
-                    }
-                    _ => crate::workspace::elements_menu(app, ui),
-                });
+                let button = submenu_button(ui, l);
+                if submenu_show(ui, &button, |ui| dyn_menu(app, ui, l)).is_some() {
+                    button.highlight();
+                }
             }
         }
     }
 }
+
+fn dyn_menu(app: &mut IncaApp, ui: &mut egui::Ui, label: &str) {
+    match label {
+        "Workspaces" => crate::workspace::menu(app, ui),
+        "Recent Files" | "Recent Projects" => {
+            let files = label == "Recent Files";
+            let list = if files { app.recent.clone() } else { app.recent_projects.clone() };
+            if list.is_empty() {
+                ui.add_enabled(false, egui::Button::new("(none)"));
+            }
+            for r in list {
+                let resp = ui.button(&r);
+                highlight_under_press(ui, &resp);
+                if resp.clicked() || released_here(ui, &resp) {
+                    if files {
+                        app.open_path(std::path::Path::new(&r));
+                    } else {
+                        crate::project::set_project(app, &r, false);
+                    }
+                    app.open_menu = None;
+                    ui.close();
+                }
+            }
+        }
+        "Assign Existing Material" => {
+            let mats: Vec<(String, String)> = app.s.mats.values().map(|m| (m.id.clone(), m.name.clone())).collect();
+            for (_, name) in mats {
+                let resp = ui.button(&name);
+                highlight_under_press(ui, &resp);
+                if resp.clicked() || released_here(ui, &resp) {
+                    let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
+                    app.open_menu = None;
+                    ui.close();
+                }
+            }
+        }
+        _ => crate::workspace::elements_menu(app, ui),
+    }
+}
+
+/// Adapted from egui 0.36's `SubMenu::show`, but with a negative gap so the submenu content
+/// touches the parent menu. egui hardcodes a few pixels of empty space between the two popups,
+/// which lets clicks fall through to the UI behind.
+fn submenu_show<R>(ui: &Ui, button_response: &Response, content: impl FnOnce(&mut Ui) -> R) -> Option<InnerResponse<R>> {
+    let frame = Frame::menu(ui.style());
+    let id = button_response.id.with("submenu");
+    let (open_item, menu_id) = egui::menu::MenuState::from_ui(ui, |state, stack| (state.open_item, stack.id));
+    let menu_config = egui::menu::MenuConfig::find(ui);
+    let menu_root_response = ui.ctx().read_response(menu_id)?;
+    let hover_pos = ui.ctx().pointer_hover_pos();
+    let menu_rect = menu_root_response.rect - frame.total_margin();
+    let is_hovering_menu = hover_pos.is_some_and(|pos| ui.ctx().layer_id_at(pos) == Some(menu_root_response.layer_id) && menu_rect.contains(pos));
+
+    let is_any_open = open_item.is_some();
+    let mut is_open = open_item == Some(id);
+    let was_open = is_open;
+    let mut set_open = None;
+    let button_rect = button_response.rect.expand2(ui.style().spacing.item_spacing / 2.0);
+    let is_hovered = hover_pos.is_some_and(|pos| button_rect.contains(pos));
+    let clicked = button_response.clicked();
+    let clicked_by_pointer = button_response.clicked_by(PointerButton::Primary);
+    let clicked_by_keyboard_or_access = clicked && !clicked_by_pointer;
+
+    if ui.is_enabled() && is_open && clicked_by_keyboard_or_access {
+        set_open = Some(false);
+        is_open = false;
+    }
+    let should_open = ui.is_enabled() && ((!was_open && clicked) || (is_hovered && !is_any_open));
+    if should_open {
+        set_open = Some(true);
+        is_open = true;
+        egui::menu::MenuState::from_id(ui.ctx(), menu_id, |state| state.open_item = None);
+    }
+
+    let mut response = button_response.clone();
+    response.interact_rect = response.interact_rect.expand2(Vec2::new(0.0, frame.total_margin().sum().y / 2.0));
+    let popup_response = Popup::from_response(&response)
+        .id(id)
+        .open(is_open)
+        .align(RectAlign::RIGHT_START)
+        .layout(Layout::top_down_justified(Align::Min))
+        .gap(-(frame.total_margin().sum().x / 2.0))
+        .style(menu_config.style.clone())
+        .frame(frame)
+        .close_behavior(PopupCloseBehavior::IgnoreClicks)
+        .info(UiStackInfo::new(UiKind::Menu).with_tag_value(egui::menu::MenuConfig::MENU_CONFIG_TAG, menu_config.clone()))
+        .show(|ui| {
+            if button_response.clicked() || button_response.is_pointer_button_down_on() {
+                ui.ctx().move_to_top(ui.layer_id());
+            }
+            content(ui)
+        });
+
+    if let Some(popup_response) = &popup_response {
+        let is_deepest_submenu = egui::menu::MenuState::is_deepest_open_sub_menu(ui.ctx(), id);
+        let clicked_outside = is_deepest_submenu && popup_response.response.clicked_elsewhere() && menu_root_response.clicked_elsewhere();
+        let submenu_button_clicked = button_response.clicked();
+        let clicked_inside = is_deepest_submenu
+            && !submenu_button_clicked
+            && response.ctx.input(|i| i.pointer.any_click())
+            && hover_pos.is_some_and(|pos| popup_response.response.interact_rect.contains(pos));
+        let click_close = match menu_config.close_behavior {
+            PopupCloseBehavior::CloseOnClick => clicked_outside || clicked_inside,
+            PopupCloseBehavior::CloseOnClickOutside => clicked_outside,
+            PopupCloseBehavior::IgnoreClicks => false,
+        };
+        if click_close {
+            set_open = Some(false);
+            ui.close();
+        }
+        let is_moving_towards_rect = ui.input(|i| i.pointer.is_moving_towards_rect(&popup_response.response.rect));
+        if is_moving_towards_rect {
+            ui.request_repaint();
+        }
+        let hovering_other_menu_entry = is_open
+            && !is_hovered
+            && !popup_response.response.contains_pointer()
+            && !is_moving_towards_rect
+            && is_hovering_menu;
+        if popup_response.response.should_close() {
+            ui.close();
+        }
+        if hovering_other_menu_entry {
+            set_open = Some(false);
+        }
+        if ui.will_parent_close() {
+            ui.data_mut(|data| data.remove_by_type::<egui::menu::MenuState>());
+        }
+    }
+    if let Some(set_open) = set_open {
+        egui::menu::MenuState::from_id(ui.ctx(), menu_id, |state| state.open_item = set_open.then_some(id));
+    }
+    popup_response
+}
+
 
 /// True when the primary button was released over this item. The JS menus run items on
 /// `mouseup`, so holding the button after opening a menu and releasing over an item runs it.
@@ -550,6 +647,25 @@ fn show_menu_popup_ui(
     // state without leaving the previous row highlighted.
     if response.ctx.input(|i| i.pointer.is_moving()) {
         response.ctx.request_repaint_after(std::time::Duration::from_millis(30));
+    }
+    // Menus are Foreground layers, so this Middle shield sits below every menu popup but above
+    // the application panels. It catches clicks that would otherwise fall through the empty
+    // space between a menu and its submenu, while leaving the menu items themselves untouched.
+    let screen = response.ctx.content_rect();
+    let shield = egui::Rect::from_min_max(egui::pos2(screen.left(), response.rect.bottom()), screen.max);
+    if shield.height() > 0.0 {
+        let clicked = egui::Area::new(egui::Id::new("menu_click_shield"))
+            .order(egui::Order::Middle)
+            .fixed_pos(shield.min)
+            .constrain(false)
+            .movable(false)
+            .show(&response.ctx, |ui| {
+                ui.allocate_exact_size(shield.size(), egui::Sense::click()).1.clicked()
+            })
+            .inner;
+        if clicked {
+            app.open_menu = None;
+        }
     }
     let mut open = true;
     let popup = egui::Popup::menu(response).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
