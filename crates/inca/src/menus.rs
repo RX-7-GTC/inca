@@ -2,6 +2,7 @@
 
 use crate::actions::label;
 use crate::app::{IncaApp, MenuSet};
+use egui::{pos2, Rect, Sense};
 use inca_core::primitives::GEN_INFO;
 use inca_core::scene::LIGHT_TYPES;
 
@@ -281,7 +282,27 @@ pub fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                 }
             }
             Sub(l, v) => {
-                ui.menu_button(*l, |ui| items(app, ui, v));
+                let (button, popup) = egui::menu::SubMenuButton::new(*l).ui(ui, |ui| items(app, ui, v));
+                if let Some(popup) = popup {
+                    // egui leaves a few pixels between a menu and its submenu. Fill that gap
+                    // with an invisible click catcher so clicks can't fall through behind it.
+                    let popup_rect = popup.response.rect;
+                    let gap = if popup_rect.left() >= button.rect.right() {
+                        Rect::from_min_max(pos2(button.rect.right(), popup_rect.top()), pos2(popup_rect.left(), popup_rect.bottom()))
+                    } else if popup_rect.right() <= button.rect.left() {
+                        Rect::from_min_max(pos2(popup_rect.right(), popup_rect.top()), pos2(button.rect.left(), popup_rect.bottom()))
+                    } else {
+                        Rect::NOTHING
+                    };
+                    if gap.width() > 0.0 {
+                        egui::Area::new(popup.response.id.with("gap_bridge"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(gap.min)
+                            .show(ui.ctx(), |ui| {
+                                let _ = ui.allocate_exact_size(gap.size(), Sense::click());
+                            });
+                    }
+                }
             }
             Sep => {
                 ui.separator();
