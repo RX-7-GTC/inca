@@ -167,7 +167,7 @@ fn lattice_tool(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Re
     }
     if let (Some(start), Some(q)) = (app.rig_tool.lat_box, resp.interact_pointer_pos()) {
         let r = Rect::from_two_pos(start, q);
-        painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Inside);
+        crate::theme::marquee(&painter, r);
         if resp.drag_stopped() {
             if !mods.shift {
                 app.rig_tool.lat_sel.clear();

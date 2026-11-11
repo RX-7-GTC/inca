@@ -1852,6 +1852,22 @@ fn open_empty_marking(app: &mut IncaApp, pos: Pos2, now: f64) {
     open_custom(app, pos, Some("Hypershade".into()), radial, vec![], now, false);
 }
 
+/// End a marquee without a primary drag-stop. A secondary press can cancel egui's primary
+/// drag, and the normal drop path (which also updates the lead node) never runs.
+fn finish_marquee(app: &mut IncaApp, nodes: &[GNode], order: &[usize]) {
+    if app.windows_state.hs.marquee.take().is_some() {
+        let lead = order
+            .iter()
+            .rev()
+            .copied()
+            .find(|&i| app.windows_state.hs.graph_sel.contains(&nodes[i].id))
+            .map(|i| nodes[i].id.strip_prefix("sg:").unwrap_or(&nodes[i].id).to_string());
+        app.windows_state.hs_selected = lead.clone();
+        app.snode_sel = lead.filter(|id| app.s.mats.contains_key(id) || app.s.texs.contains_key(id));
+        app.windows_state.hs.marquee_base.clear();
+    }
+}
+
 fn select_graph_node(app: &mut IncaApp, id: &str, additive: bool) {
     let selected_now;
     {
@@ -3247,6 +3263,15 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
     // ---- interaction
     let press = ctx.input(|i| i.pointer.press_origin());
     let additive = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
+    // A secondary press cancels egui's primary drag without a drag-stopped event. End any
+    // primary gesture now instead of leaving a frozen marquee or node drag behind.
+    if pointer.is_some_and(|p| rect.contains(p)) && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
+        app.windows_state.hs.drag_start = None;
+        finish_marquee(app, &nodes, &order);
+        if !app.windows_state.hs.wire_middle {
+            app.windows_state.hs.wire = None;
+        }
+    }
     if resp.drag_started_by(egui::PointerButton::Primary) {
         if let Some(p) = press {
             // an output port starts a wire, a node body moves the selection, empty space marquees
@@ -3355,6 +3380,16 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
     }
+    // If primary was released without a drag-stopped event (a secondary press can cancel the
+    // drag), end the gesture here so it cannot stay frozen on screen or survive a window close.
+    let primary_down = ctx.input(|i| i.pointer.primary_down());
+    if !primary_down && !resp.drag_stopped_by(egui::PointerButton::Primary) {
+        app.windows_state.hs.drag_start = None;
+        finish_marquee(app, &nodes, &order);
+        if !app.windows_state.hs.wire_middle {
+            app.windows_state.hs.wire = None;
+        }
+    }
     if let Some((a, b)) = app.windows_state.hs.marquee {
         let q = pointer.unwrap_or(b);
         app.windows_state.hs.marquee = Some((a, q));
@@ -3366,8 +3401,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
         app.windows_state.hs.graph_sel = sel;
-        painter.rect_filled(m, 0.0, Color32::from_rgba_unmultiplied(120, 170, 220, 30));
-        painter.rect_stroke(m, 0.0, Stroke::new(1.0, Color32::from_rgb(156, 208, 245)), egui::StrokeKind::Inside);
+        crate::theme::marquee(&painter, m);
     }
     if let (Some(w), Some(q)) = (wire.clone(), pointer) {
         let src = match &w {
@@ -3448,17 +3482,7 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
         app.windows_state.hs.drag_start = None;
-        if app.windows_state.hs.marquee.take().is_some() {
-            let lead = order
-                .iter()
-                .rev()
-                .copied()
-                .find(|&i| app.windows_state.hs.graph_sel.contains(&nodes[i].id))
-                .map(|i| nodes[i].id.strip_prefix("sg:").unwrap_or(&nodes[i].id).to_string());
-            app.windows_state.hs_selected = lead.clone();
-            app.snode_sel = lead.filter(|id| app.s.mats.contains_key(id) || app.s.texs.contains_key(id));
-            app.windows_state.hs.marquee_base.clear();
-        }
+        finish_marquee(app, &nodes, &order);
     }
     if resp.drag_stopped_by(egui::PointerButton::Middle) && app.windows_state.hs.wire_middle {
         app.windows_state.hs.wire_middle = false;

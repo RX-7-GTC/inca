@@ -883,7 +883,7 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
                         painter.circle_stroke(cur, r, Stroke::new(1.0, Color32::from_rgb(255, 80, 80)));
                     }
                     _ => {
-                        painter.rect_stroke(Rect::from_two_pos(start, cur), 0.0, white, egui::StrokeKind::Inside);
+                        crate::theme::marquee(&painter, Rect::from_two_pos(start, cur));
                     }
                 }
                 if resp.drag_stopped() || !pointer.primary_down() {

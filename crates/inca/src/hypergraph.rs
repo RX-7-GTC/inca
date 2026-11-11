@@ -619,9 +619,7 @@ fn graph(app: &mut IncaApp, ui: &mut egui::Ui) {
     if let Some(start) = app.hg.marquee {
         if resp.dragged_by(egui::PointerButton::Primary) {
             let q = pointer.unwrap_or(start);
-            let r = Rect::from_two_pos(start, q);
-            painter.rect_filled(r, 0.0, Color32::from_white_alpha(20));
-            painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Inside);
+            crate::theme::marquee(&painter, Rect::from_two_pos(start, q));
         }
     }
     if let (Some(d), Some(q)) = (app.hg.drag.clone(), pointer) {

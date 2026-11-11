@@ -697,7 +697,7 @@ fn interact(app: &mut IncaApp, ui: &egui::Ui, rect: Rect, resp: &egui::Response,
             app.uv_editor.drag = Some(Drag::Zoom { start, s0, anchor });
         }
         Some(Drag::Marquee { start, mode }) => {
-            p.rect_stroke(Rect::from_two_pos(start, cur), 0.0, Stroke::new(1.0, Color32::from_gray(0xee)), egui::StrokeKind::Inside);
+            crate::theme::marquee(&p, Rect::from_two_pos(start, cur));
             app.uv_editor.drag = Some(Drag::Marquee { start, mode });
         }
         Some(Drag::Xform { tool, start, pivot, items, mut axis }) => {

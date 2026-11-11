@@ -73,6 +73,14 @@ pub fn panel_frame() -> Frame {
     Frame::NONE.fill(BG).inner_margin(Margin::same(4)).stroke(Stroke::new(1.0, LINE))
 }
 
+/// Maya-style marquee: a dashed white outline with no fill. All box selections use this so the
+/// viewport, Hypershade, Hypergraph, UV editor and lattice tool match; the lasso uses the same
+/// dash pattern.
+pub fn marquee(painter: &egui::Painter, rect: egui::Rect) {
+    let pts = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
+    painter.add(egui::Shape::dashed_line(&pts, Stroke::new(1.0, Color32::WHITE), 4.0, 3.0));
+}
+
 /// A collapsible section header (Attribute Editor frames); returns whether it is open.
 pub fn fold(ui: &mut egui::Ui, text: &str) -> bool {
     let id = ui.make_persistent_id(("fold", text));
