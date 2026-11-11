@@ -265,6 +265,13 @@ pub fn open_custom(app: &mut IncaApp, pos: Pos2, title: Option<String>, radial: 
     app.marking_target = None;
 }
 
+/// A marking submenu floats over the marking menu like the toolbar/menu-bar popups.
+fn paint_popup_frame(p: &egui::Painter, rect: Rect, visuals: &egui::Visuals) {
+    p.add(visuals.popup_shadow.as_shape(rect, visuals.menu_corner_radius));
+    p.rect_filled(rect, visuals.menu_corner_radius, visuals.window_fill);
+    p.rect_stroke(rect, visuals.menu_corner_radius, visuals.window_stroke, egui::StrokeKind::Inside);
+}
+
 fn run(app: &mut IncaApp, act: Act) {
     let vp = app.marking.as_ref().map(|m| m.vp).unwrap_or(app.active_vp);
     // menus opened over an object act on it
@@ -470,6 +477,13 @@ fn radial_rect(painter_fonts: &egui::Context, m: &Menu, dir: &str, label: &str) 
 /// Draw and drive the open marking menu.
 pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     let Some(m) = app.marking.as_ref() else { return };
+    // Losing focus (Alt-Tab, Windows key) can swallow the matching release/click, which would
+    // leave a sticky marking menu locked open until Esc.
+    if !ctx.input(|i| i.focused) {
+        app.marking = None;
+        app.marking_target = None;
+        return;
+    }
     let (ptr, now, esc) = ctx.input(|i| (i.pointer.clone(), i.time, i.key_pressed(egui::Key::Escape)));
     if esc {
         app.marking = None;
@@ -504,19 +518,27 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
             }
         }
     }
-    // a radial submenu stays hot while the pointer is in it
+    // A radial submenu is a normal menu popup: it overlaps the item slightly and casts the
+    // same drop shadow as the toolbar/menu-bar popups.
     let sub_rect = |i: usize| -> Rect {
         let r = rects[i];
         let n = m.radial[i].1.sub.len() as f32;
         let left = m.radial[i].0.ends_with('W');
         let w = 130.0;
-        let x0 = if left { r.min.x - w - 2.0 } else { r.max.x + 2.0 };
+        let x0 = if left { r.min.x - w + 3.0 } else { r.max.x - 3.0 };
         Rect::from_min_size(pos2(x0, r.min.y), vec2(w, n * 20.0 + 6.0))
     };
-    if let Some(h) = m.hot_radial {
-        if !m.radial[h].1.sub.is_empty() && sub_rect(h).contains(cur) {
-            hot = Some(h);
-        }
+    // A radial submenu stays hot while the pointer is in it. The gesture line ends here too:
+    // once the pointer is in a submenu the radial gesture is over, even if the submenu hangs
+    // below the start of the bottom list.
+    let mut in_radial_sub = false;
+    if let Some(h) = [hot, m.hot_radial]
+        .into_iter()
+        .flatten()
+        .find(|h| !m.radial[*h].1.sub.is_empty() && sub_rect(*h).contains(cur))
+    {
+        hot = Some(h);
+        in_radial_sub = true;
     }
     let mut picked: Option<Act> = None;
     let mut close = false;
@@ -527,6 +549,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
     let pos = m.pos;
     let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("marking"));
     let p = ctx.layer_painter(layer);
+    let visuals = ctx.global_style().visuals.clone();
     let mut sub_hit: Option<Act> = None;
     for (i, ((_, item), r)) in radial.iter().zip(&rects).enumerate() {
         let is_hot = hot == Some(i);
@@ -538,36 +561,12 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
             label = format!("{} {label}", if c { "✔" } else { " " });
         }
         if !item.sub.is_empty() {
-            label = if radial[i].0.ends_with('W') { format!("◂ {label}") } else { format!("{label} ▸") };
+            // egui's bundled fonts support these triangles; unfilled ones like "▸" render as a square.
+            label = if radial[i].0.ends_with('W') { format!("⏴ {label}") } else { format!("{label} {}", egui::menu::SubMenuButton::RIGHT_ARROW) };
         }
         p.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.0), if item.enabled { Color32::WHITE } else { Color32::from_gray(0x80) });
         if is_hot && item.enabled && item.sub.is_empty() && primary_click {
             picked = item.act.clone();
-        }
-    }
-    // Draw the open submenu after every radial item so it sits on top of them.
-    if let Some(h) = hot {
-        let item = &radial[h].1;
-        if !item.sub.is_empty() {
-            let sr = sub_rect(h);
-            p.rect_filled(sr, 3.0, Color32::from_gray(0x44));
-            p.rect_stroke(sr, 3.0, Stroke::new(1.0, Color32::from_gray(0x2a)), egui::StrokeKind::Inside);
-            for (k, s) in item.sub.iter().enumerate() {
-                let rr = Rect::from_min_size(pos2(sr.min.x + 3.0, sr.min.y + 3.0 + k as f32 * 20.0), vec2(sr.width() - 6.0, 20.0));
-                if rr.contains(cur) {
-                    p.rect_filled(rr, 2.0, Color32::from_rgb(0x52, 0x85, 0xa6));
-                    sub_hit = s.act.clone();
-                    if s.enabled && primary_click {
-                        picked = s.act.clone();
-                    }
-                }
-                let l = match s.check {
-                    Some(true) => format!("✔ {}", s.label),
-                    Some(false) => format!("   {}", s.label),
-                    None => s.label.clone(),
-                };
-                p.text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, l, FontId::proportional(12.0), Color32::WHITE);
-            }
         }
     }
     // the list below the radial items
@@ -607,7 +606,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
             let sw = 150.0;
             let sh = 6.0 + item.sub.len() as f32 * 20.0;
             let left = rr.max.x + sw + 4.0 > screen.max.x;
-            let sx = if left { rr.min.x - sw - 2.0 } else { rr.max.x + 2.0 };
+            let sx = if left { rr.min.x - sw + 3.0 } else { rr.max.x - 3.0 };
             sub_rects[idx] = Some(Rect::from_min_size(pos2(sx, rr.min.y), vec2(sw, sh)));
         }
         // Only the parent row opens a list submenu. Once open, moving sideways into it keeps
@@ -659,8 +658,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
         }
         if let Some((idx, sr)) = open_sub {
             let Some(Some(item)) = list.get(idx) else { return };
-            p.rect_filled(sr, 3.0, Color32::from_gray(0x44));
-            p.rect_stroke(sr, 3.0, Stroke::new(1.0, Color32::from_gray(0x2a)), egui::StrokeKind::Inside);
+            paint_popup_frame(&p, sr, &visuals);
             for (k, s) in item.sub.iter().enumerate() {
                 let rr = Rect::from_min_size(pos2(sr.min.x + 3.0, sr.min.y + 3.0 + k as f32 * 20.0), vec2(sr.width() - 6.0, 20.0));
                 if rr.contains(cur) {
@@ -678,9 +676,34 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
             }
         }
     }
+    // Draw the open radial submenu last: it is a floating popup and must cover the bottom list
+    // too, not just the radial items.
+    if let Some(h) = hot {
+        let item = &radial[h].1;
+        if !item.sub.is_empty() {
+            let sr = sub_rect(h);
+            paint_popup_frame(&p, sr, &visuals);
+            for (k, s) in item.sub.iter().enumerate() {
+                let rr = Rect::from_min_size(pos2(sr.min.x + 3.0, sr.min.y + 3.0 + k as f32 * 20.0), vec2(sr.width() - 6.0, 20.0));
+                if rr.contains(cur) {
+                    p.rect_filled(rr, 2.0, Color32::from_rgb(0x52, 0x85, 0xa6));
+                    sub_hit = s.act.clone();
+                    if s.enabled && primary_click {
+                        picked = s.act.clone();
+                    }
+                }
+                let l = match s.check {
+                    Some(true) => format!("✔ {}", s.label),
+                    Some(false) => format!("   {}", s.label),
+                    None => s.label.clone(),
+                };
+                p.text(pos2(rr.min.x + 6.0, rr.center().y), Align2::LEFT_CENTER, l, FontId::proportional(12.0), Color32::WHITE);
+            }
+        }
+    }
     // The drag line is drawn last so it stays visible over every option, except when the
-    // pointer is in the bottom menu (there it behaves like a normal menu).
-    if !m.radial.is_empty() && !in_list {
+    // pointer is in the bottom menu or a radial submenu (there it behaves like a normal menu).
+    if !m.radial.is_empty() && !in_list && !in_radial_sub {
         p.line_segment([pos, cur], Stroke::new(1.5, Color32::from_gray(0xdd)));
         p.circle_filled(pos, 4.0, Color32::from_gray(0xdd));
     }
