@@ -1808,7 +1808,7 @@ pub fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 /// Objects inside a marquee (any projected vertex or the centre inside).
 #[cfg(test)]
 pub fn marquee_objects(s: &Scene, vp: &Viewport, cv: &CamView, r: Rect) -> Vec<Id> {
-    region_objects(s, vp, cv, &|q| r.contains(q), Some(r.center()), &mut MeshCache::default())
+    region_objects(s, vp, cv, &|q| r.contains(q), Some(r.center()), &mut MeshCache::default(), true)
 }
 
 /// Screen-space point-in-polygon (even-odd), for the lasso.
@@ -2828,27 +2828,20 @@ mod tests {
     }
 
     #[test]
-    fn uv_transforms_match_three_js_per_texture() {
-        let mut t = inca_core::materials::Texture { id: "t".into(), name: "uvTex".into(), ty: "file".into(), attrs: Params::new() };
-        t.attrs.insert("repeatU".into(), serde_json::json!(2.0));
-        t.attrs.insert("repeatV".into(), serde_json::json!(1.0));
-        t.attrs.insert("offsetU".into(), serde_json::json!(0.1));
-        t.attrs.insert("offsetV".into(), serde_json::json!(0.2));
-        t.attrs.insert("rotateUV".into(), serde_json::json!(90.0));
-        let xf = UvXf::from_texture(Some(&t));
-        // three.js Matrix3.setUvTransform(0.1, 0.2, 2, 1, pi/2, 0, 0)
-        let uv = xf.uv([0.25, 0.5]);
-        assert!((uv[0] - 1.1).abs() < 1e-5, "{uv:?}");
-        assert!((uv[1] + 0.05).abs() < 1e-5, "{uv:?}");
-        // procedural textures bake their repeat into the pixels and keep an identity transform
-        t.ty = "checker".into();
+    fn uv_placement_is_baked_into_texture_pixels() {
+        let mut place = inca_core::materials::Place2D::new("p".into(), "place2dTexture1".into(), "file");
+        place.attrs.insert("repeatU".into(), serde_json::json!(2.0));
+        place.attrs.insert("repeatV".into(), serde_json::json!(1.0));
+        place.attrs.insert("offsetU".into(), serde_json::json!(0.1));
+        place.attrs.insert("offsetV".into(), serde_json::json!(0.2));
+        place.attrs.insert("rotateUV".into(), serde_json::json!(90.0));
+        // Maya place2dTexture rotates around the UV centre (0.5, 0.5), then repeats/offsets.
+        let (u, v) = inca_core::materials::place_uv(Some(&place.attrs), 0.25, 0.5);
+        assert!((u - 1.1).abs() < 1e-5, "{u}");
+        assert!((v - 0.95).abs() < 1e-5, "{v}");
+        // 2D placement is baked into the 256² texture array; UvXf itself is identity.
+        let t = inca_core::materials::Texture { id: "t".into(), name: "uvTex".into(), ty: "file".into(), attrs: Params::new(), place: Some(place.id) };
         assert_eq!(UvXf::from_texture(Some(&t)).uv([0.25, 0.5]), [0.25, 0.5]);
-        // JS `a.repeatU || 1` maps zero to a single repeat
-        t.ty = "file".into();
-        t.attrs.insert("repeatU".into(), serde_json::json!(0.0));
-        t.attrs.insert("offsetU".into(), serde_json::json!(0.0));
-        t.attrs.insert("rotateUV".into(), serde_json::json!(0.0));
-        assert_eq!(UvXf::from_texture(Some(&t)).uv([0.3, 0.4])[0], 0.3);
     }
 
     #[test]
@@ -3264,18 +3257,18 @@ mod tests {
         // a little box at the centre contains no vertex, but the centre ray hits the face
         let inner = Rect::from_center_size(q, egui::vec2(20.0, 20.0));
         let inside = |p: Pos2| inner.contains(p);
-        assert_eq!(region_objects(&s, &vp, &cv, &inside, None, &mut MeshCache::default()), Vec::<String>::new());
-        assert_eq!(region_objects(&s, &vp, &cv, &inside, Some(inner.center()), &mut MeshCache::default()), vec![cube.clone()]);
+        assert_eq!(region_objects(&s, &vp, &cv, &inside, None, &mut MeshCache::default(), true), Vec::<String>::new());
+        assert_eq!(region_objects(&s, &vp, &cv, &inside, Some(inner.center()), &mut MeshCache::default(), true), vec![cube.clone()]);
         // icons are marquee-tested at their pivot, not along their drawn lines
         let l = s.create_locator("loc1");
         let at = cv.eye + cv.fwd * (cv.coi * 0.6) + cv.right * 1.5;
         s.set_world_matrix(&l, DMat4::from_translation(at));
         let arm = cv.project(at + DVec3::X * 0.9, vp.rect).unwrap();
         let r = Rect::from_center_size(arm, egui::vec2(12.0, 12.0));
-        assert!(!region_objects(&s, &vp, &cv, &|p| r.contains(p), None, &mut MeshCache::default()).contains(&l));
+        assert!(!region_objects(&s, &vp, &cv, &|p| r.contains(p), None, &mut MeshCache::default(), true).contains(&l));
         let p = cv.project(at, vp.rect).unwrap();
         let r = Rect::from_center_size(p, egui::vec2(12.0, 12.0));
-        assert!(region_objects(&s, &vp, &cv, &|p| r.contains(p), None, &mut MeshCache::default()).contains(&l));
+        assert!(region_objects(&s, &vp, &cv, &|p| r.contains(p), None, &mut MeshCache::default(), true).contains(&l));
     }
 
     #[test]
@@ -3352,6 +3345,6 @@ mod tests {
         let (s, vp, cv, id) = setup();
         let r = vp.rect;
         let poly = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
-        assert_eq!(region_objects(&s, &vp, &cv, &|q| in_polygon(&poly, q), None, &mut MeshCache::default()), vec![id]);
+        assert_eq!(region_objects(&s, &vp, &cv, &|q| in_polygon(&poly, q), None, &mut MeshCache::default(), true), vec![id]);
     }
 }
