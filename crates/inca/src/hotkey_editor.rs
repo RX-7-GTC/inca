@@ -5,6 +5,15 @@ use crate::theme;
 use egui::{pos2, vec2, Align, Align2, Color32, FontId, Key, LayerId, Modifiers, Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+/// A user-defined MEL command that can be bound like a built-in action.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeCommand {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub script: String,
+}
+
 /// chord ("Ctrl+Shift+K") -> action id, in creation order; "unbind:<action>" entries switch an
 /// action's default hotkey off. Editor-scoped keys are prefixed, e.g. "viewport:Ctrl+Shift+K".
 pub type Keymap = indexmap::IndexMap<String, String>;
@@ -122,11 +131,25 @@ pub fn save_keymaps_file(app: &mut IncaApp) -> Result<(), String> {
     std::fs::write(dir.join("keymaps.json"), json).map_err(|e| format!("could not write keymaps: {e}"))
 }
 
+pub fn load_runtime_commands_file() -> Option<Vec<RuntimeCommand>> {
+    let path = eframe::storage_dir("Inca")?.join("runtime_commands.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn save_runtime_commands_file(cmds: &[RuntimeCommand]) -> Result<(), String> {
+    let dir = eframe::storage_dir("Inca").ok_or_else(|| "no settings folder available".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let json = serde_json::to_string_pretty(cmds).map_err(|e| format!("could not encode runtime commands: {e}"))?;
+    std::fs::write(dir.join("runtime_commands.json"), json).map_err(|e| format!("could not write runtime commands: {e}"))
+}
+
 #[derive(Clone)]
 pub struct Pending {
     pub chord: String,
     pub action: String,
     pub existing: String,
+    pub existing_press: bool,
     pub existing_release: bool,
     pub scope: Scope,
 }
@@ -159,6 +182,13 @@ pub struct HkState {
     pub name_buf: String,
     pub name_focus: bool,
     pub delete_confirm: bool,
+    /// Runtime Commands window
+    pub rc_open: bool,
+    pub rc_selected: Option<String>,
+    pub rc_label: String,
+    pub rc_desc: String,
+    pub rc_script: String,
+    pub rc_delete: bool,
 }
 
 pub fn chord(key: Key, m: Modifiers) -> String {
@@ -232,6 +262,19 @@ pub fn normalize_keymap(map: Keymap) -> Keymap {
             continue;
         }
         let (scope, chord) = parse_key(&k);
+        // Older builds stored Edit Pivot as one "Insert / hold D" chord. Split it into the
+        // Maya defaults: Insert on press, D on release.
+        if chord == "Insert / hold D" && action_parts(&v).0 == "pivotEdit" {
+            let insert = scope_key(scope, "Insert");
+            let d = scope_key(scope, "D");
+            if !out.contains_key(&insert) {
+                out.insert(insert, action_value("pivotEdit", true, false));
+            }
+            if !out.contains_key(&d) {
+                out.insert(d, action_value("pivotEdit", false, true));
+            }
+            continue;
+        }
         out.insert(scope_key(scope, &canonical_chord(chord)), v);
     }
     out
@@ -284,51 +327,147 @@ fn lookup<'a>(map: &'a Keymap, chord: &str, scope: Scope) -> Option<&'a str> {
     None
 }
 
+/// The action and direction flags for a stored binding. Plain values are press-only.
+fn action_parts(a: &str) -> (&str, bool, bool) {
+    if let Some(id) = a.strip_prefix("both:") {
+        (id, true, true)
+    } else if let Some(id) = a.strip_prefix("release:") {
+        (id, false, true)
+    } else {
+        (a, true, false)
+    }
+}
+
+fn action_value(id: &str, press: bool, release: bool) -> String {
+    match (press, release) {
+        (true, true) => format!("both:{id}"),
+        (false, true) => format!("release:{id}"),
+        _ => id.to_string(),
+    }
+}
+
+fn direction_label(press: bool, release: bool) -> &'static str {
+    match (press, release) {
+        (true, true) => " (press+release)",
+        (false, true) => " (release)",
+        _ => "",
+    }
+}
+
+fn is_snap_action(id: &str) -> bool {
+    matches!(id, "snapGrid" | "snapCurve" | "snapPoint")
+}
+
+/// Scope a built-in default belongs to. Viewport display, framing and snapping keys belong to
+/// the viewport; tool and application commands stay global.
+fn default_scope(id: &str) -> Scope {
+    match id {
+        "snapGrid" | "snapCurve" | "snapPoint"
+        | "frameAll" | "frameSelected" | "frameAllAll" | "frameSelectedAll"
+        | "undoView" | "redoView" | "defaultView"
+        | "smoothOff" | "smoothCage" | "smoothOn"
+        | "shadeWire" | "shadeSmooth" | "shadeTextured" | "shadeAllLights"
+        | "objectMode" | "vertexMode" | "edgeMode" | "faceMode" | "uvMode"
+        | "toggleXray" | "cycleBackground" | "isolateSelect" => Scope::Viewport,
+        _ => Scope::Application,
+    }
+}
+
+/// Default directions for the built-in Maya hotkeys. Snapping keys are held, so they are
+/// assigned to both press and release; D holds the pivot, so it is release-only.
+fn default_directions(id: &str, chord: &str) -> (bool, bool) {
+    if is_snap_action(id) {
+        (true, true)
+    } else if id == "pivotEdit" && chord == "D" {
+        (false, true)
+    } else {
+        (true, false)
+    }
+}
+
+/// Extra default chords for actions whose Maya default is more than one key.
+fn extra_defaults_for_action(id: &str) -> &'static [(&'static str, bool, bool)] {
+    if id == "pivotEdit" { &[("D", false, true)] } else { &[] }
+}
+
+fn extra_default(c: &str) -> Option<(&'static str, bool, bool)> {
+    crate::actions::ACTIONS.iter().find_map(|(id, _, _)| {
+        extra_defaults_for_action(id).iter().find(|(chord, _, _)| *chord == c).map(|(_, press, release)| (*id, *press, *release))
+    })
+}
+
 /// The action for a key press in the given scope: a scoped binding first, then an application
-/// binding, then the Maya default unless it was removed. A release binding is taken, so its
-/// press action is suppressed too.
+/// binding, then the Maya default unless it was removed. Release-only bindings are skipped.
 pub fn resolve(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<String> {
     let c = chord(key, m);
     if let Some(a) = lookup(&app.keymap, &c, scope) {
-        let (id, release) = split_action(a);
-        return (!release).then(|| id.to_string());
+        let (id, press, _) = action_parts(a);
+        return press.then(|| id.to_string());
     }
     let a = crate::actions::hotkey(key, m, app)?;
-    (!app.keymap.contains_key(&format!("unbind:{a}"))).then(|| a.to_string())
+    // The Hypershade owns Delete for graph nodes and wires; don't also delete scene objects.
+    if scope == Scope::Hypershade && matches!(a, "deleteSel" | "deleteEdgeVertex") {
+        return None;
+    }
+    let (press, _) = default_directions(a, &c);
+    let applies = default_scope(a) == Scope::Application || default_scope(a) == scope;
+    (press && applies && !app.keymap.contains_key(&format!("unbind:{a}"))).then(|| a.to_string())
 }
 
-/// The action a key should run when released in the given scope, if it was bound on release.
+/// The action a key should run when released in the given scope, if its release direction is on.
 pub fn release_action(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<String> {
-    lookup(&app.keymap, &chord(key, m), scope).and_then(|a| a.strip_prefix("release:").map(str::to_string))
-}
-
-fn split_action(a: &str) -> (&str, bool) {
-    match a.strip_prefix("release:") {
-        Some(id) => (id, true),
-        None => (a, false),
+    if let Some(a) = lookup(&app.keymap, &chord(key, m), scope) {
+        let (id, _, release) = action_parts(a);
+        return release.then(|| id.to_string());
     }
+    let c = chord(key, m);
+    let id = crate::actions::hotkey(key, m, app)?;
+    let (_, release) = default_directions(id, &c);
+    let applies = default_scope(id) == Scope::Application || default_scope(id) == scope;
+    (release && applies && !app.keymap.contains_key(&format!("unbind:{id}"))).then(|| id.to_string())
 }
 
-fn action_value(id: &str, release: bool) -> String {
-    if release { format!("release:{id}") } else { id.to_string() }
+/// Direction flags for a key bound to a hold command (Edit Pivot or a snap toggle). On Release
+/// makes it a hold key; both directions make it tap-to-toggle / hold-to-return.
+pub fn hold_binding(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<(String, bool, bool)> {
+    let c = chord(key, m);
+    if let Some(a) = lookup(&app.keymap, &c, scope) {
+        let (id, press, release) = action_parts(a);
+        return (release && (id == "pivotEdit" || is_snap_action(id))).then(|| (id.to_string(), press, release));
+    }
+    let id = crate::actions::hotkey(key, m, app)?;
+    let ds = default_scope(id);
+    if (ds != Scope::Application && ds != scope) || app.keymap.contains_key(&format!("unbind:{id}")) {
+        return None;
+    }
+    let (press, release) = default_directions(id, &c);
+    (release && (id == "pivotEdit" || is_snap_action(id))).then(|| (id.to_string(), press, release))
 }
 
-fn bound_action(app: &IncaApp, c: &str, scope: Scope) -> Option<(String, bool)> {
+fn bound_action(app: &IncaApp, c: &str, scope: Scope) -> Option<(String, bool, bool)> {
     if let Some(a) = app.keymap.get(&scope_key(scope, c)) {
-        let (id, release) = split_action(a);
-        return Some((id.to_string(), release));
+        let (id, press, release) = action_parts(a);
+        return Some((id.to_string(), press, release));
     }
-    // Only the application scope inherits the Maya defaults; an editor binding may shadow them.
-    if scope == Scope::Application {
-        return crate::actions::ACTIONS.iter().find(|(id, _, hk)| *hk == c && !app.keymap.contains_key(&format!("unbind:{id}"))).map(|(id, _, _)| (id.to_string(), false));
+    // Application defaults apply in every scope; editor defaults only in their own scope.
+    if let Some((id, press, release)) = extra_default(c) {
+        if (default_scope(id) == Scope::Application || default_scope(id) == scope) && !app.keymap.contains_key(&format!("unbind:{id}")) {
+            return Some((id.to_string(), press, release));
+        }
+    }
+    if let Some((id, _, _)) = crate::actions::ACTIONS.iter().find(|(id, _, hk)| *hk == c && !app.keymap.contains_key(&format!("unbind:{id}"))) {
+        if default_scope(id) == Scope::Application || default_scope(id) == scope {
+            let (press, release) = default_directions(id, c);
+            return Some(((*id).to_string(), press, release));
+        }
     }
     None
 }
 
-/// Every binding for an action in a scope, with its direction (press vs release). The default
+/// Every binding for an action in a scope, with its press/release directions. The default
 /// press hotkey belongs to the application scope.
-fn binding_chords(app: &IncaApp, id: &str, scope: Scope) -> Vec<(String, bool)> {
-    let mut out: Vec<(String, bool)> = app
+fn binding_chords(app: &IncaApp, id: &str, scope: Scope) -> Vec<(String, bool, bool)> {
+    let mut out: Vec<(String, bool, bool)> = app
         .keymap
         .iter()
         .filter(|(c, _)| !c.starts_with("unbind:"))
@@ -337,14 +476,22 @@ fn binding_chords(app: &IncaApp, id: &str, scope: Scope) -> Vec<(String, bool)> 
             if key_scope != scope {
                 return None;
             }
-            let (action, release) = split_action(a);
-            (action == id).then(|| (chord.to_string(), release))
+            let (action, press, release) = action_parts(a);
+            (action == id).then(|| (chord.to_string(), press, release))
         })
         .collect();
-    if scope == Scope::Application {
+    if default_scope(id) == scope {
         let def = crate::actions::hotkey_label(id);
         if !def.is_empty() && !app.keymap.contains_key(&format!("unbind:{id}")) && !app.keymap.contains_key(def) {
-            out.push((def.to_string(), false));
+            let (press, release) = default_directions(id, def);
+            out.push((def.to_string(), press, release));
+        }
+        if !app.keymap.contains_key(&format!("unbind:{id}")) {
+            for (chord, press, release) in extra_defaults_for_action(id) {
+                if !app.keymap.contains_key(*chord) {
+                    out.push(((*chord).to_string(), *press, *release));
+                }
+            }
         }
     }
     out
@@ -352,7 +499,7 @@ fn binding_chords(app: &IncaApp, id: &str, scope: Scope) -> Vec<(String, bool)> 
 
 /// Application and editor bindings for an action, used for search ranking and keyboard highlight.
 /// Creation order is preserved; the application bindings come first.
-fn action_chords(app: &IncaApp, id: &str, scope: Scope) -> Vec<(String, bool)> {
+fn action_chords(app: &IncaApp, id: &str, scope: Scope) -> Vec<(String, bool, bool)> {
     let mut out = binding_chords(app, id, Scope::Application);
     if scope != Scope::Application {
         for binding in binding_chords(app, id, scope) {
@@ -364,13 +511,10 @@ fn action_chords(app: &IncaApp, id: &str, scope: Scope) -> Vec<(String, bool)> {
     out
 }
 
-fn binding_text_from(bindings: &[(String, bool)]) -> String {
+fn binding_text_from(bindings: &[(String, bool, bool)]) -> String {
     bindings
         .iter()
-        .map(|(c, release)| {
-            let c = display_chord(c);
-            if *release { format!("{c} (release)") } else { c }
-        })
+        .map(|(c, press, release)| format!("{}{}", display_chord(c), direction_label(*press, *release)))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -429,21 +573,21 @@ fn starts_word(text: &str, q: &str) -> bool {
 
 /// Lower is a better search match. Hotkey matches rank above command-name matches so typing
 /// "D" surfaces the command bound to D instead of every command containing the letter.
-fn search_rank(q: &str, id: &str, label: &str, cat: &str, bindings: &[(String, bool)]) -> Option<u8> {
+fn search_rank(q: &str, id: &str, label: &str, cat: &str, bindings: &[(String, bool, bool)]) -> Option<u8> {
     if q.is_empty() {
         return Some(0);
     }
-    if bindings.iter().any(|(c, _)| c.eq_ignore_ascii_case(q)) {
+    if bindings.iter().any(|(c, _, _)| c.eq_ignore_ascii_case(q)) {
         return Some(1);
     }
     // A plain key (no modifiers) is more specific than Ctrl+D etc.
-    if bindings.iter().any(|(c, _)| !c.contains('+') && binding_key(c).eq_ignore_ascii_case(q)) {
+    if bindings.iter().any(|(c, _, _)| !c.contains('+') && binding_key(c).eq_ignore_ascii_case(q)) {
         return Some(2);
     }
-    if bindings.iter().any(|(c, _)| binding_key(c).eq_ignore_ascii_case(q)) {
+    if bindings.iter().any(|(c, _, _)| binding_key(c).eq_ignore_ascii_case(q)) {
         return Some(3);
     }
-    if bindings.iter().any(|(c, _)| c.to_lowercase().contains(q)) {
+    if bindings.iter().any(|(c, _, _)| c.to_lowercase().contains(q)) {
         return Some(4);
     }
     let label = label.to_lowercase();
@@ -469,14 +613,29 @@ fn search_rank(q: &str, id: &str, label: &str, cat: &str, bindings: &[(String, b
 /// The chords that run an action on press (menus and shortcut columns). Release-only bindings
 /// are deliberately omitted; the Hotkey Editor shows them with their direction.
 pub fn chords_for(app: &IncaApp, id: &str) -> Vec<String> {
-    binding_chords(app, id, Scope::Application).into_iter().filter(|(_, release)| !release).map(|(c, _)| c).collect()
+    let mut out = Vec::new();
+    for scope in [Scope::Application, Scope::Viewport] {
+        for (c, press, _) in binding_chords(app, id, scope) {
+            if press && !out.contains(&c) {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
-fn binding_map(app: &IncaApp, scope: Scope) -> BTreeMap<String, (String, bool)> {
+fn binding_map(app: &IncaApp, scope: Scope) -> BTreeMap<String, (String, bool, bool)> {
     let mut map = BTreeMap::new();
     for (id, _, hk) in crate::actions::ACTIONS {
-        if !hk.is_empty() && !app.keymap.contains_key(&format!("unbind:{id}")) {
-            map.insert((*hk).to_string(), ((*id).to_string(), false));
+        let ds = default_scope(id);
+        if !hk.is_empty() && (ds == Scope::Application || ds == scope) && !app.keymap.contains_key(&format!("unbind:{id}")) {
+            let (press, release) = default_directions(id, hk);
+            map.insert((*hk).to_string(), ((*id).to_string(), press, release));
+        }
+        if (ds == Scope::Application || ds == scope) && !app.keymap.contains_key(&format!("unbind:{id}")) {
+            for (chord, press, release) in extra_defaults_for_action(id) {
+                map.insert((*chord).to_string(), ((*id).to_string(), *press, *release));
+            }
         }
     }
     for (c, a) in &app.keymap {
@@ -485,8 +644,8 @@ fn binding_map(app: &IncaApp, scope: Scope) -> BTreeMap<String, (String, bool)> 
         }
         let (key_scope, chord) = parse_key(c);
         if key_scope == Scope::Application {
-            let (id, release) = split_action(a);
-            map.insert(chord.to_string(), (id.to_string(), release));
+            let (id, press, release) = action_parts(a);
+            map.insert(chord.to_string(), (id.to_string(), press, release));
         }
     }
     if scope != Scope::Application {
@@ -497,8 +656,8 @@ fn binding_map(app: &IncaApp, scope: Scope) -> BTreeMap<String, (String, bool)> 
             }
             let (key_scope, chord) = parse_key(c);
             if key_scope == scope {
-                let (id, release) = split_action(a);
-                map.insert(chord.to_string(), (id.to_string(), release));
+                let (id, press, release) = action_parts(a);
+                map.insert(chord.to_string(), (id.to_string(), press, release));
             }
         }
     }
@@ -506,6 +665,9 @@ fn binding_map(app: &IncaApp, scope: Scope) -> BTreeMap<String, (String, bool)> 
 }
 
 fn category_of(id: &str) -> &'static str {
+    if id.starts_with("runtime:") {
+        return "Custom";
+    }
     let l = id.to_ascii_lowercase();
     let starts = |s: &str| l.starts_with(s);
     if l.ends_with("window") || l.ends_with("editor") || matches!(l.as_str(), "hypershade" | "grapheditor" | "dopesheet" | "renderview" | "uveditor" | "preferences" | "hotkeylist" | "about") {
@@ -541,13 +703,13 @@ fn category_of(id: &str) -> &'static str {
 const KEY_HELP: &str = "Hover over a key to see its command. Hold Ctrl / Alt / Shift to preview layers; click them to toggle.";
 
 /// Main-menu order first, then the modeling menu-set groups, then animation/rendering.
-const CATEGORY_ORDER: &[&str] = &["File", "Edit", "Create", "Select", "Modify", "Display", "Windows", "Mesh", "Tools", "Curves / Surfaces", "Animation", "Rendering", "Other"];
+const CATEGORY_ORDER: &[&str] = &["File", "Edit", "Create", "Select", "Modify", "Display", "Windows", "Mesh", "Tools", "Curves / Surfaces", "Animation", "Rendering", "Custom", "Other"];
 
 fn category_rank(c: &str) -> usize {
     CATEGORY_ORDER.iter().position(|x| *x == c).unwrap_or(CATEGORY_ORDER.len())
 }
 
-fn command_label(id: &str) -> String {
+fn builtin_command_label(id: &str) -> String {
     if let Some(g) = inca_core::primitives::GEN_INFO.iter().find(|g| g.ty == id) {
         format!("{} {}", if g.nurbs { "NURBS" } else { "Polygon" }, g.label)
     } else {
@@ -555,27 +717,37 @@ fn command_label(id: &str) -> String {
     }
 }
 
-fn all_commands() -> Vec<(&'static str, String)> {
+fn command_label(app: &IncaApp, id: &str) -> String {
+    if let Some(c) = app.runtime_cmds.iter().find(|c| c.id == id) {
+        return c.label.clone();
+    }
+    builtin_command_label(id)
+}
+
+fn all_commands(app: &IncaApp) -> Vec<(String, String)> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for (id, label, _) in crate::actions::ACTIONS {
         seen.insert(*id);
-        out.push((*id, label.to_string()));
+        out.push(((*id).to_string(), label.to_string()));
     }
     for g in inca_core::primitives::GEN_INFO {
         if seen.insert(g.ty) {
-            out.push((g.ty, command_label(g.ty)));
+            out.push((g.ty.to_string(), builtin_command_label(g.ty)));
         }
     }
     for (id, _) in inca_core::scene::LIGHT_TYPES {
         if seen.insert(*id) {
-            out.push((*id, command_label(id)));
+            out.push(((*id).to_string(), builtin_command_label(id)));
         }
+    }
+    for c in &app.runtime_cmds {
+        out.push((c.id.clone(), c.label.clone()));
     }
     out
 }
 
-fn command_description(id: &str) -> Option<String> {
+fn builtin_command_description(id: &str) -> Option<String> {
     if let Some(desc) = crate::hotkey_help::describe(id) {
         return Some(desc.to_string());
     }
@@ -583,6 +755,13 @@ fn command_description(id: &str) -> Option<String> {
         return Some(format!("Creates a {} {}.", if g.nurbs { "NURBS" } else { "polygon" }, g.label.to_lowercase()));
     }
     inca_core::scene::LIGHT_TYPES.iter().find(|(ty, _)| *ty == id).map(|(_, label)| format!("Creates a {}.", label.to_lowercase()))
+}
+
+fn command_description(app: &IncaApp, id: &str) -> Option<String> {
+    if let Some(c) = app.runtime_cmds.iter().find(|c| c.id == id) {
+        return (!c.description.trim().is_empty()).then(|| c.description.clone());
+    }
+    builtin_command_description(id)
 }
 
 fn start_capture(app: &mut IncaApp) {
@@ -610,12 +789,43 @@ fn replace_key(map: &mut Keymap, old: &str, new: &str, value: String) {
     }
 }
 
-/// Switch one existing (or default) binding between press and release.
-fn set_binding_release(app: &mut IncaApp, id: &str, chord: &str, release: bool, scope: Scope) {
+/// Apply a click on one of the two direction buttons. Press is the base direction: Release can
+/// only be turned on while Press is on, and a key always has at least one direction.
+fn toggled_directions(press: bool, release: bool, press_button: bool) -> (bool, bool) {
+    let (mut p, mut r) = (press, release);
+    if !p && !r {
+        p = true;
+    }
+    if press_button {
+        p = !p;
+    } else {
+        r = !r;
+    }
+    if !p && !r {
+        p = true;
+    }
+    (p, r)
+}
+
+/// Change one binding's direction flags, keeping its action and creation order.
+fn set_directions_in_map(map: &mut Keymap, id: &str, chord: &str, press: bool, release: bool, scope: Scope) {
     let key = scope_key(scope, chord);
-    let action = app.keymap.get(&key).map(|a| split_action(a).0.to_string()).unwrap_or_else(|| id.to_string());
-    app.keymap.insert(key, action_value(&action, release));
-    app.hk.status = format!("{chord} now runs on {}.", if release { "release" } else { "press" });
+    let action = map.get(&key).map(|a| action_parts(a).0.to_string()).unwrap_or_else(|| id.to_string());
+    map.insert(key, action_value(&action, press, release));
+}
+
+/// Switch one existing (or default) binding's press/release directions.
+fn set_binding_directions(app: &mut IncaApp, id: &str, chord: &str, press: bool, release: bool, scope: Scope) {
+    // Editing a default binding from the read-only Inca Default set starts a custom set, the
+    // same way assigning a new hotkey does.
+    ensure_editable_set(app);
+    set_directions_in_map(&mut app.keymap, id, chord, press, release, scope);
+    let word = match (press, release) {
+        (true, true) => "press and release",
+        (false, true) => "release",
+        _ => "press",
+    };
+    app.hk.status = format!("{chord} now runs on {word}.");
 }
 
 /// Remove one binding, or switch off an Application default if it was implicit.
@@ -631,7 +841,7 @@ fn remove_binding(app: &mut IncaApp, id: &str, chord: &str, scope: Scope) {
         _ => {}
     }
     app.hk.restore_layers = None;
-    app.hk.status = format!("Removed {chord} from {}.", command_label(id));
+    app.hk.status = format!("Removed {chord} from {}.", command_label(app, id));
 }
 
 /// Add a modifier to an existing binding, keeping its main key and press/release direction.
@@ -691,12 +901,12 @@ fn remove_chord_part(app: &mut IncaApp, id: &str, chord: &str, index: usize, sco
 fn override_pending(app: &mut IncaApp) {
     let Some(p) = app.hk.pending.take() else { return };
     let key = scope_key(p.scope, &p.chord);
-    if !app.keymap.contains_key(&key) && p.scope == Scope::Application && !p.existing_release && crate::actions::hotkey_label(&p.existing) == p.chord {
+    if !app.keymap.contains_key(&key) && p.scope == Scope::Application && p.existing_press && !p.existing_release && crate::actions::hotkey_label(&p.existing) == p.chord {
         app.keymap.insert(format!("unbind:{}", p.existing), p.existing.clone());
     }
     app.keymap.insert(key, p.action.clone());
     clear_modifier_layers(app);
-    app.hk.status = format!("Assigned {} to {} ({}).", p.chord, command_label(&p.action), p.scope.label());
+    app.hk.status = format!("Assigned {} to {} ({}).", p.chord, command_label(app, &p.action), p.scope.label());
 }
 
 fn remove_hotkeys(app: &mut IncaApp) {
@@ -710,13 +920,13 @@ fn remove_hotkeys(app: &mut IncaApp) {
             return true;
         }
         let (key_scope, _) = parse_key(k);
-        !(key_scope == scope && split_action(a).0 == id)
+        !(key_scope == scope && action_parts(a).0 == id)
     });
     if scope == Scope::Application && !crate::actions::hotkey_label(&id).is_empty() {
         app.keymap.insert(format!("unbind:{id}"), id.clone());
     }
     app.hk.pending = None;
-    app.hk.status = format!("Removed all {} hotkeys from {}.", scope.label().to_lowercase(), command_label(&id));
+    app.hk.status = format!("Removed all {} hotkeys from {}.", scope.label().to_lowercase(), command_label(app, &id));
 }
 
 fn restore_defaults(app: &mut IncaApp) {
@@ -759,10 +969,10 @@ fn focus_command(app: &mut IncaApp, id: &str) {
         return;
     }
     let current = (app.hk.layer_ctrl, app.hk.layer_shift, app.hk.layer_alt);
-    if chords.iter().any(|(c, _)| chord_layer(c) == current) {
+    if chords.iter().any(|(c, _, _)| chord_layer(c) == current) {
         return;
     }
-    if let Some((best, _)) = chords.iter().min_by_key(|(c, _)| chord_pref(c.as_str())) {
+    if let Some((best, _, _)) = chords.iter().min_by_key(|(c, _, _)| chord_pref(c.as_str())) {
         if app.hk.restore_layers.is_none() {
             app.hk.restore_layers = Some(current);
         }
@@ -830,24 +1040,29 @@ fn submit_chord(app: &mut IncaApp, c: String, id: String, scope: Scope) {
     app.hk.capturing = false;
     let count = binding_chords(app, &id, scope).len();
     match bound_action(app, &c, scope) {
-        Some((existing, existing_release)) if existing == id => {
-            app.hk.status = if existing_release {
-                format!("{c} is already assigned to this command on release in {} scope.", scope.label())
-            } else {
-                format!("{c} is already assigned to this command in {} scope.", scope.label())
-            };
+        Some((existing, existing_press, existing_release)) if existing == id => {
+            app.hk.status = format!(
+                "{c} is already assigned to this command{} in {} scope.",
+                direction_label(existing_press, existing_release),
+                scope.label()
+            );
         }
         _ if count >= 4 => {
             app.hk.status = format!("A command can have at most 4 hotkeys in {} scope.", scope.label());
         }
-        Some((existing, existing_release)) => {
-            app.hk.status = format!("{c} is assigned to {}{} in {} scope.", command_label(&existing), if existing_release { " (release)" } else { "" }, scope.label());
-            app.hk.pending = Some(Pending { chord: c, action: id, existing, existing_release, scope });
+        Some((existing, existing_press, existing_release)) => {
+            app.hk.status = format!(
+                "{c} is assigned to {}{} in {} scope.",
+                command_label(app, &existing),
+                direction_label(existing_press, existing_release),
+                scope.label()
+            );
+            app.hk.pending = Some(Pending { chord: c, action: id, existing, existing_press, existing_release, scope });
         }
         None => {
             assign_key(app, &c, &id, scope);
             clear_modifier_layers(app);
-            app.hk.status = format!("Assigned {c} to {} ({}).", command_label(&id), scope.label());
+            app.hk.status = format!("Assigned {c} to {} ({}).", command_label(app, &id), scope.label());
         }
     }
 }
@@ -1010,11 +1225,12 @@ enum KeyClick {
 
 #[allow(clippy::too_many_arguments)]
 fn paint_key(
+    app: &IncaApp,
     painter: &egui::Painter,
     rect: Rect,
     spec: &KeySpec,
     unit: f32,
-    bindings: &BTreeMap<String, (String, bool)>,
+    bindings: &BTreeMap<String, (String, bool, bool)>,
     selected_chords: &HashSet<String>,
     layers: (bool, bool, bool),
     hover: Option<Pos2>,
@@ -1028,7 +1244,7 @@ fn paint_key(
         bindings.iter()
             .filter(|(c, _)| c.rsplit('+').next() == Some(spec.key.as_str()))
             .min_by_key(|(c, _)| chord_pref(c))
-            .map(|(c, (a, release))| (c.clone(), a.clone(), *release))
+            .map(|(c, (a, press, release))| (c.clone(), a.clone(), *press, *release))
     } else {
         None
     };
@@ -1082,10 +1298,10 @@ fn paint_key(
             format!("{} modifier layer", m)
         } else if spec.key.is_empty() {
             format!("{}", spec.label)
-        } else if let Some((a, release)) = &bound {
-            format!("{combo}  ->  {}{}", command_label(a), if *release { "  (on release)" } else { "" })
-        } else if let Some((c, a, release)) = &hint {
-            format!("{c}  ->  {}{}  (other modifier layer)", command_label(a), if *release { "  (on release)" } else { "" })
+        } else if let Some((a, press, release)) = &bound {
+            format!("{combo}  ->  {}{}", command_label(app, a), direction_label(*press, *release))
+        } else if let Some((c, a, press, release)) = &hint {
+            format!("{c}  ->  {}{}  (other modifier layer)", command_label(app, a), direction_label(*press, *release))
         } else {
             format!("{combo}  —  no command assigned")
         };
@@ -1093,9 +1309,9 @@ fn paint_key(
     if click.is_some_and(|p| rect.contains(p)) {
         if let Some(m) = spec.modifier {
             *clicked = Some(KeyClick::Modifier(m));
-        } else if let Some((a, _)) = bound {
+        } else if let Some((a, _, _)) = bound {
             *clicked = Some(KeyClick::Action(a));
-        } else if let Some((c, a, _)) = &hint {
+        } else if let Some((c, a, _, _)) = &hint {
             *clicked = Some(KeyClick::Hint { action: a.clone(), chord: c.clone() });
         }
     }
@@ -1105,11 +1321,11 @@ fn keyboard(app: &mut IncaApp, ui: &mut egui::Ui) -> String {
     let mut bindings = binding_map(app, app.hk.scope);
     // The keyboard follows the category filter, like the command list.
     if !app.hk.category.is_empty() {
-        bindings.retain(|_, (action, _)| category_of(action) == app.hk.category);
+        bindings.retain(|_, (action, _, _)| category_of(action) == app.hk.category);
     }
     let selected_chords: HashSet<String> = app.hk.selected.as_ref()
         .filter(|id| app.hk.category.is_empty() || category_of(id) == app.hk.category)
-        .map(|id| action_chords(app, id, app.hk.scope).into_iter().map(|(c, _)| c).collect())
+        .map(|id| action_chords(app, id, app.hk.scope).into_iter().map(|(c, _, _)| c).collect())
         .unwrap_or_default();
     let (main, nav) = keyboard_rows();
     let unit = ((ui.available_width() - 12.0) / 19.2).clamp(18.0, 46.0);
@@ -1142,7 +1358,7 @@ fn keyboard(app: &mut IncaApp, ui: &mut egui::Ui) -> String {
                 continue;
             }
             let kr = Rect::from_min_size(pos2(x, y), vec2((spec.w * unit - 2.0).max(4.0), unit - 3.0));
-            paint_key(&painter, kr, spec, unit, &bindings, &selected_chords, layers, hover, click, &mut info, &mut clicked);
+            paint_key(app, &painter, kr, spec, unit, &bindings, &selected_chords, layers, hover, click, &mut info, &mut clicked);
             if drop_pos.is_some_and(|p| kr.contains(p)) && spec.modifier.is_none() && !spec.key.is_empty() {
                 painter.rect_stroke(kr, 3.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
                 drop_key = Some(spec.key.clone());
@@ -1158,7 +1374,7 @@ fn keyboard(app: &mut IncaApp, ui: &mut egui::Ui) -> String {
                 continue;
             }
             let kr = Rect::from_min_size(pos2(nav_x + col as f32 * unit, y), vec2(unit - 2.0, unit - 3.0));
-            paint_key(&painter, kr, spec, unit, &bindings, &selected_chords, layers, hover, click, &mut info, &mut clicked);
+            paint_key(app, &painter, kr, spec, unit, &bindings, &selected_chords, layers, hover, click, &mut info, &mut clicked);
             if drop_pos.is_some_and(|p| kr.contains(p)) && spec.modifier.is_none() && !spec.key.is_empty() {
                 painter.rect_stroke(kr, 3.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Outside);
                 drop_key = Some(spec.key.clone());
@@ -1172,7 +1388,7 @@ fn keyboard(app: &mut IncaApp, ui: &mut egui::Ui) -> String {
             layers.1 || mods.shift,
             layers.2 || mods.alt,
         );
-        info = format!("Release to assign {} to {c}.", command_label(action.as_str()));
+        info = format!("Release to assign {} to {c}.", command_label(app, action.as_str()));
     }
     if info.is_empty() && !hover.is_some_and(|p| rect.contains(p)) {
         info = KEY_HELP.to_string();
@@ -1277,9 +1493,9 @@ fn key_chip(ui: &mut egui::Ui, text: &str, clickable: bool) -> egui::Response {
     resp
 }
 
-/// The per-key press/release switch below a key chip; amber means on release.
-fn on_release_button(ui: &mut egui::Ui, active: bool, clickable: bool, width: f32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(width, 12.0), if clickable { Sense::click() } else { Sense::hover() });
+/// One of the two direction switches below a key chip; amber means that direction is on.
+fn direction_button(ui: &mut egui::Ui, label: &str, active: bool, clickable: bool, width: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 14.0), if clickable { Sense::click() } else { Sense::hover() });
     let amber = Color32::from_rgb(0xc5, 0x8b, 0x3a);
     let fill = if active {
         if clickable && resp.hovered() { Color32::from_rgb(0xd6, 0x9d, 0x4a) } else { amber }
@@ -1289,16 +1505,24 @@ fn on_release_button(ui: &mut egui::Ui, active: bool, clickable: bool, width: f3
         Color32::from_rgb(0x5d, 0x5d, 0x5d)
     };
     ui.painter().rect_filled(rect, 2.0, fill);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, "On Release", FontId::proportional(8.5), if active { Color32::WHITE } else { Color32::from_gray(0xdd) });
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(8.5), if active { Color32::WHITE } else { Color32::from_gray(0xdd) });
     resp
+}
+
+fn on_press_button(ui: &mut egui::Ui, active: bool, clickable: bool, width: f32) -> egui::Response {
+    direction_button(ui, "On Press", active, clickable, width)
+}
+
+fn on_release_button(ui: &mut egui::Ui, active: bool, clickable: bool, width: f32) -> egui::Response {
+    direction_button(ui, "On Release", active, clickable, width)
 }
 
 fn command_details(app: &mut IncaApp, ui: &mut egui::Ui) {
     let Some(id) = app.hk.selected.clone() else { return };
     let scope = app.hk.scope;
     let editable = app.active_keymap > 0;
-    ui.label(RichText::new(command_label(&id)).strong().size(15.0));
-    if let Some(desc) = command_description(&id) {
+    ui.label(RichText::new(command_label(app, &id)).strong().size(15.0));
+    if let Some(desc) = command_description(app, &id) {
         ui.label(RichText::new(desc).color(theme::TEXT_DIM));
     }
     ui.label(RichText::new(category_of(&id)).color(theme::TEXT_DIM));
@@ -1320,14 +1544,14 @@ fn command_details(app: &mut IncaApp, ui: &mut egui::Ui) {
                 ui.add_space(6.0);
             }
             ui.horizontal_top(|ui| {
-                for (i, (chord, release)) in pair.iter().enumerate() {
+                for (i, (chord, press, release)) in pair.iter().enumerate() {
                     if i > 0 {
                         // A plain ui.separator() would stretch to the whole details area and push
                         // the second row out of view; draw a fixed-height divider instead.
-                        let (r, _) = ui.allocate_exact_size(vec2(8.0, 50.0), Sense::hover());
+                        let (r, _) = ui.allocate_exact_size(vec2(8.0, 64.0), Sense::hover());
                         ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, Color32::from_rgb(0x5a, 0x5a, 0x5a)));
                     }
-                    ui.allocate_ui_with_layout(vec2(col_w, 50.0), egui::Layout::top_down(Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(vec2(col_w, 64.0), egui::Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         let raw: Vec<&str> = chord.split('+').collect();
                         if raw.is_empty() {
@@ -1363,12 +1587,26 @@ fn command_details(app: &mut IncaApp, ui: &mut egui::Ui) {
                                     if key_chip(ui, &display[main_idx], editable).on_hover_text("Remove this hotkey").clicked() {
                                         remove = Some(chord.clone());
                                     }
-                                    if on_release_button(ui, *release, editable, KEY_CHIP_W).on_hover_text("Run this key on release instead of press").clicked() {
-                                        toggle = Some((chord.clone(), !*release));
+                                    if on_press_button(ui, *press, true, KEY_CHIP_W).on_hover_text("Run this key when pressed").clicked() {
+                                        let (p, r) = toggled_directions(*press, *release, true);
+                                        toggle = Some((chord.clone(), p, r));
+                                    }
+                                    if on_release_button(ui, *release, true, KEY_CHIP_W).on_hover_text("Run this key when released").clicked() {
+                                        let (p, r) = toggled_directions(*press, *release, false);
+                                        toggle = Some((chord.clone(), p, r));
                                     }
                                 });
-                            } else if on_release_button(ui, *release, editable, KEY_CHIP_W).on_hover_text("Run this key on release instead of press").clicked() {
-                                toggle = Some((chord.clone(), !*release));
+                            } else {
+                                ui.vertical(|ui| {
+                                    if on_press_button(ui, *press, true, KEY_CHIP_W).on_hover_text("Run this key when pressed").clicked() {
+                                        let (p, r) = toggled_directions(*press, *release, true);
+                                        toggle = Some((chord.clone(), p, r));
+                                    }
+                                    if on_release_button(ui, *release, true, KEY_CHIP_W).on_hover_text("Run this key when released").clicked() {
+                                        let (p, r) = toggled_directions(*press, *release, false);
+                                        toggle = Some((chord.clone(), p, r));
+                                    }
+                                });
                             }
                         });
                     });
@@ -1381,8 +1619,8 @@ fn command_details(app: &mut IncaApp, ui: &mut egui::Ui) {
                 ui.label(RichText::new(format!("Application: {global}")).monospace().color(theme::TEXT_DIM));
             }
         }
-        if let Some((chord, release)) = toggle {
-            set_binding_release(app, &id, &chord, release, scope);
+        if let Some((chord, press, release)) = toggle {
+            set_binding_directions(app, &id, &chord, press, release, scope);
         }
         if let Some(chord) = remove {
             remove_binding(app, &id, &chord, scope);
@@ -1445,14 +1683,14 @@ fn save_keymaps_now(app: &mut IncaApp) {
     }
 }
 
-fn known_keymap(map: Keymap) -> (Keymap, usize) {
+fn known_keymap(map: Keymap, custom: &[String]) -> (Keymap, usize) {
     let mut dropped = 0;
     let map = map
         .into_iter()
         .filter(|(_, action)| {
-            let id = action.strip_prefix("release:").unwrap_or(action);
-            let id = id.strip_prefix("unbind:").unwrap_or(id);
-            let known = crate::actions::available(id);
+            let id = action.strip_prefix("unbind:").unwrap_or(action);
+            let (id, _, _) = action_parts(id);
+            let known = crate::actions::available(id) || custom.iter().any(|c| c == id);
             if !known {
                 dropped += 1;
             }
@@ -1489,10 +1727,11 @@ fn import_keymap_file(app: &mut IncaApp) {
     let count = sets.len();
     let mut last = String::new();
     let mut dropped = 0;
+    let custom: Vec<String> = app.runtime_cmds.iter().map(|c| c.id.clone()).collect();
     for set in sets {
         let name = unique_set_name(app, &set.name);
         last = name.clone();
-        let (map, lost) = known_keymap(set.map);
+        let (map, lost) = known_keymap(set.map, &custom);
         dropped += lost;
         create_set(app, name, map);
     }
@@ -1597,6 +1836,10 @@ fn keymap_bar(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         if ui.add_enabled(editable, egui::Button::new("Export...")).on_hover_text("Export the current set to a JSON file").clicked() {
             export_keymap_file(app);
+        }
+        if ui.button("Runtime Commands...").on_hover_text("Create custom MEL commands for hotkeys").clicked() {
+            app.hk.rc_open = true;
+            app.hk.rc_delete = false;
         }
     });
     let del_name = if app.hk.delete_confirm && app.active_keymap > 0 {
@@ -1732,7 +1975,7 @@ fn command_row(ui: &mut egui::Ui, id: &str, label: &str, keys: &str, sel: bool) 
 
 fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
     let editable = app.active_keymap > 0;
-    let commands = all_commands();
+    let commands = all_commands(app);
     let cats: Vec<&'static str> = {
         let mut s = BTreeSet::new();
         for (id, _) in &commands {
@@ -1768,7 +2011,7 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
     app.hk.category_seen = app.hk.category.clone();
     let q = app.hk.filter.trim().to_lowercase();
     let cat_filter = app.hk.category.clone();
-    let mut groups: BTreeMap<&'static str, Vec<(&'static str, String, String, u8)>> = BTreeMap::new();
+    let mut groups: BTreeMap<&'static str, Vec<(String, String, String, u8)>> = BTreeMap::new();
     for (id, label) in &commands {
         let cat = category_of(id);
         if !cat_filter.is_empty() && cat != cat_filter {
@@ -1778,9 +2021,9 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
         let Some(rank) = search_rank(&q, id, label, cat, &search) else {
             continue;
         };
-        groups.entry(cat).or_default().push((id, label.clone(), binding_text(app, id, app.hk.scope), rank));
+        groups.entry(cat).or_default().push((id.clone(), label.clone(), binding_text(app, id, app.hk.scope), rank));
     }
-    let mut groups: Vec<(&'static str, Vec<(&'static str, String, String, u8)>)> = groups.into_iter().collect();
+    let mut groups: Vec<(&'static str, Vec<(String, String, String, u8)>)> = groups.into_iter().collect();
     groups.sort_by(|(a, ai), (b, bi)| {
         let ra = ai.iter().map(|x| x.3).min().unwrap_or(0);
         let rb = bi.iter().map(|x| x.3).min().unwrap_or(0);
@@ -1796,7 +2039,7 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
         egui::Frame::NONE.inner_margin(egui::Margin { right: 20, ..Default::default() }).show(ui, |ui| {
             for (cat, mut items) in groups {
                 items.sort_by(|a, b| a.3.cmp(&b.3).then(a.1.cmp(&b.1)));
-                let reveal_here = app.hk.reveal && items.iter().any(|(id, _, _, _)| app.hk.selected.as_deref() == Some(*id));
+                let reveal_here = app.hk.reveal && items.iter().any(|(id, _, _, _)| app.hk.selected.as_deref() == Some(id.as_str()));
                 let header = format!("{} ({})", cat, items.len());
                 egui::CollapsingHeader::new(RichText::new(header).strong())
                     .id_salt(("hk_cat", cat))
@@ -1804,23 +2047,23 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
                     .open(reveal_here.then_some(true))
                     .show(ui, |ui| {
                         for (id, label, keys, _) in items {
-                            let sel = app.hk.selected.as_deref() == Some(id);
-                            let tip = if keys.is_empty() { id.to_string() } else { format!("{id}\n{keys}") };
-                            let resp = command_row(ui, id, &label, &keys, sel).on_hover_text(tip);
+                            let sel = app.hk.selected.as_deref() == Some(id.as_str());
+                            let tip = if keys.is_empty() { label.clone() } else { keys.clone() };
+                            let resp = command_row(ui, &id, &label, &keys, sel).on_hover_text(tip);
                             if resp.double_clicked() {
-                                app.hk.selected = Some(id.to_string());
+                                app.hk.selected = Some(id.clone());
                                 app.hk.pending = None;
-                                focus_command(app, id);
+                                focus_command(app, &id);
                                 start_capture(app);
                             } else if resp.clicked() {
-                                if app.hk.selected.as_deref() == Some(id) {
+                                if app.hk.selected.as_deref() == Some(id.as_str()) {
                                     app.hk.selected = None;
                                     app.hk.reveal = false;
                                     clear_modifier_layers(app);
                                 } else {
-                                    app.hk.selected = Some(id.to_string());
+                                    app.hk.selected = Some(id.clone());
                                     app.hk.pending = None;
-                                    focus_command(app, id);
+                                    focus_command(app, &id);
                                 }
                             }
                             if sel && app.hk.reveal {
@@ -1860,9 +2103,9 @@ fn status_bar(app: &mut IncaApp, ui: &mut egui::Ui) {
     ui.separator();
     if let Some(p) = app.hk.pending.clone() {
         ui.horizontal(|ui| {
-            let dir = if p.existing_release { " (release)" } else { "" };
+            let dir = direction_label(p.existing_press, p.existing_release);
             let scope = if p.scope == Scope::Application { String::new() } else { format!(" in {} scope", p.scope.label()) };
-            ui.label(RichText::new(format!("{} is assigned to {}{dir}{scope}.", p.chord, command_label(&p.existing))).color(Color32::from_rgb(0xe6, 0xc5, 0x4a)));
+            ui.label(RichText::new(format!("{} is assigned to {}{dir}{scope}.", p.chord, command_label(app, &p.existing))).color(Color32::from_rgb(0xe6, 0xc5, 0x4a)));
             if ui.button("Override").clicked() {
                 override_pending(app);
             }
@@ -1938,11 +2181,11 @@ mod tests {
 
     #[test]
     fn primitive_and_light_commands_have_labels_and_descriptions() {
-        assert_eq!(command_label("polyCube"), "Polygon Cube");
-        assert_eq!(command_label("nurbsCube"), "NURBS Cube");
-        assert_eq!(command_label("pointLight"), "Point Light");
-        assert_eq!(command_description("polyCube").as_deref(), Some("Creates a polygon cube."));
-        assert_eq!(command_description("pointLight").as_deref(), Some("Creates a point light."));
+        assert_eq!(builtin_command_label("polyCube"), "Polygon Cube");
+        assert_eq!(builtin_command_label("nurbsCube"), "NURBS Cube");
+        assert_eq!(builtin_command_label("pointLight"), "Point Light");
+        assert_eq!(builtin_command_description("polyCube").as_deref(), Some("Creates a polygon cube."));
+        assert_eq!(builtin_command_description("pointLight").as_deref(), Some("Creates a point light."));
     }
 
     #[test]
@@ -2016,21 +2259,76 @@ mod tests {
     fn hotkey_search_prefers_plain_keys() {
         assert_eq!(binding_key("Ctrl+Shift+K"), "K");
         assert_eq!(binding_key("Insert / hold D"), "D");
-        let plain_d = vec![("Insert / hold D".to_string(), false)];
-        let ctrl_d = vec![("Ctrl+D".to_string(), false)];
+        let plain_d = vec![("Insert / hold D".to_string(), true, false)];
+        let ctrl_d = vec![("Ctrl+D".to_string(), true, false)];
         let plain = search_rank("d", "pivotEdit", "Edit Pivot", "Tools", &plain_d).unwrap();
         let modified = search_rank("d", "duplicate", "Duplicate", "Edit", &ctrl_d).unwrap();
         assert!(plain < modified, "plain D should rank above Ctrl+D");
     }
 
     #[test]
-    fn release_bindings_round_trip() {
-        assert_eq!(split_action("copy"), ("copy", false));
-        assert_eq!(split_action("release:copy"), ("copy", true));
-        for release in [false, true] {
-            let value = action_value("copy", release);
-            assert_eq!(split_action(&value), ("copy", release));
+    fn binding_directions_round_trip() {
+        assert_eq!(action_parts("copy"), ("copy", true, false));
+        assert_eq!(action_parts("release:copy"), ("copy", false, true));
+        assert_eq!(action_parts("both:copy"), ("copy", true, true));
+        for (press, release) in [(true, false), (false, true), (true, true)] {
+            let value = action_value("copy", press, release);
+            assert_eq!(action_parts(&value), ("copy", press, release));
         }
+    }
+
+    #[test]
+    fn normalize_splits_the_old_pivot_chord() {
+        let mut map = Keymap::new();
+        map.insert("Insert / hold D".into(), "pivotEdit".into());
+        map.insert("viewport:Insert / hold D".into(), "release:pivotEdit".into());
+        let map = normalize_keymap(map);
+        assert_eq!(map.get("Insert").map(String::as_str), Some("pivotEdit"));
+        assert_eq!(map.get("D").map(String::as_str), Some("release:pivotEdit"));
+        assert_eq!(map.get("viewport:Insert").map(String::as_str), Some("pivotEdit"));
+        assert_eq!(map.get("viewport:D").map(String::as_str), Some("release:pivotEdit"));
+        assert!(!map.contains_key("Insert / hold D"));
+        assert!(!map.contains_key("viewport:Insert / hold D"));
+    }
+
+    #[test]
+    fn snapping_defaults_to_both_directions_in_the_viewport() {
+        assert_eq!(default_directions("snapGrid", "X"), (true, true));
+        assert_eq!(default_directions("snapCurve", "C"), (true, true));
+        assert_eq!(default_directions("snapPoint", "V"), (true, true));
+        assert_eq!(default_directions("copy", "Ctrl+C"), (true, false));
+        assert_eq!(default_directions("pivotEdit", "Insert"), (true, false));
+        assert_eq!(default_directions("pivotEdit", "D"), (false, true));
+        assert_eq!(crate::actions::hotkey_label("pivotEdit"), "Insert");
+        assert_eq!(default_scope("snapGrid"), Scope::Viewport);
+        assert_eq!(default_scope("snapCurve"), Scope::Viewport);
+        assert_eq!(default_scope("snapPoint"), Scope::Viewport);
+        assert_eq!(crate::actions::hotkey_label("snapGrid"), "X");
+        for id in [
+            "frameAll", "frameSelected", "frameAllAll", "frameSelectedAll",
+            "undoView", "redoView", "defaultView",
+            "smoothOff", "smoothCage", "smoothOn",
+            "shadeWire", "shadeSmooth", "shadeTextured", "shadeAllLights",
+            "objectMode", "vertexMode", "edgeMode", "faceMode", "uvMode",
+            "toggleXray", "cycleBackground", "isolateSelect",
+        ] {
+            assert_eq!(default_scope(id), Scope::Viewport, "{id}");
+        }
+        assert_eq!(default_scope("copy"), Scope::Application);
+        assert_eq!(default_scope("moveTool"), Scope::Application);
+        assert_eq!(default_scope("pivotEdit"), Scope::Application);
+    }
+
+    #[test]
+    fn direction_toggles_never_leave_both_off() {
+        assert_eq!(toggled_directions(true, false, true), (true, false));
+        assert_eq!(toggled_directions(true, false, false), (true, true));
+        assert_eq!(toggled_directions(true, true, true), (false, true));
+        assert_eq!(toggled_directions(true, true, false), (true, false));
+        assert_eq!(toggled_directions(false, true, true), (true, true));
+        assert_eq!(toggled_directions(false, true, false), (true, false));
+        assert_eq!(toggled_directions(false, false, true), (true, false));
+        assert_eq!(toggled_directions(false, false, false), (true, true));
     }
 
     #[test]
@@ -2040,14 +2338,97 @@ mod tests {
         map.insert("Ctrl+X".into(), "notARealAction".into());
         map.insert("Ctrl+R".into(), "release:repeatLast".into());
         map.insert("Ctrl+Y".into(), "release:notARealAction".into());
+        map.insert("Ctrl+B".into(), "both:repeatLast".into());
+        map.insert("Ctrl+J".into(), "both:notARealAction".into());
         map.insert("unbind:copy".into(), "copy".into());
-        let (map, dropped) = known_keymap(map);
-        assert_eq!(dropped, 2);
+        let (map, dropped) = known_keymap(map, &[]);
+        assert_eq!(dropped, 3);
         assert!(map.contains_key("Ctrl+C"));
         assert!(map.contains_key("unbind:copy"));
         assert_eq!(map.get("Ctrl+R").map(String::as_str), Some("release:repeatLast"));
+        assert_eq!(map.get("Ctrl+B").map(String::as_str), Some("both:repeatLast"));
         assert!(!map.contains_key("Ctrl+X"));
         assert!(!map.contains_key("Ctrl+Y"));
+        assert!(!map.contains_key("Ctrl+J"));
+    }
+
+    #[test]
+    fn direction_toggle_updates_existing_and_default_bindings() {
+        let mut map = Keymap::new();
+        map.insert("viewport:L".into(), "pivotEdit".into());
+        set_directions_in_map(&mut map, "pivotEdit", "L", true, true, Scope::Viewport);
+        assert_eq!(map.get("viewport:L").map(String::as_str), Some("both:pivotEdit"));
+        set_directions_in_map(&mut map, "pivotEdit", "L", false, true, Scope::Viewport);
+        assert_eq!(map.get("viewport:L").map(String::as_str), Some("release:pivotEdit"));
+        set_directions_in_map(&mut map, "pivotEdit", "L", true, false, Scope::Viewport);
+        assert_eq!(map.get("viewport:L").map(String::as_str), Some("pivotEdit"));
+
+        let mut defaults = Keymap::new();
+        set_directions_in_map(&mut defaults, "undo", "Ctrl+Z", true, true, Scope::Application);
+        assert_eq!(defaults.get("Ctrl+Z").map(String::as_str), Some("both:undo"));
+    }
+
+    #[test]
+    fn release_strip_accepts_clicks_in_the_binding_row() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        ctx.set_pixels_per_point(1.0);
+        let mut time = 0.0;
+        let mut btn: Option<egui::Rect> = None;
+        let mut clicked = false;
+        for frame in 0..6 {
+            time += 0.1;
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 200.0)));
+            input.time = Some(time);
+            if let Some(rect) = btn {
+                if frame == 2 {
+                    input.events.push(egui::Event::PointerMoved(rect.center()));
+                } else if frame == 3 {
+                    input.events.push(egui::Event::PointerButton {
+                        pos: rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    });
+                } else if frame == 4 {
+                    input.events.push(egui::Event::PointerButton {
+                        pos: rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    });
+                }
+            }
+            ctx.begin_pass(input);
+            egui::Area::new(egui::Id::new("release-button-test"))
+                .fixed_pos(egui::pos2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("release-button-test-details")
+                        .max_height(260.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.allocate_ui_with_layout(egui::vec2(300.0, 64.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.horizontal_top(|ui| {
+                                    ui.vertical(|ui| {
+                                        let _ = key_chip(ui, "L", true);
+                                        let _ = on_press_button(ui, true, true, KEY_CHIP_W);
+                                        let response = on_release_button(ui, false, true, KEY_CHIP_W);
+                                        btn = Some(response.rect);
+                                        if response.clicked() {
+                                            clicked = true;
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                });
+            let mut out = ctx.end_pass();
+            out.textures_delta.clear();
+        }
+        assert!(clicked, "the On Release strip should accept a click");
     }
 }
 
@@ -2060,7 +2441,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     capture(app, ctx);
     // A distinct id discards window state stored by older builds. That state had ratcheted to
     // the full screen, so a default size alone could not shrink it again.
-    let shown = egui::Window::new("Hotkey Editor").id(egui::Id::new("HotkeyEditorWindow2")).open(&mut open).default_size([1280.0, 720.0]).min_size([900.0, 620.0]).resizable([true, false]).show(ctx, |ui| {
+    let shown = egui::Window::new("Hotkey Editor").id(egui::Id::new("HotkeyEditorWindow2")).open(&mut open).default_size([1280.0, 720.0]).min_size([900.0, 620.0]).resizable([true, false]).constrain(false).show(ctx, |ui| {
         // A fixed content height keeps the window from resizing when the selected command,
         // its hotkeys or the details area content change.
         let height = 720.0;
@@ -2095,4 +2476,176 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         app.hk.restore_layers = None;
     }
     app.win.hotkeys = open;
+    if open {
+        runtime_window(app, ctx);
+    } else {
+        app.hk.rc_open = false;
+    }
+}
+
+fn new_runtime_command(app: &mut IncaApp) {
+    let mut n = 1;
+    while app.runtime_cmds.iter().any(|c| c.id == format!("runtime:{n}")) {
+        n += 1;
+    }
+    let cmd = RuntimeCommand {
+        id: format!("runtime:{n}"),
+        label: format!("Custom Command {n}"),
+        description: "Runs a custom MEL script.".into(),
+        script: String::new(),
+    };
+    app.hk.rc_selected = Some(cmd.id.clone());
+    app.hk.rc_label = cmd.label.clone();
+    app.hk.rc_desc = cmd.description.clone();
+    app.hk.rc_script = cmd.script.clone();
+    app.runtime_cmds.push(cmd);
+    if let Err(e) = save_runtime_commands_file(&app.runtime_cmds) {
+        app.hk.status = format!("Could not save runtime commands: {e}");
+    } else {
+        app.hk.status = "Created a runtime command.".into();
+    }
+}
+
+fn apply_runtime_command(app: &mut IncaApp) {
+    let Some(id) = app.hk.rc_selected.clone() else { return };
+    let label = app.hk.rc_label.trim().to_string();
+    let label = if label.is_empty() { "Custom Command".to_string() } else { label };
+    if let Some(c) = app.runtime_cmds.iter_mut().find(|c| c.id == id) {
+        c.label = label;
+        c.description = app.hk.rc_desc.clone();
+        c.script = app.hk.rc_script.clone();
+        if let Err(e) = save_runtime_commands_file(&app.runtime_cmds) {
+            app.hk.status = format!("Could not save runtime commands: {e}");
+        } else {
+            app.hk.status = "Runtime command saved.".into();
+        }
+    }
+}
+
+fn delete_runtime_command(app: &mut IncaApp) {
+    let Some(id) = app.hk.rc_selected.clone() else { return };
+    app.runtime_cmds.retain(|c| c.id != id);
+    for set in &mut app.keymaps {
+        set.map.retain(|_, a| action_parts(a).0 != id);
+    }
+    app.keymap.retain(|_, a| action_parts(a).0 != id);
+    if app.hk.selected.as_deref() == Some(id.as_str()) {
+        app.hk.selected = None;
+    }
+    app.hk.rc_selected = None;
+    app.hk.rc_label.clear();
+    app.hk.rc_desc.clear();
+    app.hk.rc_script.clear();
+    app.hk.rc_delete = false;
+    if let Err(e) = save_runtime_commands_file(&app.runtime_cmds) {
+        app.hk.status = format!("Could not save runtime commands: {e}");
+    } else {
+        app.hk.status = "Deleted runtime command and its hotkeys.".into();
+    }
+}
+
+fn runtime_window(app: &mut IncaApp, ctx: &egui::Context) {
+    if !app.hk.rc_open {
+        return;
+    }
+    let mut open = true;
+    let mut add = false;
+    let mut delete_clicked = false;
+    let mut confirm_delete = false;
+    let mut apply = false;
+    egui::Window::new("Runtime Commands")
+        .id(egui::Id::new("RuntimeCommandsWindow4"))
+        .open(&mut open)
+        .order(egui::Order::Foreground)
+        .default_pos(egui::pos2(300.0, 160.0))
+        .default_size([700.0, 480.0])
+        .min_size([700.0, 410.0])
+        .resizable(true)
+        .constrain(false)
+        .show(ctx, |ui| {
+            // Solid scrollbars: visible as soon as content overflows, not only on hover.
+            ui.style_mut().spacing.scroll.floating = false;
+            egui::Panel::top("rc_head")
+                .frame(egui::Frame::NONE)
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Custom MEL commands appear under Custom in the Hotkey Editor command list.").color(theme::TEXT_DIM));
+                    ui.separator();
+                });
+            egui::Panel::bottom("rc_foot")
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 5)))
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    // Fixed-height slot: the delete confirmation appears here without changing
+                    // the window's size.
+                    ui.allocate_ui_with_layout(vec2(ui.available_width(), 24.0), egui::Layout::left_to_right(Align::Center), |ui| {
+                        ui.set_height(24.0);
+                        if app.hk.rc_delete {
+                            ui.label(RichText::new("Delete this command and all of its hotkeys?").color(Color32::from_rgb(0xe6, 0xc5, 0x4a)));
+                            if ui.button("Delete").clicked() {
+                                confirm_delete = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                app.hk.rc_delete = false;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.label(RichText::new(&app.hk.status).color(theme::TEXT_DIM));
+                });
+            egui::Panel::left("rc_list_panel")
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 0, right: 6, top: 0, bottom: 0 }))
+                .resizable(false)
+                .exact_size(210.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("New").clicked() {
+                            add = true;
+                        }
+                        if ui.add_enabled(app.hk.rc_selected.is_some(), egui::Button::new("Delete")).clicked() {
+                            delete_clicked = true;
+                        }
+                    });
+                    egui::ScrollArea::vertical().id_salt("rc_list").auto_shrink([false, false]).show(ui, |ui| {
+                        for c in &app.runtime_cmds {
+                            let sel = app.hk.rc_selected.as_deref() == Some(c.id.as_str());
+                            if ui.selectable_label(sel, &c.label).clicked() {
+                                app.hk.rc_selected = Some(c.id.clone());
+                                app.hk.rc_label = c.label.clone();
+                                app.hk.rc_desc = c.description.clone();
+                                app.hk.rc_script = c.script.clone();
+                                app.hk.rc_delete = false;
+                            }
+                        }
+                    });
+                });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin { left: 10, right: 8, top: 8, bottom: 8 }))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("rc_editor").auto_shrink([false, false]).show(ui, |ui| {
+                        ui.label("Name");
+                        ui.add(egui::TextEdit::singleline(&mut app.hk.rc_label).desired_width(f32::INFINITY));
+                        ui.label("Description");
+                        ui.add(egui::TextEdit::singleline(&mut app.hk.rc_desc).desired_width(f32::INFINITY));
+                        ui.label("MEL script");
+                        ui.add(egui::TextEdit::multiline(&mut app.hk.rc_script).code_editor().desired_width(f32::INFINITY).desired_rows(10));
+                        if ui.add_enabled(app.hk.rc_selected.is_some(), egui::Button::new("Apply")).clicked() {
+                            apply = true;
+                        }
+                    });
+                });
+        });
+    if delete_clicked {
+        app.hk.rc_delete = true;
+    }
+    if confirm_delete {
+        delete_runtime_command(app);
+    }
+    if add {
+        new_runtime_command(app);
+    }
+    if apply {
+        apply_runtime_command(app);
+    }
+    app.hk.rc_open = open;
 }

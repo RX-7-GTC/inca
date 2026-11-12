@@ -343,6 +343,8 @@ pub fn describe(id: &str) -> Option<&'static str> {
         "about" => "Shows version and credits.",
         "uvEditor" => "Opens the UV Editor.",
         "snapGrid" => "Hold to snap the manipulator to the grid.",
+    "snapCurve" => "Hold to snap the manipulator to curves.",
+    "snapPoint" => "Hold to snap the manipulator to points.",
         "manipBigger" => "Increases the manipulator size.",
         "manipSmaller" => "Decreases the manipulator size.",
         "toggleShelf" => "Shows or hides the shelf.",

@@ -7,6 +7,10 @@ use inca_core::mel::{Interp, Val};
 use inca_core::scene::{CompMode, MsgKind, Scene, SelMode};
 use std::collections::{HashMap, HashSet};
 
+/// A press shorter than this, without mouse use, is a tap; anything else is a hold.
+/// Maya's default sticky hotkey time is 200 ms (`kStickyKeyTime` in `nexOpts.cpp`).
+const TAP_HOLD_SECS: f64 = 0.2;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
     Select,
@@ -204,6 +208,12 @@ pub struct IncaApp {
     pub manip_size: f32,
     /// Edit Pivot: the move manipulator moves pivots instead of objects
     pub pivot_mode: bool,
+    /// Key holding Edit Pivot: key, pivot mode to restore, tap toggles, press time, mouse use.
+    pub pivot_hold: Option<(egui::Key, bool, bool, f64, bool)>,
+    /// Key holding a snap toggle: key, action, prior state, tap toggles, press time, mouse use.
+    pub snap_hold: Option<(egui::Key, String, bool, bool, f64, bool)>,
+    /// Last known window focus, so hold keys are only released on an actual focus loss.
+    pub was_focused: bool,
     pub gpu: Option<Gpu>,
     /// Kept so the GPU renderer can be rebuilt when MSAA changes at runtime.
     pub gpu_rs: Option<eframe::egui_wgpu::RenderState>,
@@ -282,6 +292,8 @@ pub struct IncaApp {
     pub keymap: crate::hotkey_editor::Keymap,
     pub keymaps: Vec<crate::hotkey_editor::KeymapSet>,
     pub active_keymap: usize,
+    /// user-defined MEL commands, bindable like actions
+    pub runtime_cmds: Vec<crate::hotkey_editor::RuntimeCommand>,
     pub hk: crate::hotkey_editor::HkState,
     pub ce: crate::component_editor::CeState,
     pub prefs: crate::prefs::Prefs,
@@ -442,6 +454,9 @@ impl IncaApp {
             history_on: true,
             manip_size: cc.storage.and_then(|s| eframe::get_value(s, "manipSize")).unwrap_or(1.0),
             pivot_mode: false,
+            pivot_hold: None,
+            snap_hold: None,
+            was_focused: true,
             gpu,
             gpu_rs,
             camera_names: HashMap::new(),
@@ -499,6 +514,9 @@ impl IncaApp {
             inview_offset: egui::Vec2::ZERO,
             uv_mode: false,
             keymap,
+            runtime_cmds: crate::hotkey_editor::load_runtime_commands_file()
+                .or_else(|| cc.storage.and_then(|s| eframe::get_value(s, "runtimeCommands")))
+                .unwrap_or_default(),
             keymaps,
             active_keymap,
             hk: Default::default(),
@@ -1024,6 +1042,16 @@ impl IncaApp {
     pub fn action(&mut self, id: &str) {
         self.open_menu = None;
         self.hotbox = None;
+        if let Some(cmd) = self.runtime_cmds.iter().find(|c| c.id == id) {
+            let label = cmd.label.clone();
+            let script = cmd.script.clone();
+            if script.trim().is_empty() {
+                self.warn(format!("{label} has no MEL script."));
+            } else {
+                let _ = self.run_mel(&label, &script);
+            }
+            return;
+        }
         if crate::actions::repeatable(id) {
             self.last_action = Some(id.to_string());
         }
@@ -1037,7 +1065,49 @@ impl IncaApp {
 
     // ------------------------------------------------------------ frame
 
+    /// Restore the pivot mode after a hold key. Focus loss or an early return can swallow the
+    /// key-up event.
+    fn end_pivot_hold(&mut self) {
+        if let Some((_, was_on, _, _, _)) = self.pivot_hold.take() {
+            self.pivot_mode = was_on;
+        }
+    }
+
+    fn snap_state(&self, id: &str) -> bool {
+        match id {
+            "snapGrid" => self.snap_grid,
+            "snapCurve" => self.snap_curve,
+            "snapPoint" => self.snap_point,
+            _ => false,
+        }
+    }
+
+    fn set_snap_state(&mut self, id: &str, on: bool) {
+        match id {
+            "snapGrid" => self.snap_grid = on,
+            "snapCurve" => self.snap_curve = on,
+            "snapPoint" => self.snap_point = on,
+            _ => {}
+        }
+    }
+
+    fn end_snap_hold(&mut self) {
+        if let Some((_, id, was_on, _, _, _)) = self.snap_hold.take() {
+            self.set_snap_state(&id, was_on);
+        }
+    }
+
+    fn end_holds(&mut self) {
+        self.end_pivot_hold();
+        self.end_snap_hold();
+    }
+
     fn hotkeys(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.focused);
+        if !focused && self.was_focused {
+            self.end_holds();
+        }
+        self.was_focused = focused;
         // clicked buttons and the viewport take keyboard focus in egui; only text fields should keep it
         if let Some(id) = ctx.memory(|m| m.focused()) {
             if egui::text_edit::TextEditState::load(ctx, id).is_none() {
@@ -1045,11 +1115,23 @@ impl IncaApp {
             }
         }
         if ctx.egui_wants_keyboard_input() || crate::uv_editor::wants_keys(self, ctx) {
+            self.end_holds();
             return;
         }
         // The Hotkey Editor owns the next key press while assigning a shortcut.
         if self.win.hotkeys && self.hk.capturing {
+            self.end_holds();
             return;
+        }
+        // A hold key is momentary when the mouse is doing something while it is down; otherwise
+        // a press/release is a tap that toggles the state.
+        if ctx.input(|i| i.pointer.any_down()) {
+            if let Some((_, _, _, _, used)) = &mut self.pivot_hold {
+                *used = true;
+            }
+            if let Some((_, _, _, _, _, used)) = &mut self.snap_hold {
+                *used = true;
+            }
         }
         let events = ctx.input(|i| i.events.clone());
         let now = ctx.input(|i| i.time);
@@ -1067,12 +1149,6 @@ impl IncaApp {
                     }
                 }
             }
-            // holding D edits the pivot
-            if let egui::Event::Key { key: egui::Key::D, pressed, repeat: false, modifiers, .. } = e {
-                if !modifiers.ctrl && !modifiers.command && !modifiers.alt && !modifiers.shift {
-                    self.pivot_mode = *pressed;
-                }
-            }
         }
         if let Some(t0) = self.space_down {
             if now - t0 >= 0.25 && self.hotbox.is_none() {
@@ -1084,6 +1160,22 @@ impl IncaApp {
         for e in events {
             match e {
                 egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } => {
+                    // Edit Pivot and snapping are hold commands: tap toggles, hold is temporary.
+                    if let Some((id, _press, release)) = crate::hotkey_editor::hold_binding(self, key, modifiers, scope) {
+                        if release {
+                            if id == "pivotEdit" {
+                                if self.pivot_hold.is_none() {
+                                    self.pivot_hold = Some((key, self.pivot_mode, true, now, false));
+                                    self.pivot_mode = true;
+                                }
+                            } else if self.snap_hold.is_none() {
+                                let was_on = self.snap_state(&id);
+                                self.set_snap_state(&id, true);
+                                self.snap_hold = Some((key, id, was_on, true, now, false));
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(a) = crate::hotkey_editor::resolve(self, key, modifiers, scope) {
                         self.action(&a);
                     }
@@ -1092,6 +1184,23 @@ impl IncaApp {
                     }
                 }
                 egui::Event::Key { key, pressed: false, repeat: false, .. } => {
+                    if let Some((hold, was_on, tap, since, used)) = self.pivot_hold {
+                        if hold == key {
+                            let tap = tap && !used && now - since < TAP_HOLD_SECS;
+                            self.pivot_mode = if tap { !was_on } else { was_on };
+                            self.pivot_hold = None;
+                            continue;
+                        }
+                    }
+                    if let Some((hold, id, was_on, tap, since, used)) = self.snap_hold.clone() {
+                        if hold == key {
+                            let tap = tap && !used && now - since < TAP_HOLD_SECS;
+                            let on = if tap { !was_on } else { was_on };
+                            self.set_snap_state(&id, on);
+                            self.snap_hold = None;
+                            continue;
+                        }
+                    }
                     if let Some(a) = self.release_keys.remove(&key) {
                         self.action(&a);
                     }
@@ -1193,6 +1302,10 @@ impl eframe::App for IncaApp {
         eframe::set_value(storage, "keymap", &self.keymap);
         if let Err(e) = crate::hotkey_editor::save_keymaps_file(self) {
             eprintln!("Failed to save keymaps.json: {e}");
+        }
+        eframe::set_value(storage, "runtimeCommands", &self.runtime_cmds);
+        if let Err(e) = crate::hotkey_editor::save_runtime_commands_file(&self.runtime_cmds) {
+            eprintln!("Failed to save runtime_commands.json: {e}");
         }
         eframe::set_value(storage, "prefs", &self.prefs);
         if let Some(p) = &self.s.project {

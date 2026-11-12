@@ -3031,9 +3031,13 @@ fn work_area(app: &mut IncaApp, ui: &mut egui::Ui) {
         if ctx.input(|i| i.key_pressed(egui::Key::F)) {
             app.windows_state.hs.frame = Some(true);
         }
-        if app.windows_state.hs.sel_wire.is_some() && !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+        if !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
             if let Some(w) = app.windows_state.hs.sel_wire.take() {
                 break_connection(app, &w);
+            } else if !app.windows_state.hs.graph_sel.is_empty() {
+                let ids = app.windows_state.hs.graph_sel.clone();
+                delete_graph_nodes(app, &ids);
+                app.windows_state.hs.graph_sel.clear();
             }
         }
     }
