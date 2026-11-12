@@ -5,8 +5,74 @@ use crate::theme;
 use egui::{pos2, vec2, Align, Align2, Color32, FontId, Key, LayerId, Modifiers, Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-/// chord ("Ctrl+Shift+K") -> action id; "unbind:<action>" entries switch an action's default hotkey off.
-pub type Keymap = BTreeMap<String, String>;
+/// chord ("Ctrl+Shift+K") -> action id, in creation order; "unbind:<action>" entries switch an
+/// action's default hotkey off. Editor-scoped keys are prefixed, e.g. "viewport:Ctrl+Shift+K".
+pub type Keymap = indexmap::IndexMap<String, String>;
+
+/// Where a binding applies. Application bindings always apply; editor scopes only while the
+/// pointer is over that editor (same rule as the UV Editor's own keys).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum Scope {
+    #[default]
+    Application,
+    Viewport,
+    Hypershade,
+    UvEditor,
+}
+
+impl Scope {
+    pub const ALL: [Scope; 4] = [Scope::Application, Scope::Viewport, Scope::Hypershade, Scope::UvEditor];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Scope::Application => "Application",
+            Scope::Viewport => "Viewport",
+            Scope::Hypershade => "Hypershade",
+            Scope::UvEditor => "UV Editor",
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Scope::Application => "",
+            Scope::Viewport => "viewport",
+            Scope::Hypershade => "hypershade",
+            Scope::UvEditor => "uv",
+        }
+    }
+}
+
+fn scope_key(scope: Scope, chord: &str) -> String {
+    if scope == Scope::Application { chord.to_string() } else { format!("{}:{chord}", scope.prefix()) }
+}
+
+fn parse_key(key: &str) -> (Scope, &str) {
+    for scope in [Scope::Viewport, Scope::Hypershade, Scope::UvEditor] {
+        if let Some(rest) = key.strip_prefix(scope.prefix()).and_then(|r| r.strip_prefix(':')) {
+            return (scope, rest);
+        }
+    }
+    (Scope::Application, key)
+}
+
+/// The editor under the pointer; viewport panels are checked after the floating editors and
+/// the Hotkey Editor itself.
+pub fn active_scope(app: &IncaApp, ctx: &egui::Context) -> Scope {
+    let Some(p) = ctx.pointer_hover_pos() else { return Scope::Application };
+    if app.hk.window_rect.is_some_and(|r| r.contains(p)) {
+        return Scope::Application;
+    }
+    if app.uv_editor.contains_pointer(p) {
+        return Scope::UvEditor;
+    }
+    if app.win.hypershade && app.windows_state.hs.window_rect.is_some_and(|r| r.contains(p)) {
+        return Scope::Hypershade;
+    }
+    if app.vps.iter().any(|v| v.rect.contains(p)) {
+        return Scope::Viewport;
+    }
+    Scope::Application
+}
 
 /// A named custom hotkey set. Inca Default is implicit and read-only.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -62,21 +128,23 @@ pub struct Pending {
     pub action: String,
     pub existing: String,
     pub existing_release: bool,
-    pub release: bool,
+    pub scope: Scope,
 }
 
 #[derive(Default)]
 pub struct HkState {
     pub filter: String,
     pub category: String,
+    /// editor scope the command list is editing
+    pub scope: Scope,
+    /// the Hotkey Editor window rect, so viewport scoped keys don't fire while editing
+    pub window_rect: Option<Rect>,
     /// filter/category as of the last frame, for resetting the command list scroll
     pub filter_seen: String,
     pub category_seen: String,
     pub selected: Option<String>,
     /// waiting for the next key press to bind to `selected`
     pub capturing: bool,
-    /// assign the next hotkey to key release instead of key press
-    pub release: bool,
     pub layer_ctrl: bool,
     pub layer_alt: bool,
     pub layer_shift: bool,
@@ -104,7 +172,69 @@ pub fn chord(key: Key, m: Modifiers) -> String {
     if m.alt {
         s += "Alt+";
     }
-    s + key.name()
+    s += key.name();
+    canonical_chord(&s)
+}
+
+fn canonical_part(part: &str) -> &str {
+    match part {
+        "ControlLeft" | "ControlRight" => "Ctrl",
+        "ShiftLeft" | "ShiftRight" => "Shift",
+        "AltLeft" | "AltRight" => "Alt",
+        _ => part,
+    }
+}
+
+/// Both Ctrl keys produce "Ctrl", both Shift keys "Shift", etc. Duplicate modifiers collapse,
+/// so "Ctrl+ControlLeft" becomes "Ctrl" and "Ctrl+Shift+ShiftLeft" becomes "Ctrl+Shift".
+fn canonical_chord(c: &str) -> String {
+    let (mut ctrl, mut shift, mut alt) = (false, false, false);
+    let mut key: Option<&str> = None;
+    for part in c.split('+') {
+        match canonical_part(part) {
+            "Ctrl" => ctrl = true,
+            "Shift" => shift = true,
+            "Alt" => alt = true,
+            other => key = Some(other),
+        }
+    }
+    let mut out = String::new();
+    if ctrl {
+        out += "Ctrl+";
+    }
+    if shift {
+        out += "Shift+";
+    }
+    if alt {
+        out += "Alt+";
+    }
+    if let Some(k) = key {
+        out += k;
+    } else if out.ends_with('+') {
+        out.pop();
+    }
+    out
+}
+
+fn is_canonical_modifier(part: &str) -> bool {
+    matches!(canonical_part(part), "Ctrl" | "Shift" | "Alt")
+}
+
+fn chord_with_modifier(chord: &str, modifier: &str) -> String {
+    canonical_chord(&format!("{modifier}+{chord}"))
+}
+
+pub fn normalize_keymap(map: Keymap) -> Keymap {
+    let mut out = Keymap::new();
+    for (k, v) in map {
+        if k.starts_with("unbind:") {
+            out.insert(k, v);
+            continue;
+        }
+        let (scope, chord) = parse_key(&k);
+        out.insert(scope_key(scope, &canonical_chord(chord)), v);
+    }
+    out
 }
 
 fn layer_chord(key: &str, ctrl: bool, shift: bool, alt: bool) -> String {
@@ -143,10 +273,23 @@ fn chord_pref(c: &str) -> (usize, bool, bool, bool) {
     (count, !ctrl, !shift, !alt)
 }
 
-/// The action for a key press: a user binding first, then the Maya default unless it was removed.
-/// A chord bound to release is taken, so its default press action is suppressed too.
-pub fn resolve(app: &IncaApp, key: Key, m: Modifiers) -> Option<String> {
-    if let Some(a) = app.keymap.get(&chord(key, m)) {
+/// The binding that wins for a chord: a scoped one, otherwise the application one.
+fn lookup<'a>(map: &'a Keymap, chord: &str, scope: Scope) -> Option<&'a str> {
+    if let Some(a) = map.get(&scope_key(scope, chord)) {
+        return Some(a);
+    }
+    if scope != Scope::Application {
+        return map.get(chord).map(String::as_str);
+    }
+    None
+}
+
+/// The action for a key press in the given scope: a scoped binding first, then an application
+/// binding, then the Maya default unless it was removed. A release binding is taken, so its
+/// press action is suppressed too.
+pub fn resolve(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<String> {
+    let c = chord(key, m);
+    if let Some(a) = lookup(&app.keymap, &c, scope) {
         let (id, release) = split_action(a);
         return (!release).then(|| id.to_string());
     }
@@ -154,9 +297,9 @@ pub fn resolve(app: &IncaApp, key: Key, m: Modifiers) -> Option<String> {
     (!app.keymap.contains_key(&format!("unbind:{a}"))).then(|| a.to_string())
 }
 
-/// The action a key should run when released, if it was bound on release.
-pub fn release_action(app: &IncaApp, key: Key, m: Modifiers) -> Option<String> {
-    app.keymap.get(&chord(key, m)).and_then(|a| a.strip_prefix("release:").map(str::to_string))
+/// The action a key should run when released in the given scope, if it was bound on release.
+pub fn release_action(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<String> {
+    lookup(&app.keymap, &chord(key, m), scope).and_then(|a| a.strip_prefix("release:").map(str::to_string))
 }
 
 fn split_action(a: &str) -> (&str, bool) {
@@ -170,41 +313,108 @@ fn action_value(id: &str, release: bool) -> String {
     if release { format!("release:{id}") } else { id.to_string() }
 }
 
-fn bound_action(app: &IncaApp, c: &str) -> Option<(String, bool)> {
-    if let Some(a) = app.keymap.get(c) {
+fn bound_action(app: &IncaApp, c: &str, scope: Scope) -> Option<(String, bool)> {
+    if let Some(a) = app.keymap.get(&scope_key(scope, c)) {
         let (id, release) = split_action(a);
         return Some((id.to_string(), release));
     }
-    crate::actions::ACTIONS.iter().find(|(id, _, hk)| *hk == c && !app.keymap.contains_key(&format!("unbind:{id}"))).map(|(id, _, _)| (id.to_string(), false))
+    // Only the application scope inherits the Maya defaults; an editor binding may shadow them.
+    if scope == Scope::Application {
+        return crate::actions::ACTIONS.iter().find(|(id, _, hk)| *hk == c && !app.keymap.contains_key(&format!("unbind:{id}"))).map(|(id, _, _)| (id.to_string(), false));
+    }
+    None
 }
 
-/// Every binding for an action, with its direction (press vs release). Includes the default
-/// press hotkey unless that chord was rebound or the default was switched off.
-fn binding_chords(app: &IncaApp, id: &str) -> Vec<(String, bool)> {
+/// Every binding for an action in a scope, with its direction (press vs release). The default
+/// press hotkey belongs to the application scope.
+fn binding_chords(app: &IncaApp, id: &str, scope: Scope) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = app
         .keymap
         .iter()
         .filter(|(c, _)| !c.starts_with("unbind:"))
         .filter_map(|(c, a)| {
+            let (key_scope, chord) = parse_key(c);
+            if key_scope != scope {
+                return None;
+            }
             let (action, release) = split_action(a);
-            (action == id).then(|| (c.clone(), release))
+            (action == id).then(|| (chord.to_string(), release))
         })
         .collect();
-    let def = crate::actions::hotkey_label(id);
-    if !def.is_empty() && !app.keymap.contains_key(&format!("unbind:{id}")) && !app.keymap.contains_key(def) {
-        out.push((def.to_string(), false));
+    if scope == Scope::Application {
+        let def = crate::actions::hotkey_label(id);
+        if !def.is_empty() && !app.keymap.contains_key(&format!("unbind:{id}")) && !app.keymap.contains_key(def) {
+            out.push((def.to_string(), false));
+        }
     }
-    out.sort();
-    out.dedup();
+    out
+}
+
+/// Application and editor bindings for an action, used for search ranking and keyboard highlight.
+/// Creation order is preserved; the application bindings come first.
+fn action_chords(app: &IncaApp, id: &str, scope: Scope) -> Vec<(String, bool)> {
+    let mut out = binding_chords(app, id, Scope::Application);
+    if scope != Scope::Application {
+        for binding in binding_chords(app, id, scope) {
+            if !out.contains(&binding) {
+                out.push(binding);
+            }
+        }
+    }
     out
 }
 
 fn binding_text_from(bindings: &[(String, bool)]) -> String {
-    bindings.iter().map(|(c, release)| if *release { format!("{c} (release)") } else { c.clone() }).collect::<Vec<_>>().join(", ")
+    bindings
+        .iter()
+        .map(|(c, release)| {
+            let c = display_chord(c);
+            if *release { format!("{c} (release)") } else { c }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-fn binding_text(app: &IncaApp, id: &str) -> String {
-    binding_text_from(&binding_chords(app, id))
+/// Display a key by its symbol/short label rather than its internal name.
+fn display_key(key: &str) -> &str {
+    match key {
+        "Semicolon" => ";",
+        "Period" => ".",
+        "Comma" => ",",
+        "Quote" => "'",
+        "Slash" => "/",
+        "Backslash" => "\\",
+        "OpenBracket" => "[",
+        "CloseBracket" => "]",
+        "Minus" => "-",
+        "Equals" => "=",
+        "Backtick" => "`",
+        "ControlLeft" | "ControlRight" => "Ctrl",
+        "ShiftLeft" | "ShiftRight" => "Shift",
+        "AltLeft" | "AltRight" => "Alt",
+        "Backspace" => "Bksp",
+        "Escape" => "Esc",
+        "Delete" => "Del",
+        "Insert" => "Ins",
+        "PageUp" => "PgUp",
+        "PageDown" => "PgDn",
+        "ArrowUp" => "↑",
+        "ArrowDown" => "↓",
+        "ArrowLeft" => "←",
+        "ArrowRight" => "→",
+        _ => key,
+    }
+}
+
+fn display_chord(c: &str) -> String {
+    match c.rsplit_once('+') {
+        Some((prefix, key)) => format!("{prefix}+{}", display_key(key)),
+        None => display_key(c).to_string(),
+    }
+}
+
+fn binding_text(app: &IncaApp, id: &str, scope: Scope) -> String {
+    binding_text_from(&binding_chords(app, id, scope))
 }
 
 /// The key part of a binding, ignoring modifiers: "Ctrl+Shift+K" -> "K", "Insert / hold D" -> "D".
@@ -259,10 +469,10 @@ fn search_rank(q: &str, id: &str, label: &str, cat: &str, bindings: &[(String, b
 /// The chords that run an action on press (menus and shortcut columns). Release-only bindings
 /// are deliberately omitted; the Hotkey Editor shows them with their direction.
 pub fn chords_for(app: &IncaApp, id: &str) -> Vec<String> {
-    binding_chords(app, id).into_iter().filter(|(_, release)| !release).map(|(c, _)| c).collect()
+    binding_chords(app, id, Scope::Application).into_iter().filter(|(_, release)| !release).map(|(c, _)| c).collect()
 }
 
-fn binding_map(app: &IncaApp) -> BTreeMap<String, (String, bool)> {
+fn binding_map(app: &IncaApp, scope: Scope) -> BTreeMap<String, (String, bool)> {
     let mut map = BTreeMap::new();
     for (id, _, hk) in crate::actions::ACTIONS {
         if !hk.is_empty() && !app.keymap.contains_key(&format!("unbind:{id}")) {
@@ -270,9 +480,26 @@ fn binding_map(app: &IncaApp) -> BTreeMap<String, (String, bool)> {
         }
     }
     for (c, a) in &app.keymap {
-        if !c.starts_with("unbind:") {
+        if c.starts_with("unbind:") {
+            continue;
+        }
+        let (key_scope, chord) = parse_key(c);
+        if key_scope == Scope::Application {
             let (id, release) = split_action(a);
-            map.insert(c.clone(), (id.to_string(), release));
+            map.insert(chord.to_string(), (id.to_string(), release));
+        }
+    }
+    if scope != Scope::Application {
+        // Editor bindings shadow application ones only in their own scope.
+        for (c, a) in &app.keymap {
+            if c.starts_with("unbind:") {
+                continue;
+            }
+            let (key_scope, chord) = parse_key(c);
+            if key_scope == scope {
+                let (id, release) = split_action(a);
+                map.insert(chord.to_string(), (id.to_string(), release));
+            }
         }
     }
     map
@@ -311,7 +538,7 @@ fn category_of(id: &str) -> &'static str {
 }
 
 /// Shown when the pointer is outside the keyboard, not in the small gaps between keys.
-const KEY_HELP: &str = "Hover over a key to see its command. Toggle Ctrl / Alt / Shift to view those layers.";
+const KEY_HELP: &str = "Hover over a key to see its command. Hold Ctrl / Alt / Shift to preview layers; click them to toggle.";
 
 /// Main-menu order first, then the modeling menu-set groups, then animation/rendering.
 const CATEGORY_ORDER: &[&str] = &["File", "Edit", "Create", "Select", "Modify", "Display", "Windows", "Mesh", "Tools", "Curves / Surfaces", "Animation", "Rendering", "Other"];
@@ -364,28 +591,112 @@ fn start_capture(app: &mut IncaApp) {
         app.hk.capturing = true;
         app.hk.pending = None;
         app.hk.restore_confirm = false;
-        app.hk.status = if app.hk.release {
-            "Press a key combination for the selected command (on release)… (Esc cancels)".into()
-        } else {
-            "Press a key combination for the selected command… (Esc cancels)".into()
-        };
+        let scope = if app.hk.scope == Scope::Application { String::new() } else { format!(" in the {}", app.hk.scope.label()) };
+        app.hk.status = format!("Press a key combination for the selected command{scope}… (Esc cancels)");
     }
 }
 
-fn assign_key(app: &mut IncaApp, c: &str, id: &str, release: bool) {
-    app.keymap.insert(c.to_string(), action_value(id, release));
+fn assign_key(app: &mut IncaApp, c: &str, id: &str, scope: Scope) {
+    app.keymap.insert(scope_key(scope, c), id.to_string());
+}
+
+/// Re-key a binding without moving it in the creation order.
+fn replace_key(map: &mut Keymap, old: &str, new: &str, value: String) {
+    if let Some(index) = map.get_index_of(old) {
+        map.shift_remove(old);
+        map.shift_insert(index, new.to_string(), value);
+    } else {
+        map.insert(new.to_string(), value);
+    }
+}
+
+/// Switch one existing (or default) binding between press and release.
+fn set_binding_release(app: &mut IncaApp, id: &str, chord: &str, release: bool, scope: Scope) {
+    let key = scope_key(scope, chord);
+    let action = app.keymap.get(&key).map(|a| split_action(a).0.to_string()).unwrap_or_else(|| id.to_string());
+    app.keymap.insert(key, action_value(&action, release));
+    app.hk.status = format!("{chord} now runs on {}.", if release { "release" } else { "press" });
+}
+
+/// Remove one binding, or switch off an Application default if it was implicit.
+fn remove_binding(app: &mut IncaApp, id: &str, chord: &str, scope: Scope) {
+    let key = scope_key(scope, chord);
+    if app.keymap.shift_remove(&key).is_none() && scope == Scope::Application && crate::actions::hotkey_label(id) == chord {
+        app.keymap.insert(format!("unbind:{id}"), id.to_string());
+    }
+    match canonical_part(chord) {
+        "Ctrl" => app.hk.layer_ctrl = false,
+        "Shift" => app.hk.layer_shift = false,
+        "Alt" => app.hk.layer_alt = false,
+        _ => {}
+    }
+    app.hk.restore_layers = None;
+    app.hk.status = format!("Removed {chord} from {}.", command_label(id));
+}
+
+/// Add a modifier to an existing binding, keeping its main key and press/release direction.
+fn add_chord_part(app: &mut IncaApp, id: &str, chord: &str, modifier: &str, scope: Scope) {
+    let new_chord = chord_with_modifier(chord, modifier);
+    if new_chord == chord {
+        return;
+    }
+    let key = scope_key(scope, chord);
+    let new_key = scope_key(scope, &new_chord);
+    if app.keymap.contains_key(&new_key) {
+        app.hk.status = format!("{new_chord} is already assigned.");
+        return;
+    }
+    if let Some(value) = app.keymap.get(&key).cloned() {
+        replace_key(&mut app.keymap, &key, &new_key, value);
+        app.hk.status = format!("Added {modifier} to {chord}.");
+    } else if scope == Scope::Application && crate::actions::hotkey_label(id) == chord {
+        app.keymap.insert(format!("unbind:{id}"), id.to_string());
+        app.keymap.insert(new_key, id.to_string());
+        app.hk.status = format!("Added {modifier} to {chord}.");
+    }
+}
+
+/// Drop one modifier from a chord, keeping the rest and its press/release direction.
+fn remove_chord_part(app: &mut IncaApp, id: &str, chord: &str, index: usize, scope: Scope) {
+    let mut parts: Vec<&str> = chord.split('+').collect();
+    if index + 1 >= parts.len() {
+        remove_binding(app, id, chord, scope);
+        return;
+    }
+    match canonical_part(parts[index]) {
+        "Ctrl" => app.hk.layer_ctrl = false,
+        "Shift" => app.hk.layer_shift = false,
+        "Alt" => app.hk.layer_alt = false,
+        _ => {}
+    }
+    app.hk.restore_layers = None;
+    parts.remove(index);
+    let new_chord = parts.join("+");
+    let key = scope_key(scope, chord);
+    let new_key = scope_key(scope, &new_chord);
+    if app.keymap.contains_key(&new_key) {
+        app.hk.status = format!("{new_chord} is already assigned.");
+        return;
+    }
+    if let Some(value) = app.keymap.get(&key).cloned() {
+        replace_key(&mut app.keymap, &key, &new_key, value);
+        app.hk.status = format!("Removed a key from {chord}.");
+    } else if scope == Scope::Application && crate::actions::hotkey_label(id) == chord {
+        app.keymap.insert(format!("unbind:{id}"), id.to_string());
+        app.keymap.insert(new_key, id.to_string());
+        app.hk.status = format!("Removed a key from {chord}.");
+    }
 }
 
 fn override_pending(app: &mut IncaApp) {
     let Some(p) = app.hk.pending.take() else { return };
-    if app.keymap.get(&p.chord).is_some_and(|a| split_action(a).0 == p.existing) {
-        app.keymap.remove(&p.chord);
-    }
-    if !p.existing_release && crate::actions::hotkey_label(&p.existing) == p.chord {
+    let key = scope_key(p.scope, &p.chord);
+    if !app.keymap.contains_key(&key) && p.scope == Scope::Application && !p.existing_release && crate::actions::hotkey_label(&p.existing) == p.chord {
         app.keymap.insert(format!("unbind:{}", p.existing), p.existing.clone());
     }
-    assign_key(app, &p.chord, &p.action, p.release);
-    app.hk.status = format!("Assigned {}{} to {}.", p.chord, if p.release { " (release)" } else { "" }, command_label(&p.action));
+    app.keymap.insert(key, p.action.clone());
+    clear_modifier_layers(app);
+    app.hk.status = format!("Assigned {} to {} ({}).", p.chord, command_label(&p.action), p.scope.label());
 }
 
 fn remove_hotkeys(app: &mut IncaApp) {
@@ -393,12 +704,19 @@ fn remove_hotkeys(app: &mut IncaApp) {
         return;
     }
     let Some(id) = app.hk.selected.clone() else { return };
-    app.keymap.retain(|_, a| split_action(a).0 != id);
-    if !crate::actions::hotkey_label(&id).is_empty() {
+    let scope = app.hk.scope;
+    app.keymap.retain(|k, a| {
+        if k.starts_with("unbind:") {
+            return true;
+        }
+        let (key_scope, _) = parse_key(k);
+        !(key_scope == scope && split_action(a).0 == id)
+    });
+    if scope == Scope::Application && !crate::actions::hotkey_label(&id).is_empty() {
         app.keymap.insert(format!("unbind:{id}"), id.clone());
     }
     app.hk.pending = None;
-    app.hk.status = format!("Removed all hotkeys from {}.", command_label(&id));
+    app.hk.status = format!("Removed all {} hotkeys from {}.", scope.label().to_lowercase(), command_label(&id));
 }
 
 fn restore_defaults(app: &mut IncaApp) {
@@ -435,7 +753,7 @@ fn clear_modifier_layers(app: &mut IncaApp) {
 }
 
 fn focus_command(app: &mut IncaApp, id: &str) {
-    let chords = binding_chords(app, id);
+    let chords = action_chords(app, id, app.hk.scope);
     if chords.is_empty() {
         clear_modifier_layers(app);
         return;
@@ -507,27 +825,35 @@ fn delete_set(app: &mut IncaApp) {
     app.hk.status = format!("Deleted hotkey set \"{name}\". Using Inca Default.");
 }
 
-fn submit_chord(app: &mut IncaApp, c: String, id: String, release: bool) {
+fn submit_chord(app: &mut IncaApp, c: String, id: String, scope: Scope) {
     ensure_editable_set(app);
     app.hk.capturing = false;
-    let dir = if release { " (release)" } else { "" };
-    match bound_action(app, &c) {
+    let count = binding_chords(app, &id, scope).len();
+    match bound_action(app, &c, scope) {
         Some((existing, existing_release)) if existing == id => {
-            app.hk.status = if existing_release == release {
-                format!("{c}{dir} is already assigned to this command.")
+            app.hk.status = if existing_release {
+                format!("{c} is already assigned to this command on release in {} scope.", scope.label())
             } else {
-                format!("{c} is already assigned to this command on {}.", if existing_release { "release" } else { "press" })
+                format!("{c} is already assigned to this command in {} scope.", scope.label())
             };
         }
+        _ if count >= 4 => {
+            app.hk.status = format!("A command can have at most 4 hotkeys in {} scope.", scope.label());
+        }
         Some((existing, existing_release)) => {
-            app.hk.status = format!("{c} is assigned to {}{}.", command_label(&existing), if existing_release { " (release)" } else { "" });
-            app.hk.pending = Some(Pending { chord: c, action: id, existing, existing_release, release });
+            app.hk.status = format!("{c} is assigned to {}{} in {} scope.", command_label(&existing), if existing_release { " (release)" } else { "" }, scope.label());
+            app.hk.pending = Some(Pending { chord: c, action: id, existing, existing_release, scope });
         }
         None => {
-            assign_key(app, &c, &id, release);
-            app.hk.status = format!("Assigned {c}{dir} to {}.", command_label(&id));
+            assign_key(app, &c, &id, scope);
+            clear_modifier_layers(app);
+            app.hk.status = format!("Assigned {c} to {} ({}).", command_label(&id), scope.label());
         }
     }
+}
+
+fn is_modifier_key(key: Key) -> bool {
+    matches!(key, Key::ControlLeft | Key::ControlRight | Key::ShiftLeft | Key::ShiftRight | Key::AltLeft | Key::AltRight | Key::SuperLeft | Key::SuperRight)
 }
 
 fn capture(app: &mut IncaApp, ctx: &egui::Context) {
@@ -540,7 +866,8 @@ fn capture(app: &mut IncaApp, ctx: &egui::Context) {
     }
     let pressed = ctx.input(|i| {
         i.events.iter().find_map(|e| match e {
-            egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } => Some((*key, *modifiers)),
+            // Wait for a real key: pressing Ctrl/Shift/Alt first must not end the capture.
+            egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } if !is_modifier_key(*key) => Some((*key, *modifiers)),
             _ => None,
         })
     });
@@ -554,8 +881,8 @@ fn capture(app: &mut IncaApp, ctx: &egui::Context) {
         app.hk.capturing = false;
         return;
     };
-    let release = app.hk.release;
-    submit_chord(app, chord(key, m), id, release);
+    let scope = app.hk.scope;
+    submit_chord(app, chord(key, m), id, scope);
 }
 
 #[derive(Clone)]
@@ -775,14 +1102,14 @@ fn paint_key(
 }
 
 fn keyboard(app: &mut IncaApp, ui: &mut egui::Ui) -> String {
-    let mut bindings = binding_map(app);
+    let mut bindings = binding_map(app, app.hk.scope);
     // The keyboard follows the category filter, like the command list.
     if !app.hk.category.is_empty() {
         bindings.retain(|_, (action, _)| category_of(action) == app.hk.category);
     }
     let selected_chords: HashSet<String> = app.hk.selected.as_ref()
         .filter(|id| app.hk.category.is_empty() || category_of(id) == app.hk.category)
-        .map(|id| binding_chords(app, id).into_iter().map(|(c, _)| c).collect())
+        .map(|id| action_chords(app, id, app.hk.scope).into_iter().map(|(c, _)| c).collect())
         .unwrap_or_default();
     let (main, nav) = keyboard_rows();
     let unit = ((ui.available_width() - 12.0) / 19.2).clamp(18.0, 46.0);
@@ -839,28 +1166,28 @@ fn keyboard(app: &mut IncaApp, ui: &mut egui::Ui) -> String {
         }
     }
     if let (Some(action), Some(key)) = (&drop_payload, &drop_key) {
-        let c = layer_chord(key, layers.0 || mods.ctrl || mods.command, layers.1 || mods.shift, layers.2 || mods.alt);
+        let c = layer_chord(
+            key,
+            layers.0 || mods.ctrl || mods.command,
+            layers.1 || mods.shift,
+            layers.2 || mods.alt,
+        );
         info = format!("Release to assign {} to {c}.", command_label(action.as_str()));
     }
     if info.is_empty() && !hover.is_some_and(|p| rect.contains(p)) {
         info = KEY_HELP.to_string();
     }
     if let Some(action) = resp.dnd_release_payload::<String>() {
+        let action = (*action).clone();
         if let Some(key) = drop_key {
             let ctrl = layers.0 || mods.ctrl || mods.command;
             let shift = layers.1 || mods.shift;
             let alt = layers.2 || mods.alt;
-            if app.hk.restore_layers.is_none() && ((ctrl && !app.hk.layer_ctrl) || (shift && !app.hk.layer_shift) || (alt && !app.hk.layer_alt)) {
-                app.hk.restore_layers = Some((app.hk.layer_ctrl, app.hk.layer_shift, app.hk.layer_alt));
-            }
-            app.hk.layer_ctrl |= ctrl;
-            app.hk.layer_shift |= shift;
-            app.hk.layer_alt |= alt;
-            app.hk.selected = Some((*action).clone());
+            app.hk.selected = Some(action.clone());
             app.hk.pending = None;
             app.hk.status.clear();
-            let release = app.hk.release;
-            submit_chord(app, layer_chord(&key, ctrl, shift, alt), (*action).clone(), release);
+            let scope = app.hk.scope;
+            submit_chord(app, layer_chord(&key, ctrl, shift, alt), action, scope);
         }
     }
     if let Some(click) = clicked {
@@ -931,17 +1258,142 @@ fn legend(ui: &mut egui::Ui) {
     });
 }
 
-fn command_details(app: &IncaApp, ui: &mut egui::Ui) {
-    ui.label(RichText::new("Drag a command from the list onto a key to assign it.").color(theme::TEXT_DIM));
-    let Some(id) = &app.hk.selected else { return };
-    let keys = binding_text(app, id);
-    ui.label(RichText::new(if keys.is_empty() { "No hotkey assigned".to_string() } else { format!("Hotkey: {keys}") }).monospace().color(if keys.is_empty() { theme::TEXT_DIM } else { Color32::from_rgb(0x9f, 0xc6, 0xe0) }));
-    ui.label(RichText::new(category_of(id)).color(theme::TEXT_DIM));
-    if let Some(desc) = command_description(id) {
+const KEY_CHIP_W: f32 = 80.0;
+const KEY_CHIP_H: f32 = 26.0;
+
+/// A large amber key chip, like the selected keys on the keyboard. Every chip is the same size
+/// so the details area never reflows; long labels shrink instead.
+fn key_chip(ui: &mut egui::Ui, text: &str, clickable: bool) -> egui::Response {
+    let mut size = 12.0;
+    let mut galley = ui.painter().layout_no_wrap(text.to_string(), FontId::monospace(size), Color32::WHITE);
+    while galley.size().x > KEY_CHIP_W - 8.0 && size > 7.0 {
+        size -= 0.5;
+        galley = ui.painter().layout_no_wrap(text.to_string(), FontId::monospace(size), Color32::WHITE);
+    }
+    let (rect, resp) = ui.allocate_exact_size(vec2(KEY_CHIP_W, KEY_CHIP_H), if clickable { Sense::click() } else { Sense::hover() });
+    let fill = if clickable && resp.hovered() { Color32::from_rgb(0xd6, 0x9d, 0x4a) } else { Color32::from_rgb(0xc5, 0x8b, 0x3a) };
+    ui.painter().rect_filled(rect, 3.0, fill);
+    ui.painter().galley(rect.center() - galley.size() * 0.5, galley, Color32::WHITE);
+    resp
+}
+
+/// The per-key press/release switch below a key chip; amber means on release.
+fn on_release_button(ui: &mut egui::Ui, active: bool, clickable: bool, width: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 12.0), if clickable { Sense::click() } else { Sense::hover() });
+    let amber = Color32::from_rgb(0xc5, 0x8b, 0x3a);
+    let fill = if active {
+        if clickable && resp.hovered() { Color32::from_rgb(0xd6, 0x9d, 0x4a) } else { amber }
+    } else if clickable && resp.hovered() {
+        Color32::from_rgb(0x6f, 0x6f, 0x6f)
+    } else {
+        Color32::from_rgb(0x5d, 0x5d, 0x5d)
+    };
+    ui.painter().rect_filled(rect, 2.0, fill);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, "On Release", FontId::proportional(8.5), if active { Color32::WHITE } else { Color32::from_gray(0xdd) });
+    resp
+}
+
+fn command_details(app: &mut IncaApp, ui: &mut egui::Ui) {
+    let Some(id) = app.hk.selected.clone() else { return };
+    let scope = app.hk.scope;
+    let editable = app.active_keymap > 0;
+    ui.label(RichText::new(command_label(&id)).strong().size(15.0));
+    if let Some(desc) = command_description(&id) {
         ui.label(RichText::new(desc).color(theme::TEXT_DIM));
     }
-    ui.label(RichText::new(command_label(id)).strong().size(15.0));
-    ui.separator();
+    ui.label(RichText::new(category_of(&id)).color(theme::TEXT_DIM));
+    let bindings = binding_chords(app, &id, scope);
+    if bindings.is_empty() {
+        let text = if scope == Scope::Application { "No hotkey assigned".to_string() } else { format!("No {} hotkey", scope.label()) };
+        ui.label(RichText::new(text).monospace().color(theme::TEXT_DIM));
+    } else {
+        let title = if scope == Scope::Application { "Hotkeys:".to_string() } else { format!("Hotkeys ({}):", scope.label()) };
+        ui.label(RichText::new(title).color(theme::TEXT_DIM));
+        let mut toggle = None;
+        let mut remove = None;
+        let mut remove_part = None;
+        let mut add_mod = None;
+        let gap = ui.spacing().item_spacing.x;
+        let col_w = ((ui.available_width() - gap - 12.0) / 2.0).max(280.0);
+        for (row, pair) in bindings.chunks(2).enumerate() {
+            if row > 0 {
+                ui.add_space(6.0);
+            }
+            ui.horizontal_top(|ui| {
+                for (i, (chord, release)) in pair.iter().enumerate() {
+                    if i > 0 {
+                        // A plain ui.separator() would stretch to the whole details area and push
+                        // the second row out of view; draw a fixed-height divider instead.
+                        let (r, _) = ui.allocate_exact_size(vec2(8.0, 50.0), Sense::hover());
+                        ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, Color32::from_rgb(0x5a, 0x5a, 0x5a)));
+                    }
+                    ui.allocate_ui_with_layout(vec2(col_w, 50.0), egui::Layout::top_down(Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let raw: Vec<&str> = chord.split('+').collect();
+                        if raw.is_empty() {
+                            return;
+                        }
+                        let display: Vec<String> = raw.iter().map(|p| display_key(p).to_string()).collect();
+                        let main_idx = raw.iter().rposition(|p| !is_canonical_modifier(p));
+                        let absent: Vec<&str> = ["Ctrl", "Shift", "Alt"].into_iter().filter(|m| !raw.iter().any(|p| canonical_part(p) == *m)).collect();
+                        ui.horizontal_top(|ui| {
+                            for modifier in ["Ctrl", "Shift", "Alt"] {
+                                if raw.iter().any(|p| canonical_part(p) == modifier) {
+                                    if key_chip(ui, modifier, editable).on_hover_text(format!("Remove {modifier}")).clicked() {
+                                        if let Some(i) = raw.iter().position(|p| canonical_part(p) == modifier) {
+                                            remove_part = Some((chord.clone(), i));
+                                        }
+                                    }
+                                }
+                            }
+                            // The add-modifier control sits immediately left of the main key.
+                            if editable && !absent.is_empty() {
+                                let menu = ui.menu_button("+", |ui| {
+                                    for m in absent {
+                                        if ui.button(m).clicked() {
+                                            add_mod = Some((chord.clone(), m.to_string()));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                                menu.response.on_hover_text("Add a modifier");
+                            }
+                            if let Some(main_idx) = main_idx {
+                                ui.vertical(|ui| {
+                                    if key_chip(ui, &display[main_idx], editable).on_hover_text("Remove this hotkey").clicked() {
+                                        remove = Some(chord.clone());
+                                    }
+                                    if on_release_button(ui, *release, editable, KEY_CHIP_W).on_hover_text("Run this key on release instead of press").clicked() {
+                                        toggle = Some((chord.clone(), !*release));
+                                    }
+                                });
+                            } else if on_release_button(ui, *release, editable, KEY_CHIP_W).on_hover_text("Run this key on release instead of press").clicked() {
+                                toggle = Some((chord.clone(), !*release));
+                            }
+                        });
+                    });
+                }
+            });
+        }
+        if scope != Scope::Application {
+            let global = binding_text(app, &id, Scope::Application);
+            if !global.is_empty() {
+                ui.label(RichText::new(format!("Application: {global}")).monospace().color(theme::TEXT_DIM));
+            }
+        }
+        if let Some((chord, release)) = toggle {
+            set_binding_release(app, &id, &chord, release, scope);
+        }
+        if let Some(chord) = remove {
+            remove_binding(app, &id, &chord, scope);
+        }
+        if let Some((chord, index)) = remove_part {
+            remove_chord_part(app, &id, &chord, index, scope);
+        }
+        if let Some((chord, modifier)) = add_mod {
+            add_chord_part(app, &id, &chord, &modifier, scope);
+        }
+    }
 }
 
 fn commit_name(app: &mut IncaApp, mode: NameMode) {
@@ -1007,7 +1459,7 @@ fn known_keymap(map: Keymap) -> (Keymap, usize) {
             known
         })
         .collect();
-    (map, dropped)
+    (normalize_keymap(map), dropped)
 }
 
 fn import_keymap_file(app: &mut IncaApp) {
@@ -1206,19 +1658,29 @@ fn keymap_bar(app: &mut IncaApp, ui: &mut egui::Ui) {
 fn left_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
     keymap_bar(app, ui);
     ui.horizontal(|ui| {
-        ui.label("Modifier layer:");
-        let mut changed = false;
-        changed |= ui.checkbox(&mut app.hk.layer_ctrl, "Ctrl").changed();
-        changed |= ui.checkbox(&mut app.hk.layer_alt, "Alt").changed();
-        changed |= ui.checkbox(&mut app.hk.layer_shift, "Shift").changed();
-        if changed {
-            app.hk.restore_layers = None;
-        }
+        ui.label("Scope:");
+        let scope_combo = egui::ComboBox::from_id_salt("hk_scope").width(120.0).selected_text(app.hk.scope.label()).show_ui(ui, |ui| {
+            for scope in Scope::ALL {
+                if ui.selectable_label(app.hk.scope == scope, scope.label()).clicked() && app.hk.scope != scope {
+                    app.hk.scope = scope;
+                    app.hk.pending = None;
+                    app.hk.capturing = false;
+                }
+            }
+        });
+        scope_combo.response.on_hover_text("Editor hotkeys apply only while the pointer is over that editor. Application hotkeys still work unless overridden.");
     });
     let info = keyboard(app, ui);
     ui.label(RichText::new(if info.is_empty() { " " } else { &info }).color(theme::TEXT_DIM));
     legend(ui);
-    ui.with_layout(egui::Layout::bottom_up(Align::Min), |ui| {
+    // Fixed-height details quadrant: selecting a command with no bindings must not resize the
+    // window or make the content above it jump.
+    let details_h = 260.0;
+    let avail = ui.available_height();
+    if avail > details_h {
+        ui.add_space(avail - details_h);
+    }
+    egui::ScrollArea::vertical().id_salt("hk_details").max_height(details_h).auto_shrink([false, false]).show(ui, |ui| {
         command_details(app, ui);
     });
 }
@@ -1248,7 +1710,22 @@ fn command_row(ui: &mut egui::Ui, id: &str, label: &str, keys: &str, sel: bool) 
         ui.painter().text(rect.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, "—", egui::TextStyle::Body.resolve(ui.style()), theme::TEXT_DIM);
     } else {
         let color = if sel { Color32::WHITE } else { Color32::from_rgb(0x9f, 0xc6, 0xe0) };
-        ui.painter().text(rect.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, keys, egui::TextStyle::Monospace.resolve(ui.style()), color);
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let max_w = (rect.width() * 0.55).max(70.0);
+        let mut shown = keys.to_string();
+        let mut galley = ui.painter().layout_no_wrap(shown.clone(), font.clone(), color);
+        if galley.size().x > max_w {
+            while !shown.is_empty() {
+                shown.pop();
+                let candidate = format!("{}…", shown);
+                galley = ui.painter().layout_no_wrap(candidate.clone(), font.clone(), color);
+                if galley.size().x <= max_w {
+                    shown = candidate;
+                    break;
+                }
+            }
+        }
+        ui.painter().with_clip_rect(rect).text(rect.right_center() - vec2(6.0, 0.0), Align2::RIGHT_CENTER, shown, font, color);
     }
     resp
 }
@@ -1297,11 +1774,11 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
         if !cat_filter.is_empty() && cat != cat_filter {
             continue;
         }
-        let bindings = binding_chords(app, id);
-        let Some(rank) = search_rank(&q, id, label, cat, &bindings) else {
+        let search = action_chords(app, id, app.hk.scope);
+        let Some(rank) = search_rank(&q, id, label, cat, &search) else {
             continue;
         };
-        groups.entry(cat).or_default().push((id, label.clone(), binding_text_from(&bindings), rank));
+        groups.entry(cat).or_default().push((id, label.clone(), binding_text(app, id, app.hk.scope), rank));
     }
     let mut groups: Vec<(&'static str, Vec<(&'static str, String, String, u8)>)> = groups.into_iter().collect();
     groups.sort_by(|(a, ai), (b, bi)| {
@@ -1309,7 +1786,7 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
         let rb = bi.iter().map(|x| x.3).min().unwrap_or(0);
         ra.cmp(&rb).then(category_rank(a).cmp(&category_rank(b))).then(a.cmp(b))
     });
-    let list_h = (ui.available_height() - 78.0).max(120.0);
+    let list_h = (ui.available_height() - 54.0).max(120.0);
     let mut list = egui::ScrollArea::vertical().id_salt("hk_command_list").auto_shrink([false, false]).max_height(list_h);
     if reset_scroll {
         list = list.vertical_scroll_offset(0.0);
@@ -1328,7 +1805,8 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
                     .show(ui, |ui| {
                         for (id, label, keys, _) in items {
                             let sel = app.hk.selected.as_deref() == Some(id);
-                            let resp = command_row(ui, id, &label, &keys, sel).on_hover_text(id);
+                            let tip = if keys.is_empty() { id.to_string() } else { format!("{id}\n{keys}") };
+                            let resp = command_row(ui, id, &label, &keys, sel).on_hover_text(tip);
                             if resp.double_clicked() {
                                 app.hk.selected = Some(id.to_string());
                                 app.hk.pending = None;
@@ -1357,18 +1835,7 @@ fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
     ui.separator();
     let selected = app.hk.selected.clone();
     let has_sel = selected.is_some();
-    let has_keys = selected.as_ref().is_some_and(|id| !binding_chords(app, id).is_empty());
-    ui.horizontal(|ui| {
-        let mut release = app.hk.release;
-        if ui
-            .add_enabled(!app.hk.capturing && app.hk.pending.is_none(), egui::Checkbox::new(&mut release, "On Release"))
-            .on_hover_text("Run the command when the key is released instead of pressed")
-            .changed()
-        {
-            app.hk.release = release;
-        }
-        ui.label(RichText::new("run on key-up").color(theme::TEXT_DIM).size(11.0));
-    });
+    let has_keys = selected.as_ref().is_some_and(|id| !binding_chords(app, id, app.hk.scope).is_empty());
     ui.horizontal(|ui| {
         let txt = if app.hk.capturing { "Press a key… (Esc cancels)" } else { "Assign New Hotkey" };
         if ui.add_enabled(has_sel, egui::Button::new(txt)).clicked() {
@@ -1394,7 +1861,8 @@ fn status_bar(app: &mut IncaApp, ui: &mut egui::Ui) {
     if let Some(p) = app.hk.pending.clone() {
         ui.horizontal(|ui| {
             let dir = if p.existing_release { " (release)" } else { "" };
-            ui.label(RichText::new(format!("{} is assigned to {}{dir}.", p.chord, command_label(&p.existing))).color(Color32::from_rgb(0xe6, 0xc5, 0x4a)));
+            let scope = if p.scope == Scope::Application { String::new() } else { format!(" in {} scope", p.scope.label()) };
+            ui.label(RichText::new(format!("{} is assigned to {}{dir}{scope}.", p.chord, command_label(&p.existing))).color(Color32::from_rgb(0xe6, 0xc5, 0x4a)));
             if ui.button("Override").clicked() {
                 override_pending(app);
             }
@@ -1478,6 +1946,62 @@ mod tests {
     }
 
     #[test]
+    fn keymap_preserves_creation_order() {
+        let mut map = Keymap::new();
+        map.insert("Z".into(), "a".into());
+        map.insert("A".into(), "b".into());
+        map.insert("M".into(), "c".into());
+        assert_eq!(map.keys().cloned().collect::<Vec<_>>(), vec!["Z", "A", "M"]);
+    }
+
+    #[test]
+    fn left_and_right_modifiers_share_one_chord() {
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(chord(Key::ControlLeft, ctrl), "Ctrl");
+        assert_eq!(chord(Key::ControlRight, ctrl), "Ctrl");
+        let shift = Modifiers { shift: true, ..Default::default() };
+        assert_eq!(chord(Key::ShiftLeft, shift), "Shift");
+        assert_eq!(chord(Key::ShiftRight, shift), "Shift");
+        assert_eq!(canonical_chord("Ctrl+ControlLeft"), "Ctrl");
+        assert_eq!(canonical_chord("Ctrl+Shift+ShiftLeft"), "Ctrl+Shift");
+        assert!(is_modifier_key(Key::ControlLeft));
+        assert!(is_modifier_key(Key::ShiftRight));
+        assert!(!is_modifier_key(Key::L));
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(chord(Key::L, ctrl), "Ctrl+L");
+        assert_eq!(chord_with_modifier("L", "Ctrl"), "Ctrl+L");
+        assert_eq!(chord_with_modifier("Shift+L", "Ctrl"), "Ctrl+Shift+L");
+        assert_eq!(chord_with_modifier("Ctrl+L", "Shift"), "Ctrl+Shift+L");
+
+        let mut map = Keymap::new();
+        map.insert("viewport:Ctrl+ControlLeft".into(), "pivotEdit".into());
+        map.insert("viewport:Ctrl+ControlRight".into(), "pivotEdit".into());
+        let map = normalize_keymap(map);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("viewport:Ctrl"));
+    }
+
+    #[test]
+    fn scoped_keys_round_trip() {
+        assert_eq!(parse_key("W"), (Scope::Application, "W"));
+        assert_eq!(scope_key(Scope::Viewport, "Ctrl+W"), "viewport:Ctrl+W");
+        assert_eq!(parse_key("viewport:Ctrl+W"), (Scope::Viewport, "Ctrl+W"));
+        assert_eq!(parse_key("hypershade:Q"), (Scope::Hypershade, "Q"));
+        assert_eq!(parse_key("uv:F"), (Scope::UvEditor, "F"));
+        assert_eq!(parse_key("unbind:copy"), (Scope::Application, "unbind:copy"));
+    }
+
+    #[test]
+    fn scoped_bindings_shadow_application_keys() {
+        let mut map = Keymap::new();
+        map.insert("W".into(), "moveTool".into());
+        map.insert("viewport:W".into(), "pivotEdit".into());
+        assert_eq!(lookup(&map, "W", Scope::Application), Some("moveTool"));
+        assert_eq!(lookup(&map, "W", Scope::Viewport), Some("pivotEdit"));
+        assert_eq!(lookup(&map, "Q", Scope::Viewport), None);
+    }
+
+    #[test]
     fn one_letter_search_matches_word_starts_only() {
         assert!(starts_word("Quad Draw", "d"));
         assert!(starts_word("Duplicate", "d"));
@@ -1530,15 +2054,16 @@ mod tests {
 pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     let mut open = app.win.hotkeys;
     if !open {
+        app.hk.window_rect = None;
         return;
     }
     capture(app, ctx);
     // A distinct id discards window state stored by older builds. That state had ratcheted to
     // the full screen, so a default size alone could not shrink it again.
-    egui::Window::new("Hotkey Editor").id(egui::Id::new("HotkeyEditorWindow2")).open(&mut open).default_size([1280.0, 720.0]).min_size([900.0, 620.0]).resizable([true, false]).show(ctx, |ui| {
-        // A stable content height: deriving it from ui.available_height() inside an auto-sized
-        // window feeds the window size back into itself and makes it grow every frame.
-        let height = (ctx.content_rect().height() * 0.55).clamp(520.0, 620.0);
+    let shown = egui::Window::new("Hotkey Editor").id(egui::Id::new("HotkeyEditorWindow2")).open(&mut open).default_size([1280.0, 720.0]).min_size([900.0, 620.0]).resizable([true, false]).show(ctx, |ui| {
+        // A fixed content height keeps the window from resizing when the selected command,
+        // its hotkeys or the details area content change.
+        let height = 720.0;
         ui.horizontal_top(|ui| {
             // Compute both widths from the window, not from how wide the left content
             // happened to lay out; that made the right list jump when the details appeared.
@@ -1564,6 +2089,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
             status_bar(app, ui);
         });
     });
+    app.hk.window_rect = if open { shown.map(|r| r.response.rect) } else { None };
     if !open {
         app.hk.capturing = false;
         app.hk.restore_layers = None;

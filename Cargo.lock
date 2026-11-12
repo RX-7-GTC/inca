@@ -1855,6 +1855,7 @@ dependencies = [
  "half",
  "image",
  "inca-core",
+ "indexmap",
  "resvg",
  "rfd",
  "rhai",

@@ -400,6 +400,10 @@ impl IncaApp {
             keymaps.push(crate::hotkey_editor::KeymapSet { name: "Custom".into(), map: legacy_keymap });
             active_keymap = 1;
         }
+        // Older builds stored left/right modifier keys separately; fold them into Ctrl/Shift/Alt.
+        for set in &mut keymaps {
+            set.map = crate::hotkey_editor::normalize_keymap(set.map.clone());
+        }
         if active_keymap > keymaps.len() {
             active_keymap = 0;
         }
@@ -1049,6 +1053,7 @@ impl IncaApp {
         }
         let events = ctx.input(|i| i.events.clone());
         let now = ctx.input(|i| i.time);
+        let scope = crate::hotkey_editor::active_scope(self, ctx);
         for e in &events {
             // Space: a tap toggles single/four view, holding it opens the hotbox
             if let egui::Event::Key { key: egui::Key::Space, pressed, repeat: false, modifiers, .. } = e {
@@ -1079,10 +1084,10 @@ impl IncaApp {
         for e in events {
             match e {
                 egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } => {
-                    if let Some(a) = crate::hotkey_editor::resolve(self, key, modifiers) {
+                    if let Some(a) = crate::hotkey_editor::resolve(self, key, modifiers, scope) {
                         self.action(&a);
                     }
-                    if let Some(a) = crate::hotkey_editor::release_action(self, key, modifiers) {
+                    if let Some(a) = crate::hotkey_editor::release_action(self, key, modifiers, scope) {
                         self.release_keys.insert(key, a);
                     }
                 }

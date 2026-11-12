@@ -878,5 +878,11 @@ fn keys(app: &mut IncaApp, ui: &egui::Ui, rect: Rect, resp: &egui::Response) {
 
 /// The UV Editor takes Q/W/E/R/F/A while the pointer is over it, so the scene hotkeys skip them.
 pub fn wants_keys(app: &IncaApp, ctx: &egui::Context) -> bool {
-    app.uv_editor.win_rect.zip(ctx.pointer_hover_pos()).is_some_and(|(r, p)| r.contains(p))
+    ctx.pointer_hover_pos().is_some_and(|p| app.uv_editor.contains_pointer(p))
+}
+
+impl UvEditor {
+    pub fn contains_pointer(&self, p: egui::Pos2) -> bool {
+        self.open && self.win_rect.is_some_and(|r| r.contains(p))
+    }
 }
