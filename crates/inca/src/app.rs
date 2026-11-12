@@ -7,10 +7,6 @@ use inca_core::mel::{Interp, Val};
 use inca_core::scene::{CompMode, MsgKind, Scene, SelMode};
 use std::collections::{HashMap, HashSet};
 
-/// A press shorter than this, without mouse use, is a tap; anything else is a hold.
-/// Maya's default sticky hotkey time is 200 ms (`kStickyKeyTime` in `nexOpts.cpp`).
-const TAP_HOLD_SECS: f64 = 0.2;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
     Select,
@@ -208,10 +204,10 @@ pub struct IncaApp {
     pub manip_size: f32,
     /// Edit Pivot: the move manipulator moves pivots instead of objects
     pub pivot_mode: bool,
-    /// Key holding Edit Pivot: key, pivot mode to restore, tap toggles, press time, mouse use.
-    pub pivot_hold: Option<(egui::Key, bool, bool, f64, bool)>,
-    /// Key holding a snap toggle: key, action, prior state, tap toggles, press time, mouse use.
-    pub snap_hold: Option<(egui::Key, String, bool, bool, f64, bool)>,
+    /// Key holding Edit Pivot: key, and the pivot mode to restore on release.
+    pub pivot_hold: Option<(egui::Key, bool)>,
+    /// Key holding a snap toggle: key, action, and the state to restore on release.
+    pub snap_hold: Option<(egui::Key, String, bool)>,
     /// Last known window focus, so hold keys are only released on an actual focus loss.
     pub was_focused: bool,
     pub gpu: Option<Gpu>,
@@ -1068,7 +1064,7 @@ impl IncaApp {
     /// Restore the pivot mode after a hold key. Focus loss or an early return can swallow the
     /// key-up event.
     fn end_pivot_hold(&mut self) {
-        if let Some((_, was_on, _, _, _)) = self.pivot_hold.take() {
+        if let Some((_, was_on)) = self.pivot_hold.take() {
             self.pivot_mode = was_on;
         }
     }
@@ -1092,7 +1088,7 @@ impl IncaApp {
     }
 
     fn end_snap_hold(&mut self) {
-        if let Some((_, id, was_on, _, _, _)) = self.snap_hold.take() {
+        if let Some((_, id, was_on)) = self.snap_hold.take() {
             self.set_snap_state(&id, was_on);
         }
     }
@@ -1122,16 +1118,6 @@ impl IncaApp {
         if self.win.hotkeys && self.hk.capturing {
             self.end_holds();
             return;
-        }
-        // A hold key is momentary when the mouse is doing something while it is down; otherwise
-        // a press/release is a tap that toggles the state.
-        if ctx.input(|i| i.pointer.any_down()) {
-            if let Some((_, _, _, _, used)) = &mut self.pivot_hold {
-                *used = true;
-            }
-            if let Some((_, _, _, _, _, used)) = &mut self.snap_hold {
-                *used = true;
-            }
         }
         let events = ctx.input(|i| i.events.clone());
         let now = ctx.input(|i| i.time);
@@ -1165,13 +1151,13 @@ impl IncaApp {
                         if release {
                             if id == "pivotEdit" {
                                 if self.pivot_hold.is_none() {
-                                    self.pivot_hold = Some((key, self.pivot_mode, true, now, false));
+                                    self.pivot_hold = Some((key, self.pivot_mode));
                                     self.pivot_mode = true;
                                 }
                             } else if self.snap_hold.is_none() {
                                 let was_on = self.snap_state(&id);
                                 self.set_snap_state(&id, true);
-                                self.snap_hold = Some((key, id, was_on, true, now, false));
+                                self.snap_hold = Some((key, id, was_on));
                             }
                             continue;
                         }
@@ -1184,19 +1170,16 @@ impl IncaApp {
                     }
                 }
                 egui::Event::Key { key, pressed: false, repeat: false, .. } => {
-                    if let Some((hold, was_on, tap, since, used)) = self.pivot_hold {
+                    if let Some((hold, was_on)) = self.pivot_hold {
                         if hold == key {
-                            let tap = tap && !used && now - since < TAP_HOLD_SECS;
-                            self.pivot_mode = if tap { !was_on } else { was_on };
+                            self.pivot_mode = was_on;
                             self.pivot_hold = None;
                             continue;
                         }
                     }
-                    if let Some((hold, id, was_on, tap, since, used)) = self.snap_hold.clone() {
+                    if let Some((hold, id, was_on)) = self.snap_hold.clone() {
                         if hold == key {
-                            let tap = tap && !used && now - since < TAP_HOLD_SECS;
-                            let on = if tap { !was_on } else { was_on };
-                            self.set_snap_state(&id, on);
+                            self.set_snap_state(&id, was_on);
                             self.snap_hold = None;
                             continue;
                         }

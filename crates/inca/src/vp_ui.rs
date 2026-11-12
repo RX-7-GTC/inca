@@ -1773,8 +1773,8 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     }
     // JS `dragStep`: grid snap (X) snaps translation to the grid spacing; discrete move / rotate /
     // scale each have their own step; holding J is a 15 degree rotate snap
-    let key_x = tool == Tool::Move && ui.input(|i| i.key_down(egui::Key::X));
-    let key_j = tool == Tool::Rotate && ui.input(|i| i.key_down(egui::Key::J));
+    let key_x = mode_tool == Tool::Move && ui.input(|i| i.key_down(egui::Key::X));
+    let key_j = mode_tool == Tool::Rotate && ui.input(|i| i.key_down(egui::Key::J));
     let trans_step = if app.snap_grid || key_x {
         Some(app.prefs.grid_spacing)
     } else if app.vp_state.discrete[0] {
@@ -1790,7 +1790,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         None
     };
     let scl_step = app.vp_state.discrete[2].then_some(app.vp_state.snap_scale);
-    let (snapping, snap_distance, snap_angle, snap_scale) = match tool {
+    let (snapping, snap_distance, snap_angle, snap_scale) = match mode_tool {
         Tool::Move => (trans_step.is_some(), trans_step.unwrap_or(1.0) as f32, 0.0, 0.0),
         Tool::Rotate => (rot_step.is_some(), 0.0, (rot_step.unwrap_or(15.0) as f32).to_radians(), 0.0),
         _ => (scl_step.is_some(), 0.0, 0.0, scl_step.unwrap_or(1.0) as f32),
@@ -2092,11 +2092,13 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                         d.cur.scale = d.start.scale;
                     }
                 }
-                if d.handle == Some(GizmoMode::TranslateView) && (app.snap_grid || ui.input(|i| i.key_down(egui::Key::X))) {
-                    let st = DVec3::from(d.start.translation);
-                    if let Some(w) = grid_snap_center(cv, app.vps[idx].rect, st, cursor, d.press_px, app.prefs.grid_spacing.max(1e-6)) {
-                        d.cur.translation = w.into();
-                    }
+            }
+            // The app can fail to name the centre handle (handle=None) while the gizmo still
+            // starts the drag; the centre grid snap must not depend on the handle being named.
+            if matches!(d.handle, Some(GizmoMode::TranslateView) | None) && (app.snap_grid || ui.input(|i| i.key_down(egui::Key::X))) {
+                let st = DVec3::from(d.start.translation);
+                if let Some(w) = grid_snap_center(cv, app.vps[idx].rect, st, cursor, d.press_px, app.prefs.grid_spacing.max(1e-6)) {
+                    d.cur.translation = w.into();
                 }
             }
             let d = app.vp_state.drag.as_mut().unwrap();
@@ -2109,6 +2111,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     h.params.insert("translateY".into(), serde_json::json!(t.y));
                 }
                 app.s.set_history_param(&id, i, "translateZ", serde_json::json!(t.z));
+                if !interaction.dragging {
+                    if let Some(d) = app.vp_state.drag.take() {
+                        finish_drag(app, d);
+                    }
+                }
                 return true;
             }
             let d = app.vp_state.drag.as_mut().unwrap();
@@ -2178,6 +2185,13 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             }
             app.s.touch();
             ui.ctx().request_repaint();
+            // The gizmo can return a final result on the release frame. Finish the drag here too,
+            // otherwise the next press reuses this drag's start point and press position.
+            if !interaction.dragging {
+                if let Some(d) = app.vp_state.drag.take() {
+                    finish_drag(app, d);
+                }
+            }
             true
         }
         None => {
