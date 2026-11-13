@@ -940,13 +940,41 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             _ => None,
         };
-        let mut plot = Plot::new("graph").include_y(y0).include_y(y1).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_double_click_reset(true);
+        let mut plot = Plot::new("graph").include_y(y0).include_y(y1).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_axis_zoom_drag(false).allow_boxed_zoom(false).allow_double_click_reset(true);
         if empty {
             plot = plot.default_x_bounds(t0, t1.max(t0 + 1.0)).default_y_bounds(-1.5, 1.5);
         }
         let resp = plot.show(ui, |pu| {
             if let Some(bounds) = frame_bounds {
                 pu.set_plot_bounds(bounds);
+            }
+            // Maya-style navigation: Alt+left/middle pans, Alt+right zooms.
+            let alt = pu.ctx().input(|i| i.modifiers.alt);
+            let over = pu.response().hovered() || pu.response().dragged();
+            if alt && over {
+                let (delta, primary, middle, secondary) = pu.ctx().input(|i| (i.pointer.delta(), i.pointer.primary_down(), i.pointer.middle_down(), i.pointer.secondary_down()));
+                if primary || middle {
+                    let b = pu.plot_bounds();
+                    let (xr, yr) = (b.range_x(), b.range_y());
+                    let rect = pu.response().rect;
+                    if rect.width() > 0.0 && rect.height() > 0.0 {
+                        let dx = -(delta.x as f64) * (*xr.end() - *xr.start()) / rect.width() as f64;
+                        let dy = (delta.y as f64) * (*yr.end() - *yr.start()) / rect.height() as f64;
+                        pu.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                            [*xr.start() + dx, *yr.start() + dy],
+                            [*xr.end() + dx, *yr.end() + dy],
+                        ));
+                    }
+                } else if secondary && delta.x != 0.0 {
+                    let bounds = pu.plot_bounds();
+                    let (xr, yr) = (bounds.range_x(), bounds.range_y());
+                    let anchor = pu.pointer_coordinate().unwrap_or_else(|| egui_plot::PlotPoint::new((*xr.start() + *xr.end()) * 0.5, (*yr.start() + *yr.end()) * 0.5));
+                    let factor = ((delta.x * 0.01).exp() as f64).clamp(0.5, 2.0);
+                    pu.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                        [anchor.x + (*xr.start() - anchor.x) / factor, anchor.y + (*yr.start() - anchor.y) / factor],
+                        [anchor.x + (*xr.end() - anchor.x) / factor, anchor.y + (*yr.end() - anchor.y) / factor],
+                    ));
+                }
             }
             for (i, k) in shown.iter().enumerate() {
                 let c = &app.s.anim.curves[k];
@@ -982,7 +1010,9 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let pointer = resp.inner;
         let r = resp.response;
         let tf = resp.transform;
+        let alt = ui.input(|i| i.modifiers.alt);
         let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
+        if !alt {
         if r.drag_started() {
             if let Some(pp) = r.interact_pointer_pos() {
                 if let Some((ck, ki)) = nearest_graph_key(app, &shown, &tf, pp) {
@@ -1056,6 +1086,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             if let Some(end) = r.interact_pointer_pos() {
                 theme::marquee(&ui.painter_at(r.rect), egui::Rect::from_two_pos(start, end));
             }
+        }
         }
         if r.drag_stopped() {
             if let Some(start) = app.windows_state.ge_box.take() {
