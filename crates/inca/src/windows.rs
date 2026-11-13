@@ -74,8 +74,14 @@ pub struct WinState {
     pub pixels: Option<(Vec<u8>, [u32; 2])>,
     pub hs_selected: Option<String>,
     pub ge_curves: std::collections::HashSet<String>,
-    pub ge_key: Option<(String, usize)>,
+    /// Selected keys: curve id and key index.
+    pub ge_keys: Vec<(String, usize)>,
     pub ge_drag: bool,
+    /// Keys captured at drag start: curve, index, original time and value.
+    pub ge_drag_keys: Vec<(String, usize, f64, f64)>,
+    pub ge_drag_anchor: Option<(f64, f64)>,
+    /// Marquee origin in screen coordinates while box-selecting.
+    pub ge_box: Option<egui::Pos2>,
     /// Pending Graph Editor frame request: 1 = selected, 2 = all.
     pub ge_frame: Option<u8>,
     /// Optional Dope Sheet time view, set by frame actions.
@@ -703,20 +709,34 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_nam
 
 // ------------------------------------------------------------------ graph editor
 
-/// Delete the key selected in the Graph Editor.
-pub(crate) fn delete_selected_key(app: &mut IncaApp) {
-    let Some((ck, ki)) = app.windows_state.ge_key.take() else { return };
-    if !app.s.anim.curves.get(&ck).is_some_and(|c| ki < c.keys.len()) {
+/// Delete all keys selected in the Graph Editor.
+pub(crate) fn delete_selected_keys(app: &mut IncaApp) {
+    let selected = std::mem::take(&mut app.windows_state.ge_keys);
+    if selected.is_empty() {
         return;
     }
-    app.s.checkpoint("delete key");
-    if let Some(c) = app.s.anim.curves.get_mut(&ck) {
-        c.keys.remove(ki);
+    app.s.checkpoint("delete keys");
+    let mut by_curve: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (ck, ki) in selected {
+        by_curve.entry(ck).or_default().push(ki);
+    }
+    for (ck, mut indices) in by_curve {
+        indices.sort_unstable();
+        indices.dedup();
+        if let Some(c) = app.s.anim.curves.get_mut(&ck) {
+            for &i in indices.iter().rev() {
+                if i < c.keys.len() {
+                    c.keys.remove(i);
+                }
+            }
+        }
     }
     app.s.anim.curves.retain(|_, c| !c.keys.is_empty());
     app.s.apply_anim();
     app.s.touch();
     app.windows_state.ge_drag = false;
+    app.windows_state.ge_drag_keys.clear();
+    app.windows_state.ge_box = None;
 }
 
 /// Delete keys at the current time for the selected objects (Dope Sheet).
@@ -746,12 +766,46 @@ pub(crate) fn dope_frame(app: &mut IncaApp, selected_only: bool) {
     app.windows_state.ds_view = Some((lo, hi.max(lo + 1.0)));
 }
 
+fn ge_selected(app: &IncaApp, ck: &str, ki: usize) -> bool {
+    app.windows_state.ge_keys.iter().any(|(k, i)| k == ck && *i == ki)
+}
+
+fn ge_select_only(app: &mut IncaApp, ck: &str, ki: usize) {
+    app.windows_state.ge_keys.clear();
+    app.windows_state.ge_keys.push((ck.to_string(), ki));
+}
+
+fn ge_toggle(app: &mut IncaApp, ck: &str, ki: usize) {
+    if let Some(pos) = app.windows_state.ge_keys.iter().position(|(k, i)| k == ck && *i == ki) {
+        app.windows_state.ge_keys.remove(pos);
+    } else {
+        app.windows_state.ge_keys.push((ck.to_string(), ki));
+    }
+}
+
+fn nearest_graph_key(app: &IncaApp, shown: &[String], tf: &egui_plot::PlotTransform, pp: egui::Pos2) -> Option<(String, usize)> {
+    let mut best: Option<(f32, String, usize)> = None;
+    for k in shown {
+        for (i, key) in app.s.anim.curves[k].keys.iter().enumerate() {
+            let sp = tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v));
+            let d = sp.distance(pp);
+            if d < 10.0 && best.as_ref().is_none_or(|b| d < b.0) {
+                best = Some((d, k.clone(), i));
+            }
+        }
+    }
+    best.map(|b| (b.1, b.2))
+}
+
 fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use egui_plot::{Line, Plot, PlotPoints, Points};
     let curves: Vec<(String, String, String)> = app.s.anim.curves.iter().filter(|(_, c)| app.s.sel.contains(&c.node) && !c.keys.is_empty()).map(|(k, c)| (k.clone(), app.s.name_of(&c.node), c.attr.clone())).collect();
     ui.horizontal(|ui| {
-        if let Some((ck, ki)) = app.windows_state.ge_key.clone() {
-            if let Some(c) = app.s.anim.curves.get(&ck).cloned() {
+        let selected_count = app.windows_state.ge_keys.len();
+        if let Some((ck, ki)) = app.windows_state.ge_keys.first().cloned() {
+            if selected_count > 1 {
+                ui.label(format!("{selected_count} keys selected"));
+            } else if let Some(c) = app.s.anim.curves.get(&ck).cloned() {
                 if let Some(k) = c.keys.get(ki).cloned() {
                     ui.label(format!("Key  t={}  v={}", inca_core::math::fmt_num(k.t), inca_core::math::fmt_num(k.v)));
                     let mut tan = k.ot.clone();
@@ -801,6 +855,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         app.windows_state.ge_curves.remove(k);
                     } else {
                         app.windows_state.ge_curves.insert(k.clone());
+                        app.windows_state.ge_keys.retain(|(sk, _)| sk != k);
                     }
                 }
             }
@@ -810,7 +865,8 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let t1 = app.s.time.end;
         let cur = app.s.time.current;
         let shown: Vec<String> = curves.iter().filter(|c| !app.windows_state.ge_curves.contains(&c.0)).map(|c| c.0.clone()).collect();
-        let selected_key = app.windows_state.ge_key.clone();
+        app.windows_state.ge_keys.retain(|(ck, _)| shown.contains(ck));
+        let selected_keys = app.windows_state.ge_keys.clone();
         // A single key or a flat curve gives egui_plot a zero-height y range, which makes it show
         // raw values like 217.13609496869865 at the axis limits. Pad the visible range.
         let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -850,13 +906,23 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         // F frames the selected key, or all visible curves; with nothing selected it returns to
         // Maya's default graph view.
         let frame_req = app.windows_state.ge_frame.take();
-        let key_bounds = app.windows_state.ge_key.as_ref().and_then(|(ck, ki)| {
-            app.s.anim.curves.get(ck).and_then(|c| c.keys.get(*ki)).map(|k| {
-                let xpad = ((x1 - x0) * 0.1).max(2.0);
-                let ypad = ((y1 - y0) * 0.1).max(1.0);
-                egui_plot::PlotBounds::from_min_max([k.t - xpad, k.v - ypad], [k.t + xpad, k.v + ypad])
-            })
-        });
+        let mut key_bounds = None;
+        if !selected_keys.is_empty() {
+            let (mut t0k, mut t1k, mut v0k, mut v1k) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+            for (ck, ki) in &selected_keys {
+                if let Some(k) = app.s.anim.curves.get(ck).and_then(|c| c.keys.get(*ki)) {
+                    t0k = t0k.min(k.t);
+                    t1k = t1k.max(k.t);
+                    v0k = v0k.min(k.v);
+                    v1k = v1k.max(k.v);
+                }
+            }
+            if t0k.is_finite() && t1k.is_finite() && v0k.is_finite() && v1k.is_finite() {
+                let xpad = ((t1k - t0k) * 0.05).max(2.0);
+                let ypad = ((v1k - v0k) * 0.1).max(1.0);
+                key_bounds = Some(egui_plot::PlotBounds::from_min_max([t0k - xpad, v0k - ypad], [t1k + xpad, v1k + ypad]));
+            }
+        }
         let frame_bounds = match frame_req {
             Some(1) => key_bounds.or_else(|| {
                 if shown.is_empty() {
@@ -898,12 +964,16 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 pu.line(Line::new(c.attr.clone(), pts).color(col).width(1.5));
                 let kp: PlotPoints = c.keys.iter().map(|k| [k.t, k.v]).collect();
                 pu.points(Points::new(format!("{} keys", c.attr), kp).radius(3.5).color(Color32::BLACK));
-                if let Some((sk, si)) = &selected_key {
+                let mut selected_pts: Vec<[f64; 2]> = vec![];
+                for (sk, si) in &selected_keys {
                     if sk == k {
                         if let Some(key) = c.keys.get(*si) {
-                            pu.points(Points::new("selected", vec![[key.t, key.v]]).radius(5.0).color(Color32::from_rgb(255, 230, 0)));
+                            selected_pts.push([key.t, key.v]);
                         }
                     }
+                }
+                if !selected_pts.is_empty() {
+                    pu.points(Points::new(format!("selected {}", c.attr), selected_pts).radius(5.0).color(Color32::from_rgb(255, 230, 0)));
                 }
             }
             pu.vline(egui_plot::VLine::new("time", cur).color(Color32::from_rgb(200, 60, 60)));
@@ -912,41 +982,103 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let pointer = resp.inner;
         let r = resp.response;
         let tf = resp.transform;
-        if r.drag_started() || r.clicked() {
-            // pick the nearest key in screen space
+        let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
+        if r.drag_started() {
             if let Some(pp) = r.interact_pointer_pos() {
-                let mut best: Option<(f32, String, usize)> = None;
-                for k in &shown {
-                    for (i, key) in app.s.anim.curves[k].keys.iter().enumerate() {
-                        let sp = tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v));
-                        let d = sp.distance(pp);
-                        if d < 10.0 && best.as_ref().is_none_or(|b| d < b.0) {
-                            best = Some((d, k.clone(), i));
-                        }
+                if let Some((ck, ki)) = nearest_graph_key(app, &shown, &tf, pp) {
+                    if additive {
+                        ge_toggle(app, &ck, ki);
+                    } else if !ge_selected(app, &ck, ki) {
+                        ge_select_only(app, &ck, ki);
                     }
+                    if ge_selected(app, &ck, ki) {
+                        app.s.checkpoint("move keys");
+                        app.windows_state.ge_drag = true;
+                        app.windows_state.ge_drag_anchor = pointer.map(|p| (p.x, p.y));
+                        let keys = app.windows_state.ge_keys.clone();
+                        app.windows_state.ge_drag_keys = keys
+                            .into_iter()
+                            .filter_map(|(k, i)| app.s.anim.curves.get(&k).and_then(|c| c.keys.get(i)).map(|key| (k, i, key.t, key.v)))
+                            .collect();
+                        app.windows_state.ge_box = None;
+                    }
+                } else {
+                    app.windows_state.ge_box = Some(pp);
+                    app.windows_state.ge_drag = false;
+                    app.windows_state.ge_drag_keys.clear();
                 }
-                app.windows_state.ge_key = best.map(|b| (b.1, b.2));
-                if app.windows_state.ge_key.is_some() && r.drag_started() {
-                    app.s.checkpoint("move key");
-                    app.windows_state.ge_drag = true;
+            }
+        } else if r.clicked() {
+            if let Some(pp) = r.interact_pointer_pos() {
+                if let Some((ck, ki)) = nearest_graph_key(app, &shown, &tf, pp) {
+                    if additive {
+                        ge_toggle(app, &ck, ki);
+                    } else {
+                        ge_select_only(app, &ck, ki);
+                    }
+                } else if !additive {
+                    app.windows_state.ge_keys.clear();
                 }
             }
         }
         if r.dragged() && app.windows_state.ge_drag {
-            if let (Some((ck, ki)), Some(p)) = (app.windows_state.ge_key.clone(), pointer) {
-                if let Some(c) = app.s.anim.curves.get_mut(&ck) {
-                    let n = c.keys.len();
-                    let lo = if ki > 0 { c.keys[ki - 1].t + 1.0 } else { f64::MIN };
-                    let hi = if ki + 1 < n { c.keys[ki + 1].t - 1.0 } else { f64::MAX };
-                    c.keys[ki].t = p.x.round().clamp(lo, hi);
-                    c.keys[ki].v = p.y;
+            if let (Some((ax, ay)), Some(p)) = (app.windows_state.ge_drag_anchor, pointer) {
+                let raw_dt = (p.x - ax).round();
+                let dv = p.y - ay;
+                let mut dt_min = f64::NEG_INFINITY;
+                let mut dt_max = f64::INFINITY;
+                for (ck, ki, t0k, _) in &app.windows_state.ge_drag_keys {
+                    if let Some(c) = app.s.anim.curves.get(ck) {
+                        let selected: std::collections::HashSet<usize> = app.windows_state.ge_drag_keys.iter().filter(|(k, _, _, _)| k == ck).map(|(_, i, _, _)| *i).collect();
+                        if let Some(prev) = (0..*ki).rev().find(|i| !selected.contains(i)) {
+                            dt_min = dt_min.max(c.keys[prev].t - *t0k + 1.0);
+                        }
+                        if let Some(next) = (*ki + 1..c.keys.len()).find(|i| !selected.contains(i)) {
+                            dt_max = dt_max.min(c.keys[next].t - *t0k - 1.0);
+                        }
+                    }
+                }
+                let dt = if dt_min <= dt_max { raw_dt.clamp(dt_min, dt_max) } else { 0.0 };
+                let keys = app.windows_state.ge_drag_keys.clone();
+                for (ck, ki, t0k, v0k) in keys {
+                    if let Some(c) = app.s.anim.curves.get_mut(&ck) {
+                        if let Some(key) = c.keys.get_mut(ki) {
+                            key.t = t0k + dt;
+                            key.v = v0k + dv;
+                        }
+                    }
                 }
                 app.s.apply_anim();
                 app.s.touch();
             }
         }
+        if let Some(start) = app.windows_state.ge_box {
+            if let Some(end) = r.interact_pointer_pos() {
+                theme::marquee(&ui.painter_at(r.rect), egui::Rect::from_two_pos(start, end));
+            }
+        }
         if r.drag_stopped() {
+            if let Some(start) = app.windows_state.ge_box.take() {
+                if let Some(end) = ui.input(|i| i.pointer.latest_pos()) {
+                    let rect = egui::Rect::from_two_pos(start, end);
+                    if rect.width() > 3.0 || rect.height() > 3.0 {
+                        if !additive {
+                            app.windows_state.ge_keys.clear();
+                        }
+                        for k in &shown {
+                            for (i, key) in app.s.anim.curves[k].keys.iter().enumerate() {
+                                let sp = tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v));
+                                if rect.contains(sp) && !ge_selected(app, k, i) {
+                                    app.windows_state.ge_keys.push((k.clone(), i));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             app.windows_state.ge_drag = false;
+            app.windows_state.ge_drag_anchor = None;
+            app.windows_state.ge_drag_keys.clear();
         }
     });
 }
@@ -1213,13 +1345,13 @@ mod tests {
         c.set_key(1.0, 0.0, "linear");
         c.set_key(10.0, 5.0, "linear");
         app.s.anim.curves.insert(ck.clone(), c);
-        app.windows_state.ge_key = Some((ck.clone(), 0));
-        delete_selected_key(&mut app);
+        app.windows_state.ge_keys = vec![(ck.clone(), 0)];
+        delete_selected_keys(&mut app);
         let c = app.s.anim.curves.get(&ck).expect("curve with a remaining key should stay");
         assert_eq!(c.keys.len(), 1);
         assert_eq!(c.keys[0].t, 10.0);
-        app.windows_state.ge_key = Some((ck.clone(), 0));
-        delete_selected_key(&mut app);
+        app.windows_state.ge_keys = vec![(ck.clone(), 0)];
+        delete_selected_keys(&mut app);
         assert!(!app.s.anim.curves.contains_key(&ck), "empty curve should be removed");
     }
 
@@ -1438,6 +1570,24 @@ mod tests {
         run(&mut app, &mut frame, vec![], 1.4);
         let reopened = ctx.memory(|m| m.area_rect(id)).expect("Hypershade reopened");
         assert!((reopened.left() - moved.left()).abs() < 2.0 && (reopened.top() - moved.top()).abs() < 2.0, "Hypershade position changed on reopen: {moved:?} -> {reopened:?}");
+    }
+
+    #[test]
+    fn graph_delete_removes_all_selected_keys() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let ck = inca_core::anim::Anim::key("pCube1", "translateX");
+        let mut c = inca_core::anim::AnimCurve::new("pCube1", "translateX");
+        for (i, t) in [1.0, 5.0, 10.0, 15.0].iter().enumerate() {
+            c.set_key(*t, i as f64, "linear");
+        }
+        app.s.anim.curves.insert(ck.clone(), c);
+        app.windows_state.ge_keys = vec![(ck.clone(), 1), (ck.clone(), 3)];
+        delete_selected_keys(&mut app);
+        let c = app.s.anim.curves.get(&ck).expect("curve should remain");
+        assert_eq!(c.keys.iter().map(|k| k.t).collect::<Vec<_>>(), vec![1.0, 10.0]);
     }
 
     #[test]
