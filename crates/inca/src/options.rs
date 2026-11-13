@@ -80,7 +80,13 @@ pub fn dialog(app: &mut IncaApp, ctx: &egui::Context) {
     let (mut apply, mut close, mut reset) = (false, false, false);
     let mut vals: BTreeMap<String, f64> = sp.iter().map(|o| (o.key.to_string(), get(app, &action, o.key))).collect();
     let mut text = app.type_text.clone();
-    egui::Window::new(format!("{} Options", crate::actions::label(&action))).id(egui::Id::new(("optbox", &action))).open(&mut open).resizable(false).show(ctx, |ui| {
+    let id = egui::Id::new(("optbox", &action));
+    let _ = crate::windows::place_window(app, ctx, id, open, |_app, fix| {
+        let mut window = egui::Window::new(format!("{} Options", crate::actions::label(&action))).id(id).open(&mut open).resizable(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         egui::Grid::new("opts").num_columns(2).show(ui, |ui| {
             if action == "createType" {
                 ui.label("Text");
@@ -129,6 +135,7 @@ pub fn dialog(app: &mut IncaApp, ctx: &egui::Context) {
             reset = ui.button("Reset").clicked();
             close |= ui.button("Close").clicked();
         });
+    })
     });
     if reset {
         vals = sp.iter().map(|o| (o.key.to_string(), o.default)).collect();

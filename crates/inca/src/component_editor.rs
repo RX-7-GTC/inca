@@ -17,7 +17,12 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Component Editor").open(&mut open).default_size([460.0, 380.0]).constrain(false).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Component Editor"), open, |app, fix| {
+        let mut window = egui::Window::new("Component Editor").open(&mut open).default_size([460.0, 380.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut app.ce.tab, 0, "Polygons");
             ui.selectable_value(&mut app.ce.tab, 1, "Smooth Skins");
@@ -33,6 +38,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
             0 => positions(app, ui, &rows),
             _ => weights(app, ui, &rows),
         });
+    })
     });
     app.win.component_editor = open;
 }

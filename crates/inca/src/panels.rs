@@ -1876,10 +1876,17 @@ pub fn ae_copies(app: &mut IncaApp, ctx: &egui::Context) {
         let tabs = ae_tabs(app, &id);
         let Some((title, _)) = tabs.get(tab).cloned() else { continue };
         let mut open = true;
-        egui::Window::new(format!("Attribute Editor: {title}")).id(egui::Id::new(("aecopy", i, &id, tab))).open(&mut open).default_size([380.0, 520.0]).constrain(false).show(ctx, |ui| {
-            ui.push_id(("aecopy", i), |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
-            });
+        let wid = egui::Id::new(("aecopy", i, &id, tab));
+        let _ = crate::windows::place_window(app, ctx, wid, open, |app, fix| {
+            let mut window = egui::Window::new(format!("Attribute Editor: {title}")).id(wid).open(&mut open).default_size([380.0, 520.0]).constrain(false);
+            if let Some(p) = fix {
+                window = window.fixed_pos(p);
+            }
+            window.show(ctx, |ui| {
+                ui.push_id(("aecopy", i), |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
+                });
+            })
         });
         if open {
             keep.push((id, tab));

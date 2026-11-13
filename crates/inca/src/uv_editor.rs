@@ -250,7 +250,12 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         }
     }
     let mut open = true;
-    let shown = egui::Window::new("UV Editor").open(&mut open).default_size([760.0, 620.0]).constrain(false).show(ctx, |ui| {
+    let shown = crate::windows::place_window(app, ctx, egui::Id::new("UV Editor"), open, |app, fix| {
+        let mut window = egui::Window::new("UV Editor").open(&mut open).default_size([760.0, 620.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         menus(app, ui);
         toolbar(app, ui);
         let avail = ui.available_size() - vec2(0.0, 20.0);
@@ -265,6 +270,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         let n_sel = app.uv_editor.sel_count();
         let n_all: usize = targets(app).iter().filter_map(|i| mesh(app, i)).map(|pm| uv::all_corners(&pm, &CornerIndex::new(&pm)).len()).sum();
         ui.label(egui::RichText::new(format!("{} mesh(es)   UV corners: {n_sel} / {n_all} selected   Q/W/E/R tools · Alt+MMB pan · Alt+RMB / wheel zoom · Shift constrains · F/A frame", targets(app).len())).size(11.0).color(crate::theme::TEXT_DIM));
+        })
     });
     app.uv_editor.win_rect = shown.map(|r| r.response.rect);
     if !open {

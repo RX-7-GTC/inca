@@ -559,6 +559,9 @@ impl IncaApp {
             menu_popup_rect: None,
         };
         app.panels.ol = cc.storage.and_then(|s| eframe::get_value(s, "outliner")).unwrap_or_default();
+        if let Some(saved) = cc.storage.and_then(|s| eframe::get_value::<Vec<(u64, [f32; 4])>>(s, "windowRects")) {
+            app.windows_state.window_last_rect = crate::windows::decode_window_rects(saved);
+        }
         if app.test.is_none() {
             if let Some(p) = cc.storage.and_then(|s| eframe::get_value::<String>(s, "lastProject")) {
                 crate::project::set_project(&mut app, &p, true);
@@ -1377,6 +1380,7 @@ impl eframe::App for IncaApp {
         eframe::set_value(storage, "shelfTab", &self.shelf_tab);
         eframe::set_value(storage, "showRight", &self.show_right);
         eframe::set_value(storage, "showOutliner", &self.show_outliner);
+        eframe::set_value(storage, "windowRects", &crate::windows::encode_window_rects(&self.windows_state.window_last_rect));
         // a Ctrl+Space hide isn't remembered
         let hidden = self.ui_stash.as_ref().map_or(&self.hidden, |s| &s.0);
         eframe::set_value(storage, "hiddenUi", hidden);
@@ -1384,6 +1388,7 @@ impl eframe::App for IncaApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.windows_state.window_seen_now.clear();
         crate::marking::block_pointer(self, &ctx);
         // files dropped on the window open (.inca) or import (everything else)
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
@@ -1496,6 +1501,7 @@ impl eframe::App for IncaApp {
         crate::project::autosave_tick(self, ctx.input(|i| i.time));
         crate::menus::hotbox(self, &ctx);
         crate::test_hook::step(self, &ctx);
+        std::mem::swap(&mut self.windows_state.window_seen, &mut self.windows_state.window_seen_now);
         if self.panels.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

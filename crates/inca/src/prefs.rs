@@ -188,26 +188,32 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Preferences").open(&mut open).default_size([640.0, 440.0]).constrain(false).show(ctx, |ui| {
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(170.0);
-                ui.label(RichText::new("Categories").strong());
-                for (i, c) in CATEGORIES.iter().enumerate() {
-                    ui.selectable_value(&mut app.prefs_cat, i, *c);
-                }
-            });
-            ui.separator();
-            ui.vertical(|ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| category(app, ui));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Restore Default Settings").clicked() {
-                        app.prefs = Prefs::default();
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Preferences"), open, |app, fix| {
+        let mut window = egui::Window::new("Preferences").open(&mut open).default_size([640.0, 440.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(170.0);
+                    ui.label(RichText::new("Categories").strong());
+                    for (i, c) in CATEGORIES.iter().enumerate() {
+                        ui.selectable_value(&mut app.prefs_cat, i, *c);
                     }
                 });
+                ui.separator();
+                ui.vertical(|ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| category(app, ui));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Restore Default Settings").clicked() {
+                            app.prefs = Prefs::default();
+                        }
+                    });
+                });
             });
-        });
+        })
     });
     app.win.prefs = open;
 }

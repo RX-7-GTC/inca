@@ -2482,7 +2482,12 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     capture(app, ctx);
     // A distinct id discards window state stored by older builds. That state had ratcheted to
     // the full screen, so a default size alone could not shrink it again.
-    let shown = egui::Window::new("Hotkey Editor").id(egui::Id::new("HotkeyEditorWindow2")).open(&mut open).default_size([1280.0, 720.0]).min_size([900.0, 620.0]).resizable([true, false]).constrain(false).show(ctx, |ui| {
+    let shown = crate::windows::place_window(app, ctx, egui::Id::new("HotkeyEditorWindow2"), open, |app, fix| {
+        let mut window = egui::Window::new("Hotkey Editor").id(egui::Id::new("HotkeyEditorWindow2")).open(&mut open).default_size([1280.0, 720.0]).min_size([900.0, 620.0]).resizable([true, false]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         // A fixed content height keeps the window from resizing when the selected command,
         // its hotkeys or the details area content change.
         let height = 720.0;
@@ -2510,6 +2515,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         ui.allocate_ui_with_layout(vec2(ui.available_width(), 56.0), egui::Layout::top_down(Align::Min), |ui| {
             status_bar(app, ui);
         });
+        })
     });
     app.hk.window_rect = if open { shown.map(|r| r.response.rect) } else { None };
     if !open {
@@ -2594,16 +2600,20 @@ fn runtime_window(app: &mut IncaApp, ctx: &egui::Context) {
     let mut delete_clicked = false;
     let mut confirm_delete = false;
     let mut apply = false;
-    egui::Window::new("Runtime Commands")
-        .id(egui::Id::new("RuntimeCommandsWindow4"))
-        .open(&mut open)
-        .order(egui::Order::Foreground)
-        .default_pos(egui::pos2(300.0, 160.0))
-        .default_size([700.0, 480.0])
-        .min_size([700.0, 410.0])
-        .resizable(true)
-        .constrain(false)
-        .show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("RuntimeCommandsWindow4"), open, |app, fix| {
+        let mut window = egui::Window::new("Runtime Commands")
+            .id(egui::Id::new("RuntimeCommandsWindow4"))
+            .open(&mut open)
+            .order(egui::Order::Foreground)
+            .default_pos(egui::pos2(300.0, 160.0))
+            .default_size([700.0, 480.0])
+            .min_size([700.0, 410.0])
+            .resizable(true)
+            .constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
             // Solid scrollbars: visible as soon as content overflows, not only on hover.
             ui.style_mut().spacing.scroll.floating = false;
             egui::Panel::top("rc_head")
@@ -2675,7 +2685,8 @@ fn runtime_window(app: &mut IncaApp, ctx: &egui::Context) {
                         }
                     });
                 });
-        });
+        })
+    });
     if delete_clicked {
         app.hk.rc_delete = true;
     }

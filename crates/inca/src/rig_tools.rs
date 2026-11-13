@@ -407,7 +407,12 @@ pub fn sdk_window(app: &mut IncaApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Set Driven Key").open(&mut open).default_size([460.0, 420.0]).constrain(false).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Set Driven Key"), open, |app, fix| {
+        let mut window = egui::Window::new("Set Driven Key").open(&mut open).default_size([460.0, 420.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         let mut st = std::mem::take(&mut app.rig_tool.sdk);
         st.driver = st.driver.filter(|d| app.s.node(d).is_some());
         st.driven.retain(|d| app.s.node(d).is_some());
@@ -473,6 +478,7 @@ pub fn sdk_window(app: &mut IncaApp, ctx: &egui::Context) {
         });
         ui.label(dim("Pick the driver attribute and the driven attributes, pose both, then Key. Repeat for each pose."));
         app.rig_tool.sdk = st;
+    })
     });
     app.win.sdk = open;
 }

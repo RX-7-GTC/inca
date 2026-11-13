@@ -473,7 +473,12 @@ pub fn shelf_editor(app: &mut IncaApp, ctx: &egui::Context) {
     if app.shelves.is_empty() {
         app.shelves = default_shelves(&[]);
     }
-    egui::Window::new("Shelf Editor").open(&mut open).default_size([760.0, 420.0]).constrain(false).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Shelf Editor"), open, |app, fix| {
+        let mut window = egui::Window::new("Shelf Editor").open(&mut open).default_size([760.0, 420.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         let (mut si, mut ii) = app.shelf_edit;
         si = si.min(app.shelves.len().saturating_sub(1));
         ui.horizontal_top(|ui| {
@@ -613,6 +618,7 @@ pub fn shelf_editor(app: &mut IncaApp, ctx: &egui::Context) {
             });
         });
         app.shelf_edit = (si, ii);
+    })
     });
     app.win.shelf_editor = open;
 }

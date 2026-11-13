@@ -80,9 +80,12 @@ pub struct WinState {
     pub ge_window_rect: Option<egui::Rect>,
     /// Last drawn Dope Sheet window rect, used to activate its hotkey scope.
     pub ds_window_rect: Option<egui::Rect>,
-    /// Whether the editors were open last frame, so reopening places them on screen.
-    pub ge_was_open: bool,
-    pub ds_was_open: bool,
+    /// Windows already seen open last frame, windows seen this frame, and those needing a recenter.
+    pub window_seen: std::collections::HashSet<egui::Id>,
+    pub window_seen_now: std::collections::HashSet<egui::Id>,
+    pub window_recenter: std::collections::HashSet<egui::Id>,
+    /// Last rect each floating window had while open, keyed by egui id value so it can be saved.
+    pub window_last_rect: std::collections::HashMap<u64, egui::Rect>,
     pub rv: crate::render_view::RvState,
     pub hs: crate::hypershade::HsState,
 }
@@ -171,6 +174,81 @@ fn help_line(ui: &mut egui::Ui, l: &str) {
     ui.label(job);
 }
 
+/// A window with less than 10% of its area visible, or with an unreachable title bar, is lost.
+fn window_reachable(ctx: &egui::Context, rect: egui::Rect) -> bool {
+    let content = ctx.content_rect();
+    let inter = content.intersect(rect);
+    let area = rect.width().max(0.0) * rect.height().max(0.0);
+    let visible = inter.width().max(0.0) * inter.height().max(0.0);
+    let title = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 26.0));
+    area > 0.0 && visible >= area * 0.10 && content.intersect(title).width() > 0.0
+}
+
+fn centered_window_pos(ctx: &egui::Context, size: egui::Vec2) -> egui::Pos2 {
+    let content = ctx.content_rect();
+    let p = content.center() - size * 0.5;
+    egui::pos2(p.x.max(content.left()), p.y.max(content.top()))
+}
+
+/// Serialize the remembered window rects for the app storage.
+pub(crate) fn encode_window_rects(map: &std::collections::HashMap<u64, egui::Rect>) -> Vec<(u64, [f32; 4])> {
+    map.iter().map(|(k, r)| (*k, [r.min.x, r.min.y, r.width(), r.height()])).collect()
+}
+
+/// Restore the remembered window rects from the app storage.
+pub(crate) fn decode_window_rects(list: Vec<(u64, [f32; 4])>) -> std::collections::HashMap<u64, egui::Rect> {
+    list.into_iter().map(|(k, r)| (k, egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], r[3])))).collect()
+}
+
+/// Show a floating window and repair an off-screen saved/auto position. A window that opens
+/// outside the viewport is recentered on the next frame; reopening a lost window recenters it
+/// immediately.
+pub(crate) fn place_window<R>(
+    app: &mut IncaApp,
+    ctx: &egui::Context,
+    id: egui::Id,
+    open: bool,
+    show: impl FnOnce(&mut IncaApp, Option<egui::Pos2>) -> Option<egui::InnerResponse<Option<R>>>,
+) -> Option<egui::InnerResponse<Option<R>>> {
+    let first = open && !app.windows_state.window_seen.contains(&id);
+    if open {
+        app.windows_state.window_seen_now.insert(id);
+    }
+    let key = id.value();
+    let persisted = ctx.memory(|m| m.area_rect(id));
+    let saved = persisted.filter(|r| r.width() > 1.0 && r.height() > 1.0);
+    let last = app.windows_state.window_last_rect.get(&key).copied().or(saved);
+    let mut fix = None;
+    if first {
+        if let Some(rect) = last {
+            if window_reachable(ctx, rect) {
+                fix = Some(rect.min);
+            } else {
+                fix = Some(centered_window_pos(ctx, rect.size()));
+            }
+        }
+    }
+    // A legacy egui position has no size. Center it once on first open instead of placing its
+    // top-left at the old, possibly off-screen, position.
+    let stale_pos = first && last.is_none() && persisted.is_some();
+    if app.windows_state.window_recenter.remove(&id) {
+        let size = last.map_or(egui::vec2(480.0, 360.0), |r| r.size());
+        fix = Some(centered_window_pos(ctx, size));
+    }
+    let resp = show(app, fix);
+    if open {
+        if let Some(r) = &resp {
+            let rect = r.response.rect;
+            app.windows_state.window_last_rect.insert(key, rect);
+            if first && (stale_pos || !window_reachable(ctx, rect)) {
+                app.windows_state.window_recenter.insert(id);
+                ctx.request_repaint();
+            }
+        }
+    }
+    resp
+}
+
 pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) {
     if app.playblast.running.is_some() {
         // floating windows would end up in the captured frames
@@ -179,27 +257,41 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     crate::rig_tools::sdk_window(app, ctx);
     crate::anim_extras::window(app, ctx);
     let mut open = app.win.help;
-    egui::Window::new("Getting Started with Inca").open(&mut open).default_size([600.0, 520.0]).constrain(false).show(ctx, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for (title, lines) in HELP {
-                theme::section_header(ui, title);
-                for l in *lines {
-                    help_line(ui, l);
+    let is_open = open;
+    let _ = place_window(app, ctx, egui::Id::new("Getting Started with Inca"), is_open, |_app, fix| {
+        let mut window = egui::Window::new("Getting Started with Inca").open(&mut open).default_size([600.0, 520.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (title, lines) in HELP {
+                    theme::section_header(ui, title);
+                    for l in *lines {
+                        help_line(ui, l);
+                    }
+                    ui.add_space(4.0);
                 }
-                ui.add_space(4.0);
-            }
-        });
+            });
+        })
     });
     app.win.help = open;
     let mut open = app.win.assign_material;
+    let is_open = open;
     let mut pick: Option<&str> = None;
-    egui::Window::new("Assign New Material").open(&mut open).default_size([260.0, 300.0]).constrain(false).show(ctx, |ui| {
-        ui.label(RichText::new("Assign a new material to the selection:").color(theme::TEXT_DIM));
-        for t in MAT_TYPES {
-            if ui.add(egui::Button::new(t.label).frame(false)).on_hover_text(format!("Assign a new {} to the selection", t.label)).clicked() {
-                pick = Some(t.ty);
-            }
+    let _ = place_window(app, ctx, egui::Id::new("Assign New Material"), is_open, |_app, fix| {
+        let mut window = egui::Window::new("Assign New Material").open(&mut open).default_size([260.0, 300.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
         }
+        window.show(ctx, |ui| {
+            ui.label(RichText::new("Assign a new material to the selection:").color(theme::TEXT_DIM));
+            for t in MAT_TYPES {
+                if ui.add(egui::Button::new(t.label).frame(false)).on_hover_text(format!("Assign a new {} to the selection", t.label)).clicked() {
+                    pick = Some(t.ty);
+                }
+            }
+        })
     });
     if let Some(ty) = pick {
         let _ = app.run_mel("assign new material", &format!("string $m = `shadingNode -asShader {ty}`; hyperShade -assign $m;"));
@@ -207,47 +299,77 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     }
     app.win.assign_material = open;
     let mut open = app.win.script_editor;
-    egui::Window::new("Script Editor").open(&mut open).default_size([640.0, 460.0]).constrain(false).show(ctx, |ui| script_editor(app, ui));
+    let is_open = open;
+    let _ = place_window(app, ctx, egui::Id::new("Script Editor"), is_open, |app, fix| {
+        let mut window = egui::Window::new("Script Editor").open(&mut open).default_size([640.0, 460.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| script_editor(app, ui))
+    });
     app.win.script_editor = open;
     let mut open = app.win.hypershade;
+    let is_open = open;
     // A distinct id discards the old stored area state that had grown to the screen width
     // (the layout feedback bug); the window now starts at its default size again.
-    egui::Window::new("Hypershade").id(egui::Id::new("HypershadeWindow")).open(&mut open).default_size([980.0, 560.0]).min_size([600.0, 420.0]).constrain(false).show(ctx, |ui| crate::hypershade::window(app, ui));
+    let _ = place_window(app, ctx, egui::Id::new("HypershadeWindow"), is_open, |app, fix| {
+        let mut window = egui::Window::new("Hypershade").id(egui::Id::new("HypershadeWindow")).open(&mut open).default_size([980.0, 560.0]).min_size([600.0, 420.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| crate::hypershade::window(app, ui))
+    });
     // File > Close sets the flag from inside the window; the X button clears `open`.
     app.win.hypershade = open && app.win.hypershade;
     if app.win.graph_editor {
         let mut open = true;
-        let mut window = egui::Window::new("Graph Editor").open(&mut open).default_pos(egui::pos2(60.0, 80.0)).default_size([760.0, 420.0]);
-        if !app.windows_state.ge_was_open {
-            window = window.fixed_pos(egui::pos2(60.0, 80.0));
-        }
-        let resp = window.show(ctx, |ui| graph_editor(app, ui));
+        let is_open = open;
+        let resp = place_window(app, ctx, egui::Id::new("Graph Editor"), is_open, |app, fix| {
+            let mut window = egui::Window::new("Graph Editor").open(&mut open).default_pos(egui::pos2(60.0, 80.0)).default_size([760.0, 420.0]).constrain(false);
+            if let Some(p) = fix {
+                window = window.fixed_pos(p);
+            }
+            window.show(ctx, |ui| graph_editor(app, ui))
+        });
         app.windows_state.ge_window_rect = resp.map(|r| r.response.rect);
-        app.windows_state.ge_was_open = open;
         app.win.graph_editor = open;
     } else {
         app.windows_state.ge_window_rect = None;
-        app.windows_state.ge_was_open = false;
     }
     if app.win.dope_sheet {
         let mut open = true;
-        let mut window = egui::Window::new("Dope Sheet").open(&mut open).default_pos(egui::pos2(820.0, 80.0)).default_size([760.0, 260.0]);
-        if !app.windows_state.ds_was_open {
-            window = window.fixed_pos(egui::pos2(820.0, 80.0));
-        }
-        let resp = window.show(ctx, |ui| dope_sheet(app, ui));
+        let is_open = open;
+        let resp = place_window(app, ctx, egui::Id::new("Dope Sheet"), is_open, |app, fix| {
+            let mut window = egui::Window::new("Dope Sheet").open(&mut open).default_pos(egui::pos2(820.0, 80.0)).default_size([760.0, 260.0]).constrain(false);
+            if let Some(p) = fix {
+                window = window.fixed_pos(p);
+            }
+            window.show(ctx, |ui| dope_sheet(app, ui))
+        });
         app.windows_state.ds_window_rect = resp.map(|r| r.response.rect);
-        app.windows_state.ds_was_open = open;
         app.win.dope_sheet = open;
     } else {
         app.windows_state.ds_window_rect = None;
-        app.windows_state.ds_was_open = false;
     }
     let mut open = app.win.render_view;
-    egui::Window::new("Render View").open(&mut open).default_size([700.0, 560.0]).constrain(false).show(ctx, |ui| crate::render_view::render_view(app, ui));
+    let is_open = open;
+    let _ = place_window(app, ctx, egui::Id::new("Render View"), is_open, |app, fix| {
+        let mut window = egui::Window::new("Render View").open(&mut open).default_size([700.0, 560.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| crate::render_view::render_view(app, ui))
+    });
     app.win.render_view = open;
     let mut open = app.win.render_settings;
-    egui::Window::new("Render Settings").open(&mut open).default_size([340.0, 260.0]).constrain(false).show(ctx, |ui| render_settings(app, ui));
+    let is_open = open;
+    let _ = place_window(app, ctx, egui::Id::new("Render Settings"), is_open, |app, fix| {
+        let mut window = egui::Window::new("Render Settings").open(&mut open).default_size([340.0, 260.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| render_settings(app, ui))
+    });
     app.win.render_settings = open;
     crate::prefs::window(app, ctx);
     if let Some(msg) = app.win.backend_notice.clone() {
@@ -306,28 +428,42 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     crate::hypergraph::connection_editor(app, ctx);
     crate::hik_ui::window(app, ctx);
     let mut open = app.win.command_list;
-    egui::Window::new("MEL Command Reference").open(&mut open).default_size([380.0, 480.0]).constrain(false).show(ctx, |ui| {
-        ui.label("Commands available to MEL scripts, the command line and the Script Editor:");
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for g in inca_core::primitives::GEN_INFO {
-                let flags: Vec<String> = g.short.iter().map(|(s, l)| format!("-{s} ({l})")).collect();
-                ui.label(RichText::new(g.ty).monospace().strong()).on_hover_text(flags.join("\n"));
-            }
-            for c in inca_core::commands::CORE_COMMANDS {
-                ui.label(RichText::new(*c).monospace());
-            }
-            ui.separator();
-            ui.label("Language: int/float/string/vector variables and arrays, procs, if/else, for, for-in, while, do-while, switch, backtick command capture, print, size, sin/cos/..., tokenize, substring, gmatch ...");
-        });
+    let is_open = open;
+    let _ = place_window(app, ctx, egui::Id::new("MEL Command Reference"), is_open, |_app, fix| {
+        let mut window = egui::Window::new("MEL Command Reference").open(&mut open).default_size([380.0, 480.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+            ui.label("Commands available to MEL scripts, the command line and the Script Editor:");
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for g in inca_core::primitives::GEN_INFO {
+                    let flags: Vec<String> = g.short.iter().map(|(s, l)| format!("-{s} ({l})")).collect();
+                    ui.label(RichText::new(g.ty).monospace().strong()).on_hover_text(flags.join("\n"));
+                }
+                for c in inca_core::commands::CORE_COMMANDS {
+                    ui.label(RichText::new(*c).monospace());
+                }
+                ui.separator();
+                ui.label("Language: int/float/string/vector variables and arrays, procs, if/else, for, for-in, while, do-while, switch, backtick command capture, print, size, sin/cos/..., tokenize, substring, gmatch ...");
+            });
+        })
     });
     app.win.command_list = open;
     let mut open = app.win.about;
-    egui::Window::new("About Inca").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-        ui.heading("Inca");
-        ui.label(format!("version {}", env!("CARGO_PKG_VERSION")));
-        ui.label("A free, open-source 3D modeling, animation and rendering application.");
-        ui.label("Built with egui/eframe, wgpu, glam, transform-gizmo, boolmesh, tobj, gltf, stl_io, rayon and rhai.");
-        ui.hyperlink("https://incacad.com");
+    let is_open = open;
+    let _ = place_window(app, ctx, egui::Id::new("About Inca"), is_open, |_app, fix| {
+        let mut window = egui::Window::new("About Inca").open(&mut open).collapsible(false).resizable(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+            ui.heading("Inca");
+            ui.label(format!("version {}", env!("CARGO_PKG_VERSION")));
+            ui.label("A free, open-source 3D modeling, animation and rendering application.");
+            ui.label("Built with egui/eframe, wgpu, glam, transform-gizmo, boolmesh, tobj, gltf, stl_io, rayon and rhai.");
+            ui.hyperlink("https://incacad.com");
+        })
     });
     app.win.about = open;
     // rename dialog
@@ -996,9 +1132,225 @@ mod tests {
     }
 
     #[test]
-    fn graph_and_dope_windows_open_on_screen() {
+    fn offscreen_window_is_recentered() {
         let ctx = egui::Context::default();
         theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = egui::Id::new("offscreen_recenter_test");
+        let raw = || {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+            raw
+        };
+        // Seed an off-screen position.
+        let mut out = ctx.run_ui(raw(), |ui| {
+            let ctx = ui.ctx().clone();
+            egui::Window::new("Offscreen Recenter Test").id(id).fixed_pos(egui::pos2(5000.0, 5000.0)).constrain(false).show(&ctx, |ui| {
+                ui.label("x");
+            });
+        });
+        out.textures_delta.clear();
+        assert!(!window_reachable(&ctx, ctx.memory(|m| m.area_rect(id)).expect("seeded window")));
+        // Reopening through the placement helper must bring it back.
+        let mut open = true;
+        let is_open = open;
+        let mut out = ctx.run_ui(raw(), |ui| {
+            let ctx = ui.ctx().clone();
+            let _ = place_window(&mut app, &ctx, id, is_open, |_app, fix| {
+                let mut window = egui::Window::new("Offscreen Recenter Test").id(id).open(&mut open).constrain(false);
+                if let Some(p) = fix {
+                    window = window.fixed_pos(p);
+                }
+                window.show(&ctx, |ui| {
+                    ui.label("x");
+                })
+            });
+        });
+        out.textures_delta.clear();
+        let rect = ctx.memory(|m| m.area_rect(id)).expect("reopened window");
+        assert!(window_reachable(&ctx, rect), "window is still off screen: {rect:?}");
+    }
+
+    #[test]
+    fn placed_window_can_be_dragged() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = egui::Id::new("drag_window_test");
+        let mut open = true;
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+            raw.time = Some(t);
+            raw.events = events;
+            let is_open = open;
+            app.windows_state.window_seen_now.clear();
+            let mut out = ctx.run_ui(raw, |ui| {
+                let ctx = ui.ctx().clone();
+                let _ = place_window(app, &ctx, id, is_open, |_app, fix| {
+                    let mut window = egui::Window::new("Drag Test").id(id).open(&mut open).constrain(false);
+                    if let Some(p) = fix {
+                        window = window.fixed_pos(p);
+                    }
+                    window.show(&ctx, |ui| {
+                        ui.label("x");
+                    })
+                });
+            });
+            out.textures_delta.clear();
+            std::mem::swap(&mut app.windows_state.window_seen, &mut app.windows_state.window_seen_now);
+        };
+        run(&mut app, vec![], 0.0);
+        let before = ctx.memory(|m| m.area_rect(id)).expect("window shown");
+        let start = egui::pos2(before.left() + 40.0, before.top() + 10.0);
+        let end = start + egui::vec2(60.0, 40.0);
+        run(&mut app, vec![egui::Event::PointerMoved(start)], 0.1);
+        run(&mut app, vec![egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.2);
+        run(&mut app, vec![egui::Event::PointerMoved(end)], 0.3);
+        run(&mut app, vec![egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 0.4);
+        let after = ctx.memory(|m| m.area_rect(id)).expect("window still shown");
+        assert!(after.left() > before.left() + 20.0, "window did not move: {before:?} -> {after:?}");
+    }
+
+    #[test]
+    fn window_rects_round_trip() {
+        let map = std::collections::HashMap::from([(42u64, egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0)))]);
+        assert_eq!(decode_window_rects(encode_window_rects(&map)), map);
+    }
+
+    #[derive(Default)]
+    struct TestStorage(std::collections::HashMap<String, String>);
+
+    impl eframe::Storage for TestStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_string(), value);
+        }
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn window_rects_persist_through_storage() {
+        let map = std::collections::HashMap::from([(42u64, egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(300.0, 200.0)))]);
+        let mut storage = TestStorage::default();
+        eframe::set_value(&mut storage, "windowRects", &encode_window_rects(&map));
+        let loaded: Vec<(u64, [f32; 4])> = eframe::get_value(&storage, "windowRects").expect("stored rects");
+        assert_eq!(decode_window_rects(loaded), map);
+    }
+
+    #[test]
+    fn reopened_window_keeps_its_position() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = egui::Id::new("reopen_position_test");
+        let open = std::cell::Cell::new(true);
+        let run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+            raw.time = Some(t);
+            raw.events = events;
+            let is_open = open.get();
+            app.windows_state.window_seen_now.clear();
+            let mut out = ctx.run_ui(raw, |ui| {
+                let ctx = ui.ctx().clone();
+                let mut o = is_open;
+                let _ = place_window(app, &ctx, id, is_open, |_app, fix| {
+                    let mut window = egui::Window::new("Reopen Test").id(id).open(&mut o).constrain(false);
+                    if let Some(p) = fix {
+                        window = window.fixed_pos(p);
+                    }
+                    window.show(&ctx, |ui| {
+                        ui.label("x");
+                    })
+                });
+                open.set(o);
+            });
+            out.textures_delta.clear();
+            std::mem::swap(&mut app.windows_state.window_seen, &mut app.windows_state.window_seen_now);
+        };
+        run(&mut app, vec![], 0.0);
+        let before = ctx.memory(|m| m.area_rect(id)).expect("window shown");
+        let start = egui::pos2(before.left() + 40.0, before.top() + 10.0);
+        let end = start + egui::vec2(60.0, 40.0);
+        run(&mut app, vec![egui::Event::PointerMoved(start)], 0.1);
+        run(&mut app, vec![egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.2);
+        run(&mut app, vec![egui::Event::PointerMoved(end)], 0.3);
+        run(&mut app, vec![egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 0.4);
+        let moved = ctx.memory(|m| m.area_rect(id)).expect("window moved");
+        open.set(false);
+        for i in 0..4 {
+            run(&mut app, vec![], 0.5 + i as f64 * 0.1);
+        }
+        // Corrupt egui's saved area position while the window is closed: the app's last-rect
+        // memory must still win on reopen.
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+        raw.time = Some(1.3);
+        let mut out = ctx.run_ui(raw, |ui| {
+            let ctx = ui.ctx().clone();
+            egui::Window::new("Reopen Test").id(id).fixed_pos(egui::pos2(1400.0, 900.0)).constrain(false).show(&ctx, |ui| {
+                ui.label("x");
+            });
+        });
+        out.textures_delta.clear();
+        open.set(true);
+        run(&mut app, vec![], 1.4);
+        let reopened = ctx.memory(|m| m.area_rect(id)).expect("window reopened");
+        assert!((reopened.left() - moved.left()).abs() < 2.0 && (reopened.top() - moved.top()).abs() < 2.0, "position changed on reopen: {moved:?} -> {reopened:?}");
+    }
+
+    #[test]
+    fn reopened_hypershade_keeps_its_position() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        let run = |app: &mut IncaApp, frame: &mut eframe::Frame, events: Vec<egui::Event>, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+            raw.time = Some(t);
+            raw.events = events;
+            app.windows_state.window_seen_now.clear();
+            let mut out = ctx.run_ui(raw, |ui| show(app, ui.ctx(), frame));
+            out.textures_delta.clear();
+            std::mem::swap(&mut app.windows_state.window_seen, &mut app.windows_state.window_seen_now);
+        };
+        app.win.hypershade = true;
+        for i in 0..4 {
+            run(&mut app, &mut frame, vec![], i as f64 * 0.1);
+        }
+        let id = egui::Id::new("HypershadeWindow");
+        let before = ctx.memory(|m| m.area_rect(id)).expect("Hypershade shown");
+        let start = egui::pos2(before.left() + 80.0, before.top() + 12.0);
+        let end = start + egui::vec2(60.0, 40.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(start)], 0.5);
+        run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.6);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(end)], 0.7);
+        run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 0.8);
+        let moved = ctx.memory(|m| m.area_rect(id)).expect("Hypershade moved");
+        app.win.hypershade = false;
+        for i in 0..4 {
+            run(&mut app, &mut frame, vec![], 0.9 + i as f64 * 0.1);
+        }
+        app.win.hypershade = true;
+        run(&mut app, &mut frame, vec![], 1.4);
+        let reopened = ctx.memory(|m| m.area_rect(id)).expect("Hypershade reopened");
+        assert!((reopened.left() - moved.left()).abs() < 2.0 && (reopened.top() - moved.top()).abs() < 2.0, "Hypershade position changed on reopen: {moved:?} -> {reopened:?}");
+    }
+
+    #[test]
+    fn graph_and_dope_windows_open_on_screen() {
+        let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
         let mut app = IncaApp::new(&cc);
         let mut frame = eframe::Frame::_new_kittest();
@@ -1006,8 +1358,10 @@ mod tests {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
             raw.time = Some(t);
+            app.windows_state.window_seen_now.clear();
             let mut out = ctx.run_ui(raw, |ui| show(app, ui.ctx(), frame));
             out.textures_delta.clear();
+            std::mem::swap(&mut app.windows_state.window_seen, &mut app.windows_state.window_seen_now);
         };
         // Closed windows run their fade-out once; opening the editors after that is when the
         // old auto-placement could push them below the screen.

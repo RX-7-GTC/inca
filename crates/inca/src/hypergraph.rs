@@ -324,7 +324,12 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         return;
     }
     let title = if app.hg.connections { "Hypergraph InputOutput" } else { "Hypergraph Hierarchy" };
-    egui::Window::new(title).id(egui::Id::new("hypergraph")).open(&mut open).default_size([820.0, 500.0]).constrain(false).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("hypergraph"), open, |app, fix| {
+        let mut window = egui::Window::new(title).id(egui::Id::new("hypergraph")).open(&mut open).default_size([820.0, 500.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         ui.horizontal(|ui| {
             if ui.selectable_label(!app.hg.connections, "Scene Hierarchy").on_hover_text("Show the scene DAG").clicked() && app.hg.connections {
                 app.hg.connections = false;
@@ -417,6 +422,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
             ui.label(RichText::new(format!("{}%", (app.hg.zoom * 100.0).round() as i32)).color(theme::TEXT_DIM).size(10.5));
         });
         graph(app, ui);
+        })
     });
     // Rename dialog for the Hypergraph (renames the box's object directly, like the JS
     // double-click rename; the generic Rename window acts on the current selection).
@@ -1598,7 +1604,12 @@ pub fn connection_editor(app: &mut IncaApp, ctx: &egui::Context) {
     let mut remove_output = false;
     let mut close = false;
     let mut nav: Option<(bool, Option<NodeRef>)> = None;
-    egui::Window::new("Connection Editor").order(egui::Order::Foreground).open(&mut open).default_size([560.0, 520.0]).constrain(false).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Connection Editor"), open, |app, fix| {
+        let mut window = egui::Window::new("Connection Editor").order(egui::Order::Foreground).open(&mut open).default_size([560.0, 520.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.menu_button("Options", |ui| {
                 if ui.checkbox(&mut app.hg.ce_auto, "Auto-connect").changed() {
@@ -1807,6 +1818,7 @@ pub fn connection_editor(app: &mut IncaApp, ctx: &egui::Context) {
             ui.separator();
             ui.label(RichText::new(if app.hg.ce_auto { "Auto-connect is on" } else { "Auto-connect is off" }).color(theme::TEXT_DIM).size(10.5));
         });
+    })
     });
     for e in edits {
         apply_edit(app, e);
