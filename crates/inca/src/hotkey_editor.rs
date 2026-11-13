@@ -374,6 +374,8 @@ fn is_snap_action(id: &str) -> bool {
 /// the viewport; tool and application commands stay global.
 fn default_scope(id: &str) -> Scope {
     match id {
+        "graphFrameSelected" | "graphFrameAll" | "graphDeleteKey" => Scope::GraphEditor,
+        "dopeFrameSelected" | "dopeFrameAll" | "dopeDeleteKeys" => Scope::DopeSheet,
         "snapGrid" | "snapCurve" | "snapPoint"
         | "frameAll" | "frameSelected" | "frameAllAll" | "frameSelectedAll"
         | "undoView" | "redoView" | "defaultView"
@@ -408,6 +410,27 @@ fn extra_default(c: &str) -> Option<(&'static str, bool, bool)> {
     })
 }
 
+/// Match a default hotkey label like `Del` against the chord egui reports.
+fn hotkey_label_matches(hk: &str, c: &str) -> bool {
+    hk == c || (hk == "Del" && matches!(c, "Delete" | "Backspace"))
+}
+
+/// A default binding that belongs specifically to this editor scope, e.g. F in the Graph Editor.
+/// These shadow same-chord application defaults.
+fn scoped_default(app: &IncaApp, c: &str, scope: Scope) -> Option<(&'static str, bool, bool)> {
+    if scope == Scope::Application {
+        return None;
+    }
+    crate::actions::ACTIONS.iter().find_map(|(id, _, hk)| {
+        if hotkey_label_matches(hk, c) && default_scope(id) == scope && !app.keymap.contains_key(&format!("unbind:{id}")) {
+            let (press, release) = default_directions(id, c);
+            Some((*id, press, release))
+        } else {
+            None
+        }
+    })
+}
+
 /// The action for a key press in the given scope: a scoped binding first, then an application
 /// binding, then the Maya default unless it was removed. Release-only bindings are skipped.
 pub fn resolve(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<String> {
@@ -415,6 +438,11 @@ pub fn resolve(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<St
     if let Some(a) = lookup(&app.keymap, &c, scope) {
         let (id, press, _) = action_parts(a);
         return press.then(|| id.to_string());
+    }
+    if let Some((id, press, _)) = scoped_default(app, &c, scope) {
+        if press {
+            return Some(id.to_string());
+        }
     }
     let a = crate::actions::hotkey(key, m, app)?;
     // These editors own Delete for keys/nodes/wires; don't also delete scene objects.
@@ -428,11 +456,16 @@ pub fn resolve(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<St
 
 /// The action a key should run when released in the given scope, if its release direction is on.
 pub fn release_action(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<String> {
-    if let Some(a) = lookup(&app.keymap, &chord(key, m), scope) {
+    let c = chord(key, m);
+    if let Some(a) = lookup(&app.keymap, &c, scope) {
         let (id, _, release) = action_parts(a);
         return release.then(|| id.to_string());
     }
-    let c = chord(key, m);
+    if let Some((id, _, release)) = scoped_default(app, &c, scope) {
+        if release {
+            return Some(id.to_string());
+        }
+    }
     let id = crate::actions::hotkey(key, m, app)?;
     let (_, release) = default_directions(id, &c);
     let applies = default_scope(id) == Scope::Application || default_scope(id) == scope;
@@ -459,6 +492,9 @@ pub fn hold_binding(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Opti
 fn bound_action(app: &IncaApp, c: &str, scope: Scope) -> Option<(String, bool, bool)> {
     if let Some(a) = app.keymap.get(&scope_key(scope, c)) {
         let (id, press, release) = action_parts(a);
+        return Some((id.to_string(), press, release));
+    }
+    if let Some((id, press, release)) = scoped_default(app, c, scope) {
         return Some((id.to_string(), press, release));
     }
     // Application defaults apply in every scope; editor defaults only in their own scope.
@@ -2248,6 +2284,23 @@ mod tests {
         assert_eq!(parse_key("unbind:copy"), (Scope::Application, "unbind:copy"));
     }
 
+    #[test]
+    fn editor_scopes_have_frame_and_delete_defaults() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        app.keymap.clear();
+        let none = Modifiers::default();
+        assert_eq!(resolve(&app, Key::F, none, Scope::GraphEditor), Some("graphFrameSelected".into()));
+        assert_eq!(resolve(&app, Key::A, none, Scope::GraphEditor), Some("graphFrameAll".into()));
+        assert_eq!(resolve(&app, Key::Delete, none, Scope::GraphEditor), Some("graphDeleteKey".into()));
+        assert_eq!(resolve(&app, Key::F, none, Scope::DopeSheet), Some("dopeFrameSelected".into()));
+        assert_eq!(resolve(&app, Key::A, none, Scope::DopeSheet), Some("dopeFrameAll".into()));
+        assert_eq!(resolve(&app, Key::Delete, none, Scope::DopeSheet), Some("dopeDeleteKeys".into()));
+        assert_eq!(resolve(&app, Key::F, none, Scope::Viewport), Some("frameSelected".into()));
+    }
+
     fn scope_at(ctx: &egui::Context, app: &IncaApp, pos: egui::Pos2, time: f64) -> Scope {
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
@@ -2273,6 +2326,23 @@ mod tests {
         app.win.dope_sheet = true;
         app.windows_state.ds_window_rect = Some(rect);
         assert_eq!(scope_at(&ctx, &app, rect.center(), 0.2), Scope::DopeSheet);
+    }
+
+    #[test]
+    fn editor_scopes_display_frame_and_delete_defaults() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        app.keymap.clear();
+        let ge = binding_map(&app, Scope::GraphEditor);
+        assert_eq!(ge.get("F").map(|(id, _, _)| id.as_str()), Some("graphFrameSelected"));
+        assert_eq!(ge.get("A").map(|(id, _, _)| id.as_str()), Some("graphFrameAll"));
+        assert_eq!(ge.get("Del").map(|(id, _, _)| id.as_str()), Some("graphDeleteKey"));
+        let ds = binding_map(&app, Scope::DopeSheet);
+        assert_eq!(ds.get("F").map(|(id, _, _)| id.as_str()), Some("dopeFrameSelected"));
+        assert_eq!(ds.get("A").map(|(id, _, _)| id.as_str()), Some("dopeFrameAll"));
+        assert_eq!(ds.get("Del").map(|(id, _, _)| id.as_str()), Some("dopeDeleteKeys"));
     }
 
     #[test]

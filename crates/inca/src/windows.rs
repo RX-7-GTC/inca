@@ -76,6 +76,10 @@ pub struct WinState {
     pub ge_curves: std::collections::HashSet<String>,
     pub ge_key: Option<(String, usize)>,
     pub ge_drag: bool,
+    /// Pending Graph Editor frame request: 1 = selected, 2 = all.
+    pub ge_frame: Option<u8>,
+    /// Optional Dope Sheet time view, set by frame actions.
+    pub ds_view: Option<(f64, f64)>,
     /// Last drawn Graph Editor window rect, used to activate its hotkey scope.
     pub ge_window_rect: Option<egui::Rect>,
     /// Last drawn Dope Sheet window rect, used to activate its hotkey scope.
@@ -335,6 +339,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
         app.win.graph_editor = open;
     } else {
         app.windows_state.ge_window_rect = None;
+        app.windows_state.ge_frame = None;
     }
     if app.win.dope_sheet {
         let mut open = true;
@@ -699,7 +704,7 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_nam
 // ------------------------------------------------------------------ graph editor
 
 /// Delete the key selected in the Graph Editor.
-fn delete_selected_key(app: &mut IncaApp) {
+pub(crate) fn delete_selected_key(app: &mut IncaApp) {
     let Some((ck, ki)) = app.windows_state.ge_key.take() else { return };
     if !app.s.anim.curves.get(&ck).is_some_and(|c| ki < c.keys.len()) {
         return;
@@ -712,6 +717,33 @@ fn delete_selected_key(app: &mut IncaApp) {
     app.s.apply_anim();
     app.s.touch();
     app.windows_state.ge_drag = false;
+}
+
+/// Delete keys at the current time for the selected objects (Dope Sheet).
+pub(crate) fn delete_keys_at_current_time(app: &mut IncaApp) {
+    let names: Vec<String> = app.s.sel.iter().map(|n| app.s.name_of(n)).collect();
+    if names.is_empty() {
+        return;
+    }
+    let t = app.s.time.current;
+    let _ = app.run_mel("cut keys", &format!("cutKey -t {t} {};", names.join(" ")));
+}
+
+/// Frame the Dope Sheet: selected nodes' keys (F) or every key in the scene (A).
+pub(crate) fn dope_frame(app: &mut IncaApp, selected_only: bool) {
+    let mut times: Vec<f64> = if selected_only {
+        app.s.anim.key_times(&app.s.sel)
+    } else {
+        app.s.anim.curves.values().flat_map(|c| c.keys.iter().map(|k| k.t)).collect()
+    };
+    times.retain(|t| t.is_finite());
+    if times.is_empty() {
+        app.windows_state.ds_view = None;
+        return;
+    }
+    let lo = times.iter().copied().fold(f64::INFINITY, f64::min) - 1.0;
+    let hi = times.iter().copied().fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    app.windows_state.ds_view = Some((lo, hi.max(lo + 1.0)));
 }
 
 fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
@@ -812,21 +844,30 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let (x0, x1) = (xmin - 10.0, xmax + 10.0);
         // F frames the selected key, or all visible curves; with nothing selected it returns to
         // Maya's default graph view.
-        let frame = ui.rect_contains_pointer(ui.max_rect()) && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::F));
-        let frame_bounds = if frame {
-            if let Some((ck, ki)) = app.windows_state.ge_key.as_ref() {
-                app.s.anim.curves.get(ck).and_then(|c| c.keys.get(*ki)).map(|k| {
-                    let xpad = ((x1 - x0) * 0.1).max(5.0);
-                    let ypad = ((y1 - y0) * 0.1).max(1.0);
-                    egui_plot::PlotBounds::from_min_max([k.t - xpad, k.v - ypad], [k.t + xpad, k.v + ypad])
-                })
-            } else if shown.is_empty() {
-                Some(egui_plot::PlotBounds::from_min_max([t0, -1.5], [t1, 1.5]))
-            } else {
-                Some(egui_plot::PlotBounds::from_min_max([x0, y0], [x1, y1]))
+        let frame_req = app.windows_state.ge_frame.take();
+        let key_bounds = app.windows_state.ge_key.as_ref().and_then(|(ck, ki)| {
+            app.s.anim.curves.get(ck).and_then(|c| c.keys.get(*ki)).map(|k| {
+                let xpad = ((x1 - x0) * 0.1).max(5.0);
+                let ypad = ((y1 - y0) * 0.1).max(1.0);
+                egui_plot::PlotBounds::from_min_max([k.t - xpad, k.v - ypad], [k.t + xpad, k.v + ypad])
+            })
+        });
+        let frame_bounds = match frame_req {
+            Some(1) => key_bounds.or_else(|| {
+                if shown.is_empty() {
+                    Some(egui_plot::PlotBounds::from_min_max([t0, -1.5], [t1, 1.5]))
+                } else {
+                    Some(egui_plot::PlotBounds::from_min_max([x0, y0], [x1, y1]))
+                }
+            }),
+            Some(2) => {
+                if shown.is_empty() {
+                    Some(egui_plot::PlotBounds::from_min_max([t0, -1.5], [t1, 1.5]))
+                } else {
+                    Some(egui_plot::PlotBounds::from_min_max([x0, y0], [x1, y1]))
+                }
             }
-        } else {
-            None
+            _ => None,
         };
         let mut plot = Plot::new("graph").include_y(y0).include_y(y1).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_double_click_reset(true);
         if empty {
@@ -902,9 +943,6 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         if r.drag_stopped() {
             app.windows_state.ge_drag = false;
         }
-        if r.hovered() && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
-            delete_selected_key(app);
-        }
     });
 }
 
@@ -913,7 +951,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
 fn dope_sheet(app: &mut IncaApp, ui: &mut egui::Ui) {
     use egui::{pos2, vec2, Rect, Sense, Stroke};
     let nodes: Vec<String> = app.s.sel.clone();
-    let (t0, t1) = (app.s.time.start, app.s.time.end.max(app.s.time.start + 1.0));
+    let (t0, t1) = app.windows_state.ds_view.unwrap_or((app.s.time.start, app.s.time.end.max(app.s.time.start + 1.0)));
     ui.label(RichText::new("Drag keys to retime them (the summary row moves every key). Delete removes the keys at the current time.").color(theme::TEXT_DIM));
     let rows: Vec<(Option<String>, String, Vec<f64>)> = std::iter::once((None, "Dope Sheet Summary".to_string(), app.s.anim.key_times(&nodes)))
         .chain(nodes.iter().map(|n| (Some(n.clone()), app.s.name_of(n), app.s.anim.key_times(std::slice::from_ref(n)))))
@@ -1000,13 +1038,6 @@ fn dope_sheet(app: &mut IncaApp, ui: &mut egui::Ui) {
                 let t = t_of(pp.x).round().clamp(t0, t1);
                 app.s.set_time(t);
             }
-        }
-    }
-    if ui.input(|i| i.key_pressed(egui::Key::Delete)) && resp.hovered() {
-        let names: Vec<String> = nodes.iter().map(|n| app.s.name_of(n)).collect();
-        if !names.is_empty() {
-            let t = app.s.time.current;
-            let _ = app.run_mel("cut keys", &format!("cutKey -t {t} {};", names.join(" ")));
         }
     }
 }
