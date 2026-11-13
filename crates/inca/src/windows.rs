@@ -940,7 +940,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             _ => None,
         };
-        let mut plot = Plot::new("graph").include_y(y0).include_y(y1).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_axis_zoom_drag(false).allow_boxed_zoom(false).allow_double_click_reset(true);
+        let mut plot = Plot::new("graph").include_y(y0).include_y(y1).grid_color(egui::Color32::from_gray(0x50)).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_axis_zoom_drag(false).allow_boxed_zoom(false).allow_double_click_reset(true);
         if empty {
             plot = plot.default_x_bounds(t0, t1.max(t0 + 1.0)).default_y_bounds(-1.5, 1.5);
         }
