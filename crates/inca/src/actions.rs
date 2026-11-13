@@ -224,6 +224,8 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("graphFrameSelected", "Graph Editor: Frame Selected", "F"),
     ("graphFrameAll", "Graph Editor: Frame All", "A"),
     ("graphDeleteKey", "Graph Editor: Delete Selected Keys", "Del"),
+    ("graphCopy", "Graph Editor: Copy Keys", "Ctrl+C"),
+    ("graphPaste", "Graph Editor: Paste Keys", "Ctrl+V"),
     ("dopeFrameSelected", "Dope Sheet: Frame Selected", "F"),
     ("dopeFrameAll", "Dope Sheet: Frame All", "A"),
     ("dopeDeleteKeys", "Dope Sheet: Delete Keys", "Del"),
@@ -846,11 +848,19 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         }
         "addAttribute" => app.add_attr = Some(crate::edit_cmds::AddAttr { name: String::new(), ty: 0, default: 0.0 }),
         "copy" => {
-            let data: Vec<serde_json::Value> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).map(|i| app.s.serialize_node(&i)).collect();
-            app.clipboard = Some(serde_json::Value::Array(data));
+            if app.win.graph_editor && !app.windows_state.ge_keys.is_empty() {
+                crate::windows::copy_selected_keys(app);
+            } else {
+                let data: Vec<serde_json::Value> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).map(|i| app.s.serialize_node(&i)).collect();
+                let n = data.len();
+                app.clipboard = Some(serde_json::Value::Array(data));
+                app.help = format!("Copied {n} object{}", if n == 1 { "" } else { "s" });
+            }
         }
         "paste" => {
-            if let Some(serde_json::Value::Array(list)) = app.clipboard.clone() {
+            if app.win.graph_editor && !app.windows_state.ge_keys.is_empty() && !app.windows_state.ge_clipboard.is_empty() {
+                crate::windows::paste_keys(app);
+            } else if let Some(serde_json::Value::Array(list)) = app.clipboard.clone() {
                 app.s.checkpoint("paste");
                 let mut map = std::collections::HashMap::new();
                 let mut made = vec![];
@@ -862,7 +872,9 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
                         made.push(nid);
                     }
                 }
+                let n = made.len();
                 app.s.select(&made, SelMode::Replace);
+                app.help = format!("Pasted {n} object{}", if n == 1 { "" } else { "s" });
             }
         }
         "renameSel" => {
@@ -1145,6 +1157,8 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "graphFrameSelected" => app.windows_state.ge_frame = Some(1),
         "graphFrameAll" => app.windows_state.ge_frame = Some(2),
         "graphDeleteKey" => crate::windows::delete_selected_keys(app),
+        "graphCopy" => crate::windows::copy_selected_keys(app),
+        "graphPaste" => crate::windows::paste_keys(app),
         "dopeFrameSelected" => crate::windows::dope_frame(app, true),
         "dopeFrameAll" => crate::windows::dope_frame(app, false),
         "dopeDeleteKeys" => crate::windows::delete_keys_at_current_time(app),

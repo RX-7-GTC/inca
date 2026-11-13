@@ -374,7 +374,7 @@ fn is_snap_action(id: &str) -> bool {
 /// the viewport; tool and application commands stay global.
 fn default_scope(id: &str) -> Scope {
     match id {
-        "graphFrameSelected" | "graphFrameAll" | "graphDeleteKey" => Scope::GraphEditor,
+        "graphFrameSelected" | "graphFrameAll" | "graphDeleteKey" | "graphCopy" | "graphPaste" => Scope::GraphEditor,
         "dopeFrameSelected" | "dopeFrameAll" | "dopeDeleteKeys" => Scope::DopeSheet,
         "snapGrid" | "snapCurve" | "snapPoint"
         | "frameAll" | "frameSelected" | "frameAllAll" | "frameSelectedAll"
@@ -2298,6 +2298,10 @@ mod tests {
         assert_eq!(resolve(&app, Key::F, none, Scope::DopeSheet), Some("dopeFrameSelected".into()));
         assert_eq!(resolve(&app, Key::A, none, Scope::DopeSheet), Some("dopeFrameAll".into()));
         assert_eq!(resolve(&app, Key::Delete, none, Scope::DopeSheet), Some("dopeDeleteKeys".into()));
+        let ctrl = Modifiers { ctrl: true, ..Default::default() };
+        assert_eq!(resolve(&app, Key::C, ctrl, Scope::GraphEditor), Some("graphCopy".into()));
+        assert_eq!(resolve(&app, Key::V, ctrl, Scope::GraphEditor), Some("graphPaste".into()));
+        assert_eq!(resolve(&app, Key::C, ctrl, Scope::Application), Some("copy".into()));
         assert_eq!(resolve(&app, Key::F, none, Scope::Viewport), Some("frameSelected".into()));
     }
 

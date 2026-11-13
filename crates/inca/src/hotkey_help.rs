@@ -326,6 +326,8 @@ pub fn describe(id: &str) -> Option<&'static str> {
         "graphFrameSelected" => "Frames the selected key or the visible curves in the Graph Editor.",
         "graphFrameAll" => "Frames all visible curves in the Graph Editor.",
         "graphDeleteKey" => "Deletes the selected keys in the Graph Editor.",
+        "graphCopy" => "Copies the selected keys in the Graph Editor.",
+        "graphPaste" => "Pastes copied keys at the current time in the Graph Editor.",
         "dopeFrameSelected" => "Frames the selected objects' keys in the Dope Sheet.",
         "dopeFrameAll" => "Frames every key in the Dope Sheet.",
         "dopeDeleteKeys" => "Deletes keys at the current time in the Dope Sheet.",

@@ -82,6 +82,12 @@ pub struct WinState {
     pub ge_drag_anchor: Option<(f64, f64)>,
     /// Marquee origin in screen coordinates while box-selecting.
     pub ge_box: Option<egui::Pos2>,
+    /// Copied Graph Editor keys: source curve, original time, key data.
+    pub ge_clipboard: Vec<(String, f64, inca_core::anim::Key)>,
+    /// Last copy/paste status shown in the Graph Editor.
+    pub ge_status: Option<String>,
+    /// Screen position of the first visible key, used by the in-app UI tests.
+    pub ge_first_key_screen: Option<egui::Pos2>,
     /// Pending Graph Editor frame request: 1 = selected, 2 = all.
     pub ge_frame: Option<u8>,
     /// Optional Dope Sheet time view, set by frame actions.
@@ -346,6 +352,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     } else {
         app.windows_state.ge_window_rect = None;
         app.windows_state.ge_frame = None;
+        app.windows_state.ge_status = None;
     }
     if app.win.dope_sheet {
         let mut open = true;
@@ -739,6 +746,70 @@ pub(crate) fn delete_selected_keys(app: &mut IncaApp) {
     app.windows_state.ge_box = None;
 }
 
+/// Copy the selected Graph Editor keys.
+pub(crate) fn copy_selected_keys(app: &mut IncaApp) {
+    let selected = app.windows_state.ge_keys.clone();
+    let mut clip = Vec::new();
+    for (ck, ki) in selected {
+        if let Some(key) = app.s.anim.curves.get(&ck).and_then(|c| c.keys.get(ki)) {
+            clip.push((ck, key.t, key.clone()));
+        }
+    }
+    if clip.is_empty() {
+        return;
+    }
+    let n = clip.len();
+    app.windows_state.ge_clipboard = clip;
+    let msg = format!("Copied {n} key{}", if n == 1 { "" } else { "s" });
+    app.windows_state.ge_status = Some(msg.clone());
+    app.help = msg;
+}
+
+/// Paste copied Graph Editor keys at the current time, preserving their relative spacing.
+pub(crate) fn paste_keys(app: &mut IncaApp) {
+    let clip = app.windows_state.ge_clipboard.clone();
+    if clip.is_empty() {
+        return;
+    }
+    let valid: Vec<(String, f64, inca_core::anim::Key)> = clip.into_iter().filter(|(ck, _, _)| app.s.anim.curves.contains_key(ck)).collect();
+    if valid.is_empty() {
+        return;
+    }
+    let first = valid.iter().map(|(_, t, _)| *t).fold(f64::INFINITY, f64::min);
+    let offset = app.s.time.current - first;
+    app.s.checkpoint("paste keys");
+    let mut pasted: Vec<(String, f64)> = Vec::new();
+    for (ck, t, key) in &valid {
+        let new_t = *t + offset;
+        if let Some(c) = app.s.anim.curves.get_mut(ck) {
+            let mut k = key.clone();
+            k.t = new_t;
+            if let Some(i) = c.find(new_t) {
+                c.keys[i] = k;
+            } else {
+                c.keys.push(k);
+                c.sort();
+            }
+            pasted.push((ck.clone(), new_t));
+        }
+    }
+    let mut selected = Vec::new();
+    for (ck, t) in &pasted {
+        if let Some(c) = app.s.anim.curves.get(ck) {
+            if let Some(i) = c.find(*t) {
+                selected.push((ck.clone(), i));
+            }
+        }
+    }
+    app.windows_state.ge_keys = selected;
+    app.s.apply_anim();
+    app.s.touch();
+    let n = pasted.len();
+    let msg = format!("Pasted {n} key{}", if n == 1 { "" } else { "s" });
+    app.windows_state.ge_status = Some(msg.clone());
+    app.help = msg;
+}
+
 /// Delete keys at the current time for the selected objects (Dope Sheet).
 pub(crate) fn delete_keys_at_current_time(app: &mut IncaApp) {
     let names: Vec<String> = app.s.sel.iter().map(|n| app.s.name_of(n)).collect();
@@ -800,7 +871,12 @@ fn nearest_graph_key(app: &IncaApp, shown: &[String], tf: &egui_plot::PlotTransf
 fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use egui_plot::{Line, Plot, PlotPoints, Points};
     let curves: Vec<(String, String, String)> = app.s.anim.curves.iter().filter(|(_, c)| app.s.sel.contains(&c.node) && !c.keys.is_empty()).map(|(k, c)| (k.clone(), app.s.name_of(&c.node), c.attr.clone())).collect();
+    let status = app.windows_state.ge_status.clone();
     ui.horizontal(|ui| {
+        if let Some(status) = &status {
+            ui.label(RichText::new(status).color(theme::TEXT_DIM));
+            ui.separator();
+        }
         let selected_count = app.windows_state.ge_keys.len();
         if let Some((ck, ki)) = app.windows_state.ge_keys.first().cloned() {
             if selected_count > 1 {
@@ -1010,8 +1086,16 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let pointer = resp.inner;
         let r = resp.response;
         let tf = resp.transform;
+        app.windows_state.ge_first_key_screen = shown.iter().find_map(|k| {
+            app.s.anim.curves.get(k).and_then(|c| c.keys.first()).map(|key| tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v)))
+        });
         let alt = ui.input(|i| i.modifiers.alt);
         let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
+        if r.clicked() || r.drag_started() {
+            if let Some(id) = ui.ctx().memory(|m| m.focused()) {
+                ui.ctx().memory_mut(|m| m.surrender_focus(id));
+            }
+        }
         if !alt {
         if r.drag_started() {
             if let Some(pp) = r.interact_pointer_pos() {
@@ -1128,6 +1212,11 @@ fn dope_sheet(app: &mut IncaApp, ui: &mut egui::Ui) {
     let row_h = 20.0;
     let w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h * rows.len().max(1) as f32 + 18.0), Sense::click_and_drag());
+    if resp.clicked() || resp.drag_started() {
+        if let Some(id) = ui.ctx().memory(|m| m.focused()) {
+            ui.ctx().memory_mut(|m| m.surrender_focus(id));
+        }
+    }
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, theme::BG_DARK);
     let track = Rect::from_min_max(pos2(rect.min.x + label_w, rect.min.y + 18.0), rect.max);
@@ -1619,6 +1708,29 @@ mod tests {
         delete_selected_keys(&mut app);
         let c = app.s.anim.curves.get(&ck).expect("curve should remain");
         assert_eq!(c.keys.iter().map(|k| k.t).collect::<Vec<_>>(), vec![1.0, 10.0]);
+    }
+
+    #[test]
+    fn graph_copy_paste_preserves_relative_spacing() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let ck = inca_core::anim::Anim::key("pCube1", "translateX");
+        let mut c = inca_core::anim::AnimCurve::new("pCube1", "translateX");
+        for (i, t) in [1.0, 5.0, 10.0].iter().enumerate() {
+            c.set_key(*t, i as f64 * 10.0, "linear");
+        }
+        app.s.anim.curves.insert(ck.clone(), c);
+        app.windows_state.ge_keys = vec![(ck.clone(), 0), (ck.clone(), 2)];
+        copy_selected_keys(&mut app);
+        app.s.time.current = 20.0;
+        paste_keys(&mut app);
+        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        assert_eq!(times, vec![1.0, 5.0, 10.0, 20.0, 29.0]);
+        let mut selected: Vec<f64> = app.windows_state.ge_keys.iter().filter(|(k, _)| k == &ck).map(|(_, i)| app.s.anim.curves[&ck].keys[*i].t).collect();
+        selected.sort_by(|a, b| a.total_cmp(b));
+        assert_eq!(selected, vec![20.0, 29.0]);
     }
 
     #[test]

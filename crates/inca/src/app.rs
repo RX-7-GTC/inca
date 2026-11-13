@@ -1507,3 +1507,136 @@ impl eframe::App for IncaApp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_event(key: egui::Key, ctrl: bool, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers { ctrl, ..Default::default() },
+        }
+    }
+
+    fn raw_with(events: Vec<egui::Event>) -> egui::RawInput {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+        raw.events = events;
+        raw
+    }
+
+    #[test]
+    fn graph_copy_paste_hotkeys_work() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.keymap.clear();
+        let ck = inca_core::anim::Anim::key("pCube1", "translateX");
+        let mut curve = inca_core::anim::AnimCurve::new("pCube1", "translateX");
+        curve.set_key(1.0, 0.0, "linear");
+        curve.set_key(10.0, 1.0, "linear");
+        app.s.anim.curves.insert(ck.clone(), curve);
+        app.windows_state.ge_keys = vec![(ck.clone(), 0)];
+        app.win.graph_editor = true;
+        app.windows_state.ge_window_rect = Some(egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)));
+
+        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(egui::pos2(200.0, 200.0)), key_event(egui::Key::C, true, true)]), |ui| app.hotkeys(ui.ctx()));
+        out.textures_delta.clear();
+        assert!(!app.windows_state.ge_clipboard.is_empty(), "Ctrl+C did not copy keys");
+
+        app.s.time.current = 20.0;
+        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(egui::pos2(200.0, 200.0)), key_event(egui::Key::V, true, true)]), |ui| app.hotkeys(ui.ctx()));
+        out.textures_delta.clear();
+        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        assert_eq!(times, vec![1.0, 10.0, 20.0], "Ctrl+V did not paste at the current time");
+    }
+
+    #[test]
+    fn graph_copy_help_through_real_window() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.keymap.clear();
+        app.run_mel("test", "polyCube; setKeyframe -at translateX -t 1 -v 0; setKeyframe -at translateX -t 10 -v 1;").expect("scene setup");
+        let ck = app.s.anim.curves.keys().find(|k| k.contains("translateX")).expect("curve").clone();
+        app.windows_state.ge_keys = vec![(ck, 0)];
+        app.win.graph_editor = true;
+        let mut frame = eframe::Frame::_new_kittest();
+        for _ in 0..4 {
+            let mut out = ctx.run_ui(raw_with(vec![]), |ui| crate::windows::show(&mut app, ui.ctx(), &mut frame));
+            out.textures_delta.clear();
+        }
+        let rect = app.windows_state.ge_window_rect.expect("Graph Editor window rect");
+        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(rect.center()), key_event(egui::Key::C, true, true)]), |ui| app.hotkeys(ui.ctx()));
+        out.textures_delta.clear();
+        assert!(app.help.starts_with("Copied"), "help line was {:?}", app.help);
+    }
+
+    #[test]
+    fn application_copy_paste_uses_graph_keys_when_selected() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.keymap.clear();
+        let ck = inca_core::anim::Anim::key("pCube1", "translateX");
+        let mut curve = inca_core::anim::AnimCurve::new("pCube1", "translateX");
+        curve.set_key(1.0, 0.0, "linear");
+        curve.set_key(10.0, 1.0, "linear");
+        app.s.anim.curves.insert(ck.clone(), curve);
+        app.windows_state.ge_keys = vec![(ck.clone(), 0)];
+        app.win.graph_editor = true;
+        app.action("copy");
+        assert!(!app.windows_state.ge_clipboard.is_empty(), "application copy did not defer to keys");
+        app.s.time.current = 20.0;
+        app.action("paste");
+        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        assert_eq!(times, vec![1.0, 10.0, 20.0], "application paste did not defer to keys");
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn graph_copy_paste_click_flow() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        app.run_mel("test", "polyCube; setKeyframe -at translateX -t 1 -v 0; setKeyframe -at translateX -t 10 -v 1;").expect("scene setup");
+        app.win.graph_editor = true;
+        let run = |app: &mut IncaApp, frame: &mut eframe::Frame, events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(raw_with(events), |ui| eframe::App::ui(app, ui, frame));
+            out.textures_delta.clear();
+        };
+        for _ in 0..5 {
+            run(&mut app, &mut frame, vec![]);
+        }
+        let pos = app.windows_state.ge_first_key_screen.expect("first key screen position");
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(pos)]);
+        run(&mut app, &mut frame, vec![pointer_button(pos, true)]);
+        run(&mut app, &mut frame, vec![pointer_button(pos, false)]);
+        assert!(!app.windows_state.ge_keys.is_empty(), "click did not select a key");
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(pos), key_event(egui::Key::C, true, true)]);
+        assert!(!app.windows_state.ge_clipboard.is_empty(), "Ctrl+C did not copy a key; help={:?}", app.help);
+        app.s.time.current = 20.0;
+        let bottom = egui::pos2(800.0, 950.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(bottom), key_event(egui::Key::V, true, true)]);
+        let ck = app.s.anim.curves.keys().find(|k| k.contains("translateX")).expect("curve").clone();
+        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        assert!(times.contains(&20.0), "Ctrl+V did not paste at the current time: {times:?}");
+    }
+}
