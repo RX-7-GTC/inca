@@ -76,6 +76,13 @@ pub struct WinState {
     pub ge_curves: std::collections::HashSet<String>,
     pub ge_key: Option<(String, usize)>,
     pub ge_drag: bool,
+    /// Last drawn Graph Editor window rect, used to activate its hotkey scope.
+    pub ge_window_rect: Option<egui::Rect>,
+    /// Last drawn Dope Sheet window rect, used to activate its hotkey scope.
+    pub ds_window_rect: Option<egui::Rect>,
+    /// Whether the editors were open last frame, so reopening places them on screen.
+    pub ge_was_open: bool,
+    pub ds_was_open: bool,
     pub rv: crate::render_view::RvState,
     pub hs: crate::hypershade::HsState,
 }
@@ -208,12 +215,34 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     egui::Window::new("Hypershade").id(egui::Id::new("HypershadeWindow")).open(&mut open).default_size([980.0, 560.0]).min_size([600.0, 420.0]).constrain(false).show(ctx, |ui| crate::hypershade::window(app, ui));
     // File > Close sets the flag from inside the window; the X button clears `open`.
     app.win.hypershade = open && app.win.hypershade;
-    let mut open = app.win.graph_editor;
-    egui::Window::new("Graph Editor").open(&mut open).default_size([760.0, 420.0]).constrain(false).show(ctx, |ui| graph_editor(app, ui));
-    app.win.graph_editor = open;
-    let mut open = app.win.dope_sheet;
-    egui::Window::new("Dope Sheet").open(&mut open).default_size([760.0, 260.0]).constrain(false).show(ctx, |ui| dope_sheet(app, ui));
-    app.win.dope_sheet = open;
+    if app.win.graph_editor {
+        let mut open = true;
+        let mut window = egui::Window::new("Graph Editor").open(&mut open).default_pos(egui::pos2(60.0, 80.0)).default_size([760.0, 420.0]);
+        if !app.windows_state.ge_was_open {
+            window = window.fixed_pos(egui::pos2(60.0, 80.0));
+        }
+        let resp = window.show(ctx, |ui| graph_editor(app, ui));
+        app.windows_state.ge_window_rect = resp.map(|r| r.response.rect);
+        app.windows_state.ge_was_open = open;
+        app.win.graph_editor = open;
+    } else {
+        app.windows_state.ge_window_rect = None;
+        app.windows_state.ge_was_open = false;
+    }
+    if app.win.dope_sheet {
+        let mut open = true;
+        let mut window = egui::Window::new("Dope Sheet").open(&mut open).default_pos(egui::pos2(820.0, 80.0)).default_size([760.0, 260.0]);
+        if !app.windows_state.ds_was_open {
+            window = window.fixed_pos(egui::pos2(820.0, 80.0));
+        }
+        let resp = window.show(ctx, |ui| dope_sheet(app, ui));
+        app.windows_state.ds_window_rect = resp.map(|r| r.response.rect);
+        app.windows_state.ds_was_open = open;
+        app.win.dope_sheet = open;
+    } else {
+        app.windows_state.ds_window_rect = None;
+        app.windows_state.ds_was_open = false;
+    }
     let mut open = app.win.render_view;
     egui::Window::new("Render View").open(&mut open).default_size([700.0, 560.0]).constrain(false).show(ctx, |ui| crate::render_view::render_view(app, ui));
     app.win.render_view = open;
@@ -533,6 +562,22 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_nam
 
 // ------------------------------------------------------------------ graph editor
 
+/// Delete the key selected in the Graph Editor.
+fn delete_selected_key(app: &mut IncaApp) {
+    let Some((ck, ki)) = app.windows_state.ge_key.take() else { return };
+    if !app.s.anim.curves.get(&ck).is_some_and(|c| ki < c.keys.len()) {
+        return;
+    }
+    app.s.checkpoint("delete key");
+    if let Some(c) = app.s.anim.curves.get_mut(&ck) {
+        c.keys.remove(ki);
+    }
+    app.s.anim.curves.retain(|_, c| !c.keys.is_empty());
+    app.s.apply_anim();
+    app.s.touch();
+    app.windows_state.ge_drag = false;
+}
+
 fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use egui_plot::{Line, Plot, PlotPoints, Points};
     let curves: Vec<(String, String, String)> = app.s.anim.curves.iter().filter(|(_, c)| app.s.sel.contains(&c.node) && !c.keys.is_empty()).map(|(k, c)| (k.clone(), app.s.name_of(&c.node), c.attr.clone())).collect();
@@ -664,6 +709,9 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         if r.drag_stopped() {
             app.windows_state.ge_drag = false;
+        }
+        if r.hovered() && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+            delete_selected_key(app);
         }
     });
 }
@@ -921,3 +969,60 @@ fn render_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
     r.insert("format".into(), json!(format));
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_delete_key_removes_only_the_selected_key() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let ck = inca_core::anim::Anim::key("pCube1", "translateX");
+        let mut c = inca_core::anim::AnimCurve::new("pCube1", "translateX");
+        c.set_key(1.0, 0.0, "linear");
+        c.set_key(10.0, 5.0, "linear");
+        app.s.anim.curves.insert(ck.clone(), c);
+        app.windows_state.ge_key = Some((ck.clone(), 0));
+        delete_selected_key(&mut app);
+        let c = app.s.anim.curves.get(&ck).expect("curve with a remaining key should stay");
+        assert_eq!(c.keys.len(), 1);
+        assert_eq!(c.keys[0].t, 10.0);
+        app.windows_state.ge_key = Some((ck.clone(), 0));
+        delete_selected_key(&mut app);
+        assert!(!app.s.anim.curves.contains_key(&ck), "empty curve should be removed");
+    }
+
+    #[test]
+    fn graph_and_dope_windows_open_on_screen() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        let run = |app: &mut IncaApp, frame: &mut eframe::Frame, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+            raw.time = Some(t);
+            let mut out = ctx.run_ui(raw, |ui| show(app, ui.ctx(), frame));
+            out.textures_delta.clear();
+        };
+        // Closed windows run their fade-out once; opening the editors after that is when the
+        // old auto-placement could push them below the screen.
+        for i in 0..3 {
+            run(&mut app, &mut frame, i as f64 * 0.1);
+        }
+        app.win.graph_editor = true;
+        app.win.dope_sheet = true;
+        for i in 3..6 {
+            run(&mut app, &mut frame, i as f64 * 0.1);
+        }
+        let content = ctx.content_rect();
+        for (name, rect) in [("Graph Editor", app.windows_state.ge_window_rect), ("Dope Sheet", app.windows_state.ds_window_rect)] {
+            let rect = rect.unwrap_or_else(|| panic!("{name} was not shown"));
+            assert!(content.contains_rect(rect), "{name} is off screen: {rect:?} outside {content:?}");
+        }
+    }
+}

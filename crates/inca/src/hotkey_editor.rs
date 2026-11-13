@@ -26,17 +26,21 @@ pub enum Scope {
     Application,
     Viewport,
     Hypershade,
+    GraphEditor,
+    DopeSheet,
     UvEditor,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 4] = [Scope::Application, Scope::Viewport, Scope::Hypershade, Scope::UvEditor];
+    pub const ALL: [Scope; 6] = [Scope::Application, Scope::Viewport, Scope::Hypershade, Scope::GraphEditor, Scope::DopeSheet, Scope::UvEditor];
 
     pub fn label(self) -> &'static str {
         match self {
             Scope::Application => "Application",
             Scope::Viewport => "Viewport",
             Scope::Hypershade => "Hypershade",
+            Scope::GraphEditor => "Graph Editor",
+            Scope::DopeSheet => "Dope Sheet",
             Scope::UvEditor => "UV Editor",
         }
     }
@@ -46,6 +50,8 @@ impl Scope {
             Scope::Application => "",
             Scope::Viewport => "viewport",
             Scope::Hypershade => "hypershade",
+            Scope::GraphEditor => "graph",
+            Scope::DopeSheet => "dope",
             Scope::UvEditor => "uv",
         }
     }
@@ -56,7 +62,7 @@ fn scope_key(scope: Scope, chord: &str) -> String {
 }
 
 fn parse_key(key: &str) -> (Scope, &str) {
-    for scope in [Scope::Viewport, Scope::Hypershade, Scope::UvEditor] {
+    for scope in [Scope::Viewport, Scope::Hypershade, Scope::GraphEditor, Scope::DopeSheet, Scope::UvEditor] {
         if let Some(rest) = key.strip_prefix(scope.prefix()).and_then(|r| r.strip_prefix(':')) {
             return (scope, rest);
         }
@@ -76,6 +82,12 @@ pub fn active_scope(app: &IncaApp, ctx: &egui::Context) -> Scope {
     }
     if app.win.hypershade && app.windows_state.hs.window_rect.is_some_and(|r| r.contains(p)) {
         return Scope::Hypershade;
+    }
+    if app.win.graph_editor && app.windows_state.ge_window_rect.is_some_and(|r| r.contains(p)) {
+        return Scope::GraphEditor;
+    }
+    if app.win.dope_sheet && app.windows_state.ds_window_rect.is_some_and(|r| r.contains(p)) {
+        return Scope::DopeSheet;
     }
     if app.vps.iter().any(|v| v.rect.contains(p)) {
         return Scope::Viewport;
@@ -405,8 +417,8 @@ pub fn resolve(app: &IncaApp, key: Key, m: Modifiers, scope: Scope) -> Option<St
         return press.then(|| id.to_string());
     }
     let a = crate::actions::hotkey(key, m, app)?;
-    // The Hypershade owns Delete for graph nodes and wires; don't also delete scene objects.
-    if scope == Scope::Hypershade && matches!(a, "deleteSel" | "deleteEdgeVertex") {
+    // These editors own Delete for keys/nodes/wires; don't also delete scene objects.
+    if matches!(scope, Scope::Hypershade | Scope::GraphEditor | Scope::DopeSheet) && matches!(a, "deleteSel" | "deleteEdgeVertex") {
         return None;
     }
     let (press, _) = default_directions(a, &c);
@@ -2230,8 +2242,37 @@ mod tests {
         assert_eq!(scope_key(Scope::Viewport, "Ctrl+W"), "viewport:Ctrl+W");
         assert_eq!(parse_key("viewport:Ctrl+W"), (Scope::Viewport, "Ctrl+W"));
         assert_eq!(parse_key("hypershade:Q"), (Scope::Hypershade, "Q"));
+        assert_eq!(parse_key("graph:F"), (Scope::GraphEditor, "F"));
+        assert_eq!(parse_key("dope:Del"), (Scope::DopeSheet, "Del"));
         assert_eq!(parse_key("uv:F"), (Scope::UvEditor, "F"));
         assert_eq!(parse_key("unbind:copy"), (Scope::Application, "unbind:copy"));
+    }
+
+    fn scope_at(ctx: &egui::Context, app: &IncaApp, pos: egui::Pos2, time: f64) -> Scope {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+        raw.time = Some(time);
+        raw.events = vec![egui::Event::PointerMoved(pos)];
+        let mut scope = Scope::Application;
+        let mut out = ctx.run_ui(raw, |ui| scope = active_scope(app, ui.ctx()));
+        out.textures_delta.clear();
+        scope
+    }
+
+    #[test]
+    fn editor_windows_activate_their_scopes() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(500.0, 400.0));
+        app.win.graph_editor = true;
+        app.windows_state.ge_window_rect = Some(rect);
+        assert_eq!(scope_at(&ctx, &app, rect.center(), 0.0), Scope::GraphEditor);
+        app.win.graph_editor = false;
+        app.win.dope_sheet = true;
+        app.windows_state.ds_window_rect = Some(rect);
+        assert_eq!(scope_at(&ctx, &app, rect.center(), 0.2), Scope::DopeSheet);
     }
 
     #[test]
