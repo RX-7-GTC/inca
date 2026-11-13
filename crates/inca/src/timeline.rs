@@ -17,6 +17,14 @@ fn fmt(t: f64) -> String {
 }
 
 pub fn time_slider(app: &mut IncaApp, ui: &mut egui::Ui) {
+    if (ui.input(|i| i.modifiers.ctrl || i.modifiers.command)) && ui.rect_contains_pointer(ui.max_rect()) {
+        if ui.input(|i| i.key_pressed(egui::Key::C)) {
+            app.action("timelineCopy");
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::V)) {
+            app.action("timelinePaste");
+        }
+    }
     ui.horizontal_centered(|ui| {
         let ctl_w = 250.0;
         let w = (ui.available_width() - ctl_w).max(100.0);
@@ -176,7 +184,7 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
     resp.context_menu(|ui| time_menu(app, ui));
 }
 
-fn key_range(app: &IncaApp) -> (f64, f64) {
+pub(crate) fn key_range(app: &IncaApp) -> (f64, f64) {
     match app.range_sel {
         Some((a, b)) => (a.min(b), a.max(b)),
         None => (app.s.time.current, app.s.time.current),
@@ -271,12 +279,12 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.close();
     }
     if ui.button("Copy").clicked() {
-        copy_keys(app, lo, hi);
+        app.action("timelineCopy");
         ui.close();
     }
     ui.menu_button("Paste", |ui| {
         if ui.add_enabled(!app.key_clip.is_empty(), egui::Button::new("Paste")).clicked() {
-            paste_keys(app);
+            app.action("timelinePaste");
             ui.close();
         }
     });
@@ -337,6 +345,14 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
 }
 
 pub fn range_slider(app: &mut IncaApp, ui: &mut egui::Ui) {
+    if (ui.input(|i| i.modifiers.ctrl || i.modifiers.command)) && ui.rect_contains_pointer(ui.max_rect()) {
+        if ui.input(|i| i.key_pressed(egui::Key::C)) {
+            app.action("timelineCopy");
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::V)) {
+            app.action("timelinePaste");
+        }
+    }
     // Measure the fixed controls so the bar gets exactly the leftover width. A constant reserve
     // under-reserves when the numeric fields get wider, and a floating window then grows by the
     // shortfall every frame.

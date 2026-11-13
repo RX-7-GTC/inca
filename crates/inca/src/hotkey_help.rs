@@ -331,6 +331,8 @@ pub fn describe(id: &str) -> Option<&'static str> {
         "dopeFrameSelected" => "Frames the selected objects' keys in the Dope Sheet.",
         "dopeFrameAll" => "Frames every key in the Dope Sheet.",
         "dopeDeleteKeys" => "Deletes keys at the current time in the Dope Sheet.",
+        "timelineCopy" => "Copies keys in the selected timeline range, or at the current time.",
+        "timelinePaste" => "Pastes timeline keys at the current time.",
         "renderView" => "Opens the Render View.",
         "renderSettings" => "Opens the Render Settings window.",
         "preferences" => "Opens Inca's preferences.",

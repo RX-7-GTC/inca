@@ -28,11 +28,12 @@ pub enum Scope {
     Hypershade,
     GraphEditor,
     DopeSheet,
+    Timeline,
     UvEditor,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 6] = [Scope::Application, Scope::Viewport, Scope::Hypershade, Scope::GraphEditor, Scope::DopeSheet, Scope::UvEditor];
+    pub const ALL: [Scope; 7] = [Scope::Application, Scope::Viewport, Scope::Hypershade, Scope::GraphEditor, Scope::DopeSheet, Scope::Timeline, Scope::UvEditor];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -41,6 +42,7 @@ impl Scope {
             Scope::Hypershade => "Hypershade",
             Scope::GraphEditor => "Graph Editor",
             Scope::DopeSheet => "Dope Sheet",
+            Scope::Timeline => "Timeline",
             Scope::UvEditor => "UV Editor",
         }
     }
@@ -52,6 +54,7 @@ impl Scope {
             Scope::Hypershade => "hypershade",
             Scope::GraphEditor => "graph",
             Scope::DopeSheet => "dope",
+            Scope::Timeline => "timeline",
             Scope::UvEditor => "uv",
         }
     }
@@ -62,7 +65,7 @@ fn scope_key(scope: Scope, chord: &str) -> String {
 }
 
 fn parse_key(key: &str) -> (Scope, &str) {
-    for scope in [Scope::Viewport, Scope::Hypershade, Scope::GraphEditor, Scope::DopeSheet, Scope::UvEditor] {
+    for scope in [Scope::Viewport, Scope::Hypershade, Scope::GraphEditor, Scope::DopeSheet, Scope::Timeline, Scope::UvEditor] {
         if let Some(rest) = key.strip_prefix(scope.prefix()).and_then(|r| r.strip_prefix(':')) {
             return (scope, rest);
         }
@@ -88,6 +91,9 @@ pub fn active_scope(app: &IncaApp, ctx: &egui::Context) -> Scope {
     }
     if app.win.dope_sheet && app.windows_state.ds_window_rect.is_some_and(|r| r.contains(p)) {
         return Scope::DopeSheet;
+    }
+    if app.windows_state.timeline_rect.is_some_and(|r| r.contains(p)) {
+        return Scope::Timeline;
     }
     if app.vps.iter().any(|v| v.rect.contains(p)) {
         return Scope::Viewport;
@@ -376,6 +382,7 @@ fn default_scope(id: &str) -> Scope {
     match id {
         "graphFrameSelected" | "graphFrameAll" | "graphDeleteKey" | "graphCopy" | "graphPaste" => Scope::GraphEditor,
         "dopeFrameSelected" | "dopeFrameAll" | "dopeDeleteKeys" => Scope::DopeSheet,
+        "timelineCopy" | "timelinePaste" => Scope::Timeline,
         "snapGrid" | "snapCurve" | "snapPoint"
         | "frameAll" | "frameSelected" | "frameAllAll" | "frameSelectedAll"
         | "undoView" | "redoView" | "defaultView"
@@ -2280,6 +2287,7 @@ mod tests {
         assert_eq!(parse_key("hypershade:Q"), (Scope::Hypershade, "Q"));
         assert_eq!(parse_key("graph:F"), (Scope::GraphEditor, "F"));
         assert_eq!(parse_key("dope:Del"), (Scope::DopeSheet, "Del"));
+        assert_eq!(parse_key("timeline:Ctrl+C"), (Scope::Timeline, "Ctrl+C"));
         assert_eq!(parse_key("uv:F"), (Scope::UvEditor, "F"));
         assert_eq!(parse_key("unbind:copy"), (Scope::Application, "unbind:copy"));
     }
@@ -2301,6 +2309,8 @@ mod tests {
         let ctrl = Modifiers { ctrl: true, ..Default::default() };
         assert_eq!(resolve(&app, Key::C, ctrl, Scope::GraphEditor), Some("graphCopy".into()));
         assert_eq!(resolve(&app, Key::V, ctrl, Scope::GraphEditor), Some("graphPaste".into()));
+        assert_eq!(resolve(&app, Key::C, ctrl, Scope::Timeline), Some("timelineCopy".into()));
+        assert_eq!(resolve(&app, Key::V, ctrl, Scope::Timeline), Some("timelinePaste".into()));
         assert_eq!(resolve(&app, Key::C, ctrl, Scope::Application), Some("copy".into()));
         assert_eq!(resolve(&app, Key::F, none, Scope::Viewport), Some("frameSelected".into()));
     }
@@ -2327,9 +2337,14 @@ mod tests {
         app.windows_state.ge_window_rect = Some(rect);
         assert_eq!(scope_at(&ctx, &app, rect.center(), 0.0), Scope::GraphEditor);
         app.win.graph_editor = false;
+        app.windows_state.ge_window_rect = None;
         app.win.dope_sheet = true;
         app.windows_state.ds_window_rect = Some(rect);
         assert_eq!(scope_at(&ctx, &app, rect.center(), 0.2), Scope::DopeSheet);
+        app.win.dope_sheet = false;
+        app.windows_state.ds_window_rect = None;
+        app.windows_state.timeline_rect = Some(rect);
+        assert_eq!(scope_at(&ctx, &app, rect.center(), 0.4), Scope::Timeline);
     }
 
     #[test]
@@ -2347,6 +2362,9 @@ mod tests {
         assert_eq!(ds.get("F").map(|(id, _, _)| id.as_str()), Some("dopeFrameSelected"));
         assert_eq!(ds.get("A").map(|(id, _, _)| id.as_str()), Some("dopeFrameAll"));
         assert_eq!(ds.get("Del").map(|(id, _, _)| id.as_str()), Some("dopeDeleteKeys"));
+        let tl = binding_map(&app, Scope::Timeline);
+        assert_eq!(tl.get("Ctrl+C").map(|(id, _, _)| id.as_str()), Some("timelineCopy"));
+        assert_eq!(tl.get("Ctrl+V").map(|(id, _, _)| id.as_str()), Some("timelinePaste"));
     }
 
     #[test]

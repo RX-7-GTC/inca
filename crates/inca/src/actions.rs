@@ -226,6 +226,8 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("graphDeleteKey", "Graph Editor: Delete Selected Keys", "Del"),
     ("graphCopy", "Graph Editor: Copy Keys", "Ctrl+C"),
     ("graphPaste", "Graph Editor: Paste Keys", "Ctrl+V"),
+    ("timelineCopy", "Timeline: Copy Keys", "Ctrl+C"),
+    ("timelinePaste", "Timeline: Paste Keys", "Ctrl+V"),
     ("dopeFrameSelected", "Dope Sheet: Frame Selected", "F"),
     ("dopeFrameAll", "Dope Sheet: Frame All", "A"),
     ("dopeDeleteKeys", "Dope Sheet: Delete Keys", "Del"),
@@ -723,12 +725,35 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             app.action("deleteSel");
         }
         "copyKeys" => {
-            let ks = app.s.anim.key_times(&app.s.sel);
-            if let (Some(a), Some(b)) = (ks.first().copied(), ks.last().copied()) {
-                crate::timeline::copy_keys(app, a, b);
+            if app.win.graph_editor && !app.windows_state.ge_keys.is_empty() {
+                crate::windows::copy_selected_keys(app);
+            } else {
+                let ks = app.s.anim.key_times(&app.s.sel);
+                if let (Some(a), Some(b)) = (ks.first().copied(), ks.last().copied()) {
+                    crate::timeline::copy_keys(app, a, b);
+                    app.windows_state.key_clip_kind = crate::windows::KeyClipKind::Timeline;
+                    app.windows_state.key_clipboard_marker = true;
+                    let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+                    app.help = format!("Copied {n} timeline key{}", if n == 1 { "" } else { "s" });
+                }
             }
         }
-        "pasteKeys" => crate::timeline::paste_keys(app),
+        "pasteKeys" => {
+            let kind = app.windows_state.key_clip_kind;
+            if kind == crate::windows::KeyClipKind::Graph && !app.windows_state.ge_clipboard.is_empty() {
+                crate::windows::paste_keys(app);
+            } else if kind == crate::windows::KeyClipKind::Timeline && !app.key_clip.is_empty() {
+                let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+                crate::timeline::paste_keys(app);
+                app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
+            } else if app.win.graph_editor && !app.windows_state.ge_keys.is_empty() && !app.windows_state.ge_clipboard.is_empty() {
+                crate::windows::paste_keys(app);
+            } else {
+                let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+                crate::timeline::paste_keys(app);
+                app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
+            }
+        }
         "bakeKeys" => crate::edit_cmds::bake(app),
         "createGhost" => crate::anim_extras::ghost(app),
         "dynamicsReset" => {
@@ -854,12 +879,19 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
                 let data: Vec<serde_json::Value> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).map(|i| app.s.serialize_node(&i)).collect();
                 let n = data.len();
                 app.clipboard = Some(serde_json::Value::Array(data));
+                app.windows_state.key_clip_kind = crate::windows::KeyClipKind::None;
+                app.windows_state.key_clipboard_marker = true;
                 app.help = format!("Copied {n} object{}", if n == 1 { "" } else { "s" });
             }
         }
         "paste" => {
-            if app.win.graph_editor && !app.windows_state.ge_keys.is_empty() && !app.windows_state.ge_clipboard.is_empty() {
+            let kind = app.windows_state.key_clip_kind;
+            if kind == crate::windows::KeyClipKind::Graph && !app.windows_state.ge_clipboard.is_empty() {
                 crate::windows::paste_keys(app);
+            } else if kind == crate::windows::KeyClipKind::Timeline && !app.key_clip.is_empty() {
+                let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+                crate::timeline::paste_keys(app);
+                app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
             } else if let Some(serde_json::Value::Array(list)) = app.clipboard.clone() {
                 app.s.checkpoint("paste");
                 let mut map = std::collections::HashMap::new();
@@ -1162,6 +1194,19 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "dopeFrameSelected" => crate::windows::dope_frame(app, true),
         "dopeFrameAll" => crate::windows::dope_frame(app, false),
         "dopeDeleteKeys" => crate::windows::delete_keys_at_current_time(app),
+        "timelineCopy" => {
+            let (lo, hi) = crate::timeline::key_range(app);
+            crate::timeline::copy_keys(app, lo, hi);
+            app.windows_state.key_clipboard_marker = true;
+            app.windows_state.key_clip_kind = crate::windows::KeyClipKind::Timeline;
+            let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+            app.help = format!("Copied {n} timeline key{}", if n == 1 { "" } else { "s" });
+        }
+        "timelinePaste" => {
+            let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+            crate::timeline::paste_keys(app);
+            app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
+        }
         "renderView" => app.win.render_view = !app.win.render_view,
         "renderSettings" => app.win.render_settings = !app.win.render_settings,
         "preferences" => app.win.prefs = !app.win.prefs,

@@ -65,6 +65,14 @@ pub struct RenderJob {
     pub camera: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyClipKind {
+    #[default]
+    None,
+    Graph,
+    Timeline,
+}
+
 #[derive(Default)]
 pub struct WinState {
     /// dope sheet key drag: (node, time grabbed, current offset)
@@ -86,6 +94,10 @@ pub struct WinState {
     pub ge_clipboard: Vec<(String, f64, inca_core::anim::Key)>,
     /// Last copy/paste status shown in the Graph Editor.
     pub ge_status: Option<String>,
+    /// Set after copying keys so the next frame can put a marker on the OS clipboard.
+    pub key_clipboard_marker: bool,
+    /// Which key clipboard was copied last.
+    pub key_clip_kind: KeyClipKind,
     /// Screen position of the first visible key, used by the in-app UI tests.
     pub ge_first_key_screen: Option<egui::Pos2>,
     /// Pending Graph Editor frame request: 1 = selected, 2 = all.
@@ -96,6 +108,8 @@ pub struct WinState {
     pub ge_window_rect: Option<egui::Rect>,
     /// Last drawn Dope Sheet window rect, used to activate its hotkey scope.
     pub ds_window_rect: Option<egui::Rect>,
+    /// Docked Time Slider / Range Slider rect, used to activate the Timeline scope.
+    pub timeline_rect: Option<egui::Rect>,
     /// Windows already seen open last frame, windows seen this frame, and those needing a recenter.
     pub window_seen: std::collections::HashSet<egui::Id>,
     pub window_seen_now: std::collections::HashSet<egui::Id>,
@@ -760,6 +774,8 @@ pub(crate) fn copy_selected_keys(app: &mut IncaApp) {
     }
     let n = clip.len();
     app.windows_state.ge_clipboard = clip;
+    app.windows_state.key_clipboard_marker = true;
+    app.windows_state.key_clip_kind = KeyClipKind::Graph;
     let msg = format!("Copied {n} key{}", if n == 1 { "" } else { "s" });
     app.windows_state.ge_status = Some(msg.clone());
     app.help = msg;
@@ -870,6 +886,14 @@ fn nearest_graph_key(app: &IncaApp, shown: &[String], tf: &egui_plot::PlotTransf
 
 fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use egui_plot::{Line, Plot, PlotPoints, Points};
+    if (ui.input(|i| i.modifiers.ctrl || i.modifiers.command)) && ui.rect_contains_pointer(ui.max_rect()) {
+        if ui.input(|i| i.key_pressed(egui::Key::C)) {
+            copy_selected_keys(app);
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::V)) {
+            paste_keys(app);
+        }
+    }
     let curves: Vec<(String, String, String)> = app.s.anim.curves.iter().filter(|(_, c)| app.s.sel.contains(&c.node) && !c.keys.is_empty()).map(|(k, c)| (k.clone(), app.s.name_of(&c.node), c.attr.clone())).collect();
     let status = app.windows_state.ge_status.clone();
     ui.horizontal(|ui| {
@@ -1092,6 +1116,8 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let alt = ui.input(|i| i.modifiers.alt);
         let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
         if r.clicked() || r.drag_started() {
+            app.hk.capturing = false;
+            app.hk.pending = None;
             if let Some(id) = ui.ctx().memory(|m| m.focused()) {
                 ui.ctx().memory_mut(|m| m.surrender_focus(id));
             }

@@ -1143,24 +1143,51 @@ impl IncaApp {
             self.end_holds();
         }
         self.was_focused = focused;
+        if self.windows_state.key_clipboard_marker {
+            ctx.copy_text("Inca clipboard".to_string());
+            self.windows_state.key_clipboard_marker = false;
+        }
         // clicked buttons and the viewport take keyboard focus in egui; only text fields should keep it
         if let Some(id) = ctx.memory(|m| m.focused()) {
             if egui::text_edit::TextEditState::load(ctx, id).is_none() {
                 ctx.memory_mut(|m| m.surrender_focus(id));
             }
         }
-        if ctx.egui_wants_keyboard_input() || crate::uv_editor::wants_keys(self, ctx) {
+        // The Hotkey Editor owns the next key press while assigning a shortcut.
+        let scope = crate::hotkey_editor::active_scope(self, ctx);
+        // egui-winit turns Ctrl+C/Ctrl+V into clipboard events rather than key events.
+        let copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy) || matches!(e, egui::Event::Key { key: egui::Key::C, pressed: true, repeat: false, modifiers, .. } if modifiers.ctrl || modifiers.command)));
+        let paste = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)) || matches!(e, egui::Event::Key { key: egui::Key::V, pressed: true, repeat: false, modifiers, .. } if modifiers.ctrl || modifiers.command)));
+        let editor_scope = matches!(scope, crate::hotkey_editor::Scope::GraphEditor | crate::hotkey_editor::Scope::Timeline);
+        if (copy || paste) && (editor_scope || !ctx.egui_wants_keyboard_input()) {
+            self.hk.capturing = false;
+            self.hk.pending = None;
+            if copy {
+                match scope {
+                    crate::hotkey_editor::Scope::GraphEditor => self.action("graphCopy"),
+                    crate::hotkey_editor::Scope::Timeline => self.action("timelineCopy"),
+                    _ => self.action("copy"),
+                }
+            }
+            if paste {
+                match self.windows_state.key_clip_kind {
+                    crate::windows::KeyClipKind::Graph if !self.windows_state.ge_clipboard.is_empty() => self.action("graphPaste"),
+                    crate::windows::KeyClipKind::Timeline if !self.key_clip.is_empty() => self.action("timelinePaste"),
+                    _ => self.action("paste"),
+                }
+            }
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Copy | egui::Event::Paste(_)) && !matches!(e, egui::Event::Key { key: egui::Key::C | egui::Key::V, pressed: true, repeat: false, modifiers, .. } if modifiers.ctrl || modifiers.command)));
+        }
+        if self.win.hotkeys && self.hk.capturing {
             self.end_holds();
             return;
         }
-        // The Hotkey Editor owns the next key press while assigning a shortcut.
-        if self.win.hotkeys && self.hk.capturing {
+        if ctx.egui_wants_keyboard_input() || crate::uv_editor::wants_keys(self, ctx) {
             self.end_holds();
             return;
         }
         let events = ctx.input(|i| i.events.clone());
         let now = ctx.input(|i| i.time);
-        let scope = crate::hotkey_editor::active_scope(self, ctx);
         for e in &events {
             // Space: a tap toggles single/four view, holding it opens the hotbox
             if let egui::Event::Key { key: egui::Key::Space, pressed, repeat: false, modifiers, .. } = e {
@@ -1389,6 +1416,7 @@ impl eframe::App for IncaApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.windows_state.window_seen_now.clear();
+        self.windows_state.timeline_rect = None;
         crate::marking::block_pointer(self, &ctx);
         // files dropped on the window open (.inca) or import (everything else)
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
@@ -1456,6 +1484,7 @@ impl eframe::App for IncaApp {
         if self.shown("rangeslider") && !self.detached.contains("rangeslider") {
             egui::Panel::bottom("range").exact_size(26.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| {
                 let rect = ui.max_rect();
+                self.windows_state.timeline_rect = Some(self.windows_state.timeline_rect.map_or(rect, |old| old.union(rect)));
                 egui::Frame::NONE.inner_margin(egui::Margin { left: 4, right: 0, top: 0, bottom: 0 }).show(ui, |ui| timeline::range_slider(self, ui));
                 panel_grip_left(self, ui, "rangeslider", rect);
             });
@@ -1463,6 +1492,7 @@ impl eframe::App for IncaApp {
         if self.shown("timeslider") && !self.detached.contains("timeslider") {
             egui::Panel::bottom("timeslider").exact_size(36.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| {
                 let rect = ui.max_rect();
+                self.windows_state.timeline_rect = Some(self.windows_state.timeline_rect.map_or(rect, |old| old.union(rect)));
                 egui::Frame::NONE.inner_margin(egui::Margin { left: 4, right: 0, top: 0, bottom: 0 }).show(ui, |ui| timeline::time_slider(self, ui));
                 panel_grip_left(self, ui, "timeslider", rect);
             });
@@ -1545,12 +1575,12 @@ mod tests {
         app.win.graph_editor = true;
         app.windows_state.ge_window_rect = Some(egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)));
 
-        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(egui::pos2(200.0, 200.0)), key_event(egui::Key::C, true, true)]), |ui| app.hotkeys(ui.ctx()));
+        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(egui::pos2(200.0, 200.0)), egui::Event::Copy]), |ui| app.hotkeys(ui.ctx()));
         out.textures_delta.clear();
         assert!(!app.windows_state.ge_clipboard.is_empty(), "Ctrl+C did not copy keys");
 
         app.s.time.current = 20.0;
-        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(egui::pos2(200.0, 200.0)), key_event(egui::Key::V, true, true)]), |ui| app.hotkeys(ui.ctx()));
+        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(egui::pos2(200.0, 200.0)), egui::Event::Paste("Inca keyframes".into())]), |ui| app.hotkeys(ui.ctx()));
         out.textures_delta.clear();
         let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
         assert_eq!(times, vec![1.0, 10.0, 20.0], "Ctrl+V did not paste at the current time");
@@ -1573,7 +1603,7 @@ mod tests {
             out.textures_delta.clear();
         }
         let rect = app.windows_state.ge_window_rect.expect("Graph Editor window rect");
-        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(rect.center()), key_event(egui::Key::C, true, true)]), |ui| app.hotkeys(ui.ctx()));
+        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(rect.center()), egui::Event::Copy]), |ui| app.hotkeys(ui.ctx()));
         out.textures_delta.clear();
         assert!(app.help.starts_with("Copied"), "help line was {:?}", app.help);
     }
@@ -1630,13 +1660,59 @@ mod tests {
         run(&mut app, &mut frame, vec![pointer_button(pos, true)]);
         run(&mut app, &mut frame, vec![pointer_button(pos, false)]);
         assert!(!app.windows_state.ge_keys.is_empty(), "click did not select a key");
-        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(pos), key_event(egui::Key::C, true, true)]);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(pos), egui::Event::Copy]);
         assert!(!app.windows_state.ge_clipboard.is_empty(), "Ctrl+C did not copy a key; help={:?}", app.help);
         app.s.time.current = 20.0;
         let bottom = egui::pos2(800.0, 950.0);
-        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(bottom), key_event(egui::Key::V, true, true)]);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(bottom), egui::Event::Paste("Inca keyframes".into())]);
         let ck = app.s.anim.curves.keys().find(|k| k.contains("translateX")).expect("curve").clone();
         let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
         assert!(times.contains(&20.0), "Ctrl+V did not paste at the current time: {times:?}");
+    }
+
+    #[test]
+    fn timeline_copy_paste_actions_work() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.keymap.clear();
+        app.run_mel("test", "polyCube; setKeyframe -at translateX -t 10 -v 0; setKeyframe -at translateX -t 10 -v 1;").expect("scene setup");
+        app.s.time.current = 10.0;
+        app.action("timelineCopy");
+        assert!(!app.key_clip.is_empty(), "timeline copy produced no clip");
+        app.s.time.current = 20.0;
+        app.action("timelinePaste");
+        let ck = app.s.anim.curves.keys().find(|k| k.contains("translateX")).expect("curve").clone();
+        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        assert!(times.contains(&20.0), "timeline paste did not create a key at 20: {times:?}");
+    }
+
+    #[test]
+    fn graph_ctrl_c_works_with_text_focus() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.keymap.clear();
+        let ck = inca_core::anim::Anim::key("pCube1", "translateX");
+        let mut curve = inca_core::anim::AnimCurve::new("pCube1", "translateX");
+        curve.set_key(1.0, 0.0, "linear");
+        curve.set_key(10.0, 1.0, "linear");
+        app.s.anim.curves.insert(ck.clone(), curve);
+        app.windows_state.ge_keys = vec![(ck, 0)];
+        app.win.graph_editor = true;
+        app.windows_state.ge_window_rect = Some(egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)));
+        let mut text = String::new();
+        let mut out = ctx.run_ui(raw_with(vec![]), |ui| {
+            ui.text_edit_singleline(&mut text).request_focus();
+        });
+        out.textures_delta.clear();
+        assert!(ctx.egui_wants_keyboard_input(), "text field should have focus");
+        app.hk.capturing = true;
+        let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(egui::pos2(200.0, 200.0)), egui::Event::Copy]), |ui| app.hotkeys(ui.ctx()));
+        out.textures_delta.clear();
+        assert!(!app.windows_state.ge_clipboard.is_empty(), "Ctrl+C was swallowed by text focus");
+        assert!(!app.hk.capturing, "editor copy should cancel hotkey capture");
     }
 }
