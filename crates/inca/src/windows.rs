@@ -830,24 +830,29 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let span = ymax - ymin;
         let pad = if empty { 0.0 } else if span < 1e-6 { ymax.abs().max(1.0) * 0.01 } else { span * 0.1 };
         let (y0, y1) = (ymin - pad, ymax + pad);
-        let (mut xmin, mut xmax) = (t0, t1);
+        let (mut kx0, mut kx1) = (f64::INFINITY, f64::NEG_INFINITY);
         for k in &shown {
             if let Some(c) = app.s.anim.curves.get(k) {
                 if let Some(first) = c.keys.first() {
-                    xmin = xmin.min(first.t);
+                    kx0 = kx0.min(first.t);
                 }
                 if let Some(last) = c.keys.last() {
-                    xmax = xmax.max(last.t);
+                    kx1 = kx1.max(last.t);
                 }
             }
         }
-        let (x0, x1) = (xmin - 10.0, xmax + 10.0);
+        let (x0, x1) = if kx0.is_finite() && kx1.is_finite() {
+            let pad = ((kx1 - kx0) * 0.05).max(2.0);
+            (kx0 - pad, kx1 + pad)
+        } else {
+            (t0, t1)
+        };
         // F frames the selected key, or all visible curves; with nothing selected it returns to
         // Maya's default graph view.
         let frame_req = app.windows_state.ge_frame.take();
         let key_bounds = app.windows_state.ge_key.as_ref().and_then(|(ck, ki)| {
             app.s.anim.curves.get(ck).and_then(|c| c.keys.get(*ki)).map(|k| {
-                let xpad = ((x1 - x0) * 0.1).max(5.0);
+                let xpad = ((x1 - x0) * 0.1).max(2.0);
                 let ypad = ((y1 - y0) * 0.1).max(1.0);
                 egui_plot::PlotBounds::from_min_max([k.t - xpad, k.v - ypad], [k.t + xpad, k.v + ypad])
             })
