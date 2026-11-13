@@ -791,13 +791,51 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
         if !ymin.is_finite() || !ymax.is_finite() || ymax < ymin {
-            ymin = -1.0;
-            ymax = 1.0;
+            ymin = -1.5;
+            ymax = 1.5;
         }
+        let empty = shown.is_empty();
         let span = ymax - ymin;
-        let pad = if span < 1e-6 { ymax.abs().max(1.0) * 0.01 } else { span * 0.1 };
+        let pad = if empty { 0.0 } else if span < 1e-6 { ymax.abs().max(1.0) * 0.01 } else { span * 0.1 };
         let (y0, y1) = (ymin - pad, ymax + pad);
-        let resp = Plot::new("graph").include_y(y0).include_y(y1).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_double_click_reset(true).show(ui, |pu| {
+        let (mut xmin, mut xmax) = (t0, t1);
+        for k in &shown {
+            if let Some(c) = app.s.anim.curves.get(k) {
+                if let Some(first) = c.keys.first() {
+                    xmin = xmin.min(first.t);
+                }
+                if let Some(last) = c.keys.last() {
+                    xmax = xmax.max(last.t);
+                }
+            }
+        }
+        let (x0, x1) = (xmin - 10.0, xmax + 10.0);
+        // F frames the selected key, or all visible curves; with nothing selected it returns to
+        // Maya's default graph view.
+        let frame = ui.rect_contains_pointer(ui.max_rect()) && !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::F));
+        let frame_bounds = if frame {
+            if let Some((ck, ki)) = app.windows_state.ge_key.as_ref() {
+                app.s.anim.curves.get(ck).and_then(|c| c.keys.get(*ki)).map(|k| {
+                    let xpad = ((x1 - x0) * 0.1).max(5.0);
+                    let ypad = ((y1 - y0) * 0.1).max(1.0);
+                    egui_plot::PlotBounds::from_min_max([k.t - xpad, k.v - ypad], [k.t + xpad, k.v + ypad])
+                })
+            } else if shown.is_empty() {
+                Some(egui_plot::PlotBounds::from_min_max([t0, -1.5], [t1, 1.5]))
+            } else {
+                Some(egui_plot::PlotBounds::from_min_max([x0, y0], [x1, y1]))
+            }
+        } else {
+            None
+        };
+        let mut plot = Plot::new("graph").include_y(y0).include_y(y1).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_double_click_reset(true);
+        if empty {
+            plot = plot.default_x_bounds(t0, t1.max(t0 + 1.0)).default_y_bounds(-1.5, 1.5);
+        }
+        let resp = plot.show(ui, |pu| {
+            if let Some(bounds) = frame_bounds {
+                pu.set_plot_bounds(bounds);
+            }
             for (i, k) in shown.iter().enumerate() {
                 let c = &app.s.anim.curves[k];
                 let col = match c.attr.chars().last() {
