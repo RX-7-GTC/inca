@@ -311,6 +311,77 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
             None => app.win.rename = Some(name),
         }
     }
+    floating(app, ctx);
+}
+
+/// Main panels undocked from the frame, shown as floating windows. Closing the window or
+/// clicking Dock returns the panel to the main layout.
+fn floating(app: &mut IncaApp, ctx: &egui::Context) {
+    const PANELS: &[(&str, &str, [f32; 2], [f32; 2])] = &[
+        ("shelf", "Shelf", [300.0, 120.0], [720.0, 96.0]),
+        ("toolbox", "Tool Box", [300.0, 240.0], [64.0, 420.0]),
+        ("outliner", "Outliner", [380.0, 240.0], [300.0, 420.0]),
+        ("rightpanel", "Attribute Editor / Channel Box", [800.0, 180.0], [360.0, 620.0]),
+        ("timeslider", "Time Slider", [300.0, 700.0], [720.0, 110.0]),
+        ("rangeslider", "Range Slider", [300.0, 590.0], [900.0, 120.0]),
+        ("cmdline", "Command Line", [300.0, 810.0], [720.0, 110.0]),
+    ];
+    let mut dock = None;
+    for &(id, title, pos, size) in PANELS {
+        let visible = match id {
+            "outliner" => app.show_outliner,
+            "rightpanel" => app.show_right,
+            _ => app.shown(id),
+        };
+        if !visible {
+            app.detached.remove(id);
+            continue;
+        }
+        if !app.detached.contains(id) {
+            continue;
+        }
+        let mut open = true;
+        let gen = app.detach_gen.get(id).copied().unwrap_or(0);
+        let pos = app.detach_pos.get(id).copied().unwrap_or(egui::pos2(pos[0], pos[1]));
+        let mut window = egui::Window::new(title)
+            // v3: discard any size persisted before the range-bar width feedback fix.
+            .id(egui::Id::new(("floating_panel_v3", id, gen)))
+            .default_pos(pos)
+            .default_size(size)
+            .resizable(true)
+            .constrain(false)
+            .open(&mut open);
+        if app.drag_panel == Some(id) {
+            if let Some(p) = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) {
+                window = window.fixed_pos(p);
+            }
+            if !ctx.input(|i| i.pointer.primary_down()) {
+                app.drag_panel = None;
+            }
+        }
+        window.show(ctx, |ui| {
+            if ui.button("Dock").clicked() {
+                dock = Some(id);
+            }
+            ui.separator();
+            match id {
+                "shelf" => crate::toolbar::shelf(app, ui),
+                "toolbox" => crate::toolbar::tool_box(app, ui),
+                "outliner" => crate::panels::outliner(app, ui),
+                "rightpanel" => crate::panels::right_panel(app, ui),
+                "timeslider" => crate::timeline::time_slider(app, ui),
+                "rangeslider" => crate::timeline::range_slider(app, ui),
+                "cmdline" => crate::timeline::command_line(app, ui),
+                _ => {}
+            }
+        });
+        if !open {
+            dock = Some(id);
+        }
+    }
+    if let Some(id) = dock {
+        app.detached.remove(id);
+    }
 }
 
 // ------------------------------------------------------------------ script editor

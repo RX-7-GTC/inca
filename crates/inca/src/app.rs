@@ -180,6 +180,14 @@ pub struct IncaApp {
     pub right_tab: RightTab,
     pub show_right: bool,
     pub show_outliner: bool,
+    /// Main panels currently undocked into floating windows.
+    pub detached: HashSet<&'static str>,
+    /// Where each panel was dragged out, and a generation for a fresh floating window.
+    pub detach_pos: HashMap<&'static str, egui::Pos2>,
+    pub detach_gen: HashMap<&'static str, u64>,
+    /// Panel whose floating window should follow the pointer until release.
+    pub drag_panel: Option<&'static str>,
+
     /// Material or texture selected in the Hypershade/Hypergraph. Mutually exclusive with
     /// `s.sel`, like Maya's single selection: one Attribute Editor target at a time.
     pub snode_sel: Option<String>,
@@ -351,6 +359,14 @@ impl IncaApp {
     pub fn shown(&self, element: &str) -> bool {
         !self.hidden.contains(element)
     }
+
+    pub fn detach_panel(&mut self, panel: &'static str, pos: Option<egui::Pos2>) {
+        self.detached.insert(panel);
+        if let Some(p) = pos {
+            self.detach_pos.insert(panel, p);
+        }
+        *self.detach_gen.entry(panel).or_default() += 1;
+    }
     /// The manipulator tool the settings/marking menus act on (the active manip tool, or the
     /// last one when another tool is active).
     pub fn manip_tool(&self) -> Tool {
@@ -434,6 +450,10 @@ impl IncaApp {
             show_right: cc.storage.and_then(|s| eframe::get_value(s, "showRight")).unwrap_or(true),
             snode_sel: None,
             show_outliner: cc.storage.and_then(|s| eframe::get_value(s, "showOutliner")).unwrap_or(false),
+            detached: Default::default(),
+            detach_pos: Default::default(),
+            detach_gen: Default::default(),
+            drag_panel: None,
             hidden: cc.storage.and_then(|s| eframe::get_value(s, "hiddenUi")).unwrap_or_default(),
             ui_stash: None,
             workspace: cc.storage.and_then(|s| eframe::get_value(s, "workspace")).unwrap_or_else(|| "Maya Classic".into()),
@@ -1038,6 +1058,22 @@ impl IncaApp {
     pub fn action(&mut self, id: &str) {
         self.open_menu = None;
         self.hotbox = None;
+        let panel = match id {
+            "panelShelf" => Some("shelf"),
+            "panelToolbox" => Some("toolbox"),
+            "panelOutliner" => Some("outliner"),
+            "panelRight" => Some("rightpanel"),
+            "panelTimeslider" => Some("timeslider"),
+            "panelRangeslider" => Some("rangeslider"),
+            "panelCmdline" => Some("cmdline"),
+            _ => None,
+        };
+        if let Some(panel) = panel {
+            if !self.detached.remove(panel) {
+                self.detach_panel(panel, None);
+            }
+            return;
+        }
         if let Some(cmd) = self.runtime_cmds.iter().find(|c| c.id == id) {
             let label = cmd.label.clone();
             let script = cmd.script.clone();
@@ -1258,7 +1294,50 @@ impl IncaApp {
     }
 }
 
+/// Maya's double-dotted grip on a horizontal bar: drag it out to undock.
+fn panel_grip_left(app: &mut IncaApp, ui: &mut egui::Ui, panel: &'static str, content: egui::Rect) {
+    let rect = egui::Rect::from_min_size(content.left_top() - egui::vec2(3.0, 0.0), egui::vec2(3.0, content.height()));
+    let resp = ui.interact(rect, ui.id().with(("grip_left", panel)), egui::Sense::drag());
+    let painter = ui.painter().with_clip_rect(ui.clip_rect().union(rect));
+    let color = theme::TEXT_DIM;
+    let mut y = rect.top() + 2.0;
+    while y < rect.bottom() - 1.0 {
+        painter.circle_filled(egui::pos2(rect.center().x - 0.5, y), 0.6, color);
+        painter.circle_filled(egui::pos2(rect.center().x + 0.5, y), 0.6, color);
+        y += 4.0;
+    }
+    let resp = resp.on_hover_cursor(egui::CursorIcon::Grab);
+    if resp.dragged() && resp.drag_delta().length() > 10.0 {
+        let pos = ui.ctx().pointer_interact_pos().or_else(|| ui.ctx().input(|i| i.pointer.hover_pos()));
+        app.detach_panel(panel, pos);
+        app.drag_panel = Some(panel);
+    }
+}
+
+/// The grip on a vertical panel.
+fn panel_grip_top(app: &mut IncaApp, ui: &mut egui::Ui, panel: &'static str) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::drag());
+    let color = theme::TEXT_DIM;
+    let mut x = rect.left() + 3.0;
+    while x < rect.right() - 2.0 {
+        ui.painter().circle_filled(egui::pos2(x, rect.center().y - 1.0), 0.7, color);
+        ui.painter().circle_filled(egui::pos2(x, rect.center().y + 1.0), 0.7, color);
+        x += 4.0;
+    }
+    let resp = resp.on_hover_cursor(egui::CursorIcon::Grab);
+    if resp.dragged() && resp.drag_delta().length() > 10.0 {
+        let pos = ui.ctx().pointer_interact_pos().or_else(|| ui.ctx().input(|i| i.pointer.hover_pos()));
+        app.detach_panel(panel, pos);
+        app.drag_panel = Some(panel);
+    }
+}
+
 impl eframe::App for IncaApp {
+    fn persist_egui_memory(&self) -> bool {
+        // Test runs must not overwrite the user's real window layout.
+        self.test.is_none()
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         // Test runs must not overwrite the user's real preferences and keymaps.
         if self.test.is_some() {
@@ -1352,32 +1431,57 @@ impl eframe::App for IncaApp {
         if self.shown("statusline") {
             egui::Panel::top("statusline").exact_size(28.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| toolbar::status_line(self, ui));
         }
-        if self.shown("shelf") {
-            egui::Panel::top("shelf").exact_size(64.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| toolbar::shelf(self, ui));
+        if self.shown("shelf") && !self.detached.contains("shelf") {
+            egui::Panel::top("shelf").exact_size(64.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| {
+                let rect = ui.max_rect();
+                egui::Frame::NONE.inner_margin(egui::Margin { left: 4, right: 0, top: 0, bottom: 0 }).show(ui, |ui| toolbar::shelf(self, ui));
+                panel_grip_left(self, ui, "shelf", rect);
+            });
         }
         if self.shown("helpline") {
             egui::Panel::bottom("helpline").exact_size(20.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| timeline::help_line(self, ui));
         }
-        if self.shown("cmdline") {
-            egui::Panel::bottom("cmdline").exact_size(24.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| timeline::command_line(self, ui));
+        if self.shown("cmdline") && !self.detached.contains("cmdline") {
+            egui::Panel::bottom("cmdline").exact_size(24.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| {
+                let rect = ui.max_rect();
+                egui::Frame::NONE.inner_margin(egui::Margin { left: 4, right: 0, top: 0, bottom: 0 }).show(ui, |ui| timeline::command_line(self, ui));
+                panel_grip_left(self, ui, "cmdline", rect);
+            });
         }
-        if self.shown("rangeslider") {
-            egui::Panel::bottom("range").exact_size(26.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| timeline::range_slider(self, ui));
+        if self.shown("rangeslider") && !self.detached.contains("rangeslider") {
+            egui::Panel::bottom("range").exact_size(26.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| {
+                let rect = ui.max_rect();
+                egui::Frame::NONE.inner_margin(egui::Margin { left: 4, right: 0, top: 0, bottom: 0 }).show(ui, |ui| timeline::range_slider(self, ui));
+                panel_grip_left(self, ui, "rangeslider", rect);
+            });
         }
-        if self.shown("timeslider") {
-            egui::Panel::bottom("timeslider").exact_size(36.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| timeline::time_slider(self, ui));
+        if self.shown("timeslider") && !self.detached.contains("timeslider") {
+            egui::Panel::bottom("timeslider").exact_size(36.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| {
+                let rect = ui.max_rect();
+                egui::Frame::NONE.inner_margin(egui::Margin { left: 4, right: 0, top: 0, bottom: 0 }).show(ui, |ui| timeline::time_slider(self, ui));
+                panel_grip_left(self, ui, "timeslider", rect);
+            });
         }
-        if self.shown("toolbox") {
-            egui::Panel::left("toolbox").exact_size(38.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| toolbar::tool_box(self, ui));
+        if self.shown("toolbox") && !self.detached.contains("toolbox") {
+            egui::Panel::left("toolbox").exact_size(38.0).resizable(false).frame(theme::bar_frame()).show(ui, |ui| {
+                panel_grip_top(self, ui, "toolbox");
+                toolbar::tool_box(self, ui);
+            });
         }
-        if self.show_outliner {
-            egui::Panel::left("outlinerWindow").default_size(220.0).frame(theme::panel_frame()).show(ui, |ui| panels::outliner(self, ui));
+        if self.show_outliner && !self.detached.contains("outliner") {
+            egui::Panel::left("outlinerWindow").default_size(220.0).frame(theme::panel_frame()).show(ui, |ui| {
+                panel_grip_top(self, ui, "outliner");
+                panels::outliner(self, ui);
+            });
         }
         if self.shown("sidetabs") {
             egui::Panel::right("sidetabs").exact_size(20.0).resizable(false).frame(egui::Frame::NONE.fill(theme::BG2).stroke(egui::Stroke::new(1.0, theme::LINE))).show(ui, |ui| panels::side_tabs(self, ui));
         }
-        if self.show_right {
-            egui::Panel::right("rightpanel").default_size(300.0).min_size(220.0).frame(theme::panel_frame()).show(ui, |ui| panels::right_panel(self, ui));
+        if self.show_right && !self.detached.contains("rightpanel") {
+            egui::Panel::right("rightpanel").default_size(300.0).min_size(220.0).frame(theme::panel_frame()).show(ui, |ui| {
+                panel_grip_top(self, ui, "rightpanel");
+                panels::right_panel(self, ui);
+            });
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::BG_DARK)).show(ui, |ui| vp_ui::viewports(self, ui, frame));
         windows::show(self, &ctx, frame);
