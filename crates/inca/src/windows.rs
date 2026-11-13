@@ -779,7 +779,25 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let cur = app.s.time.current;
         let shown: Vec<String> = curves.iter().filter(|c| !app.windows_state.ge_curves.contains(&c.0)).map(|c| c.0.clone()).collect();
         let selected_key = app.windows_state.ge_key.clone();
-        let resp = Plot::new("graph").allow_drag(false).allow_double_click_reset(true).show(ui, |pu| {
+        // A single key or a flat curve gives egui_plot a zero-height y range, which makes it show
+        // raw values like 217.13609496869865 at the axis limits. Pad the visible range.
+        let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
+        for k in &shown {
+            if let Some(c) = app.s.anim.curves.get(k) {
+                for key in &c.keys {
+                    ymin = ymin.min(key.v);
+                    ymax = ymax.max(key.v);
+                }
+            }
+        }
+        if !ymin.is_finite() || !ymax.is_finite() || ymax < ymin {
+            ymin = -1.0;
+            ymax = 1.0;
+        }
+        let span = ymax - ymin;
+        let pad = if span < 1e-6 { ymax.abs().max(1.0) * 0.01 } else { span * 0.1 };
+        let (y0, y1) = (ymin - pad, ymax + pad);
+        let resp = Plot::new("graph").include_y(y0).include_y(y1).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_double_click_reset(true).show(ui, |pu| {
             for (i, k) in shown.iter().enumerate() {
                 let c = &app.s.anim.curves[k];
                 let col = match c.attr.chars().last() {
