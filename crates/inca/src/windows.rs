@@ -90,6 +90,13 @@ pub struct WinState {
     pub ge_drag_anchor: Option<(f64, f64)>,
     /// Marquee origin in screen coordinates while box-selecting.
     pub ge_box: Option<egui::Pos2>,
+    /// Scale-keys tool and drag state.
+    pub ge_scale: bool,
+    pub ge_scaling: bool,
+    pub ge_scale_pivot: Option<(f64, f64)>,
+    pub ge_scale_factors: (f64, f64),
+    /// Tangent handle being dragged: -1 = in, +1 = out.
+    pub ge_tan_drag: Option<i8>,
     /// Copied Graph Editor keys: source curve, original time, key data.
     pub ge_clipboard: Vec<(String, f64, inca_core::anim::Key)>,
     /// Last copy/paste status shown in the Graph Editor.
@@ -884,6 +891,39 @@ fn nearest_graph_key(app: &IncaApp, shown: &[String], tf: &egui_plot::PlotTransf
     best.map(|b| (b.1, b.2))
 }
 
+/// Screen positions of the selected key and its in/out tangent handles.
+fn graph_tangent_handles(app: &IncaApp, tf: &egui_plot::PlotTransform, selected: &[(String, usize)]) -> Option<(egui::Pos2, egui::Pos2, egui::Pos2)> {
+    if selected.len() != 1 {
+        return None;
+    }
+    let (ck, ki) = &selected[0];
+    let c = app.s.anim.curves.get(ck)?;
+    let key = c.keys.get(*ki)?;
+    let kp = tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v));
+    let left = tf.value_from_position(kp - egui::vec2(36.0, 0.0));
+    let right = tf.value_from_position(kp + egui::vec2(36.0, 0.0));
+    let in_dx = (key.t - left.x).abs().max(1e-6);
+    let out_dx = (right.x - key.t).abs().max(1e-6);
+    let in_slope = if key.it == "fixed" { key.is } else { (key.v - c.eval(key.t - 0.01)) / 0.01 };
+    let out_slope = if key.ot == "fixed" { key.os } else { (c.eval(key.t + 0.01) - key.v) / 0.01 };
+    let ip = tf.position_from_point(&egui_plot::PlotPoint::new(key.t - in_dx, key.v - in_slope * in_dx));
+    let op = tf.position_from_point(&egui_plot::PlotPoint::new(key.t + out_dx, key.v + out_slope * out_dx));
+    Some((kp, ip, op))
+}
+
+fn graph_selection_pivot(app: &IncaApp) -> Option<(f64, f64)> {
+    let (mut t0, mut t1, mut v0, mut v1) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for (ck, ki) in &app.windows_state.ge_keys {
+        if let Some(k) = app.s.anim.curves.get(ck).and_then(|c| c.keys.get(*ki)) {
+            t0 = t0.min(k.t);
+            t1 = t1.max(k.t);
+            v0 = v0.min(k.v);
+            v1 = v1.max(k.v);
+        }
+    }
+    (t0.is_finite() && t1.is_finite()).then_some(((t0 + t1) * 0.5, (v0 + v1) * 0.5))
+}
+
 fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use egui_plot::{Line, Plot, PlotPoints, Points};
     if (ui.input(|i| i.modifiers.ctrl || i.modifiers.command)) && ui.rect_contains_pointer(ui.max_rect()) {
@@ -901,6 +941,11 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             ui.label(RichText::new(status).color(theme::TEXT_DIM));
             ui.separator();
         }
+        if ui.selectable_label(app.windows_state.ge_scale, "Scale").on_hover_text("Scale selected keys (R)").clicked() {
+            app.windows_state.ge_scale = !app.windows_state.ge_scale;
+            app.windows_state.ge_scaling = false;
+        }
+        ui.separator();
         let selected_count = app.windows_state.ge_keys.len();
         if let Some((ck, ki)) = app.windows_state.ge_keys.first().cloned() {
             if selected_count > 1 {
@@ -1130,15 +1175,31 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         if !alt {
         if r.drag_started() {
             if let Some(pp) = r.interact_pointer_pos() {
-                if let Some((ck, ki)) = nearest_graph_key(app, &shown, &tf, pp) {
+                let handle_side = if app.windows_state.ge_scale {
+                    None
+                } else {
+                    graph_tangent_handles(app, &tf, &app.windows_state.ge_keys)
+                        .and_then(|(_, ip, op)| if ip.distance(pp) < 7.0 { Some(-1) } else if op.distance(pp) < 7.0 { Some(1) } else { None })
+                };
+                if let Some(side) = handle_side {
+                    app.s.checkpoint("key tangents");
+                    app.windows_state.ge_tan_drag = Some(side);
+                    app.windows_state.ge_drag = false;
+                    app.windows_state.ge_box = None;
+                } else if let Some((ck, ki)) = nearest_graph_key(app, &shown, &tf, pp) {
                     if additive {
                         ge_toggle(app, &ck, ki);
                     } else if !ge_selected(app, &ck, ki) {
                         ge_select_only(app, &ck, ki);
                     }
                     if ge_selected(app, &ck, ki) {
-                        app.s.checkpoint("move keys");
+                        let scaling = app.windows_state.ge_scale;
+                        let pivot = if scaling { graph_selection_pivot(app) } else { None };
+                        app.s.checkpoint(if scaling { "scale keys" } else { "move keys" });
                         app.windows_state.ge_drag = true;
+                        app.windows_state.ge_scaling = pivot.is_some();
+                        app.windows_state.ge_scale_pivot = pivot;
+                        app.windows_state.ge_scale_factors = (1.0, 1.0);
                         app.windows_state.ge_drag_anchor = pointer.map(|p| (p.x, p.y));
                         let keys = app.windows_state.ge_keys.clone();
                         app.windows_state.ge_drag_keys = keys
@@ -1146,10 +1207,12 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             .filter_map(|(k, i)| app.s.anim.curves.get(&k).and_then(|c| c.keys.get(i)).map(|key| (k, i, key.t, key.v)))
                             .collect();
                         app.windows_state.ge_box = None;
+                        app.windows_state.ge_tan_drag = None;
                     }
                 } else {
                     app.windows_state.ge_box = Some(pp);
                     app.windows_state.ge_drag = false;
+                    app.windows_state.ge_tan_drag = None;
                     app.windows_state.ge_drag_keys.clear();
                 }
             }
@@ -1166,35 +1229,78 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             }
         }
-        if r.dragged() && app.windows_state.ge_drag {
-            if let (Some((ax, ay)), Some(p)) = (app.windows_state.ge_drag_anchor, pointer) {
-                let raw_dt = (p.x - ax).round();
-                let dv = p.y - ay;
-                let mut dt_min = f64::NEG_INFINITY;
-                let mut dt_max = f64::INFINITY;
-                for (ck, ki, t0k, _) in &app.windows_state.ge_drag_keys {
-                    if let Some(c) = app.s.anim.curves.get(ck) {
-                        let selected: std::collections::HashSet<usize> = app.windows_state.ge_drag_keys.iter().filter(|(k, _, _, _)| k == ck).map(|(_, i, _, _)| *i).collect();
-                        if let Some(prev) = (0..*ki).rev().find(|i| !selected.contains(i)) {
-                            dt_min = dt_min.max(c.keys[prev].t - *t0k + 1.0);
+        if r.dragged() {
+            if let Some(side) = app.windows_state.ge_tan_drag {
+                if let Some(p) = pointer {
+                    if let Some((ck, ki)) = app.windows_state.ge_keys.first().cloned() {
+                        if let Some(c) = app.s.anim.curves.get_mut(&ck) {
+                            if let Some(key) = c.keys.get_mut(ki) {
+                                let dx = if side < 0 { key.t - p.x } else { p.x - key.t };
+                                if dx.abs() > 1e-6 {
+                                    let slope = if side < 0 { (key.v - p.y) / dx } else { (p.y - key.v) / dx };
+                                    if side < 0 {
+                                        key.it = "fixed".into();
+                                        key.is = slope;
+                                    } else {
+                                        key.ot = "fixed".into();
+                                        key.os = slope;
+                                    }
+                                }
+                            }
                         }
-                        if let Some(next) = (*ki + 1..c.keys.len()).find(|i| !selected.contains(i)) {
-                            dt_max = dt_max.min(c.keys[next].t - *t0k - 1.0);
-                        }
+                        app.s.apply_anim();
+                        app.s.touch();
                     }
                 }
-                let dt = if dt_min <= dt_max { raw_dt.clamp(dt_min, dt_max) } else { 0.0 };
-                let keys = app.windows_state.ge_drag_keys.clone();
-                for (ck, ki, t0k, v0k) in keys {
-                    if let Some(c) = app.s.anim.curves.get_mut(&ck) {
-                        if let Some(key) = c.keys.get_mut(ki) {
-                            key.t = t0k + dt;
-                            key.v = v0k + dv;
+            } else if app.windows_state.ge_drag {
+                if let (Some((ax, ay)), Some(p)) = (app.windows_state.ge_drag_anchor, pointer) {
+                    if app.windows_state.ge_scaling {
+                        if let Some((pt, pv)) = app.windows_state.ge_scale_pivot {
+                            let sx = ((p.x - ax) / 60.0).exp().clamp(0.01, 100.0);
+                            let sy = ((p.y - ay) / 60.0).exp().clamp(0.01, 100.0);
+                            app.windows_state.ge_scale_factors = (sx, sy);
+                            let keys = app.windows_state.ge_drag_keys.clone();
+                            for (ck, ki, t0, v0) in keys {
+                                if let Some(c) = app.s.anim.curves.get_mut(&ck) {
+                                    if let Some(key) = c.keys.get_mut(ki) {
+                                        key.t = pt + (t0 - pt) * sx;
+                                        key.v = pv + (v0 - pv) * sy;
+                                    }
+                                }
+                            }
+                            app.s.apply_anim();
+                            app.s.touch();
                         }
+                    } else {
+                        let raw_dt = (p.x - ax).round();
+                        let dv = p.y - ay;
+                        let mut dt_min = f64::NEG_INFINITY;
+                        let mut dt_max = f64::INFINITY;
+                        for (ck, ki, t0k, _) in &app.windows_state.ge_drag_keys {
+                            if let Some(c) = app.s.anim.curves.get(ck) {
+                                let selected: std::collections::HashSet<usize> = app.windows_state.ge_drag_keys.iter().filter(|(k, _, _, _)| k == ck).map(|(_, i, _, _)| *i).collect();
+                                if let Some(prev) = (0..*ki).rev().find(|i| !selected.contains(i)) {
+                                    dt_min = dt_min.max(c.keys[prev].t - *t0k + 1.0);
+                                }
+                                if let Some(next) = (*ki + 1..c.keys.len()).find(|i| !selected.contains(i)) {
+                                    dt_max = dt_max.min(c.keys[next].t - *t0k - 1.0);
+                                }
+                            }
+                        }
+                        let dt = if dt_min <= dt_max { raw_dt.clamp(dt_min, dt_max) } else { 0.0 };
+                        let keys = app.windows_state.ge_drag_keys.clone();
+                        for (ck, ki, t0k, v0k) in keys {
+                            if let Some(c) = app.s.anim.curves.get_mut(&ck) {
+                                if let Some(key) = c.keys.get_mut(ki) {
+                                    key.t = t0k + dt;
+                                    key.v = v0k + dv;
+                                }
+                            }
+                        }
+                        app.s.apply_anim();
+                        app.s.touch();
                     }
                 }
-                app.s.apply_anim();
-                app.s.touch();
             }
         }
         if let Some(start) = app.windows_state.ge_box {
@@ -1202,6 +1308,16 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 theme::marquee(&ui.painter_at(r.rect), egui::Rect::from_two_pos(start, end));
             }
         }
+        }
+        if !app.windows_state.ge_scale {
+            if let Some((kp, ip, op)) = graph_tangent_handles(app, &tf, &selected_keys) {
+                let p = ui.painter_at(r.rect);
+                let col = Color32::from_rgb(220, 180, 80);
+                p.line_segment([kp, ip], egui::Stroke::new(1.0, col));
+                p.line_segment([kp, op], egui::Stroke::new(1.0, col));
+                p.circle_filled(ip, 3.0, col);
+                p.circle_filled(op, 3.0, col);
+            }
         }
         if r.drag_stopped() {
             if let Some(start) = app.windows_state.ge_box.take() {
@@ -1222,6 +1338,38 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                 }
             }
+            if app.windows_state.ge_scaling {
+                let (sx, sy) = app.windows_state.ge_scale_factors;
+                let pivot = app.windows_state.ge_scale_pivot;
+                let keys = app.windows_state.ge_drag_keys.clone();
+                let affected: std::collections::HashSet<String> = keys.iter().map(|(ck, _, _, _)| ck.clone()).collect();
+                for ck in &affected {
+                    if let Some(c) = app.s.anim.curves.get_mut(ck) {
+                        c.sort();
+                    }
+                }
+                let mut selected = Vec::new();
+                if let Some((pt, pv)) = pivot {
+                    for (ck, _, t0, v0) in &keys {
+                        let nt = pt + (t0 - pt) * sx;
+                        let nv = pv + (v0 - pv) * sy;
+                        if let Some(c) = app.s.anim.curves.get(ck) {
+                            if let Some(i) = c.find(nt) {
+                                if (c.keys[i].v - nv).abs() < 1e-4 {
+                                    selected.push((ck.clone(), i));
+                                }
+                            }
+                        }
+                    }
+                }
+                app.windows_state.ge_keys = selected;
+                app.s.apply_anim();
+                app.s.touch();
+            }
+            app.windows_state.ge_tan_drag = None;
+            app.windows_state.ge_scaling = false;
+            app.windows_state.ge_scale_pivot = None;
+            app.windows_state.ge_scale_factors = (1.0, 1.0);
             app.windows_state.ge_drag = false;
             app.windows_state.ge_drag_anchor = None;
             app.windows_state.ge_drag_keys.clear();
@@ -1762,6 +1910,18 @@ mod tests {
         let mut selected: Vec<f64> = app.windows_state.ge_keys.iter().filter(|(k, _)| k == &ck).map(|(_, i)| app.s.anim.curves[&ck].keys[*i].t).collect();
         selected.sort_by(|a, b| a.total_cmp(b));
         assert_eq!(selected, vec![20.0, 29.0]);
+    }
+
+    #[test]
+    fn graph_scale_mode_toggles() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        app.action("graphScaleKeys");
+        assert!(app.windows_state.ge_scale);
+        app.action("graphSelectKeys");
+        assert!(!app.windows_state.ge_scale);
     }
 
     #[test]

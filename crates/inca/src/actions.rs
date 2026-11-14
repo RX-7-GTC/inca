@@ -226,6 +226,8 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("graphDeleteKey", "Graph Editor: Delete Selected Keys", "Del"),
     ("graphCopy", "Graph Editor: Copy Keys", "Ctrl+C"),
     ("graphPaste", "Graph Editor: Paste Keys", "Ctrl+V"),
+    ("graphScaleKeys", "Graph Editor: Scale Keys", "R"),
+    ("graphSelectKeys", "Graph Editor: Select Keys", "Q"),
     ("timelineCopy", "Timeline: Copy Keys", "Ctrl+C"),
     ("timelinePaste", "Timeline: Paste Keys", "Ctrl+V"),
     ("dopeFrameSelected", "Dope Sheet: Frame Selected", "F"),
@@ -1191,6 +1193,15 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "graphDeleteKey" => crate::windows::delete_selected_keys(app),
         "graphCopy" => crate::windows::copy_selected_keys(app),
         "graphPaste" => crate::windows::paste_keys(app),
+        "graphScaleKeys" => {
+            app.windows_state.ge_scale = !app.windows_state.ge_scale;
+            app.windows_state.ge_scaling = false;
+            app.help = if app.windows_state.ge_scale { "Scale Keys: ON".into() } else { "Scale Keys: OFF".into() };
+        }
+        "graphSelectKeys" => {
+            app.windows_state.ge_scale = false;
+            app.windows_state.ge_scaling = false;
+        }
         "dopeFrameSelected" => crate::windows::dope_frame(app, true),
         "dopeFrameAll" => crate::windows::dope_frame(app, false),
         "dopeDeleteKeys" => crate::windows::delete_keys_at_current_time(app),

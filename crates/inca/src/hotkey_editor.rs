@@ -380,7 +380,7 @@ fn is_snap_action(id: &str) -> bool {
 /// the viewport; tool and application commands stay global.
 fn default_scope(id: &str) -> Scope {
     match id {
-        "graphFrameSelected" | "graphFrameAll" | "graphDeleteKey" | "graphCopy" | "graphPaste" => Scope::GraphEditor,
+        "graphFrameSelected" | "graphFrameAll" | "graphDeleteKey" | "graphCopy" | "graphPaste" | "graphScaleKeys" | "graphSelectKeys" => Scope::GraphEditor,
         "dopeFrameSelected" | "dopeFrameAll" | "dopeDeleteKeys" => Scope::DopeSheet,
         "timelineCopy" | "timelinePaste" => Scope::Timeline,
         "snapGrid" | "snapCurve" | "snapPoint"
@@ -2309,6 +2309,8 @@ mod tests {
         let ctrl = Modifiers { ctrl: true, ..Default::default() };
         assert_eq!(resolve(&app, Key::C, ctrl, Scope::GraphEditor), Some("graphCopy".into()));
         assert_eq!(resolve(&app, Key::V, ctrl, Scope::GraphEditor), Some("graphPaste".into()));
+        assert_eq!(resolve(&app, Key::R, none, Scope::GraphEditor), Some("graphScaleKeys".into()));
+        assert_eq!(resolve(&app, Key::Q, none, Scope::GraphEditor), Some("graphSelectKeys".into()));
         assert_eq!(resolve(&app, Key::C, ctrl, Scope::Timeline), Some("timelineCopy".into()));
         assert_eq!(resolve(&app, Key::V, ctrl, Scope::Timeline), Some("timelinePaste".into()));
         assert_eq!(resolve(&app, Key::C, ctrl, Scope::Application), Some("copy".into()));
