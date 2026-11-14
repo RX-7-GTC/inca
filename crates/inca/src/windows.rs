@@ -565,6 +565,9 @@ fn floating(app: &mut IncaApp, ctx: &egui::Context) {
             .resizable(true)
             .constrain(false)
             .open(&mut open);
+        if id == "rightpanel" {
+            window = window.min_width(crate::app::RIGHT_PANEL_MIN_W);
+        }
         if app.drag_panel == Some(id) {
             if let Some(p) = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())) {
                 window = window.fixed_pos(p);

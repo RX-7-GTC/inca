@@ -598,6 +598,7 @@ pub fn side_tabs(app: &mut IncaApp, ui: &mut egui::Ui) {
 }
 
 pub fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
+    ui.set_min_width(crate::app::RIGHT_PANEL_MIN_W);
     if app.shown("sidetabs") {
         // the side tabs switch panels; show the panel's title like the JS dock
         let title = SIDE_TABS.iter().find(|t| t.0 == Some(app.right_tab)).map(|t| t.1).unwrap_or("");
@@ -2225,7 +2226,7 @@ pub fn ae_copies(app: &mut IncaApp, ctx: &egui::Context) {
         let mut open = true;
         let wid = egui::Id::new(("aecopy", i, &id, tab));
         let _ = crate::windows::place_window(app, ctx, wid, open, |app, fix| {
-            let mut window = egui::Window::new(format!("Attribute Editor: {title}")).id(wid).open(&mut open).default_size([380.0, 520.0]).constrain(false);
+            let mut window = egui::Window::new(format!("Attribute Editor: {title}")).id(wid).open(&mut open).default_size([380.0, 520.0]).min_width(crate::app::RIGHT_PANEL_MIN_W).constrain(false);
             if let Some(p) = fix {
                 window = window.fixed_pos(p);
             }

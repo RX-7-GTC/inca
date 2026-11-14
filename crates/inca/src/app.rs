@@ -135,6 +135,10 @@ pub enum RightTab {
     ModelingToolkit,
 }
 
+/// Minimum width of the right dock (Channel Box / Attribute Editor). Below this the panel bar
+/// wraps and the channel fields run into the viewport/other UI.
+pub(crate) const RIGHT_PANEL_MIN_W: f32 = 320.0;
+
 /// UI-side commands raised while MEL runs (tools, windows, viewports).
 #[derive(Default)]
 pub struct UiHost {
@@ -1513,7 +1517,7 @@ impl eframe::App for IncaApp {
             egui::Panel::right("sidetabs").exact_size(20.0).resizable(false).frame(egui::Frame::NONE.fill(theme::BG2).stroke(egui::Stroke::new(1.0, theme::LINE))).show(ui, |ui| panels::side_tabs(self, ui));
         }
         if self.show_right && !self.detached.contains("rightpanel") {
-            egui::Panel::right("rightpanel").default_size(300.0).min_size(220.0).frame(theme::panel_frame()).show(ui, |ui| {
+            egui::Panel::right("rightpanel").default_size(RIGHT_PANEL_MIN_W).min_size(RIGHT_PANEL_MIN_W).frame(theme::panel_frame()).show(ui, |ui| {
                 panel_grip_top(self, ui, "rightpanel");
                 panels::right_panel(self, ui);
             });
