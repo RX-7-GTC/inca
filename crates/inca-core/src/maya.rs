@@ -441,6 +441,7 @@ pub fn import_ma(s: &mut Scene, src: &str) -> Result<Vec<Id>, String> {
     let f = parse(src);
     let unit = f.linear_scale;
     let ang = |a: [f64; 3]| if f.angle_rad { a.map(f64::to_degrees) } else { a };
+    let ang1 = |v: f64| if f.angle_rad { v.to_degrees() } else { v };
     let mut dag: HashMap<String, Id> = HashMap::new();
     let mut made: Vec<Id> = vec![];
     let shape_of: HashMap<&str, &MaNode> = f.nodes.iter().filter(|n| n.parent.is_some() && matches!(n.ty.as_str(), "mesh" | "camera" | "nurbsCurve" | "locator") || LIGHTS.contains(&n.ty.as_str())).map(|n| (n.parent.as_deref().unwrap_or(""), n)).collect();
@@ -616,6 +617,49 @@ pub fn import_ma(s: &mut Scene, src: &str) -> Result<Vec<Id>, String> {
         if let Some(ro) = n.f(&["ro", "rotateOrder"]) {
             x.ro = ["xyz", "yzx", "zxy", "xzy", "yxz", "zyx"][(ro as usize).min(5)].into();
         }
+        if let Some(ra) = n.v3(&["ra", "rotateAxis"]) {
+            x.ra = ang(ra);
+        }
+        if let Some(sh) = n.v3(&["sh", "shear"]) {
+            x.sh = sh;
+        }
+        if let Some(it) = n.s(&["it", "inheritsTransform"]) {
+            x.it = !matches!(it.as_str(), "no" | "0" | "false" | "off");
+        }
+        if let Some(a) = n.get(&["opm", "offsetParentMatrix"]) {
+            let v: Vec<f64> = a.vals.iter().filter_map(|s| s.parse().ok()).collect();
+            if v.len() >= 16 {
+                let mut m = [[0.0; 4]; 4];
+                for i in 0..4 {
+                    m[i][i] = 1.0;
+                }
+                for r in 0..4 {
+                    for c in 0..4 {
+                        m[c][r] = v[r * 4 + c];
+                    }
+                }
+                for i in 0..3 {
+                    m[3][i] *= unit;
+                }
+                x.opm = m;
+            }
+        }
+        for (prefix, lim) in [("", &mut x.lim.translate), ("R", &mut x.lim.rotate), ("S", &mut x.lim.scale)] {
+            for (i, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                if let Some(v) = n.f(&[format!("limit{prefix}{axis}Min").as_str()]) {
+                    lim.min[i] = if prefix == "R" { ang1(v) } else { v * unit };
+                }
+                if let Some(v) = n.f(&[format!("limit{prefix}{axis}Max").as_str()]) {
+                    lim.max[i] = if prefix == "R" { ang1(v) } else { v * unit };
+                }
+                let en = format!("limit{prefix}{axis}Enable");
+                if let Some(v) = n.s(&[en.as_str()]) {
+                    lim.on = matches!(v.as_str(), "yes" | "1" | "true" | "on");
+                } else if let Some(v) = n.f(&[en.as_str()]) {
+                    lim.on = v != 0.0;
+                }
+            }
+        }
         if n.s(&["v", "visibility"]).is_some_and(|v| v == "no" || v == "0" || v == "off") {
             s.nodes.get_mut(&id).unwrap().visible = false;
         }
@@ -701,6 +745,20 @@ fn n(x: f64) -> String {
     if x == 0.0 { "0".into() } else { format!("{x}") }
 }
 
+fn write_limit(o: &mut String, prefix: &str, lim: &crate::scene::Limit) {
+    let (def_min, def_max) = if prefix == "R" { (-360.0, 360.0) } else { (-1.0e6, 1.0e6) };
+    if !lim.on && lim.min == [def_min; 3] && lim.max == [def_max; 3] {
+        return;
+    }
+    for (i, axis) in ["X", "Y", "Z"].iter().enumerate() {
+        let _ = writeln!(o, "\tsetAttr \".limit{prefix}{axis}Min\" {} ;", n(lim.min[i]));
+        let _ = writeln!(o, "\tsetAttr \".limit{prefix}{axis}Max\" {} ;", n(lim.max[i]));
+    }
+    for axis in ["X", "Y", "Z"] {
+        let _ = writeln!(o, "\tsetAttr \".limit{prefix}{axis}Enable\" {} ;", if lim.on { 1 } else { 0 });
+    }
+}
+
 /// Write the scene (or the selection) as Maya ASCII.
 pub fn export_ma(s: &Scene, sel_only: bool) -> String {
     let mut o = String::new();
@@ -734,10 +792,31 @@ pub fn export_ma(s: &Scene, sel_only: bool) -> String {
         if x.jo != [0.0; 3] {
             let _ = writeln!(o, "\tsetAttr \".jo\" -type \"double3\" {} {} {} ;", n(x.jo[0]), n(x.jo[1]), n(x.jo[2]));
         }
+        if x.ra != [0.0; 3] {
+            let _ = writeln!(o, "\tsetAttr \".ra\" -type \"double3\" {} {} {} ;", n(x.ra[0]), n(x.ra[1]), n(x.ra[2]));
+        }
+        if x.sh != [0.0; 3] {
+            let _ = writeln!(o, "\tsetAttr \".sh\" -type \"double3\" {} {} {} ;", n(x.sh[0]), n(x.sh[1]), n(x.sh[2]));
+        }
+        if !x.it {
+            let _ = writeln!(o, "\tsetAttr \".it\" no;");
+        }
+        if x.opm != [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]] {
+            let mut vals = Vec::with_capacity(16);
+            for r in 0..4 {
+                for c in 0..4 {
+                    vals.push(n(x.opm[c][r]));
+                }
+            }
+            let _ = writeln!(o, "\tsetAttr \".opm\" -type \"matrix\" {} ;", vals.join(" "));
+        }
         if x.p != [0.0; 3] {
             let _ = writeln!(o, "\tsetAttr \".rp\" -type \"double3\" {} {} {} ;", n(x.p[0]), n(x.p[1]), n(x.p[2]));
             let _ = writeln!(o, "\tsetAttr \".sp\" -type \"double3\" {} {} {} ;", n(x.p[0]), n(x.p[1]), n(x.p[2]));
         }
+        write_limit(&mut o, "", &x.lim.translate);
+        write_limit(&mut o, "R", &x.lim.rotate);
+        write_limit(&mut o, "S", &x.lim.scale);
         if let Some(ro) = ["xyz", "yzx", "zxy", "xzy", "yxz", "zyx"].iter().position(|r| *r == x.ro).filter(|r| *r != 0) {
             let _ = writeln!(o, "\tsetAttr \".ro\" {ro};");
         }
@@ -1021,6 +1100,36 @@ connectAttr "pCube1_translateX.o" "pCube1.tx";
         let bx = t.find("box").unwrap();
         assert_eq!(t.node(&bx).unwrap().xf.r[1], 30.0);
         assert_eq!(t.anim.curves.values().filter(|c| c.node == bx).count(), 1);
+    }
+
+    #[test]
+    fn transform_extras_round_trip() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let r = crate::scene::NodeRef::Dag(id.clone());
+        s.set_attr(&r, "shearXY", json!(0.25));
+        s.set_attr(&r, "rotateAxisZ", json!(12.0));
+        s.set_attr(&r, "inheritsTransform", json!(0));
+        s.set_attr(&r, "limitXEnable", json!(1));
+        s.set_attr(&r, "limitXMin", json!(-2.0));
+        s.set_attr(&r, "limitXMax", json!(2.0));
+        let mut opm = [[0.0; 4]; 4];
+        for i in 0..4 {
+            opm[i][i] = 1.0;
+        }
+        opm[3][0] = 5.0;
+        s.set_attr(&r, "offsetParentMatrix", json!(opm));
+        let txt = export_ma(&s, false);
+        let mut t = Scene::new();
+        import_ma(&mut t, &txt).unwrap();
+        let n = t.node(&t.find("pCube1").unwrap()).unwrap();
+        assert_eq!(n.xf.sh[0], 0.25);
+        assert_eq!(n.xf.ra[2], 12.0);
+        assert!(!n.xf.it);
+        assert!(n.xf.lim.translate.on);
+        assert_eq!(n.xf.lim.translate.min[0], -2.0);
+        assert_eq!(n.xf.lim.translate.max[0], 2.0);
+        assert!((n.xf.opm[3][0] - 5.0).abs() < 1e-9);
     }
 
     #[test]
