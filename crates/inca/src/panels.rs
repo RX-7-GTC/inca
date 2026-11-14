@@ -302,6 +302,9 @@ pub struct PanelState {
     cb_editing: Option<(String, String)>,
     cb_edit_text: String,
     cb_edit_new: bool,
+    /// Channel Box object name field: shown name and edit buffer.
+    cb_name: (String, String),
+    pub cb_name_rect: Option<Rect>,
     /// Last drawn Channel Box rows for the in-app UI tests: key, name rect, field rect.
     pub cb_row_rects: Vec<(String, String, Rect, Rect)>,
     pub ae_tab: usize,
@@ -758,7 +761,7 @@ pub fn side_tabs(app: &mut IncaApp, ui: &mut egui::Ui) {
 }
 
 pub fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
-    ui.set_min_width(crate::app::RIGHT_PANEL_MIN_W);
+    ui.set_min_width(crate::app::right_panel_min_width(app.right_tab));
     if app.shown("sidetabs") {
         // the side tabs switch panels; show the panel's title like the JS dock
         let title = SIDE_TABS.iter().find(|t| t.0 == Some(app.right_tab)).map(|t| t.1).unwrap_or("");
@@ -1438,12 +1441,18 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
     let name = n.name.clone();
     let shape = n.shape_name.clone();
     let mut cb_rows: Vec<CbRow> = Vec::new();
-    // object name (editable)
-    let mut nm = name.clone();
-    let r = ui.add(egui::TextEdit::singleline(&mut nm).font(egui::TextStyle::Heading).desired_width(f32::INFINITY));
-    if r.lost_focus() && nm.trim() != name && !nm.trim().is_empty() {
-        let _ = app.run_mel("rename", &format!("rename {name} \"{}\";", nm.trim()));
-        return;
+    // object name (editable; keep the edit buffer between frames so typing is not reset)
+    if app.panels.cb_name.0 != name {
+        app.panels.cb_name = (name.clone(), name.clone());
+    }
+    let r = ui.add(egui::TextEdit::singleline(&mut app.panels.cb_name.1).font(egui::TextStyle::Heading).desired_width(f32::INFINITY));
+    app.panels.cb_name_rect = Some(r.rect);
+    if r.lost_focus() {
+        let new = app.panels.cb_name.1.trim().to_string();
+        if !new.is_empty() && new != name {
+            let _ = app.run_mel("rename", &format!("rename {name} \"{new}\";"));
+            return;
+        }
     }
     // the lead object comes first: its values are the ones shown
     let mut targets: Vec<NodeRef> = vec![NodeRef::Dag(lead.clone())];
@@ -2380,7 +2389,7 @@ pub fn ae_copies(app: &mut IncaApp, ctx: &egui::Context) {
         let mut open = true;
         let wid = egui::Id::new(("aecopy", i, &id, tab));
         let _ = crate::windows::place_window(app, ctx, wid, open, |app, fix| {
-            let mut window = egui::Window::new(format!("Attribute Editor: {title}")).id(wid).open(&mut open).default_size([380.0, 520.0]).min_width(crate::app::RIGHT_PANEL_MIN_W).constrain(false);
+            let mut window = egui::Window::new(format!("Attribute Editor: {title}")).id(wid).open(&mut open).default_size([380.0, 520.0]).min_width(crate::app::RIGHT_PANEL_MIN_W_AE).constrain(false);
             if let Some(p) = fix {
                 window = window.fixed_pos(p);
             }
@@ -2945,6 +2954,36 @@ mod tests {
         run(&mut app, vec![], 5.2);
         let rotated: Vec<f64> = ["rotateX", "rotateY", "rotateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
         assert_eq!(rotated, vec![5.0, 5.0, 5.0], "Shift-click range did not apply to all fields: {rotated:?}");
+    }
+
+    #[test]
+    fn channel_box_renames_from_name_field() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let rect = app.panels.cb_name_rect.expect("Channel Box name field");
+        run(&mut app, vec![egui::Event::PointerMoved(rect.center())], 0.6);
+        run(&mut app, vec![egui::Event::PointerButton { pos: rect.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.7);
+        run(&mut app, vec![egui::Event::PointerButton { pos: rect.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 0.8);
+        run(&mut app, vec![egui::Event::ModifiersChanged(egui::Modifiers { ctrl: true, command: true, ..Default::default() })], 0.85);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers { ctrl: true, command: true, ..Default::default() } }], 0.9);
+        run(&mut app, vec![egui::Event::ModifiersChanged(egui::Modifiers::default())], 0.95);
+        run(&mut app, vec![egui::Event::Text("renamedCube".into())], 1.0);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 1.1);
+        run(&mut app, vec![], 1.2);
+        assert_eq!(app.s.name_of(&id), "renamedCube", "Channel Box name field did not rename the object");
     }
 
     #[test]
