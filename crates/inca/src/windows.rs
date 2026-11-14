@@ -1040,10 +1040,15 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             _ => None,
         };
-        let mut plot = Plot::new("graph").include_y(y0).include_y(y1).grid_color(egui::Color32::from_gray(0x50)).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_axis_zoom_drag(false).allow_boxed_zoom(false).allow_double_click_reset(true);
+        let mut plot = Plot::new("graph").grid_color(egui::Color32::from_gray(0x50)).y_axis_formatter(|m, _| format!("{:.3}", m.value)).allow_drag(false).allow_axis_zoom_drag(false).allow_boxed_zoom(false).allow_double_click_reset(true);
+        // Use fixed default bounds instead of following the data: otherwise dragging a key past
+        // the edge makes egui_plot auto-frame the view every frame.
         if empty {
             plot = plot.default_x_bounds(t0, t1.max(t0 + 1.0)).default_y_bounds(-1.5, 1.5);
+        } else {
+            plot = plot.default_x_bounds(x0, x1.max(x0 + 1.0)).default_y_bounds(y0, y1.max(y0 + 1e-6));
         }
+        plot = plot.auto_bounds(false);
         let resp = plot.show(ui, |pu| {
             if let Some(bounds) = frame_bounds {
                 pu.set_plot_bounds(bounds);
