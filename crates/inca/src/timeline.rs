@@ -97,8 +97,23 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
         }
         t += minor;
     }
-    // keys of the selection
-    for k in app.s.anim.key_times(&app.s.sel) {
+    // keys of the selection (or only the picked Channel Box channels when sync is on)
+    let key_times: Vec<f64> = if app.panels.cb_sync_timeline && !app.panels.cb_sel.is_empty() {
+        let mut t: Vec<f64> = app
+            .s
+            .anim
+            .curves
+            .values()
+            .filter(|c| app.s.sel.contains(&c.node) && app.panels.cb_sel.contains(&c.attr))
+            .flat_map(|c| c.keys.iter().map(|k| k.t))
+            .collect();
+        t.sort_by(|a, b| a.total_cmp(b));
+        t.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        t
+    } else {
+        app.s.anim.key_times(&app.s.sel)
+    };
+    for k in key_times {
         if k >= t0 && k <= t1 {
             let x = x_of(k).round();
             p.rect_filled(Rect::from_min_size(pos2(x - 1.0, rect.max.y - 22.0), vec2((px_per as f32 * 0.18).max(2.0), 22.0)), 0.0, Color32::from_rgb(0xd7, 0x3b, 0x3e));

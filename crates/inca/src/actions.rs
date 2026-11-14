@@ -602,6 +602,17 @@ pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
             "planarSurface" => format!("planarSrf -ch {ch};"),
             "rebuildCurve" => "rebuildCurve -s 4 -d 3;".into(),
             "reverseCurve" => "reverseCurve;".into(),
+            "setKey" if app.panels.cb_sync_timeline && !app.panels.cb_pick.is_empty() => {
+                let mut m = String::new();
+                for p in &app.panels.cb_pick {
+                    for t in &p.targets {
+                        if matches!(t, inca_core::scene::NodeRef::Dag(_)) {
+                            m.push_str(&format!("setKeyframe -at {} {};\n", p.attr, app.s.ref_name(t)));
+                        }
+                    }
+                }
+                m
+            }
             "setKey" => "setKeyframe;".into(),
             "keyTranslate" => "setKeyframe -at translate;".into(),
             "keyRotate" => "setKeyframe -at rotate;".into(),

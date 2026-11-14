@@ -13,6 +13,7 @@ pub enum MenuSource {
     Hotbox,
     Outliner,
     AttrEditor,
+    ChannelBox,
     RenderView,
     UvEditor,
     Hypershade,

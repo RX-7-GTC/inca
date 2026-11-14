@@ -36,6 +36,51 @@ fn cb_is_picked(fields: &[CbPick], first: &NodeRef, attr: &str) -> bool {
     fields.iter().any(|p| p.attr == attr && p.targets.first() == Some(first))
 }
 
+fn cb_short_name(attr: &str) -> &str {
+    match attr {
+        "translateX" => "tx",
+        "translateY" => "ty",
+        "translateZ" => "tz",
+        "rotateX" => "rx",
+        "rotateY" => "ry",
+        "rotateZ" => "rz",
+        "scaleX" => "sx",
+        "scaleY" => "sy",
+        "scaleZ" => "sz",
+        "visibility" => "v",
+        "rotateOrder" => "ro",
+        "rotatePivot" => "rp",
+        "scalePivot" => "sp",
+        a => a,
+    }
+}
+
+fn cb_label(app: &IncaApp, attr: &str) -> String {
+    match app.panels.cb_names {
+        1 => attr.to_string(),
+        2 => cb_short_name(attr).to_string(),
+        _ => ops::nice_name(attr),
+    }
+}
+
+fn cb_filter(app: &IncaApp) -> [bool; 4] {
+    app.panels.cb_show.unwrap_or([true; 4])
+}
+
+fn cb_shown(filter: [bool; 4], attr: &str) -> bool {
+    if attr.starts_with("translate") {
+        filter[0]
+    } else if attr.starts_with("rotate") {
+        filter[1]
+    } else if attr.starts_with("scale") {
+        filter[2]
+    } else if attr == "visibility" {
+        filter[3]
+    } else {
+        true
+    }
+}
+
 fn cb_text(kind: ChanKind, x: f64, decimals: Option<usize>) -> String {
     if kind == ChanKind::Int {
         format!("{}", x.round() as i64)
@@ -305,6 +350,12 @@ pub struct PanelState {
     /// Channel Box object name field: shown name and edit buffer.
     cb_name: (String, String),
     pub cb_name_rect: Option<Rect>,
+    /// Channel Box menu settings: slider speed, name style, attribute type filters and sync.
+    pub cb_speed: u8,
+    pub cb_names: u8,
+    pub cb_show: Option<[bool; 4]>,
+    pub cb_sync_graph: bool,
+    pub cb_sync_timeline: bool,
     /// Last drawn Channel Box rows for the in-app UI tests: key, name rect, field rect.
     pub cb_row_rects: Vec<(String, String, Rect, Rect)>,
     pub ae_tab: usize,
@@ -778,6 +829,7 @@ pub fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
     ui.separator();
     match app.right_tab {
         RightTab::ChannelBox => {
+            channel_box_menu(app, ui);
             let h = ui.available_height();
             egui::ScrollArea::vertical().id_salt("cbscroll").max_height(h * 0.68).auto_shrink([false, false]).show(ui, |ui| channel_box(app, ui));
             ui.separator();
@@ -985,7 +1037,8 @@ pub fn virtual_slider(app: &mut IncaApp, resp: &egui::Response) -> bool {
     if resp.dragged_by(egui::PointerButton::Middle) {
         let m = resp.ctx.input(|i| i.modifiers);
         app.panels.cb_drag_x += resp.drag_delta().x;
-        let d = app.panels.cb_drag_x as f64 * 0.1 * if m.ctrl || m.command { 0.1 } else if m.shift { 10.0 } else { 1.0 };
+        let speed = [0.1, 0.05, 0.2][app.panels.cb_speed.min(2) as usize];
+        let d = app.panels.cb_drag_x as f64 * speed * if m.ctrl || m.command { 0.1 } else if m.shift { 10.0 } else { 1.0 };
         for (r, a, start, int, lo, hi) in &list {
             let mut x = start + d;
             if let Some(lo) = lo {
@@ -1457,9 +1510,14 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
     // the lead object comes first: its values are the ones shown
     let mut targets: Vec<NodeRef> = vec![NodeRef::Dag(lead.clone())];
     targets.extend(app.s.sel.iter().filter(|i| **i != lead).map(|i| NodeRef::Dag(i.clone())));
+    let filter = cb_filter(app);
     for c in CHANNELS {
+        if !cb_shown(filter, c) {
+            continue;
+        }
         let kind = if c == "visibility" { ChanKind::Bool } else { ChanKind::Float };
-        channel_row_cb(app, ui, &mut cb_rows, &targets, c, &ops::nice_name(c), kind, None, None);
+        let label = cb_label(app, c);
+        channel_row_cb(app, ui, &mut cb_rows, &targets, c, &label, kind, None, None);
     }
     // added (dynamic) attributes, unless the SHAPES section lists them
     let sh_channels = app.s.shape_channels(&lead);
@@ -1475,7 +1533,8 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
             .collect()
     }).unwrap_or_default();
     for (k, kind) in extra {
-        channel_row_cb(app, ui, &mut cb_rows, &targets, &k, &ops::nice_name(&k), kind, None, None);
+        let label = cb_label(app, &k);
+        channel_row_cb(app, ui, &mut cb_rows, &targets, &k, &label, kind, None, None);
     }
     // PUBLISHED (container interface attributes)
     let published: Vec<(String, ChanKind)> = app.s.node(&lead).map(|n| {
@@ -1510,7 +1569,8 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
                 _ => ChanKind::Float,
             };
             let (mn, mx) = if c == "smoothLevel" { (Some(0.0), Some(3.0)) } else { (None, None) };
-            channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(lead.clone())], &c, &ops::nice_name(&c), kind, mn, mx);
+            let label = cb_label(app, &c);
+            channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(lead.clone())], &c, &label, kind, mn, mx);
         }
     }
     // INPUTS (construction history, newest first); a deformer handle shows its deformer
@@ -1551,7 +1611,11 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
                 if let Some((_, _, chans)) = ops::info(&ty) {
                     let r = NodeRef::History(lead.clone(), i);
                     for c in chans {
-                        let label = c.label.map(String::from).unwrap_or_else(|| ops::nice_name(c.key));
+                        let label = match app.panels.cb_names {
+                            1 => c.key.to_string(),
+                            2 => cb_short_name(c.key).to_string(),
+                            _ => c.label.map(String::from).unwrap_or_else(|| ops::nice_name(c.key)),
+                        };
                         channel_row_cb(app, ui, &mut cb_rows, std::slice::from_ref(&r), c.key, &label, c.kind, c.min, c.max);
                     }
                 }
@@ -1559,6 +1623,336 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     }
     finish_cb_rows(app, ui, &cb_rows);
+}
+
+/// Channels menu: keying and Graph Editor/Time Slider sync.
+fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
+    use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
+    panel_bar(app, ui, MenuSource::ChannelBox, &["Channels", "Edit", "Object", "Show"], false, |app, ui, title| match title {
+        "Channels" => {
+            if menu_item(app, ui, "Key Selected") {
+                if !key_selected_channels(app) {
+                    app.action("setKey");
+                }
+            }
+            if menu_item(app, ui, "Key All Keyable") {
+                let _ = app.run_mel("Key All Keyable", "setKeyframe;");
+            }
+            ui.separator();
+            if menu_check(app, ui, app.panels.cb_sync_graph, "Sync Selection in Graph Editor") {
+                app.panels.cb_sync_graph = !app.panels.cb_sync_graph;
+            }
+            if menu_check(app, ui, app.panels.cb_sync_timeline, "Sync Timeline Display") {
+                app.panels.cb_sync_timeline = !app.panels.cb_sync_timeline;
+            }
+        }
+        "Edit" => {
+            if menu_item(app, ui, "Cut Selected") {
+                if copy_channel_keys(app) {
+                    delete_channel_keys(app);
+                }
+            }
+            if menu_item(app, ui, "Copy Selected") {
+                copy_channel_keys(app);
+            }
+            if menu_item(app, ui, "Paste Selected") {
+                if !app.key_clip.is_empty() {
+                    let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+                    crate::timeline::paste_keys(app);
+                    app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
+                }
+            }
+            if menu_item(app, ui, "Delete Selected") {
+                delete_channel_keys(app);
+            }
+            ui.separator();
+            if menu_item(app, ui, "Duplicate Values") {
+                duplicate_channel_values(app);
+            }
+            if menu_item(app, ui, "Freeze") {
+                app.action("freezeTransformations");
+            }
+            ui.separator();
+            if menu_item(app, ui, "Break Connections") {
+                break_channel_connections(app);
+            }
+            if menu_item(app, ui, "Select Connection") {
+                select_channel_connection(app);
+            }
+            ui.separator();
+            if menu_item(app, ui, "Lock Selected") {
+                lock_channels(app, true);
+            }
+            if menu_item(app, ui, "Unlock Selected") {
+                lock_channels(app, false);
+            }
+            ui.separator();
+            if menu_item(app, ui, "Graph Editor") {
+                app.win.graph_editor = true;
+            }
+            if menu_item(app, ui, "Set Driven Key...") {
+                app.action("setDrivenKeyWindow");
+            }
+            if menu_item(app, ui, "Connection Editor") {
+                app.action("connectionEditor");
+            }
+            if menu_item(app, ui, "Attribute Editor") {
+                app.action("attributeEditor");
+            }
+            if menu_item(app, ui, "Material Attributes...") {
+                app.action("materialAttributes");
+            }
+            ui.separator();
+            if menu_item(app, ui, "Add Attribute...") {
+                app.action("addAttribute");
+            }
+            if menu_item(app, ui, "Publish to Asset") {
+                app.action("publishAttributes");
+            }
+        }
+        "Object" => {
+            let lead = app.s.lead().cloned();
+            for id in app.s.sel.clone() {
+                let name = app.s.name_of(&id);
+                if menu_check(app, ui, lead.as_deref() == Some(id.as_str()), &name) {
+                    app.s.sel.retain(|x| x != &id);
+                    app.s.sel.push(id);
+                }
+            }
+            ui.separator();
+            if menu_item(app, ui, "Select Node") {
+                if let Some(id) = lead {
+                    app.s.select(&[id], SelMode::Replace);
+                }
+            }
+            if menu_item(app, ui, "Delete Node") {
+                app.action("delete");
+            }
+            if menu_item(app, ui, "Delete History") {
+                app.action("deleteHistory");
+            }
+            ui.separator();
+            ui.menu_button("Settings", |ui| {
+                ui.menu_button("Attribute Adjustment Speed", |ui| {
+                    for (value, label) in [(1u8, "Slow"), (0u8, "Medium"), (2u8, "Fast")] {
+                        if menu_check(app, ui, app.panels.cb_speed == value, label) {
+                            app.panels.cb_speed = value;
+                        }
+                    }
+                });
+                if menu_item(app, ui, "Reset Settings") {
+                    app.panels.cb_speed = 0;
+                    app.panels.cb_show = None;
+                }
+            });
+            ui.menu_button("Channel Names", |ui| {
+                for (value, label) in [(0u8, "Nice"), (1u8, "Long"), (2u8, "Short")] {
+                    if menu_check(app, ui, app.panels.cb_names == value, label) {
+                        app.panels.cb_names = value;
+                    }
+                }
+            });
+        }
+        "Show" => {
+            ui.menu_button("Attributes", |ui| {
+                let mut f = cb_filter(app);
+                for (i, name) in ["Translate", "Rotate", "Scale", "Visibility"].iter().enumerate() {
+                    if menu_check(app, ui, f[i], name) {
+                        f[i] = !f[i];
+                    }
+                }
+                app.panels.cb_show = Some(f);
+            });
+            if menu_item(app, ui, "Show All") {
+                app.panels.cb_show = None;
+            }
+            if menu_item(app, ui, "Invert Shown") {
+                app.panels.cb_show = Some(cb_filter(app).map(|b| !b));
+            }
+            if menu_item(app, ui, "Clear Below") {
+                app.panels.cb_show = None;
+            }
+            if menu_item(app, ui, "Show Selected Type(s)") {
+                show_selected_channel_types(app);
+            }
+        }
+        _ => {}
+    });
+}
+
+/// Key the highlighted Channel Box channels at the current time. Returns false when none are picked.
+pub(crate) fn key_selected_channels(app: &mut IncaApp) -> bool {
+    let picks = app.panels.cb_pick.clone();
+    if picks.is_empty() {
+        return false;
+    }
+    app.s.checkpoint("key selected channels");
+    let mut n = 0;
+    for p in picks {
+        for t in &p.targets {
+            if let NodeRef::Dag(id) = t {
+                app.s.set_key(id, &p.attr, None, None);
+                n += 1;
+            }
+        }
+    }
+    app.s.apply_anim();
+    app.s.touch();
+    app.help = format!("Keyed {n} selected channel(s)");
+    n > 0
+}
+
+fn copy_channel_keys(app: &mut IncaApp) -> bool {
+    let picks = app.panels.cb_pick.clone();
+    if picks.is_empty() {
+        app.help = "Select channel names to copy their animation".into();
+        return false;
+    }
+    let mut clip: Vec<(String, String, Vec<inca_core::anim::Key>)> = Vec::new();
+    for p in picks {
+        for t in &p.targets {
+            if let NodeRef::Dag(id) = t {
+                let key = inca_core::anim::Anim::key(id, &p.attr);
+                if let Some(c) = app.s.anim.curves.get(&key) {
+                    if let Some(first) = c.keys.first() {
+                        let t0 = first.t;
+                        let keys = c.keys.iter().map(|k| inca_core::anim::Key { t: k.t - t0, ..k.clone() }).collect();
+                        clip.push((id.clone(), p.attr.clone(), keys));
+                    }
+                }
+            }
+        }
+    }
+    if clip.is_empty() {
+        app.help = "No animation on the selected channels".into();
+        return false;
+    }
+    app.key_clip = clip;
+    app.windows_state.key_clip_kind = crate::windows::KeyClipKind::Timeline;
+    app.windows_state.key_clipboard_marker = true;
+    app.help = format!("Copied {} channel curve(s)", app.key_clip.len());
+    true
+}
+
+fn delete_channel_keys(app: &mut IncaApp) -> usize {
+    let picks = app.panels.cb_pick.clone();
+    if picks.is_empty() {
+        app.help = "Select channel names to delete their animation".into();
+        return 0;
+    }
+    app.s.checkpoint("delete channel animation");
+    let mut n = 0;
+    for p in picks {
+        for t in &p.targets {
+            if let NodeRef::Dag(id) = t {
+                let key = inca_core::anim::Anim::key(id, &p.attr);
+                if app.s.anim.curves.shift_remove(&key).is_some() {
+                    n += 1;
+                }
+            }
+        }
+    }
+    if n > 0 {
+        app.s.apply_anim();
+        app.s.touch();
+    }
+    app.help = format!("Deleted {n} channel curve(s)");
+    n
+}
+
+fn duplicate_channel_values(app: &mut IncaApp) {
+    let picks = app.panels.cb_pick.clone();
+    if picks.is_empty() {
+        app.help = "Select channel names to duplicate their values".into();
+        return;
+    }
+    app.s.checkpoint("duplicate channel values");
+    let mut n = 0;
+    for p in picks {
+        let Some(first) = p.targets.first() else { continue };
+        let Some(value) = app.s.get_attr(first, &p.attr) else { continue };
+        for t in &p.targets[1..] {
+            if app.s.set_attr(t, &p.attr, value.clone()) {
+                n += 1;
+            }
+        }
+    }
+    app.s.touch();
+    app.help = format!("Copied {n} channel value(s)");
+}
+
+fn break_channel_connections(app: &mut IncaApp) {
+    let picks = app.panels.cb_pick.clone();
+    app.s.checkpoint("break channel connections");
+    for p in picks {
+        for t in &p.targets {
+            if let NodeRef::Dag(id) = t {
+                app.s.conns.retain(|c| !(c.dst == id.as_str() && c.dst_attr == p.attr));
+            }
+        }
+    }
+    app.s.touch();
+    app.help = "Broke connections on the selected channels".into();
+}
+
+fn select_channel_connection(app: &mut IncaApp) {
+    let mut ids = Vec::new();
+    for p in &app.panels.cb_pick {
+        for t in &p.targets {
+            if let NodeRef::Dag(id) = t {
+                for c in &app.s.conns {
+                    if c.dst == id.as_str() && c.dst_attr == p.attr {
+                        ids.push(c.src.clone());
+                    }
+                }
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        app.help = "No incoming connection on the selected channel(s)".into();
+    } else {
+        app.s.select(&ids, SelMode::Replace);
+        app.help = format!("Selected {} connection node(s)", ids.len());
+    }
+}
+
+fn lock_channels(app: &mut IncaApp, lock: bool) {
+    let picks = app.panels.cb_pick.clone();
+    app.s.checkpoint(if lock { "lock channels" } else { "unlock channels" });
+    for p in picks {
+        for t in &p.targets {
+            if let NodeRef::Dag(id) = t {
+                if let Some(n) = app.s.nodes.get_mut(id) {
+                    n.locks.insert(p.attr.clone(), json!(lock));
+                }
+            }
+        }
+    }
+    app.s.touch();
+    app.help = if lock { "Locked selected channels".into() } else { "Unlocked selected channels".into() };
+}
+
+fn show_selected_channel_types(app: &mut IncaApp) {
+    let mut f = [false; 4];
+    let mut any = false;
+    for p in &app.panels.cb_pick {
+        if p.attr.starts_with("translate") {
+            f[0] = true;
+            any = true;
+        } else if p.attr.starts_with("rotate") {
+            f[1] = true;
+            any = true;
+        } else if p.attr.starts_with("scale") {
+            f[2] = true;
+            any = true;
+        } else if p.attr == "visibility" {
+            f[3] = true;
+            any = true;
+        }
+    }
+    app.panels.cb_show = if any { Some(f) } else { None };
 }
 
 fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
@@ -2954,6 +3348,44 @@ mod tests {
         run(&mut app, vec![], 5.2);
         let rotated: Vec<f64> = ["rotateX", "rotateY", "rotateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
         assert_eq!(rotated, vec![5.0, 5.0, 5.0], "Shift-click range did not apply to all fields: {rotated:?}");
+    }
+
+    #[test]
+    fn channel_box_menu_actions() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let pick = CbPick { targets: vec![NodeRef::Dag(id.clone())], attr: "translateX".into(), int: false, min: None, max: None };
+        app.panels.cb_pick = vec![pick];
+        app.panels.cb_sel = vec!["translateX".into()];
+        app.s.time.current = 5.0;
+        assert!(key_selected_channels(&mut app));
+        let key = inca_core::anim::Anim::key(&id, "translateX");
+        assert!(app.s.anim.curves.get(&key).is_some_and(|c| c.keys.iter().any(|k| (k.t - 5.0).abs() < 1e-9)));
+        assert!(copy_channel_keys(&mut app));
+        assert!(!app.key_clip.is_empty());
+        assert_eq!(delete_channel_keys(&mut app), 1);
+        assert!(app.s.anim.curves.get(&key).is_none());
+        app.s.time.current = 20.0;
+        crate::timeline::paste_keys(&mut app);
+        assert!(app.s.anim.curves.get(&key).is_some_and(|c| c.keys.iter().any(|k| (k.t - 20.0).abs() < 1e-9)));
+        lock_channels(&mut app, true);
+        assert!(app.s.node(&id).unwrap().is_locked("translateX"));
+        lock_channels(&mut app, false);
+        assert!(!app.s.node(&id).unwrap().is_locked("translateX"));
+        app.panels.cb_sync_timeline = true;
+        app.s.time.current = 7.0;
+        app.action("setKey");
+        assert!(app.s.anim.curves.get(&key).is_some_and(|c| c.keys.iter().any(|k| (k.t - 7.0).abs() < 1e-9)));
+        app.panels.cb_names = 2;
+        assert_eq!(cb_label(&app, "translateX"), "tx");
+        app.panels.cb_show = Some([true, false, false, true]);
+        assert!(cb_shown(cb_filter(&app), "translateX"));
+        assert!(!cb_shown(cb_filter(&app), "rotateX"));
+        assert!(cb_shown(cb_filter(&app), "visibility"));
     }
 
     #[test]

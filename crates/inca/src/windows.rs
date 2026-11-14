@@ -979,7 +979,10 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             paste_keys(app);
         }
     }
-    let curves: Vec<(String, String, String)> = app.s.anim.curves.iter().filter(|(_, c)| app.s.sel.contains(&c.node) && !c.keys.is_empty()).map(|(k, c)| (k.clone(), app.s.name_of(&c.node), c.attr.clone())).collect();
+    let mut curves: Vec<(String, String, String)> = app.s.anim.curves.iter().filter(|(_, c)| app.s.sel.contains(&c.node) && !c.keys.is_empty()).map(|(k, c)| (k.clone(), app.s.name_of(&c.node), c.attr.clone())).collect();
+    if app.panels.cb_sync_graph && !app.panels.cb_sel.is_empty() {
+        curves.retain(|(_, _, attr)| app.panels.cb_sel.contains(attr));
+    }
     let status = app.windows_state.ge_status.clone();
     ui.horizontal(|ui| {
         if let Some(status) = &status {
