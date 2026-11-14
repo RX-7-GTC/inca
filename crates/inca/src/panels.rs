@@ -67,6 +67,11 @@ fn cb_filter(app: &IncaApp) -> [bool; 4] {
     app.panels.cb_show.unwrap_or([true; 4])
 }
 
+/// Value change per drag point for the MMB virtual slider. 0 = Medium, 1 = Slow, 2 = Fast.
+fn cb_adjust_speed(app: &IncaApp) -> f64 {
+    [0.01, 0.005, 0.05][app.panels.cb_speed.min(2) as usize]
+}
+
 fn cb_shown(filter: [bool; 4], attr: &str) -> bool {
     if attr.starts_with("translate") {
         filter[0]
@@ -1037,7 +1042,8 @@ pub fn virtual_slider(app: &mut IncaApp, resp: &egui::Response) -> bool {
     if resp.dragged_by(egui::PointerButton::Middle) {
         let m = resp.ctx.input(|i| i.modifiers);
         app.panels.cb_drag_x += resp.drag_delta().x;
-        let speed = [0.1, 0.05, 0.2][app.panels.cb_speed.min(2) as usize];
+        // 0.05 used to be Slow; it is now Fast, with much finer medium and slow settings.
+        let speed = cb_adjust_speed(app);
         let d = app.panels.cb_drag_x as f64 * speed * if m.ctrl || m.command { 0.1 } else if m.shift { 10.0 } else { 1.0 };
         for (r, a, start, int, lo, hi) in &list {
             let mut x = start + d;
@@ -1669,8 +1675,7 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             if menu_check(app, ui, app.panels.cb_sync_timeline, "Sync Timeline Display") {
                 app.panels.cb_sync_timeline = !app.panels.cb_sync_timeline;
             }
-        }
-        "Edit" => {
+            ui.separator();
             if menu_item(app, ui, "Cut Selected") {
                 if copy_channel_keys(app) {
                     delete_channel_keys(app);
@@ -1710,12 +1715,13 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             if menu_item(app, ui, "Unlock Selected") {
                 lock_channels(app, false);
             }
-            ui.separator();
-            if menu_item(app, ui, "Graph Editor") {
-                app.win.graph_editor = true;
-            }
+        }
+        "Edit" => {
             if menu_item(app, ui, "Set Driven Key...") {
                 app.action("setDrivenKeyWindow");
+            }
+            if menu_item(app, ui, "Graph Editor") {
+                app.win.graph_editor = true;
             }
             if menu_item(app, ui, "Connection Editor") {
                 app.action("connectionEditor");
@@ -1733,19 +1739,9 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             if menu_item(app, ui, "Publish to Asset") {
                 app.action("publishAttributes");
             }
-        }
-        "Object" => {
-            let lead = app.s.lead().cloned();
-            for id in app.s.sel.clone() {
-                let name = app.s.name_of(&id);
-                if menu_check(app, ui, lead.as_deref() == Some(id.as_str()), &name) {
-                    app.s.sel.retain(|x| x != &id);
-                    app.s.sel.push(id);
-                }
-            }
             ui.separator();
             if menu_item(app, ui, "Select Node") {
-                if let Some(id) = lead {
+                if let Some(id) = app.s.lead().cloned() {
                     app.s.select(&[id], SelMode::Replace);
                 }
             }
@@ -1755,7 +1751,6 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             if menu_item(app, ui, "Delete History") {
                 app.action("deleteHistory");
             }
-            ui.separator();
             ui.menu_button("Settings", |ui| {
                 ui.menu_button("Attribute Adjustment Speed", |ui| {
                     for (value, label) in [(1u8, "Slow"), (0u8, "Medium"), (2u8, "Fast")] {
@@ -1776,6 +1771,16 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                 }
             });
+        }
+        "Object" => {
+            let lead = app.s.lead().cloned();
+            for id in app.s.sel.clone() {
+                let name = app.s.name_of(&id);
+                if menu_check(app, ui, lead.as_deref() == Some(id.as_str()), &name) {
+                    app.s.sel.retain(|x| x != &id);
+                    app.s.sel.push(id);
+                }
+            }
         }
         "Show" => {
             ui.menu_button("Attributes", |ui| {
@@ -3406,6 +3411,12 @@ mod tests {
         assert!(app.s.anim.curves.get(&key).is_some_and(|c| c.keys.iter().any(|k| (k.t - 7.0).abs() < 1e-9)));
         app.panels.cb_names = 2;
         assert_eq!(cb_label(&app, "translateX"), "tx");
+        app.panels.cb_speed = 1;
+        assert!((cb_adjust_speed(&app) - 0.005).abs() < 1e-9);
+        app.panels.cb_speed = 0;
+        assert!((cb_adjust_speed(&app) - 0.01).abs() < 1e-9);
+        app.panels.cb_speed = 2;
+        assert!((cb_adjust_speed(&app) - 0.05).abs() < 1e-9);
         app.panels.cb_show = Some([true, false, false, true]);
         assert!(cb_shown(cb_filter(&app), "translateX"));
         assert!(!cb_shown(cb_filter(&app), "rotateX"));
