@@ -1351,34 +1351,58 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                 });
             }
         }
+        let channel_menu = app.right_tab == RightTab::ChannelBox;
+        if channel_menu && lresp.secondary_clicked() {
+            if !cb_is_picked(&app.panels.cb_pick, first, attr) {
+                app.panels.cb_sel = vec![attr.to_string()];
+                app.panels.cb_pick = vec![me.clone()];
+            }
+            app.panels.cb_last = Some(attr.to_string());
+            app.panels.cb_armed = true;
+        }
         lresp.context_menu(|ui| {
             let names: Vec<String> = targets.iter().map(|t| app.s.ref_name(t)).collect();
+            let multi = channel_menu && !app.panels.cb_pick.is_empty();
             if ui.button("Key Selected").clicked() {
-                let m: String = names.iter().map(|n| format!("setKeyframe \"{n}.{attr}\";\n")).collect();
-                let _ = app.run_mel("key", &m);
+                if !multi || !key_selected_channels(app) {
+                    let m: String = names.iter().map(|n| format!("setKeyframe \"{n}.{attr}\";\n")).collect();
+                    let _ = app.run_mel("key", &m);
+                }
                 ui.close();
             }
             if ui.button("Delete Keys").clicked() {
-                let m: String = names.iter().map(|n| format!("cutKey -at {attr} {n};\n")).collect();
-                let _ = app.run_mel("cut keys", &m);
+                if !multi {
+                    let m: String = names.iter().map(|n| format!("cutKey -at {attr} {n};\n")).collect();
+                    let _ = app.run_mel("cut keys", &m);
+                } else {
+                    delete_channel_keys(app);
+                }
                 ui.close();
             }
             if ui.button(if locked { "Unlock" } else { "Lock" }).clicked() {
-                app.s.checkpoint("lock");
-                for t in targets {
-                    if let NodeRef::Dag(i) = t {
-                        if let Some(n) = app.s.nodes.get_mut(i) {
-                            n.locks.insert(attr.to_string(), json!(!locked));
+                if multi {
+                    lock_channels(app, !locked);
+                } else {
+                    app.s.checkpoint("lock");
+                    for t in targets {
+                        if let NodeRef::Dag(i) = t {
+                            if let Some(n) = app.s.nodes.get_mut(i) {
+                                n.locks.insert(attr.to_string(), json!(!locked));
+                            }
                         }
                     }
+                    app.s.touch();
                 }
-                app.s.touch();
                 ui.close();
             }
             if driven && ui.button("Break Connections").clicked() {
-                app.s.checkpoint("break connection");
-                app.s.conns.retain(|c| !(c.dst == id && c.dst_attr == attr));
-                app.s.touch();
+                if multi {
+                    break_channel_connections(app);
+                } else {
+                    app.s.checkpoint("break connection");
+                    app.s.conns.retain(|c| !(c.dst == id && c.dst_attr == attr));
+                    app.s.touch();
+                }
                 ui.close();
             }
         });
@@ -3386,6 +3410,25 @@ mod tests {
         assert!(cb_shown(cb_filter(&app), "translateX"));
         assert!(!cb_shown(cb_filter(&app), "rotateX"));
         assert!(cb_shown(cb_filter(&app), "visibility"));
+    }
+
+    #[test]
+    fn channel_box_key_selected_uses_all_picked_channels() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let pick = |attr: &str| CbPick { targets: vec![NodeRef::Dag(id.clone())], attr: attr.into(), int: false, min: None, max: None };
+        app.panels.cb_pick = vec![pick("translateX"), pick("translateY")];
+        app.panels.cb_sel = vec!["translateX".into(), "translateY".into()];
+        app.s.time.current = 5.0;
+        assert!(key_selected_channels(&mut app));
+        for attr in ["translateX", "translateY"] {
+            let key = inca_core::anim::Anim::key(&id, attr);
+            assert!(app.s.anim.curves.get(&key).is_some_and(|c| c.keys.iter().any(|k| (k.t - 5.0).abs() < 1e-9)), "{attr} was not keyed");
+        }
     }
 
     #[test]
