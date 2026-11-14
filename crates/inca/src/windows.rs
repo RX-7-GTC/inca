@@ -73,6 +73,15 @@ pub enum KeyClipKind {
     Timeline,
 }
 
+/// Axis locked by the first movement of a Graph Editor MMB scale drag.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum ScaleAxis {
+    #[default]
+    Free,
+    Time,
+    Value,
+}
+
 #[derive(Default)]
 pub struct WinState {
     /// dope sheet key drag: (node, time grabbed, current offset)
@@ -95,6 +104,7 @@ pub struct WinState {
     pub ge_scaling: bool,
     pub ge_scale_pivot: Option<(f64, f64)>,
     pub ge_scale_factors: (f64, f64),
+    pub ge_scale_axis: ScaleAxis,
     /// Tangent handle being dragged: -1 = in, +1 = out.
     pub ge_tan_drag: Option<i8>,
     /// Copied Graph Editor keys: source curve, original time, key data.
@@ -913,6 +923,8 @@ fn graph_tangent_handles(app: &IncaApp, tf: &egui_plot::PlotTransform, selected:
 
 /// Drag distance, in points, that takes the scale factor from 1 to 0 (and on to -1).
 const GRAPH_SCALE_DRAG: f64 = 120.0;
+/// Movement needed before the scale drag locks to the dominant axis.
+const GRAPH_SCALE_AXIS_LOCK: f64 = 4.0;
 
 /// Ends an interactive scale: sort the curves and remap the selection to the new key indices.
 pub(crate) fn finish_graph_scale(app: &mut IncaApp) {
@@ -949,6 +961,7 @@ pub(crate) fn finish_graph_scale(app: &mut IncaApp) {
     app.windows_state.ge_scaling = false;
     app.windows_state.ge_scale_pivot = None;
     app.windows_state.ge_scale_factors = (1.0, 1.0);
+    app.windows_state.ge_scale_axis = ScaleAxis::Free;
     app.windows_state.ge_drag_anchor = None;
     app.windows_state.ge_drag_keys.clear();
 }
@@ -1017,7 +1030,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         } else {
             let hint = if app.windows_state.ge_scale {
-                "Scale Keys: select keys, then middle-drag anywhere in the graph"
+                "Scale Keys: select keys, then middle-drag in the graph; the drag locks to the first axis you move"
             } else {
                 "Select an animated object; click a key to edit it, drag to move it"
             };
@@ -1226,6 +1239,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         app.windows_state.ge_scaling = true;
                         app.windows_state.ge_scale_pivot = Some((pivot.x, pivot.y));
                         app.windows_state.ge_scale_factors = (1.0, 1.0);
+                        app.windows_state.ge_scale_axis = ScaleAxis::Free;
                         app.windows_state.ge_drag_anchor = Some((p.x as f64, p.y as f64));
                         let keys = app.windows_state.ge_keys.clone();
                         app.windows_state.ge_drag_keys = keys
@@ -1370,45 +1384,57 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             if let (Some((ax, ay)), Some(p)) = (app.windows_state.ge_drag_anchor, mid_pos) {
                 if let Some((pt, pv)) = app.windows_state.ge_scale_pivot {
                     let (px, py) = (p.x as f64, p.y as f64);
+                    let (dx, dy) = (px - ax, py - ay);
+                    // Maya locks the drag to the axis you first move in, and keeps it locked
+                    // until the middle button is released.
+                    if app.windows_state.ge_scale_axis == ScaleAxis::Free && dx.abs().max(dy.abs()) >= GRAPH_SCALE_AXIS_LOCK {
+                        app.windows_state.ge_scale_axis = if dx.abs() >= dy.abs() { ScaleAxis::Time } else { ScaleAxis::Value };
+                    }
+                    let axis = app.windows_state.ge_scale_axis;
                     // Linear scale so the factor passes through zero: the keys collapse onto the
                     // pivot and then cross over it instead of stopping at the pivot.
-                    let sx = (1.0 + (px - ax) / GRAPH_SCALE_DRAG).clamp(-100.0, 100.0);
-                    let sy = (1.0 + (py - ay) / GRAPH_SCALE_DRAG).clamp(-100.0, 100.0);
+                    let (sx, sy) = match axis {
+                        ScaleAxis::Free => (1.0, 1.0),
+                        ScaleAxis::Time => ((1.0 + dx / GRAPH_SCALE_DRAG).clamp(-100.0, 100.0), 1.0),
+                        ScaleAxis::Value => (1.0, (1.0 + dy / GRAPH_SCALE_DRAG).clamp(-100.0, 100.0)),
+                    };
                     app.windows_state.ge_scale_factors = (sx, sy);
-                    // Keep each drag key's original time/value (so the factor is applied once,
-                    // not compounded every frame) but remap its index after sorting. Sorting live
-                    // keeps the curve evaluation correct while keys cross over the pivot.
-                    let original = app.windows_state.ge_drag_keys.clone();
-                    let mut targets = Vec::with_capacity(original.len());
-                    for (ck, ki, t0, v0) in &original {
-                        let nt = pt + (t0 - pt) * sx;
-                        let nv = pv + (v0 - pv) * sy;
-                        targets.push((ck.clone(), nt, nv));
-                        if let Some(c) = app.s.anim.curves.get_mut(ck) {
-                            if let Some(key) = c.keys.get_mut(*ki) {
-                                key.t = nt;
-                                key.v = nv;
+                    if axis != ScaleAxis::Free {
+                        // Keep each drag key's original time/value (so the factor is applied once,
+                        // not compounded every frame) but remap its index after sorting. Sorting live
+                        // keeps the curve evaluation correct while keys cross over the pivot.
+                        let original = app.windows_state.ge_drag_keys.clone();
+                        let mut targets = Vec::with_capacity(original.len());
+                        for (ck, ki, t0, v0) in &original {
+                            let nt = pt + (t0 - pt) * sx;
+                            let nv = pv + (v0 - pv) * sy;
+                            targets.push((ck.clone(), nt, nv));
+                            if let Some(c) = app.s.anim.curves.get_mut(ck) {
+                                if let Some(key) = c.keys.get_mut(*ki) {
+                                    key.t = nt;
+                                    key.v = nv;
+                                }
                             }
                         }
-                    }
-                    let affected: std::collections::HashSet<String> = targets.iter().map(|(ck, _, _)| ck.clone()).collect();
-                    for ck in &affected {
-                        if let Some(c) = app.s.anim.curves.get_mut(ck) {
-                            c.sort();
-                        }
-                    }
-                    let mut remapped = Vec::with_capacity(original.len());
-                    for ((ck, _, t0, v0), (_, nt, nv)) in original.iter().zip(targets.iter()) {
-                        if let Some(c) = app.s.anim.curves.get(ck) {
-                            if let Some(i) = c.keys.iter().position(|k| k.t == *nt && k.v == *nv) {
-                                remapped.push((ck.clone(), i, *t0, *v0));
+                        let affected: std::collections::HashSet<String> = targets.iter().map(|(ck, _, _)| ck.clone()).collect();
+                        for ck in &affected {
+                            if let Some(c) = app.s.anim.curves.get_mut(ck) {
+                                c.sort();
                             }
                         }
+                        let mut remapped = Vec::with_capacity(original.len());
+                        for ((ck, _, t0, v0), (_, nt, nv)) in original.iter().zip(targets.iter()) {
+                            if let Some(c) = app.s.anim.curves.get(ck) {
+                                if let Some(i) = c.keys.iter().position(|k| k.t == *nt && k.v == *nv) {
+                                    remapped.push((ck.clone(), i, *t0, *v0));
+                                }
+                            }
+                        }
+                        app.windows_state.ge_keys = remapped.iter().map(|(ck, i, _, _)| (ck.clone(), *i)).collect();
+                        app.windows_state.ge_drag_keys = remapped;
+                        app.s.apply_anim();
+                        app.s.touch();
                     }
-                    app.windows_state.ge_keys = remapped.iter().map(|(ck, i, _, _)| (ck.clone(), *i)).collect();
-                    app.windows_state.ge_drag_keys = remapped;
-                    app.s.apply_anim();
-                    app.s.touch();
                 }
             }
         }
@@ -1416,12 +1442,23 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             finish_graph_scale(app);
         }
         if app.windows_state.ge_scaling {
+            let axis = app.windows_state.ge_scale_axis;
+            match axis {
+                ScaleAxis::Time => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal),
+                ScaleAxis::Value => ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical),
+                ScaleAxis::Free => {}
+            }
             if let Some((pt, pv)) = app.windows_state.ge_scale_pivot {
                 let sp = tf.position_from_point(&egui_plot::PlotPoint::new(pt, pv));
                 let p = ui.painter_at(r.rect);
                 let col = theme::ACCENT;
-                p.line_segment([sp - egui::vec2(7.0, 0.0), sp + egui::vec2(7.0, 0.0)], egui::Stroke::new(1.0, col));
-                p.line_segment([sp - egui::vec2(0.0, 7.0), sp + egui::vec2(0.0, 7.0)], egui::Stroke::new(1.0, col));
+                let (hx, vy) = match axis {
+                    ScaleAxis::Time => (14.0, 4.0),
+                    ScaleAxis::Value => (4.0, 14.0),
+                    ScaleAxis::Free => (7.0, 7.0),
+                };
+                p.line_segment([sp - egui::vec2(hx, 0.0), sp + egui::vec2(hx, 0.0)], egui::Stroke::new(1.0, col));
+                p.line_segment([sp - egui::vec2(0.0, vy), sp + egui::vec2(0.0, vy)], egui::Stroke::new(1.0, col));
                 p.circle_stroke(sp, 5.0, egui::Stroke::new(1.0, col));
             }
         }
@@ -2060,26 +2097,29 @@ mod tests {
         assert_eq!(app.windows_state.ge_drag_keys.len(), 2, "scale drag keys after press: {:?}", app.windows_state.ge_drag_keys);
         let pivot = app.windows_state.ge_scale_pivot.expect("scale pivot missing");
         assert!((pivot.0 - 5.5).abs() > 1.0, "pivot must be the MMB press point, not the selection center: {pivot:?}");
-        let end = start + egui::vec2(120.0, 120.0);
-        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(end)], 1.2);
-        assert!(app.windows_state.ge_scaling, "middle move ended scaling");
-        assert!((app.windows_state.ge_scale_factors.0 - 2.0).abs() < 1e-3, "factor after middle move: {:?}", app.windows_state.ge_scale_factors);
-        assert_eq!(app.windows_state.ge_drag_keys.len(), 2, "scale drag keys after move: {:?}", app.windows_state.ge_drag_keys);
-        // The view is locked while the middle button is down: the wheel must not zoom. Let the
-        // scaled key positions settle for a frame before comparing screen positions.
-        run(&mut app, &mut frame, vec![], 1.25);
+        // The view is locked while the middle button is down: the wheel must not zoom. The pointer
+        // is still over the graph here.
+        run(&mut app, &mut frame, vec![], 1.15);
         let before_wheel = app.windows_state.ge_first_key_screen.expect("key on screen");
-        run(&mut app, &mut frame, vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, 5.0), phase: egui::TouchPhase::Move, modifiers: Default::default() }], 1.3);
-        run(&mut app, &mut frame, vec![], 1.35);
+        run(&mut app, &mut frame, vec![egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, 5.0), phase: egui::TouchPhase::Move, modifiers: Default::default() }], 1.2);
+        run(&mut app, &mut frame, vec![], 1.25);
         let after_wheel = app.windows_state.ge_first_key_screen.expect("key on screen");
         assert!(app.windows_state.ge_scaling, "scaling ended during wheel");
-        assert!((app.windows_state.ge_scale_factors.0 - 2.0).abs() < 1e-3, "factors changed during wheel: {:?}", app.windows_state.ge_scale_factors);
         assert!(after_wheel.distance(before_wheel) < 0.01, "wheel changed the locked view: {before_wheel:?} -> {after_wheel:?}");
+        // The first movement is horizontal, so the drag locks to time scaling; the vertical part
+        // of the motion must not change values.
+        let end = start + egui::vec2(120.0, 120.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(end)], 1.3);
+        assert!(app.windows_state.ge_scaling, "middle move ended scaling");
+        assert_eq!(app.windows_state.ge_scale_axis, ScaleAxis::Time, "drag should lock to the time axis");
+        assert!((app.windows_state.ge_scale_factors.0 - 2.0).abs() < 1e-3, "time factor after middle move: {:?}", app.windows_state.ge_scale_factors);
+        assert!((app.windows_state.ge_scale_factors.1 - 1.0).abs() < 1e-9, "value factor must stay locked: {:?}", app.windows_state.ge_scale_factors);
+        assert_eq!(app.windows_state.ge_drag_keys.len(), 2, "scale drag keys after move: {:?}", app.windows_state.ge_drag_keys);
         run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: end, button: egui::PointerButton::Middle, pressed: false, modifiers: Default::default() }], 1.4);
         let mut expected: Vec<(f64, f64)> = before
             .iter()
             .enumerate()
-            .map(|(i, (t, v))| if i == 1 { (*t, *v) } else { (pivot.0 + (t - pivot.0) * 2.0, pivot.1 + (v - pivot.1) * 2.0) })
+            .map(|(i, (t, v))| if i == 1 { (*t, *v) } else { (pivot.0 + (t - pivot.0) * 2.0, *v) })
             .collect();
         expected.sort_by(|a, b| a.0.total_cmp(&b.0));
         let keys = &app.s.anim.curves[&ck].keys;
@@ -2090,6 +2130,7 @@ mod tests {
         }
         assert_eq!(app.windows_state.ge_keys.len(), 2, "scaled keys should stay selected");
         assert!(!app.windows_state.ge_scaling, "scale drag did not finish");
+        assert_eq!(app.windows_state.ge_scale_axis, ScaleAxis::Free, "axis lock should reset");
     }
 
     #[test]
@@ -2131,7 +2172,9 @@ mod tests {
         let drag = app.windows_state.ge_drag_keys.clone();
         let end = start + egui::vec2(-240.0, 0.0);
         run(&mut app, &mut frame, vec![egui::Event::PointerMoved(end)], 0.8);
+        assert_eq!(app.windows_state.ge_scale_axis, ScaleAxis::Time, "horizontal drag should lock to time");
         assert!((app.windows_state.ge_scale_factors.0 + 1.0).abs() < 1e-3, "factor should cross zero: {:?}", app.windows_state.ge_scale_factors);
+        assert!((app.windows_state.ge_scale_factors.1 - 1.0).abs() < 1e-9, "value factor must stay locked: {:?}", app.windows_state.ge_scale_factors);
         run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: end, button: egui::PointerButton::Middle, pressed: false, modifiers: Default::default() }], 0.9);
         let mut expected: Vec<(f64, f64)> = drag.iter().map(|(_, _, t0, v0)| (pivot.0 + (t0 - pivot.0) * -1.0, *v0)).collect();
         expected.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -2145,6 +2188,63 @@ mod tests {
         assert_eq!(expected.first().map(|k| k.1), Some(10.0), "keys stopped at the pivot instead of crossing");
         assert_eq!(expected.last().map(|k| k.1), Some(0.0));
         assert_eq!(app.windows_state.ge_keys.len(), 2, "crossed keys should stay selected");
+    }
+
+    #[test]
+    fn graph_scale_axis_stays_locked_until_release() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        let ck = inca_core::anim::Anim::key("pCube1", "translateX");
+        let mut c = inca_core::anim::AnimCurve::new("pCube1", "translateX");
+        c.set_key(1.0, 0.0, "linear");
+        c.set_key(9.0, 10.0, "linear");
+        app.s.anim.curves.insert(ck.clone(), c);
+        app.s.sel = vec!["pCube1".into()];
+        app.win.graph_editor = true;
+        app.windows_state.ge_scale = true;
+        app.windows_state.ge_keys = vec![(ck.clone(), 0), (ck.clone(), 1)];
+        let run = |app: &mut IncaApp, frame: &mut eframe::Frame, events: Vec<egui::Event>, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+            raw.time = Some(t);
+            raw.events = events;
+            app.windows_state.window_seen_now.clear();
+            let mut out = ctx.run_ui(raw, |ui| show(app, ui.ctx(), frame));
+            out.textures_delta.clear();
+            std::mem::swap(&mut app.windows_state.window_seen, &mut app.windows_state.window_seen_now);
+        };
+        for i in 0..5 {
+            run(&mut app, &mut frame, vec![], i as f64 * 0.1);
+        }
+        let key_pos = app.windows_state.ge_first_key_screen.expect("key on screen");
+        let start = key_pos + egui::vec2(80.0, -30.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(start)], 0.6);
+        run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: start, button: egui::PointerButton::Middle, pressed: true, modifiers: Default::default() }], 0.7);
+        let pivot = app.windows_state.ge_scale_pivot.expect("scale pivot");
+        // Move mostly downward first: this locks the drag to value scaling.
+        let first = start + egui::vec2(20.0, 120.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(first)], 0.8);
+        assert_eq!(app.windows_state.ge_scale_axis, ScaleAxis::Value, "vertical drag should lock to value");
+        assert!((app.windows_state.ge_scale_factors.0 - 1.0).abs() < 1e-12, "time factor must stay locked: {:?}", app.windows_state.ge_scale_factors);
+        assert!((app.windows_state.ge_scale_factors.1 - 2.0).abs() < 1e-3, "value factor after first move: {:?}", app.windows_state.ge_scale_factors);
+        // Moving far sideways must not switch axes or change times.
+        let sideways = start + egui::vec2(240.0, 140.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(sideways)], 0.9);
+        assert_eq!(app.windows_state.ge_scale_axis, ScaleAxis::Value, "axis switched while the middle button was held");
+        assert!((app.windows_state.ge_scale_factors.0 - 1.0).abs() < 1e-12, "time factor changed after sideways move: {:?}", app.windows_state.ge_scale_factors);
+        let sy = 1.0 + 140.0 / GRAPH_SCALE_DRAG;
+        assert!((app.windows_state.ge_scale_factors.1 - sy).abs() < 1e-3, "value factor after sideways move: {:?}", app.windows_state.ge_scale_factors);
+        run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: sideways, button: egui::PointerButton::Middle, pressed: false, modifiers: Default::default() }], 1.0);
+        let keys = &app.s.anim.curves[&ck].keys;
+        assert_eq!(keys.iter().map(|k| k.t).collect::<Vec<_>>(), vec![1.0, 9.0], "times changed during a value-locked drag");
+        for (key, v0) in keys.iter().zip([0.0, 10.0]) {
+            let expected = pivot.1 + (v0 - pivot.1) * sy;
+            assert!((key.v - expected).abs() < 1e-3, "value should scale around the press point: {} != {expected}", key.v);
+        }
+        assert_eq!(app.windows_state.ge_scale_axis, ScaleAxis::Free, "axis lock should reset");
     }
 
     #[test]
