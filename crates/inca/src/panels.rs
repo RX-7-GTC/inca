@@ -86,25 +86,6 @@ fn cb_apply_text(app: &mut IncaApp, fields: &[CbPick], text: &str) {
     app.echo(format!("// set {} selected field(s): {text}", fields.len()));
 }
 
-/// Row under `pos`, or the nearest one vertically. Names and fields use the same rows.
-fn cb_row_at(rows: &[CbRow], pos: egui::Pos2, numeric_only: bool) -> Option<usize> {
-    let mut best: Option<(f32, usize)> = None;
-    for (i, row) in rows.iter().enumerate() {
-        if numeric_only && !row.numeric {
-            continue;
-        }
-        let rect = if numeric_only { row.field.unwrap_or(row.label) } else { row.label };
-        let dy = if pos.y < rect.top() { rect.top() - pos.y } else if pos.y > rect.bottom() { pos.y - rect.bottom() } else { 0.0 };
-        if dy <= 0.0 {
-            return Some(i);
-        }
-        if best.is_none_or(|(bd, _)| dy < bd) {
-            best = Some((dy, i));
-        }
-    }
-    best.map(|(_, i)| i)
-}
-
 /// Picks between two row indices, keeping draw order. Fields only include unlocked numeric rows.
 fn cb_rows_range(rows: &[CbRow], anchor: &(String, String), current: usize, numeric_only: bool) -> (Vec<CbPick>, Option<(String, String)>) {
     let Some(a) = rows.iter().position(|r| &r.key == anchor) else {
@@ -113,6 +94,20 @@ fn cb_rows_range(rows: &[CbRow], anchor: &(String, String), current: usize, nume
     let (lo, hi) = (a.min(current), a.max(current));
     let picks = rows[lo..=hi].iter().filter(|r| !numeric_only || (r.numeric && !r.locked)).map(|r| r.pick.clone()).collect();
     let last = rows[lo..=hi].iter().rev().find(|r| !numeric_only || (r.numeric && !r.locked)).map(|r| r.key.clone());
+    (picks, last)
+}
+
+/// Picks whose name/field rect intersects a marquee box.
+fn cb_rows_in_box(rows: &[CbRow], rect: Rect, numeric_only: bool) -> (Vec<CbPick>, Option<(String, String)>) {
+    let hit = |r: &CbRow| {
+        if numeric_only && !(r.numeric && !r.locked) {
+            return false;
+        }
+        let target = if numeric_only { r.field.unwrap_or(r.label) } else { r.label };
+        rect.intersects(target)
+    };
+    let picks = rows.iter().filter(|r| hit(r)).map(|r| r.pick.clone()).collect();
+    let last = rows.iter().rev().find(|r| hit(r)).map(|r| r.key.clone());
     (picks, last)
 }
 
@@ -146,6 +141,8 @@ pub struct PanelState {
     /// Active Channel Box drag-select anchors: channel names and value fields.
     cb_name_drag: Option<(String, String)>,
     cb_field_drag: Option<(String, String)>,
+    /// Screen position where the current drag-select marquee started.
+    cb_drag_origin: Option<egui::Pos2>,
     /// Inline Channel Box value editor. `cb_edit_new` requests focus and select-all.
     cb_editing: Option<(String, String)>,
     cb_edit_text: String,
@@ -947,8 +944,9 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
             app.panels.cb_armed = true;
             app.help = "Middle-drag in a viewport to change the selected channels (virtual slider; Ctrl slower, Shift faster)".into();
         }
-        if selectable && lresp.drag_started() {
+        if selectable && lresp.drag_started_by(egui::PointerButton::Primary) {
             app.panels.cb_name_drag = Some(field_key.clone());
+            app.panels.cb_drag_origin = ui.input(|i| i.pointer.press_origin());
             app.panels.cb_sel = vec![attr.to_string()];
             app.panels.cb_pick = vec![me.clone()];
             app.panels.cb_last = Some(attr.to_string());
@@ -1078,8 +1076,9 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                                 app.panels.cb_editing = Some(field_key.clone());
                                 app.panels.cb_edit_new = true;
                             }
-                            if r.drag_started() {
+                            if r.drag_started_by(egui::PointerButton::Primary) {
                                 app.panels.cb_field_drag = Some(field_key.clone());
+                                app.panels.cb_drag_origin = ui.input(|i| i.pointer.press_origin());
                                 app.panels.cb_fields = vec![me.clone()];
                                 app.panels.cb_field_last = Some(field_key.clone());
                                 app.panels.cb_editing = None;
@@ -1262,13 +1261,12 @@ fn finish_cb_rows(app: &mut IncaApp, ui: &egui::Ui, rows: &[CbRow]) {
             }
         }
     }
-    // Drag over channel names selects the whole range for the MMB virtual slider.
-    if let Some(anchor) = app.panels.cb_name_drag.clone() {
-        if let Some(pos) = pos {
-            if let Some(cur) = cb_row_at(rows, pos, false) {
-                let a = rows.iter().position(|r| r.key == anchor).unwrap_or(cur);
-                let (lo, hi) = (a.min(cur), a.max(cur));
-                let picks: Vec<CbPick> = rows[lo..=hi].iter().map(|r| r.pick.clone()).collect();
+    // Drag over channel names selects every name inside the marquee box.
+    if let Some(origin) = app.panels.cb_drag_origin {
+        if let (Some(pos), true) = (pos, app.panels.cb_name_drag.is_some()) {
+            let rect = Rect::from_two_pos(origin, pos);
+            let (picks, last) = cb_rows_in_box(rows, rect, false);
+            if !picks.is_empty() {
                 let mut sel: Vec<String> = Vec::new();
                 for p in &picks {
                     if !sel.contains(&p.attr) {
@@ -1277,36 +1275,40 @@ fn finish_cb_rows(app: &mut IncaApp, ui: &egui::Ui, rows: &[CbRow]) {
                 }
                 app.panels.cb_sel = sel;
                 app.panels.cb_pick = picks;
-                app.panels.cb_last = Some(rows[cur].pick.attr.clone());
+                app.panels.cb_last = last.map(|(_, a)| a);
                 app.panels.cb_armed = true;
             }
-        }
-        if !primary_down {
-            app.panels.cb_name_drag = None;
+            theme::marquee(&ui.painter(), rect);
         }
     }
-    // Drag over value fields selects them; releasing focuses the last one for typing.
-    if let Some(anchor) = app.panels.cb_field_drag.clone() {
-        if let Some(pos) = pos {
-            if let Some(cur) = cb_row_at(rows, pos, true) {
-                let (picks, last) = cb_rows_range(rows, &anchor, cur, true);
-                if !picks.is_empty() {
-                    app.panels.cb_fields = picks;
-                    app.panels.cb_field_last = last;
-                }
+    // Drag over value fields selects every field inside the marquee box.
+    if let Some(origin) = app.panels.cb_drag_origin {
+        if let (Some(pos), true) = (pos, app.panels.cb_field_drag.is_some()) {
+            let rect = Rect::from_two_pos(origin, pos);
+            let (picks, last) = cb_rows_in_box(rows, rect, true);
+            if !picks.is_empty() {
+                app.panels.cb_fields = picks;
+                app.panels.cb_field_last = last;
+            }
+            theme::marquee(&ui.painter(), rect);
+        }
+    }
+    if app.panels.cb_name_drag.is_some() && !primary_down {
+        app.panels.cb_name_drag = None;
+    }
+    if app.panels.cb_field_drag.is_some() && !primary_down {
+        app.panels.cb_field_drag = None;
+        if let Some(last) = app.panels.cb_field_last.clone() {
+            if let Some(row) = rows.iter().find(|r| r.key == last && r.numeric && !r.locked) {
+                let old = row.pick.targets.first().and_then(|t| app.s.get_attr(t, &row.pick.attr)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                app.panels.cb_edit_text = if row.pick.int { format!("{}", old.round() as i64) } else { fmt_num(old) };
+                app.panels.cb_editing = Some(last);
+                app.panels.cb_edit_new = true;
             }
         }
-        if !primary_down {
-            app.panels.cb_field_drag = None;
-            if let Some(last) = app.panels.cb_field_last.clone() {
-                if let Some(row) = rows.iter().find(|r| r.key == last && r.numeric && !r.locked) {
-                    let old = row.pick.targets.first().and_then(|t| app.s.get_attr(t, &row.pick.attr)).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    app.panels.cb_edit_text = if row.pick.int { format!("{}", old.round() as i64) } else { fmt_num(old) };
-                    app.panels.cb_editing = Some(last);
-                    app.panels.cb_edit_new = true;
-                }
-            }
-        }
+    }
+    if !primary_down {
+        app.panels.cb_drag_origin = None;
     }
     // Drop selections/editors whose rows are no longer displayed or editable.
     app.panels.cb_fields.retain(|p| rows.iter().any(|r| r.numeric && !r.locked && r.pick.attr == p.attr && r.pick.targets.first() == p.targets.first()));
@@ -2255,6 +2257,7 @@ pub fn history_channels(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, i: usize
 
 fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab: usize) {
     let (_, r) = tabs[tab].clone();
+    let mut cb_rows: Vec<CbRow> = Vec::new();
     match &r {
         NodeRef::Dag(id) if tab == 0 => {
             let targets = vec![r.clone()];
@@ -2271,14 +2274,14 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
             }).unwrap_or_default();
             if !published.is_empty() && theme::fold(ui, "Published Attributes") {
                 for (k, kind) in published {
-                    channel_row(app, ui, &targets, &k, &k, kind, None, None);
+                    channel_row_cb(app, ui, &mut cb_rows, &targets, &k, &k, kind, None, None);
                 }
             }
             if theme::fold(ui, "Transform Attributes") {
                 for c in ["translateX", "translateY", "translateZ", "rotateX", "rotateY", "rotateZ", "scaleX", "scaleY", "scaleZ"] {
-                    channel_row(app, ui, &targets, c, &ops::nice_name(c), ChanKind::Float, None, None);
+                    channel_row_cb(app, ui, &mut cb_rows, &targets, c, &ops::nice_name(c), ChanKind::Float, None, None);
                 }
-                channel_row(app, ui, &targets, "rotateOrder", "Rotate Order", ChanKind::Enum(&inca_core::math::ROTATE_ORDERS), None, None);
+                channel_row_cb(app, ui, &mut cb_rows, &targets, "rotateOrder", "Rotate Order", ChanKind::Enum(&inca_core::math::ROTATE_ORDERS), None, None);
             }
             if theme::fold(ui, "Pivots") {
                 let p = app.s.world_pivot(id);
@@ -2288,8 +2291,8 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
                 }
             }
             if theme::fold(ui, "Display") {
-                channel_row(app, ui, &targets, "visibility", "Visibility", ChanKind::Bool, None, None);
-                channel_row(app, ui, &targets, "template", "Template", ChanKind::Bool, None, None);
+                channel_row_cb(app, ui, &mut cb_rows, &targets, "visibility", "Visibility", ChanKind::Bool, None, None);
+                channel_row_cb(app, ui, &mut cb_rows, &targets, "template", "Template", ChanKind::Bool, None, None);
                 let mut use_outliner_color = app.s.node(id).map(|n| n.use_outliner_color).unwrap_or(false);
                 if ui.checkbox(&mut use_outliner_color, "Use Outliner Color").changed() {
                     app.s.checkpoint("outliner color");
@@ -2352,7 +2355,7 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
                 if let Some((_, _, chans)) = ops::info(&ty) {
                     for c in chans {
                         let label = c.label.map(String::from).unwrap_or_else(|| ops::nice_name(c.key));
-                        channel_row(app, ui, std::slice::from_ref(&r), c.key, &label, c.kind, c.min, c.max);
+                        channel_row_cb(app, ui, &mut cb_rows, std::slice::from_ref(&r), c.key, &label, c.kind, c.min, c.max);
                     }
                 }
             }
@@ -2369,6 +2372,7 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
             }
         }
     }
+    finish_cb_rows(app, ui, &cb_rows);
 }
 
 fn shape_tab(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
@@ -2701,5 +2705,40 @@ mod tests {
         run(&mut app, vec![], 5.2);
         let rotated: Vec<f64> = ["rotateX", "rotateY", "rotateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
         assert_eq!(rotated, vec![5.0, 5.0, 5.0], "Shift-click range did not apply to all fields: {rotated:?}");
+    }
+
+    #[test]
+    fn attribute_editor_drag_selects_transform_fields() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::AttributeEditor;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let rows = app.panels.cb_row_rects.clone();
+        let field = |attr: &str| rows.iter().find(|(_, a, _, _)| a == attr).map(|(_, _, _, f)| *f).expect("AE field rect");
+        let (fx, fy, fz) = (field("translateX"), field("translateY"), field("translateZ"));
+        run(&mut app, vec![egui::Event::PointerMoved(fx.center())], 0.6);
+        run(&mut app, vec![egui::Event::PointerButton { pos: fx.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.7);
+        run(&mut app, vec![egui::Event::PointerMoved(fy.center())], 0.8);
+        run(&mut app, vec![egui::Event::PointerMoved(fz.center())], 0.9);
+        run(&mut app, vec![egui::Event::PointerButton { pos: fz.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 1.0);
+        run(&mut app, vec![], 1.1);
+        let selected: Vec<String> = app.panels.cb_fields.iter().map(|p| p.attr.clone()).collect();
+        assert_eq!(selected, vec!["translateX", "translateY", "translateZ"], "AE drag selected {selected:?}");
+        run(&mut app, vec![egui::Event::Text("6".into())], 1.2);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 1.3);
+        run(&mut app, vec![], 1.4);
+        let values: Vec<f64> = ["translateX", "translateY", "translateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
+        assert_eq!(values, vec![6.0, 6.0, 6.0], "AE multi-field edit did not apply: {values:?}");
     }
 }
