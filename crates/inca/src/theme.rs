@@ -83,8 +83,22 @@ pub fn marquee(painter: &egui::Painter, rect: egui::Rect) {
 
 /// A collapsible section header (Attribute Editor frames); returns whether it is open.
 pub fn fold(ui: &mut egui::Ui, text: &str) -> bool {
-    let id = ui.make_persistent_id(("fold", text));
-    let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, true));
+    fold_key(ui, text, true, "fold")
+}
+
+/// Attribute Editor section headers use their own namespace so old expanded states do not
+/// override Maya's collapsed-by-default layout.
+pub fn fold_ae(ui: &mut egui::Ui, text: &str) -> bool {
+    fold_key(ui, text, true, "fold_ae")
+}
+
+pub fn fold_ae_closed(ui: &mut egui::Ui, text: &str) -> bool {
+    fold_key(ui, text, false, "fold_ae")
+}
+
+fn fold_key(ui: &mut egui::Ui, text: &str, default_open: bool, namespace: &'static str) -> bool {
+    let id = ui.make_persistent_id((namespace, text));
+    let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, default_open));
     let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::click());
     ui.painter().rect_filled(r, 0.0, if resp.hovered() { Color32::from_gray(0x5a) } else { Color32::from_gray(0x52) });
     let c = egui::pos2(r.min.x + 9.0, r.center().y);

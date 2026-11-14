@@ -535,7 +535,7 @@ fn floating(app: &mut IncaApp, ctx: &egui::Context) {
         ("shelf", "Shelf", [300.0, 120.0], [720.0, 96.0]),
         ("toolbox", "Tool Box", [300.0, 240.0], [64.0, 420.0]),
         ("outliner", "Outliner", [380.0, 240.0], [300.0, 420.0]),
-        ("rightpanel", "Attribute Editor / Channel Box", [800.0, 180.0], [360.0, 620.0]),
+        ("rightpanel", "Attribute Editor / Channel Box", [800.0, 180.0], [380.0, 620.0]),
         ("timeslider", "Time Slider", [300.0, 700.0], [720.0, 110.0]),
         ("rangeslider", "Range Slider", [300.0, 590.0], [900.0, 120.0]),
         ("cmdline", "Command Line", [300.0, 810.0], [720.0, 110.0]),

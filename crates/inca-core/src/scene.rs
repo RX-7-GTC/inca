@@ -53,28 +53,184 @@ pub struct Xform {
     /// joint orient (joints only): local = T * JO * R * S
     #[serde(default)]
     pub jo: [f64; 3],
+    /// Shear components: shearXY, shearXZ, shearYZ.
+    #[serde(default)]
+    pub sh: [f64; 3],
+    /// Rotate axis, in degrees.
+    #[serde(default)]
+    pub ra: [f64; 3],
+    /// Whether this node inherits its parent's transform.
+    #[serde(default = "default_true")]
+    pub it: bool,
+    /// Transform offset parent matrix (column-major, applied between parent and local).
+    #[serde(default = "identity4")]
+    pub opm: [[f64; 4]; 4],
+    #[serde(default)]
+    pub lim: Limits,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Limit {
+    #[serde(default)]
+    pub on: bool,
+    #[serde(default = "limit_min_default")]
+    pub min: [f64; 3],
+    #[serde(default = "limit_max_default")]
+    pub max: [f64; 3],
+}
+
+fn limit_min_default() -> [f64; 3] {
+    [-1.0e6; 3]
+}
+
+fn limit_max_default() -> [f64; 3] {
+    [1.0e6; 3]
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Limits {
+    #[serde(default)]
+    pub translate: Limit,
+    #[serde(default)]
+    pub rotate: Limit,
+    #[serde(default)]
+    pub scale: Limit,
+}
+
+impl Default for Limit {
+    fn default() -> Self {
+        Limit { on: false, min: limit_min_default(), max: limit_max_default() }
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            translate: Limit::default(),
+            rotate: Limit { on: false, min: [-360.0; 3], max: [360.0; 3] },
+            scale: Limit::default(),
+        }
+    }
+}
+
+fn clamp_limit(x: f64, l: &Limit, i: usize) -> f64 {
+    if l.on {
+        x.clamp(l.min[i], l.max[i])
+    } else {
+        x
+    }
+}
+
+/// Parse Maya limit attribute names: limitXMin, limitRXMax, limitSXEnable, etc.
+/// Returns (group 0=translate/1=rotate/2=scale, axis, kind 0=min/1=max/2=enable).
+fn limit_attr(a: &str) -> Option<(u8, usize, u8)> {
+    let (group, rest) = if let Some(r) = a.strip_prefix("limitR") {
+        (1, r)
+    } else if let Some(r) = a.strip_prefix("limitS") {
+        (2, r)
+    } else if let Some(r) = a.strip_prefix("limit") {
+        (0, r)
+    } else {
+        return None;
+    };
+    let axis = match rest.chars().next()? {
+        'X' => 0,
+        'Y' => 1,
+        'Z' => 2,
+        _ => return None,
+    };
+    let kind = if rest.ends_with("Min") {
+        0
+    } else if rest.ends_with("Max") {
+        1
+    } else if rest.ends_with("Enable") {
+        2
+    } else {
+        return None;
+    };
+    Some((group, axis, kind))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn identity4() -> [[f64; 4]; 4] {
+    [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
 }
 
 impl Default for Xform {
     fn default() -> Self {
-        Xform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3], ro: "xyz".into(), p: [0.0; 3], pt: [0.0; 3], jo: [0.0; 3] }
+        Xform { t: [0.0; 3], r: [0.0; 3], s: [1.0; 3], ro: "xyz".into(), p: [0.0; 3], pt: [0.0; 3], jo: [0.0; 3], sh: [0.0; 3], ra: [0.0; 3], it: true, opm: identity4(), lim: Limits::default() }
     }
 }
 
 impl Xform {
-    /// local = T(t + pt + p) * R * S * T(-p)
     pub fn jo_quat(&self) -> DQuat {
         quat_from_euler_deg(self.jo, "xyz")
     }
 
-    pub fn matrix(&self) -> DMat4 {
-        let q = self.jo_quat() * quat_from_euler_deg(self.r, &self.ro);
-        let rs = DMat4::from_scale_rotation_translation(v3(self.s), q, DVec3::ZERO);
-        let p = v3(self.p);
-        let rp = rs.transform_point3(p);
-        let pos = v3(self.t) + v3(self.pt) + p - rp;
-        DMat4::from_scale_rotation_translation(v3(self.s), q, pos)
+    pub fn opm_matrix(&self) -> DMat4 {
+        DMat4::from_cols_array_2d(&self.opm)
     }
+
+    fn shear_matrix(&self) -> DMat4 {
+        DMat4::from_cols(
+            DVec4::new(1.0, 0.0, 0.0, 0.0),
+            DVec4::new(self.sh[0], 1.0, 0.0, 0.0),
+            DVec4::new(self.sh[1], self.sh[2], 1.0, 0.0),
+            DVec4::W,
+        )
+    }
+
+    /// Rotation/shear/scale part of the local matrix (no translation or pivot).
+    pub fn basis(&self) -> DMat4 {
+        let ra = quat_from_euler_deg(self.ra, "xyz");
+        let r = ra * quat_from_euler_deg(self.r, &self.ro) * ra.inverse();
+        DMat4::from_quat(self.jo_quat() * r) * self.shear_matrix() * DMat4::from_scale(v3(self.s))
+    }
+
+    /// local = T(t + pt + p) * (R * SH * S) * T(-p)
+    pub fn matrix(&self) -> DMat4 {
+        let basis = self.basis();
+        let p = v3(self.p);
+        let rp = basis.transform_point3(p);
+        let pos = v3(self.t) + v3(self.pt) + p - rp;
+        DMat4::from_translation(pos) * basis
+    }
+}
+
+/// Split a desired basis matrix into scale, shear and rotation, removing joint orient and
+/// rotate axis. Returns None for a degenerate matrix.
+fn decompose_basis(basis: DMat3, jo: DQuat, ra: DQuat) -> Option<(DVec3, [f64; 3], DQuat)> {
+    let b1 = basis.x_axis;
+    let mut sx = b1.length();
+    if sx < 1e-12 || !sx.is_finite() {
+        return None;
+    }
+    if basis.determinant() < 0.0 {
+        sx = -sx;
+    }
+    let r1 = b1 / sx;
+    let d2 = basis.y_axis - r1 * basis.y_axis.dot(r1);
+    let sy = d2.length();
+    if sy < 1e-12 || !sy.is_finite() {
+        return None;
+    }
+    let r2 = d2 / sy;
+    let shxy = basis.y_axis.dot(r1) / sy;
+    let d3 = basis.z_axis - r1 * basis.z_axis.dot(r1) - r2 * basis.z_axis.dot(r2);
+    let sz = d3.length();
+    if sz < 1e-12 || !sz.is_finite() {
+        return None;
+    }
+    let r3 = d3 / sz;
+    let shxz = basis.z_axis.dot(r1) / sz;
+    let shyz = basis.z_axis.dot(r2) / sz;
+    let reff = DMat3::from_cols(r1, r2, r3);
+    let q_eff = DQuat::from_mat3(&reff).normalize();
+    let q = ra.inverse() * jo.inverse() * q_eff * ra;
+    Some((DVec3::new(sx, sy, sz), [shxy, shxz, shyz], q))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -839,29 +995,59 @@ impl Scene {
         while let Some(i) = c {
             let Some(n) = self.nodes.get(&i) else { break };
             m = n.xf.matrix() * m;
+            // Offset parent matrix sits between the parent and the local transform.
+            if n.xf.opm != identity4() {
+                m = n.xf.opm_matrix() * m;
+            }
+            // Inherits Transform off: the node keeps its own local matrix but ignores its parent.
+            if !n.xf.it {
+                break;
+            }
             c = n.parent.clone();
         }
         m
     }
+    /// The matrix the node's local transform is applied under: parent world * offset parent.
     pub fn parent_world(&self, id: &str) -> DMat4 {
-        match self.nodes.get(id).and_then(|n| n.parent.clone()) {
-            Some(p) => self.world_matrix(&p),
-            None => DMat4::IDENTITY,
+        let Some(n) = self.nodes.get(id) else { return DMat4::IDENTITY };
+        let opm = n.xf.opm_matrix();
+        if !n.xf.it {
+            return opm;
+        }
+        match &n.parent {
+            Some(p) => self.world_matrix(p) * opm,
+            None => opm,
         }
     }
 
-    /// Set channels so the local matrix equals m (keeps pivots).
+    /// Set channels so the local matrix equals m (keeps pivots, shear and rotate axis).
     pub fn set_local_matrix(&mut self, id: &str, m: DMat4) {
         let Some(n) = self.nodes.get_mut(id) else { return };
-        let (s, q, pos) = m.to_scale_rotation_translation();
-        // joints keep their orient: only the remaining rotation goes into rotate
-        let e = euler_deg_from_quat_near(n.xf.jo_quat().inverse() * q, &n.xf.ro, n.xf.r);
+        let basis = DMat3::from_cols(m.x_axis.truncate(), m.y_axis.truncate(), m.z_axis.truncate());
+        let pos = m.w_axis.truncate();
+        let jo = n.xf.jo_quat();
+        let ra = quat_from_euler_deg(n.xf.ra, "xyz");
+        let (s, sh, q) = decompose_basis(basis, jo, ra).unwrap_or_else(|| {
+            let (s, q, _) = m.to_scale_rotation_translation();
+            (s, n.xf.sh, ra.inverse() * jo.inverse() * q * ra)
+        });
+        // joints and rotate axis keep their orient; only the remaining rotation goes into rotate
+        let e = euler_deg_from_quat_near(q, &n.xf.ro, n.xf.r);
         let xf = &mut n.xf;
         xf.r = e.map(|a| round_to(a, 6));
+        for i in 0..3 {
+            xf.r[i] = clamp_limit(xf.r[i], &xf.lim.rotate, i);
+        }
         xf.s = [s.x, s.y, s.z].map(|x| round_to(x, 6));
-        let rs = DMat4::from_scale_rotation_translation(s, q, DVec3::ZERO);
-        let rp = rs.transform_point3(v3(xf.p));
+        for i in 0..3 {
+            xf.s[i] = clamp_limit(xf.s[i], &xf.lim.scale, i);
+        }
+        xf.sh = sh.map(|x| round_to(x, 6));
+        let rp = xf.basis().transform_point3(v3(xf.p));
         xf.t = [0, 1, 2].map(|i| round_to(pos[i] - xf.pt[i] - xf.p[i] + rp[i], 6));
+        for i in 0..3 {
+            xf.t[i] = clamp_limit(xf.t[i], &xf.lim.translate, i);
+        }
         self.touch();
         let id = id.to_string();
         self.refresh_dependents(&id);
@@ -1378,6 +1564,26 @@ impl Scene {
                     "rotate" => return Some(json!(n.xf.r)),
                     "scale" => return Some(json!(n.xf.s)),
                     "rotatePivot" | "scalePivot" => return Some(json!(n.xf.p)),
+                    "rotateAxis" => return Some(json!(n.xf.ra)),
+                    "shear" => return Some(json!(n.xf.sh)),
+                    "shearXY" => return Some(json!(n.xf.sh[0])),
+                    "shearXZ" => return Some(json!(n.xf.sh[1])),
+                    "shearYZ" => return Some(json!(n.xf.sh[2])),
+                    "inheritsTransform" => return Some(json!(if n.xf.it { 1 } else { 0 })),
+                    "offsetParentMatrix" => return Some(json!(n.xf.opm)),
+                    _ if limit_attr(attr).is_some() => {
+                        let (group, axis, kind) = limit_attr(attr).unwrap();
+                        let l = match group {
+                            1 => &n.xf.lim.rotate,
+                            2 => &n.xf.lim.scale,
+                            _ => &n.xf.lim.translate,
+                        };
+                        return Some(match kind {
+                            0 => json!(l.min[axis]),
+                            1 => json!(l.max[axis]),
+                            _ => json!(if l.on { 1 } else { 0 }),
+                        });
+                    }
                     "visibility" => return Some(json!(if n.visible { 1 } else { 0 })),
                     "template" => return Some(json!(if n.template { 1 } else { 0 })),
                     "xray" => return Some(json!(if n.xray { 1 } else { 0 })),
@@ -1439,13 +1645,70 @@ impl Scene {
                 }
                 let f = v.as_f64().or_else(|| v.as_bool().map(|b| b as i32 as f64));
                 if let Some((k, i)) = xf_attr(attr) {
-                    let Some(x) = f else { return false };
+                    let Some(mut x) = f else { return false };
+                    let lim = match k {
+                        "t" => Some(n.xf.lim.translate.clone()),
+                        "r" => Some(n.xf.lim.rotate.clone()),
+                        "s" => Some(n.xf.lim.scale.clone()),
+                        _ => None,
+                    };
+                    if let Some(l) = lim {
+                        x = clamp_limit(x, &l, i);
+                    }
                     xf_vec_mut(&mut n.xf, k)[i] = x;
                 } else {
                     match attr {
                         "translate" | "rotate" | "scale" => {
                             let Some(vv) = crate::params::value_vec3(&v) else { return false };
-                            *xf_vec_mut(&mut n.xf, &attr[..1]) = vv.to_array();
+                            let mut a = vv.to_array();
+                            let lim = match attr {
+                                "translate" => n.xf.lim.translate.clone(),
+                                "rotate" => n.xf.lim.rotate.clone(),
+                                _ => n.xf.lim.scale.clone(),
+                            };
+                            for i in 0..3 {
+                                a[i] = clamp_limit(a[i], &lim, i);
+                            }
+                            *xf_vec_mut(&mut n.xf, &attr[..1]) = a;
+                        }
+                        "rotateAxis" => {
+                            let Some(vv) = crate::params::value_vec3(&v) else { return false };
+                            n.xf.ra = vv.to_array();
+                        }
+                        "shear" => {
+                            let Some(vv) = crate::params::value_vec3(&v) else { return false };
+                            n.xf.sh = vv.to_array();
+                        }
+                        "shearXY" => n.xf.sh[0] = f.unwrap_or(0.0),
+                        "shearXZ" => n.xf.sh[1] = f.unwrap_or(0.0),
+                        "shearYZ" => n.xf.sh[2] = f.unwrap_or(0.0),
+                        "inheritsTransform" => n.xf.it = f.unwrap_or(1.0) != 0.0,
+                        "offsetParentMatrix" => {
+                            if let Ok(m) = serde_json::from_value::<[[f64; 4]; 4]>(v.clone()) {
+                                n.xf.opm = m;
+                            } else if let Some(a) = v.as_array().filter(|a| a.len() == 16) {
+                                n.xf.opm = identity4();
+                                for (i, x) in a.iter().enumerate() {
+                                    if let Some(x) = x.as_f64() {
+                                        n.xf.opm[i % 4][i / 4] = x;
+                                    }
+                                }
+                            } else {
+                                return false;
+                            }
+                        }
+                        _ if limit_attr(attr).is_some() => {
+                            let (group, axis, kind) = limit_attr(attr).unwrap();
+                            let l = match group {
+                                1 => &mut n.xf.lim.rotate,
+                                2 => &mut n.xf.lim.scale,
+                                _ => &mut n.xf.lim.translate,
+                            };
+                            match kind {
+                                0 => l.min[axis] = f.unwrap_or(l.min[axis]),
+                                1 => l.max[axis] = f.unwrap_or(l.max[axis]),
+                                _ => l.on = f.unwrap_or(1.0) != 0.0,
+                            }
                         }
                         "visibility" => n.visible = f.unwrap_or(1.0) != 0.0,
                         "template" => n.template = f.unwrap_or(0.0) != 0.0,
@@ -2397,6 +2660,7 @@ fn xf_attr(a: &str) -> Option<(&'static str, usize)> {
         "rotate" => "r",
         "scale" => "s",
         "rotatePivot" | "scalePivot" => "p",
+        "rotateAxis" => "ra",
         _ => return None,
     };
     let i = match a.chars().last()? {
@@ -2412,6 +2676,7 @@ fn xf_vec<'a>(x: &'a Xform, k: &str) -> &'a [f64; 3] {
         "t" => &x.t,
         "r" => &x.r,
         "s" => &x.s,
+        "ra" => &x.ra,
         _ => &x.p,
     }
 }
@@ -2420,6 +2685,7 @@ fn xf_vec_mut<'a>(x: &'a mut Xform, k: &str) -> &'a mut [f64; 3] {
         "t" => &mut x.t,
         "r" => &mut x.r,
         "s" => &mut x.s,
+        "ra" => &mut x.ra,
         _ => &mut x.p,
     }
 }
@@ -2487,6 +2753,82 @@ pub const LIGHT_TYPES: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transform_shear_rotate_axis_and_inheritance() {
+        let mut s = Scene::new();
+        let parent = s.create_mesh("polyCube", &Params::new(), None);
+        let child = s.create_mesh("polyCube", &Params::new(), None);
+        assert!(s.reparent(&child, Some(&parent), None));
+        let p = NodeRef::Dag(parent.clone());
+        let c = NodeRef::Dag(child.clone());
+        s.set_attr(&p, "translateX", json!(5.0));
+        s.set_attr(&c, "inheritsTransform", json!(0));
+        assert!((s.world_matrix(&child).w_axis.x - 0.0).abs() < 1e-9, "child should ignore the parent");
+        s.set_attr(&c, "inheritsTransform", json!(1));
+        assert!((s.world_matrix(&child).w_axis.x - 5.0).abs() < 1e-9, "child should inherit the parent");
+        s.set_attr(&p, "translateX", json!(0.0));
+        s.set_attr(&c, "shearXY", json!(2.0));
+        let sheared = s.local_matrix(&child).transform_point3(DVec3::new(0.0, 1.0, 0.0));
+        assert!((sheared.x - 2.0).abs() < 1e-9 && (sheared.y - 1.0).abs() < 1e-9, "shearXY: {sheared:?}");
+        // A rotate axis on its own must not rotate the object; it only tilts the rotation axes.
+        s.set_attr(&c, "shearXY", json!(0.0));
+        s.set_attr(&c, "rotateAxisX", json!(45.0));
+        let unrotated = s.local_matrix(&child).transform_point3(DVec3::new(1.0, 0.0, 0.0));
+        assert!((unrotated - DVec3::new(1.0, 0.0, 0.0)).length() < 1e-9, "rotateAxis alone rotated the object: {unrotated:?}");
+        s.set_attr(&c, "rotateY", json!(90.0));
+        let tilted = s.local_matrix(&child).transform_point3(DVec3::new(0.0, 0.0, 1.0));
+        let k = 0.5_f64.sqrt();
+        assert!((tilted - DVec3::new(k, 0.5, 0.5)).length() < 1e-6, "rotate axis did not affect the rotation: {tilted:?}");
+
+        // set_local_matrix must recover shear and rotate axis, not just scale/rotation.
+        let mut want = Scene::new();
+        let n = want.create_mesh("polyCube", &Params::new(), None);
+        assert!(want.set_attr(&NodeRef::Dag(n.clone()), "rotateAxisX", json!(5.0)));
+        assert!(want.set_attr(&NodeRef::Dag(n.clone()), "rotateAxisY", json!(6.0)));
+        assert!(want.set_attr(&NodeRef::Dag(n.clone()), "rotateAxisZ", json!(7.0)));
+        let xf = Xform {
+            t: [1.0, 2.0, 3.0],
+            r: [10.0, 20.0, 30.0],
+            s: [2.0, 3.0, 4.0],
+            sh: [0.2, 0.3, 0.4],
+            ra: [5.0, 6.0, 7.0],
+            ..Default::default()
+        };
+        let m = xf.matrix();
+        want.set_local_matrix(&n, m);
+        let got = want.world_matrix(&n);
+        let (a, b) = (m.to_cols_array(), got.to_cols_array());
+        for i in 0..16 {
+            assert!((a[i] - b[i]).abs() < 1e-5, "matrix element {i}: {} vs {}", a[i], b[i]);
+        }
+    }
+
+    #[test]
+    fn transform_offset_parent_matrix_and_limits() {
+        let mut s = Scene::new();
+        let parent = s.create_mesh("polyCube", &Params::new(), None);
+        let child = s.create_mesh("polyCube", &Params::new(), None);
+        assert!(s.reparent(&child, Some(&parent), None));
+        let p = NodeRef::Dag(parent.clone());
+        let c = NodeRef::Dag(child.clone());
+        s.set_attr(&p, "translateX", json!(10.0));
+        let mut opm = identity4();
+        opm[3][0] = 5.0;
+        assert!(s.set_attr(&c, "offsetParentMatrix", json!(opm)));
+        assert!((s.world_matrix(&child).w_axis.x - 15.0).abs() < 1e-9, "OPM not applied between parent and local");
+        s.set_world_matrix(&child, DMat4::from_translation(DVec3::new(20.0, 0.0, 0.0)));
+        assert!((s.world_matrix(&child).w_axis.x - 20.0).abs() < 1e-9, "set_world_matrix did not invert the OPM");
+        // Limits clamp transform channels without affecting the scripted attribute access.
+        assert!(s.set_attr(&c, "limitXEnable", json!(1)));
+        assert!(s.set_attr(&c, "limitXMin", json!(-1.0)));
+        assert!(s.set_attr(&c, "limitXMax", json!(1.0)));
+        s.set_attr(&c, "translateX", json!(5.0));
+        assert!((s.get_attr(&c, "translateX").and_then(|v| v.as_f64()).unwrap_or(0.0) - 1.0).abs() < 1e-9);
+        s.set_attr(&c, "translateX", json!(-5.0));
+        assert!((s.get_attr(&c, "translateX").and_then(|v| v.as_f64()).unwrap_or(0.0) + 1.0).abs() < 1e-9);
+        assert!((s.get_attr(&c, "limitXMin").and_then(|v| v.as_f64()).unwrap_or(0.0) + 1.0).abs() < 1e-9);
+    }
 
     #[test]
     fn history_params_are_not_aliased() {

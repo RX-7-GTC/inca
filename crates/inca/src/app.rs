@@ -137,7 +137,7 @@ pub enum RightTab {
 
 /// Minimum width of the right dock (Channel Box / Attribute Editor). Below this the panel bar
 /// wraps and the channel fields run into the viewport/other UI.
-pub(crate) const RIGHT_PANEL_MIN_W: f32 = 320.0;
+pub(crate) const RIGHT_PANEL_MIN_W: f32 = 380.0;
 
 /// UI-side commands raised while MEL runs (tools, windows, viewports).
 #[derive(Default)]

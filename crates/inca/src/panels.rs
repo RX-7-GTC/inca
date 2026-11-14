@@ -6,8 +6,10 @@ use egui::{pos2, vec2, Color32, Rect, RichText};
 use inca_core::math::fmt_num;
 use inca_core::ops;
 use inca_core::primitives::ChanKind;
-use inca_core::scene::{NodeRef, SelMode, Shape, CHANNELS};
+use inca_core::scene::{Limit, NodeRef, SelMode, Shape, CHANNELS};
 use serde_json::{json, Value};
+
+const IDENTITY_OPM: [[f64; 4]; 4] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
 
 #[derive(Clone)]
 pub struct CbPick {
@@ -34,11 +36,39 @@ fn cb_is_picked(fields: &[CbPick], first: &NodeRef, attr: &str) -> bool {
     fields.iter().any(|p| p.attr == attr && p.targets.first() == Some(first))
 }
 
-fn cb_text(kind: ChanKind, x: f64) -> String {
+fn cb_text(kind: ChanKind, x: f64, decimals: Option<usize>) -> String {
     if kind == ChanKind::Int {
         format!("{}", x.round() as i64)
+    } else if let Some(d) = decimals {
+        let x = if x == 0.0 { 0.0 } else { x };
+        format!("{x:.d$}")
     } else {
         fmt_num(x)
+    }
+}
+
+fn cb_locked(app: &IncaApp, first: &NodeRef, attr: &str) -> bool {
+    match first {
+        NodeRef::Dag(i) => app.s.node(i).is_some_and(|n| n.is_locked(attr)),
+        _ => false,
+    }
+}
+
+fn cb_fill(app: &IncaApp, first: &NodeRef, attr: &str) -> Color32 {
+    let id = app.s.ref_id(first);
+    let keyed = app.s.anim.is_keyed(&id, attr);
+    let on_key = app.s.anim.on_key(&id, attr, app.s.time.current);
+    let driven = app.s.conns.iter().any(|c| c.dst == id && c.dst_attr == attr);
+    if cb_locked(app, first, attr) {
+        theme::LOCKED
+    } else if driven {
+        theme::DRIVEN.gamma_multiply(0.6)
+    } else if on_key {
+        theme::KEY
+    } else if keyed {
+        theme::KEYED.gamma_multiply(0.7)
+    } else {
+        theme::FIELD
     }
 }
 
@@ -111,6 +141,131 @@ fn cb_rows_in_box(rows: &[CbRow], rect: Rect, numeric_only: bool) -> (Vec<CbPick
     (picks, last)
 }
 
+/// One editable numeric channel field: display, drag-select, inline editing and the wheel step.
+/// Used by the Channel Box rows and by the Attribute Editor's 3-column transform rows.
+fn cb_numeric_cell(
+    app: &mut IncaApp,
+    ui: &mut egui::Ui,
+    width: f32,
+    targets: &[NodeRef],
+    attr: &str,
+    kind: ChanKind,
+    min: Option<f64>,
+    max: Option<f64>,
+    decimals: Option<usize>,
+    rows: &mut Vec<CbRow>,
+    label_rect: Rect,
+) -> egui::Response {
+    let Some(first) = targets.first() else {
+        return ui.allocate_response(egui::vec2(width, 18.0), egui::Sense::hover());
+    };
+    let Some(cur) = app.s.get_attr(first, attr) else {
+        return ui.allocate_response(egui::vec2(width, 18.0), egui::Sense::hover());
+    };
+    let x = cur.as_f64().unwrap_or(0.0);
+    let id = app.s.ref_id(first);
+    let key = (id.clone(), attr.to_string());
+    let int = matches!(kind, ChanKind::Int);
+    let me = CbPick { targets: targets.to_vec(), attr: attr.to_string(), int, min, max };
+    let field_selected = cb_is_picked(&app.panels.cb_fields, first, attr);
+    let locked = cb_locked(app, first, attr);
+    let editing = app.panels.cb_editing.as_ref().is_some_and(|(i, a)| i == &key.0 && a == &key.1);
+    let r = if editing {
+        let edit_id = ui.make_persistent_id(("cb_edit", &key.0, &key.1));
+        let mut text = app.panels.cb_edit_text.clone();
+        let r = ui.add_sized(
+            [width, 18.0],
+            egui::TextEdit::singleline(&mut text).id(edit_id).horizontal_align(egui::Align::RIGHT).margin(egui::Margin::symmetric(4, 2)),
+        );
+        app.panels.cb_edit_text = text;
+        let still_editing = app.panels.cb_editing.as_ref() == Some(&key);
+        if app.panels.cb_edit_new && still_editing {
+            ui.memory_mut(|m| m.request_focus(edit_id));
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
+                let n = app.panels.cb_edit_text.chars().count();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::default(), egui::text::CCursor::new(n))));
+                state.store(ui.ctx(), edit_id);
+            }
+            app.panels.cb_edit_new = false;
+        } else if still_editing && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.panels.cb_editing = None;
+        } else if still_editing && (r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+            let fields = if field_selected && app.panels.cb_fields.len() > 1 { app.panels.cb_fields.clone() } else { vec![me.clone()] };
+            cb_apply_text(app, &fields, &app.panels.cb_edit_text.clone());
+            app.panels.cb_editing = None;
+        }
+        r
+    } else {
+        let text = cb_text(kind, x, decimals);
+        let (rrect, r) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::click_and_drag());
+        let painter = ui.painter();
+        painter.rect_filled(rrect, 2.0, if field_selected { theme::HI } else { cb_fill(app, first, attr) });
+        painter.text(
+            rrect.right_center() - egui::vec2(5.0, 0.0),
+            egui::Align2::RIGHT_CENTER,
+            text,
+            egui::FontId::proportional(12.0),
+            if locked { theme::TEXT_DIM } else { theme::TEXT },
+        );
+        let border = if field_selected { Color32::from_rgb(0x9a, 0xc8, 0xe0) } else { theme::LINE };
+        painter.rect_stroke(rrect, 2.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+        if r.hovered() && !locked {
+            painter.rect_stroke(rrect, 2.0, egui::Stroke::new(1.0, theme::TEXT_DIM), egui::StrokeKind::Inside);
+        }
+        if r.clicked() && !locked {
+            let m = ui.input(|i| i.modifiers);
+            if m.shift {
+                app.panels.cb_field_click = Some((key.clone(), true));
+            } else if m.ctrl || m.command {
+                if cb_is_picked(&app.panels.cb_fields, first, attr) {
+                    app.panels.cb_fields.retain(|q| !(q.attr == attr && q.targets.first() == Some(first)));
+                } else {
+                    app.panels.cb_fields.push(me.clone());
+                }
+                app.panels.cb_field_last = Some(key.clone());
+            } else {
+                if !cb_is_picked(&app.panels.cb_fields, first, attr) {
+                    app.panels.cb_fields = vec![me.clone()];
+                }
+                app.panels.cb_field_last = Some(key.clone());
+            }
+            app.panels.cb_edit_text = cb_text(kind, x, decimals);
+            app.panels.cb_editing = Some(key.clone());
+            app.panels.cb_edit_new = true;
+        }
+        if r.drag_started_by(egui::PointerButton::Primary) && !locked {
+            app.panels.cb_field_drag = Some(key.clone());
+            app.panels.cb_drag_origin = ui.input(|i| i.pointer.press_origin());
+            app.panels.cb_fields = vec![me.clone()];
+            app.panels.cb_field_last = Some(key.clone());
+            app.panels.cb_editing = None;
+            app.panels.cb_edit_new = false;
+            if let Some(fid) = ui.memory(|m| m.focused()) {
+                ui.memory_mut(|m| m.surrender_focus(fid));
+            }
+        }
+        if kind == ChanKind::Int && r.hovered() && !locked {
+            let sc = wheel_notch(ui);
+            if sc != 0.0 {
+                let mut nv = x + sc.signum() as f64;
+                if let Some(a) = min {
+                    nv = nv.max(a);
+                }
+                if let Some(b) = max {
+                    nv = nv.min(b);
+                }
+                app.s.checkpoint(&format!("setAttr {attr}"));
+                for t in targets {
+                    app.s.set_attr(t, attr, json!(nv.round() as i64));
+                }
+            }
+        }
+        r.on_hover_cursor(egui::CursorIcon::Text)
+    };
+    rows.push(CbRow { key, pick: me, label: label_rect, field: Some(r.rect), numeric: true, locked });
+    r
+}
+
 #[derive(Default)]
 pub struct PanelState {
     pub outliner_filter: String,
@@ -150,6 +305,11 @@ pub struct PanelState {
     /// Last drawn Channel Box rows for the in-app UI tests: key, name rect, field rect.
     pub cb_row_rects: Vec<(String, String, Rect, Rect)>,
     pub ae_tab: usize,
+    pub ae_tab_scroll: f32,
+    /// Attribute Editor name style: 0 = nice, 1 = long, 2 = short.
+    pub ae_names: u8,
+    ae_opm_editing: bool,
+    ae_limit_editing: bool,
     pub ol: OutlinerOpts,
     /// Attribute Editor locked to a node (List > Auto Load off, or the lock button)
     pub ae_locked: Option<String>,
@@ -884,12 +1044,46 @@ fn channel_row(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: 
     channel_row_impl(app, ui, targets, attr, label, kind, min, max, None);
 }
 
+/// Attribute Editor limit row: Min/Max XYZ plus the enable checkbox.
+fn limit_row(ui: &mut egui::Ui, label: &str, lim: &mut Limit, changed: &mut bool) {
+    egui::Grid::new(("limit", label)).num_columns(6).spacing([3.0, 3.0]).show(ui, |ui| {
+        ui.label(label);
+        ui.label("Min");
+        for i in 0..3 {
+            *changed |= ui.add_sized([42.0, 18.0], egui::DragValue::new(&mut lim.min[i]).speed(0.1)).changed();
+        }
+        *changed |= ui.checkbox(&mut lim.on, "Limit").changed();
+        ui.end_row();
+        ui.label("");
+        ui.label("Max");
+        for i in 0..3 {
+            *changed |= ui.add_sized([42.0, 18.0], egui::DragValue::new(&mut lim.max[i]).speed(0.1)).changed();
+        }
+        ui.label("");
+        ui.end_row();
+    });
+}
+
+/// Attribute Editor vector row: one label followed by three numeric fields.
+fn channel_vec_row(app: &mut IncaApp, ui: &mut egui::Ui, rows: &mut Vec<CbRow>, targets: &[NodeRef], attrs: [&str; 3], label: &str, decimals: Option<usize>) {
+    ui.horizontal(|ui| {
+        let (lr, _) = ui.allocate_exact_size(egui::vec2(90.0, 18.0), egui::Sense::hover());
+        ui.painter().text(lr.right_center() - egui::vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, label, egui::FontId::proportional(12.0), theme::TEXT);
+        let gap = ui.spacing().item_spacing.x;
+        let w = ((ui.available_width() - gap * 2.0) / 3.0).max(24.0);
+        for (i, attr) in attrs.iter().enumerate() {
+            let w = if i == 2 { ui.available_width().max(24.0) } else { w };
+            cb_numeric_cell(app, ui, w, targets, attr, ChanKind::Float, None, None, decimals, rows, lr);
+        }
+    });
+}
+
 /// Channel Box row: also records its rects so drags across rows can select names or fields.
 fn channel_row_cb(app: &mut IncaApp, ui: &mut egui::Ui, rows: &mut Vec<CbRow>, targets: &[NodeRef], attr: &str, label: &str, kind: ChanKind, min: Option<f64>, max: Option<f64>) {
     channel_row_impl(app, ui, targets, attr, label, kind, min, max, Some(rows));
 }
 
-fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: &str, label: &str, kind: ChanKind, min: Option<f64>, max: Option<f64>, rows: Option<&mut Vec<CbRow>>) {
+fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: &str, label: &str, kind: ChanKind, min: Option<f64>, max: Option<f64>, mut rows: Option<&mut Vec<CbRow>>) {
     let selectable = rows.is_some();
     let Some(first) = targets.first() else { return };
     let Some(cur) = app.s.get_attr(first, attr) else { return };
@@ -902,7 +1096,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
         _ => false,
     };
     ui.horizontal(|ui| {
-        let lw = 120.0;
+        let lw = if attr == "rotateOrder" { 90.0 } else { 120.0 };
         let sense = if selectable { egui::Sense::click_and_drag() } else { egui::Sense::click() };
         let (rect, lresp) = ui.allocate_exact_size(egui::vec2(lw, 18.0), sense);
         let picked = app.panels.cb_pick.iter().any(|p| p.attr == attr && p.targets.first() == Some(first));
@@ -970,7 +1164,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
         } else {
             theme::FIELD
         };
-        let w = ui.available_width();
+        let w = if attr == "rotateOrder" { 70.0 } else { ui.available_width() };
         let frame = egui::Frame::NONE.fill(fill).show(ui, |ui| {
             ui.set_width(w);
             ui.add_enabled_ui(!locked, |ui| match kind {
@@ -1011,101 +1205,8 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                 _ => {
                     let x = cur.as_f64().unwrap_or(0.0);
                     if selectable {
-                        let editing = app.panels.cb_editing.as_ref().is_some_and(|(id, a)| id == &field_key.0 && a == &field_key.1);
-                        if editing {
-                            let edit_id = ui.make_persistent_id(("cb_edit", &field_key.0, &field_key.1));
-                            let mut text = app.panels.cb_edit_text.clone();
-                            let r = ui.add_sized(
-                                [w - 4.0, 18.0],
-                                egui::TextEdit::singleline(&mut text).id(edit_id).horizontal_align(egui::Align::RIGHT).margin(egui::Margin::symmetric(4, 2)),
-                            );
-                            app.panels.cb_edit_text = text;
-                            let still_editing = app.panels.cb_editing.as_ref() == Some(&field_key);
-                            if app.panels.cb_edit_new && still_editing {
-                                ui.memory_mut(|m| m.request_focus(edit_id));
-                                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
-                                    let n = app.panels.cb_edit_text.chars().count();
-                                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::default(), egui::text::CCursor::new(n))));
-                                    state.store(ui.ctx(), edit_id);
-                                }
-                                app.panels.cb_edit_new = false;
-                            } else if still_editing && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                                app.panels.cb_editing = None;
-                            } else if still_editing && (r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                                let fields = if field_selected && app.panels.cb_fields.len() > 1 { app.panels.cb_fields.clone() } else { vec![me.clone()] };
-                                cb_apply_text(app, &fields, &app.panels.cb_edit_text.clone());
-                                app.panels.cb_editing = None;
-                            }
-                            r
-                        } else {
-                            let text = cb_text(kind, x);
-                            let (rrect, r) = ui.allocate_exact_size(egui::vec2(w - 4.0, 18.0), egui::Sense::click_and_drag());
-                            let painter = ui.painter();
-                            if field_selected {
-                                painter.rect_filled(rrect, 2.0, theme::HI);
-                            }
-                            painter.text(
-                                rrect.right_center() - egui::vec2(5.0, 0.0),
-                                egui::Align2::RIGHT_CENTER,
-                                text,
-                                egui::FontId::proportional(12.0),
-                                if locked { theme::TEXT_DIM } else { theme::TEXT },
-                            );
-                            let border = if field_selected { Color32::from_rgb(0x9a, 0xc8, 0xe0) } else { theme::LINE };
-                            painter.rect_stroke(rrect, 2.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
-                            if r.hovered() && !locked {
-                                painter.rect_stroke(rrect, 2.0, egui::Stroke::new(1.0, theme::TEXT_DIM), egui::StrokeKind::Inside);
-                            }
-                            if r.clicked() {
-                                let m = ui.input(|i| i.modifiers);
-                                if m.shift {
-                                    app.panels.cb_field_click = Some((field_key.clone(), true));
-                                } else if m.ctrl || m.command {
-                                    if cb_is_picked(&app.panels.cb_fields, first, attr) {
-                                        app.panels.cb_fields.retain(|q| !(q.attr == attr && q.targets.first() == Some(first)));
-                                    } else {
-                                        app.panels.cb_fields.push(me.clone());
-                                    }
-                                    app.panels.cb_field_last = Some(field_key.clone());
-                                } else {
-                                    if !cb_is_picked(&app.panels.cb_fields, first, attr) {
-                                        app.panels.cb_fields = vec![me.clone()];
-                                    }
-                                    app.panels.cb_field_last = Some(field_key.clone());
-                                }
-                                app.panels.cb_edit_text = cb_text(kind, x);
-                                app.panels.cb_editing = Some(field_key.clone());
-                                app.panels.cb_edit_new = true;
-                            }
-                            if r.drag_started_by(egui::PointerButton::Primary) {
-                                app.panels.cb_field_drag = Some(field_key.clone());
-                                app.panels.cb_drag_origin = ui.input(|i| i.pointer.press_origin());
-                                app.panels.cb_fields = vec![me.clone()];
-                                app.panels.cb_field_last = Some(field_key.clone());
-                                app.panels.cb_editing = None;
-                                app.panels.cb_edit_new = false;
-                                if let Some(fid) = ui.memory(|m| m.focused()) {
-                                    ui.memory_mut(|m| m.surrender_focus(fid));
-                                }
-                            }
-                            if kind == ChanKind::Int && r.hovered() && !locked {
-                                let sc = wheel_notch(ui);
-                                if sc != 0.0 {
-                                    let mut nv = x + sc.signum() as f64;
-                                    if let Some(a) = min {
-                                        nv = nv.max(a);
-                                    }
-                                    if let Some(b) = max {
-                                        nv = nv.min(b);
-                                    }
-                                    app.s.checkpoint(&format!("setAttr {attr}"));
-                                    for t in targets {
-                                        app.s.set_attr(t, attr, json!(nv.round() as i64));
-                                    }
-                                }
-                            }
-                            r.on_hover_cursor(egui::CursorIcon::Text)
-                        }
+                        let rows = rows.as_deref_mut().expect("selectable channel rows");
+                        cb_numeric_cell(app, ui, w - 4.0, targets, attr, kind, min, max, None, rows, rect)
                     } else {
                         let mut x = x;
                         // typed expressions: "2*3", or relative "+=2" "-=1" "*=2" "/=2" applied to each selected object's own value
@@ -1183,14 +1284,16 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
         });
         if let Some(rows) = rows {
             let numeric = matches!(kind, ChanKind::Float | ChanKind::Int);
-            rows.push(CbRow {
-                key: field_key.clone(),
-                pick: me.clone(),
-                label: rect,
-                field: Some(frame.response.rect),
-                numeric,
-                locked,
-            });
+            if !(selectable && numeric) {
+                rows.push(CbRow {
+                    key: field_key.clone(),
+                    pick: me.clone(),
+                    label: rect,
+                    field: Some(frame.response.rect),
+                    numeric,
+                    locked,
+                });
+            }
         }
         lresp.context_menu(|ui| {
             let names: Vec<String> = targets.iter().map(|t| app.s.ref_name(t)).collect();
@@ -2088,7 +2191,7 @@ fn shading_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
 pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
     let target = ae_target(app);
-    let titles = ["List", "Selected", "Focus", "Attributes", "Show", "Help"];
+    let titles = ["List", "Selected", "Focus", "Attributes", "Display", "Show", "Help"];
     panel_bar(app, ui, MenuSource::AttrEditor, &titles, false, |app, ui, title| match title {
         "List" => {
             let mut auto = app.panels.ae_locked.is_none();
@@ -2118,6 +2221,19 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         "Attributes" => {
             ui.add_enabled(false, egui::Button::new("Add Attribute..."));
         }
+        "Display" => {
+            let mut mode = app.panels.ae_names;
+            if menu_check(app, ui, mode == 0, "Nice Attribute Names") {
+                mode = 0;
+            }
+            if menu_check(app, ui, mode == 1, "Long Attribute Names") {
+                mode = 1;
+            }
+            if menu_check(app, ui, mode == 2, "Short Attribute Names") {
+                mode = 2;
+            }
+            app.panels.ae_names = mode;
+        }
         "Show" => {
             if menu_item(app, ui, "Show Notes") {
                 app.help = "Notes are under Extra Attributes on the transform tab".into();
@@ -2142,22 +2258,47 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         return;
     }
     let mut tab = app.panels.ae_tab.min(tabs.len() - 1);
-    ui.horizontal_wrapped(|ui| {
-        for (i, (t, _)) in tabs.iter().enumerate() {
-            if ui.selectable_label(tab == i, t).clicked() {
-                tab = i;
-            }
+    ui.horizontal(|ui| {
+        let scroll_w = (ui.available_width() - 46.0).max(80.0);
+        let out = egui::ScrollArea::horizontal()
+            .id_salt("aetabs")
+            .max_width(scroll_w)
+            .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .horizontal_scroll_offset(app.panels.ae_tab_scroll)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, (t, _)) in tabs.iter().enumerate() {
+                        if ui.selectable_label(tab == i, t).clicked() {
+                            tab = i;
+                        }
+                    }
+                });
+            });
+        app.panels.ae_tab_scroll = out.state.offset.x;
+        if ui.small_button("◀").on_hover_text("Scroll tabs left").clicked() {
+            app.panels.ae_tab_scroll = (app.panels.ae_tab_scroll - 80.0).max(0.0);
+        }
+        if ui.small_button("▶").on_hover_text("Scroll tabs right").clicked() {
+            app.panels.ae_tab_scroll += 80.0;
         }
     });
     app.panels.ae_tab = tab;
-    // node: name field, Focus, lock
+    // node row: transform/shape label, Focus, Presets, lock; then Show/Hide
     ui.horizontal(|ui| {
-        ui.label(RichText::new("node:").color(theme::TEXT_DIM));
+        let kind = match &tabs[tab].1 {
+            NodeRef::Dag(_) if tab == 0 => "transform:",
+            NodeRef::Dag(_) => "shape:",
+            NodeRef::History(..) => "history:",
+            NodeRef::Material(_) => "material:",
+            NodeRef::Texture(_) => "texture:",
+            NodeRef::Place2D(_) => "placement:",
+        };
+        ui.label(RichText::new(kind).color(theme::TEXT_DIM));
         let title = tabs[tab].0.clone();
         if app.panels.ae_name.0 != title {
             app.panels.ae_name = (title.clone(), title.clone());
         }
-        let w = ui.available_width() - 80.0;
+        let w = (ui.available_width() - 130.0).max(40.0);
         let te = ui.add(egui::TextEdit::singleline(&mut app.panels.ae_name.1).desired_width(w));
         if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             let new = app.panels.ae_name.1.trim().to_string();
@@ -2168,10 +2309,23 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         if ui.button("Focus").on_hover_text("Show the selected node").clicked() {
             app.panels.ae_locked = None;
         }
+        if ui.button("Presets").on_hover_text("Save and reuse attribute presets").clicked() {
+            app.help = "Attribute presets: save and reuse values from the Attribute Editor".into();
+        }
         let locked = app.panels.ae_locked.is_some();
         if lock_button(ui, locked).on_hover_text("Lock the Attribute Editor to the current node").clicked() {
             app.panels.ae_locked = if locked { None } else { Some(id.clone()) };
         }
+    });
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Hide").on_hover_text("Hide the selected object(s)").clicked() {
+                app.action("hideSelection");
+            }
+            if ui.button("Show").on_hover_text("Show the selected object(s)").clicked() {
+                app.action("showSelection");
+            }
+        });
     });
     let h = ui.available_height() - 26.0;
     egui::ScrollArea::vertical().id_salt("aescroll").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
@@ -2273,25 +2427,98 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
                     })
                     .collect()
             }).unwrap_or_default();
-            if !published.is_empty() && theme::fold(ui, "Published Attributes") {
+            if !published.is_empty() && theme::fold_ae_closed(ui, "Published Attributes") {
                 for (k, kind) in published {
                     channel_row_cb(app, ui, &mut cb_rows, &targets, &k, &k, kind, None, None);
                 }
             }
-            if theme::fold(ui, "Transform Attributes") {
-                for c in ["translateX", "translateY", "translateZ", "rotateX", "rotateY", "rotateZ", "scaleX", "scaleY", "scaleZ"] {
-                    channel_row_cb(app, ui, &mut cb_rows, &targets, c, &ops::nice_name(c), ChanKind::Float, None, None);
-                }
+            if theme::fold_ae(ui, "Transform Attributes") {
+                channel_vec_row(app, ui, &mut cb_rows, &targets, ["translateX", "translateY", "translateZ"], "Translate", Some(3));
+                channel_vec_row(app, ui, &mut cb_rows, &targets, ["rotateX", "rotateY", "rotateZ"], "Rotate", Some(3));
+                channel_vec_row(app, ui, &mut cb_rows, &targets, ["scaleX", "scaleY", "scaleZ"], "Scale", Some(3));
+                channel_vec_row(app, ui, &mut cb_rows, &targets, ["shearXY", "shearXZ", "shearYZ"], "Shear", Some(3));
                 channel_row_cb(app, ui, &mut cb_rows, &targets, "rotateOrder", "Rotate Order", ChanKind::Enum(&inca_core::math::ROTATE_ORDERS), None, None);
+                channel_vec_row(app, ui, &mut cb_rows, &targets, ["rotateAxisX", "rotateAxisY", "rotateAxisZ"], "Rotate Axis", Some(3));
+                ui.horizontal(|ui| {
+                    ui.add_space(90.0 + ui.spacing().item_spacing.x);
+                    let mut inherits = app.s.get_attr(&r, "inheritsTransform").and_then(|v| v.as_bool().or_else(|| v.as_f64().map(|x| x != 0.0))).unwrap_or(true);
+                    if ui.checkbox(&mut inherits, "Inherits Transform").changed() {
+                        app.s.checkpoint("inheritsTransform");
+                        app.s.set_attr(&r, "inheritsTransform", json!(inherits));
+                    }
+                });
             }
-            if theme::fold(ui, "Pivots") {
+            if theme::fold_ae_closed(ui, "Transform Offset Parent Matrix") {
+                let mut opm = app.s.node(id).map(|n| n.xf.opm).unwrap_or(IDENTITY_OPM);
+                let mut changed = false;
+                egui::Grid::new(("opm", id)).num_columns(4).spacing([3.0, 3.0]).show(ui, |ui| {
+                    for row in 0..4 {
+                        for col in 0..4 {
+                            changed |= ui.add_sized([56.0, 18.0], egui::DragValue::new(&mut opm[col][row]).speed(0.01).max_decimals(4)).changed();
+                        }
+                        ui.end_row();
+                    }
+                });
+                if changed {
+                    if !app.panels.ae_opm_editing {
+                        app.s.checkpoint("offset parent matrix");
+                        app.panels.ae_opm_editing = true;
+                    }
+                    if let Some(n) = app.s.nodes.get_mut(id) {
+                        n.xf.opm = opm;
+                    }
+                    app.s.touch();
+                }
+                if app.panels.ae_opm_editing && !ui.input(|i| i.pointer.primary_down()) {
+                    app.panels.ae_opm_editing = false;
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("Identity").clicked() {
+                        app.s.checkpoint("offset parent matrix");
+                        if let Some(n) = app.s.nodes.get_mut(id) {
+                            n.xf.opm = IDENTITY_OPM;
+                        }
+                        app.s.touch();
+                    }
+                    if ui.small_button("Invert").clicked() {
+                        if let Some(m) = app.s.node(id).map(|n| inca_core::math::DMat4::from_cols_array_2d(&n.xf.opm).inverse().to_cols_array_2d()) {
+                            app.s.checkpoint("offset parent matrix");
+                            if let Some(n) = app.s.nodes.get_mut(id) {
+                                n.xf.opm = m;
+                            }
+                            app.s.touch();
+                        }
+                    }
+                });
+            }
+            if theme::fold_ae_closed(ui, "Pivots") {
                 let p = app.s.world_pivot(id);
                 ui.label(format!("World pivot  {:.3} {:.3} {:.3}", p.x, p.y, p.z));
                 if ui.button("Center Pivot").clicked() {
                     let _ = app.run_mel("center pivot", &format!("xform -cp {};", app.s.name_of(id)));
                 }
             }
-            if theme::fold(ui, "Display") {
+            if theme::fold_ae_closed(ui, "Limit Information") {
+                let mut lim = app.s.node(id).map(|n| n.xf.lim.clone()).unwrap_or_default();
+                let mut changed = false;
+                limit_row(ui, "Translate", &mut lim.translate, &mut changed);
+                limit_row(ui, "Rotate", &mut lim.rotate, &mut changed);
+                limit_row(ui, "Scale", &mut lim.scale, &mut changed);
+                if changed {
+                    if !app.panels.ae_limit_editing {
+                        app.s.checkpoint("limits");
+                        app.panels.ae_limit_editing = true;
+                    }
+                    if let Some(n) = app.s.nodes.get_mut(id) {
+                        n.xf.lim = lim;
+                    }
+                    app.s.touch();
+                }
+                if app.panels.ae_limit_editing && !ui.input(|i| i.pointer.primary_down()) {
+                    app.panels.ae_limit_editing = false;
+                }
+            }
+            if theme::fold_ae_closed(ui, "Display") {
                 channel_row_cb(app, ui, &mut cb_rows, &targets, "visibility", "Visibility", ChanKind::Bool, None, None);
                 channel_row_cb(app, ui, &mut cb_rows, &targets, "template", "Template", ChanKind::Bool, None, None);
                 let mut use_outliner_color = app.s.node(id).map(|n| n.use_outliner_color).unwrap_or(false);
@@ -2326,7 +2553,7 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
                     ui.label(RichText::new(layer).color(theme::TEXT_DIM));
                 });
             }
-            if theme::fold(ui, "Node Behavior") {
+            if theme::fold_ae_closed(ui, "Node Behavior") {
                 let mut on = app.s.node(id).map(|n| n.selectable).unwrap_or(true);
                 if ui.checkbox(&mut on, "Selectable").changed() {
                     app.s.checkpoint("selectable");
@@ -2335,17 +2562,29 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
                     }
                 }
             }
-            if theme::fold(ui, "Extra Attributes") {
-                ui.label(RichText::new("Notes:").color(theme::TEXT_DIM));
-                let mut notes = app.s.node(id).and_then(|n| n.extra.get("notes")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if ui.add(egui::TextEdit::multiline(&mut notes).desired_rows(2).desired_width(f32::INFINITY)).changed() {
-                    if let Some(n) = app.s.nodes.get_mut(id) {
-                        if !n.extra.is_object() {
-                            n.extra = serde_json::json!({});
-                        }
-                        n.extra.as_object_mut().unwrap().insert("notes".into(), serde_json::json!(notes));
-                        app.s.modified = true;
+            if theme::fold_ae_closed(ui, "UUID") {
+                ui.label(RichText::new(id).color(theme::TEXT_DIM));
+            }
+            if theme::fold_ae_closed(ui, "Extra Attributes") {
+                let keys: Vec<String> = app.s.node(id).and_then(|n| n.extra.as_object()).map(|e| e.keys().filter(|k| k.as_str() != "notes").cloned().collect()).unwrap_or_default();
+                if keys.is_empty() {
+                    ui.label(RichText::new("No extra attributes").color(theme::TEXT_DIM));
+                } else {
+                    for k in keys {
+                        ui.label(k);
                     }
+                }
+            }
+            ui.separator();
+            ui.label(RichText::new("Notes:").color(theme::TEXT_DIM));
+            let mut notes = app.s.node(id).and_then(|n| n.extra.get("notes")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if ui.add(egui::TextEdit::multiline(&mut notes).desired_rows(3).desired_width(f32::INFINITY)).changed() {
+                if let Some(n) = app.s.nodes.get_mut(id) {
+                    if !n.extra.is_object() {
+                        n.extra = serde_json::json!({});
+                    }
+                    n.extra.as_object_mut().unwrap().insert("notes".into(), serde_json::json!(notes));
+                    app.s.modified = true;
                 }
             }
         }
@@ -2728,6 +2967,7 @@ mod tests {
         let rows = app.panels.cb_row_rects.clone();
         let field = |attr: &str| rows.iter().find(|(_, a, _, _)| a == attr).map(|(_, _, _, f)| *f).expect("AE field rect");
         let (fx, fy, fz) = (field("translateX"), field("translateY"), field("translateZ"));
+        assert!((fx.center().y - fy.center().y).abs() < 1.0 && (fy.center().y - fz.center().y).abs() < 1.0, "translate fields are not a 3-column row");
         run(&mut app, vec![egui::Event::PointerMoved(fx.center())], 0.6);
         run(&mut app, vec![egui::Event::PointerButton { pos: fx.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.7);
         run(&mut app, vec![egui::Event::PointerMoved(fy.center())], 0.8);
