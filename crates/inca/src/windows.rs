@@ -924,6 +924,44 @@ fn graph_selection_pivot(app: &IncaApp) -> Option<(f64, f64)> {
     (t0.is_finite() && t1.is_finite()).then_some(((t0 + t1) * 0.5, (v0 + v1) * 0.5))
 }
 
+/// Ends an interactive scale: sort the curves and remap the selection to the new key indices.
+pub(crate) fn finish_graph_scale(app: &mut IncaApp) {
+    if !app.windows_state.ge_scaling {
+        return;
+    }
+    let (sx, sy) = app.windows_state.ge_scale_factors;
+    let pivot = app.windows_state.ge_scale_pivot;
+    let keys = app.windows_state.ge_drag_keys.clone();
+    let affected: std::collections::HashSet<String> = keys.iter().map(|(ck, _, _, _)| ck.clone()).collect();
+    for ck in &affected {
+        if let Some(c) = app.s.anim.curves.get_mut(ck) {
+            c.sort();
+        }
+    }
+    let mut selected = Vec::new();
+    if let Some((pt, pv)) = pivot {
+        for (ck, _, t0, v0) in &keys {
+            let nt = pt + (t0 - pt) * sx;
+            let nv = pv + (v0 - pv) * sy;
+            if let Some(c) = app.s.anim.curves.get(ck) {
+                if let Some(i) = c.find(nt) {
+                    if (c.keys[i].v - nv).abs() < 1e-4 {
+                        selected.push((ck.clone(), i));
+                    }
+                }
+            }
+        }
+    }
+    app.windows_state.ge_keys = selected;
+    app.s.apply_anim();
+    app.s.touch();
+    app.windows_state.ge_scaling = false;
+    app.windows_state.ge_scale_pivot = None;
+    app.windows_state.ge_scale_factors = (1.0, 1.0);
+    app.windows_state.ge_drag_anchor = None;
+    app.windows_state.ge_drag_keys.clear();
+}
+
 fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use egui_plot::{Line, Plot, PlotPoints, Points};
     if (ui.input(|i| i.modifiers.ctrl || i.modifiers.command)) && ui.rect_contains_pointer(ui.max_rect()) {
@@ -941,9 +979,9 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             ui.label(RichText::new(status).color(theme::TEXT_DIM));
             ui.separator();
         }
-        if ui.selectable_label(app.windows_state.ge_scale, "Scale").on_hover_text("Scale selected keys (R)").clicked() {
+        if ui.selectable_label(app.windows_state.ge_scale, "Scale").on_hover_text("Scale selected keys (R), then middle-drag in the graph").clicked() {
+            finish_graph_scale(app);
             app.windows_state.ge_scale = !app.windows_state.ge_scale;
-            app.windows_state.ge_scaling = false;
         }
         ui.separator();
         let selected_count = app.windows_state.ge_keys.len();
@@ -987,7 +1025,12 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             }
         } else {
-            ui.label(RichText::new("Select an animated object; click a key to edit it, drag to move it").color(theme::TEXT_DIM));
+            let hint = if app.windows_state.ge_scale {
+                "Scale Keys: select keys, then middle-drag anywhere in the graph"
+            } else {
+                "Select an animated object; click a key to edit it, drag to move it"
+            };
+            ui.label(RichText::new(hint).color(theme::TEXT_DIM));
         }
     });
     ui.horizontal_top(|ui| {
@@ -1165,6 +1208,10 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         });
         let alt = ui.input(|i| i.modifiers.alt);
         let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
+        let mid_down = ui.input(|i| i.pointer.middle_down());
+        let mid_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+        let mid_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Middle));
+        let mid_pos = ui.input(|i| i.pointer.interact_pos());
         if r.clicked() || r.drag_started() {
             app.hk.capturing = false;
             app.hk.pending = None;
@@ -1172,48 +1219,80 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 ui.ctx().memory_mut(|m| m.surrender_focus(id));
             }
         }
-        if !alt {
-        if r.drag_started() {
-            if let Some(pp) = r.interact_pointer_pos() {
-                let handle_side = if app.windows_state.ge_scale {
-                    None
-                } else {
-                    graph_tangent_handles(app, &tf, &app.windows_state.ge_keys)
-                        .and_then(|(_, ip, op)| if ip.distance(pp) < 7.0 { Some(-1) } else if op.distance(pp) < 7.0 { Some(1) } else { None })
-                };
-                if let Some(side) = handle_side {
-                    app.s.checkpoint("key tangents");
-                    app.windows_state.ge_tan_drag = Some(side);
-                    app.windows_state.ge_drag = false;
-                    app.windows_state.ge_box = None;
-                } else if let Some((ck, ki)) = nearest_graph_key(app, &shown, &tf, pp) {
-                    if additive {
-                        ge_toggle(app, &ck, ki);
-                    } else if !ge_selected(app, &ck, ki) {
-                        ge_select_only(app, &ck, ki);
-                    }
-                    if ge_selected(app, &ck, ki) {
-                        let scaling = app.windows_state.ge_scale;
-                        let pivot = if scaling { graph_selection_pivot(app) } else { None };
-                        app.s.checkpoint(if scaling { "scale keys" } else { "move keys" });
-                        app.windows_state.ge_drag = true;
-                        app.windows_state.ge_scaling = pivot.is_some();
-                        app.windows_state.ge_scale_pivot = pivot;
+        // Maya's Scale Keys tool scales with the middle mouse button, anywhere over the graph
+        // view, rather than requiring the left button to grab a particular key.
+        if app.windows_state.ge_scale && !alt && mid_pressed && !app.windows_state.ge_scaling {
+            if let Some(p) = mid_pos {
+                if r.rect.contains(p) {
+                    if let Some(pivot) = graph_selection_pivot(app) {
+                        app.s.checkpoint("scale keys");
+                        app.windows_state.ge_scaling = true;
+                        app.windows_state.ge_scale_pivot = Some(pivot);
                         app.windows_state.ge_scale_factors = (1.0, 1.0);
-                        app.windows_state.ge_drag_anchor = pointer.map(|p| (p.x, p.y));
+                        app.windows_state.ge_drag_anchor = Some((p.x as f64, p.y as f64));
                         let keys = app.windows_state.ge_keys.clone();
                         app.windows_state.ge_drag_keys = keys
                             .into_iter()
                             .filter_map(|(k, i)| app.s.anim.curves.get(&k).and_then(|c| c.keys.get(i)).map(|key| (k, i, key.t, key.v)))
                             .collect();
+                        app.windows_state.ge_drag = false;
                         app.windows_state.ge_box = None;
                         app.windows_state.ge_tan_drag = None;
+                    } else {
+                        app.help = "Scale Keys: select keys first".into();
                     }
-                } else {
-                    app.windows_state.ge_box = Some(pp);
+                }
+            }
+        }
+        if !alt && !app.windows_state.ge_scaling {
+        if r.drag_started() {
+            if let Some(pp) = r.interact_pointer_pos() {
+                if app.windows_state.ge_scale {
+                    // With the Scale Keys tool active, the left button only selects keys.
+                    if let Some((ck, ki)) = nearest_graph_key(app, &shown, &tf, pp) {
+                        if additive {
+                            ge_toggle(app, &ck, ki);
+                        } else if !ge_selected(app, &ck, ki) {
+                            ge_select_only(app, &ck, ki);
+                        }
+                    } else {
+                        app.windows_state.ge_box = Some(pp);
+                    }
                     app.windows_state.ge_drag = false;
                     app.windows_state.ge_tan_drag = None;
                     app.windows_state.ge_drag_keys.clear();
+                } else {
+                    let handle_side = graph_tangent_handles(app, &tf, &app.windows_state.ge_keys)
+                        .and_then(|(_, ip, op)| if ip.distance(pp) < 7.0 { Some(-1) } else if op.distance(pp) < 7.0 { Some(1) } else { None });
+                    if let Some(side) = handle_side {
+                        app.s.checkpoint("key tangents");
+                        app.windows_state.ge_tan_drag = Some(side);
+                        app.windows_state.ge_drag = false;
+                        app.windows_state.ge_box = None;
+                    } else if let Some((ck, ki)) = nearest_graph_key(app, &shown, &tf, pp) {
+                        if additive {
+                            ge_toggle(app, &ck, ki);
+                        } else if !ge_selected(app, &ck, ki) {
+                            ge_select_only(app, &ck, ki);
+                        }
+                        if ge_selected(app, &ck, ki) {
+                            app.s.checkpoint("move keys");
+                            app.windows_state.ge_drag = true;
+                            app.windows_state.ge_drag_anchor = pointer.map(|p| (p.x, p.y));
+                            let keys = app.windows_state.ge_keys.clone();
+                            app.windows_state.ge_drag_keys = keys
+                                .into_iter()
+                                .filter_map(|(k, i)| app.s.anim.curves.get(&k).and_then(|c| c.keys.get(i)).map(|key| (k, i, key.t, key.v)))
+                                .collect();
+                            app.windows_state.ge_box = None;
+                            app.windows_state.ge_tan_drag = None;
+                        }
+                    } else {
+                        app.windows_state.ge_box = Some(pp);
+                        app.windows_state.ge_drag = false;
+                        app.windows_state.ge_tan_drag = None;
+                        app.windows_state.ge_drag_keys.clear();
+                    }
                 }
             }
         } else if r.clicked() {
@@ -1254,52 +1333,33 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             } else if app.windows_state.ge_drag {
                 if let (Some((ax, ay)), Some(p)) = (app.windows_state.ge_drag_anchor, pointer) {
-                    if app.windows_state.ge_scaling {
-                        if let Some((pt, pv)) = app.windows_state.ge_scale_pivot {
-                            let sx = ((p.x - ax) / 60.0).exp().clamp(0.01, 100.0);
-                            let sy = ((p.y - ay) / 60.0).exp().clamp(0.01, 100.0);
-                            app.windows_state.ge_scale_factors = (sx, sy);
-                            let keys = app.windows_state.ge_drag_keys.clone();
-                            for (ck, ki, t0, v0) in keys {
-                                if let Some(c) = app.s.anim.curves.get_mut(&ck) {
-                                    if let Some(key) = c.keys.get_mut(ki) {
-                                        key.t = pt + (t0 - pt) * sx;
-                                        key.v = pv + (v0 - pv) * sy;
-                                    }
-                                }
+                    let raw_dt = (p.x - ax).round();
+                    let dv = p.y - ay;
+                    let mut dt_min = f64::NEG_INFINITY;
+                    let mut dt_max = f64::INFINITY;
+                    for (ck, ki, t0k, _) in &app.windows_state.ge_drag_keys {
+                        if let Some(c) = app.s.anim.curves.get(ck) {
+                            let selected: std::collections::HashSet<usize> = app.windows_state.ge_drag_keys.iter().filter(|(k, _, _, _)| k == ck).map(|(_, i, _, _)| *i).collect();
+                            if let Some(prev) = (0..*ki).rev().find(|i| !selected.contains(i)) {
+                                dt_min = dt_min.max(c.keys[prev].t - *t0k + 1.0);
                             }
-                            app.s.apply_anim();
-                            app.s.touch();
-                        }
-                    } else {
-                        let raw_dt = (p.x - ax).round();
-                        let dv = p.y - ay;
-                        let mut dt_min = f64::NEG_INFINITY;
-                        let mut dt_max = f64::INFINITY;
-                        for (ck, ki, t0k, _) in &app.windows_state.ge_drag_keys {
-                            if let Some(c) = app.s.anim.curves.get(ck) {
-                                let selected: std::collections::HashSet<usize> = app.windows_state.ge_drag_keys.iter().filter(|(k, _, _, _)| k == ck).map(|(_, i, _, _)| *i).collect();
-                                if let Some(prev) = (0..*ki).rev().find(|i| !selected.contains(i)) {
-                                    dt_min = dt_min.max(c.keys[prev].t - *t0k + 1.0);
-                                }
-                                if let Some(next) = (*ki + 1..c.keys.len()).find(|i| !selected.contains(i)) {
-                                    dt_max = dt_max.min(c.keys[next].t - *t0k - 1.0);
-                                }
+                            if let Some(next) = (*ki + 1..c.keys.len()).find(|i| !selected.contains(i)) {
+                                dt_max = dt_max.min(c.keys[next].t - *t0k - 1.0);
                             }
                         }
-                        let dt = if dt_min <= dt_max { raw_dt.clamp(dt_min, dt_max) } else { 0.0 };
-                        let keys = app.windows_state.ge_drag_keys.clone();
-                        for (ck, ki, t0k, v0k) in keys {
-                            if let Some(c) = app.s.anim.curves.get_mut(&ck) {
-                                if let Some(key) = c.keys.get_mut(ki) {
-                                    key.t = t0k + dt;
-                                    key.v = v0k + dv;
-                                }
-                            }
-                        }
-                        app.s.apply_anim();
-                        app.s.touch();
                     }
+                    let dt = if dt_min <= dt_max { raw_dt.clamp(dt_min, dt_max) } else { 0.0 };
+                    let keys = app.windows_state.ge_drag_keys.clone();
+                    for (ck, ki, t0k, v0k) in keys {
+                        if let Some(c) = app.s.anim.curves.get_mut(&ck) {
+                            if let Some(key) = c.keys.get_mut(ki) {
+                                key.t = t0k + dt;
+                                key.v = v0k + dv;
+                            }
+                        }
+                    }
+                    app.s.apply_anim();
+                    app.s.touch();
                 }
             }
         }
@@ -1308,6 +1368,32 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 theme::marquee(&ui.painter_at(r.rect), egui::Rect::from_two_pos(start, end));
             }
         }
+        }
+        // Middle-drag scaling continues even if the pointer leaves the graph view. Alt is reserved
+        // for view navigation, so it pauses scaling instead of mixing the two.
+        if app.windows_state.ge_scaling && !alt && (mid_down || mid_released) {
+            if let (Some((ax, ay)), Some(p)) = (app.windows_state.ge_drag_anchor, mid_pos) {
+                if let Some((pt, pv)) = app.windows_state.ge_scale_pivot {
+                    let (px, py) = (p.x as f64, p.y as f64);
+                    let sx = ((px - ax) / 120.0).exp().clamp(0.01, 100.0);
+                    let sy = ((py - ay) / 120.0).exp().clamp(0.01, 100.0);
+                    app.windows_state.ge_scale_factors = (sx, sy);
+                    let keys = app.windows_state.ge_drag_keys.clone();
+                    for (ck, ki, t0, v0) in keys {
+                        if let Some(c) = app.s.anim.curves.get_mut(&ck) {
+                            if let Some(key) = c.keys.get_mut(ki) {
+                                key.t = pt + (t0 - pt) * sx;
+                                key.v = pv + (v0 - pv) * sy;
+                            }
+                        }
+                    }
+                    app.s.apply_anim();
+                    app.s.touch();
+                }
+            }
+        }
+        if app.windows_state.ge_scaling && !mid_down {
+            finish_graph_scale(app);
         }
         if !app.windows_state.ge_scale {
             if let Some((kp, ip, op)) = graph_tangent_handles(app, &tf, &selected_keys) {
@@ -1338,41 +1424,12 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                 }
             }
-            if app.windows_state.ge_scaling {
-                let (sx, sy) = app.windows_state.ge_scale_factors;
-                let pivot = app.windows_state.ge_scale_pivot;
-                let keys = app.windows_state.ge_drag_keys.clone();
-                let affected: std::collections::HashSet<String> = keys.iter().map(|(ck, _, _, _)| ck.clone()).collect();
-                for ck in &affected {
-                    if let Some(c) = app.s.anim.curves.get_mut(ck) {
-                        c.sort();
-                    }
-                }
-                let mut selected = Vec::new();
-                if let Some((pt, pv)) = pivot {
-                    for (ck, _, t0, v0) in &keys {
-                        let nt = pt + (t0 - pt) * sx;
-                        let nv = pv + (v0 - pv) * sy;
-                        if let Some(c) = app.s.anim.curves.get(ck) {
-                            if let Some(i) = c.find(nt) {
-                                if (c.keys[i].v - nv).abs() < 1e-4 {
-                                    selected.push((ck.clone(), i));
-                                }
-                            }
-                        }
-                    }
-                }
-                app.windows_state.ge_keys = selected;
-                app.s.apply_anim();
-                app.s.touch();
+            if !app.windows_state.ge_scaling {
+                app.windows_state.ge_tan_drag = None;
+                app.windows_state.ge_drag = false;
+                app.windows_state.ge_drag_anchor = None;
+                app.windows_state.ge_drag_keys.clear();
             }
-            app.windows_state.ge_tan_drag = None;
-            app.windows_state.ge_scaling = false;
-            app.windows_state.ge_scale_pivot = None;
-            app.windows_state.ge_scale_factors = (1.0, 1.0);
-            app.windows_state.ge_drag = false;
-            app.windows_state.ge_drag_anchor = None;
-            app.windows_state.ge_drag_keys.clear();
         }
     });
 }
@@ -1922,6 +1979,70 @@ mod tests {
         assert!(app.windows_state.ge_scale);
         app.action("graphSelectKeys");
         assert!(!app.windows_state.ge_scale);
+    }
+
+    #[test]
+    fn graph_scale_uses_middle_drag_not_left_drag() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        let ck = inca_core::anim::Anim::key("pCube1", "translateX");
+        let mut c = inca_core::anim::AnimCurve::new("pCube1", "translateX");
+        for (i, t) in [1.0, 5.0, 10.0].iter().enumerate() {
+            c.set_key(*t, i as f64 * 10.0, "linear");
+        }
+        app.s.anim.curves.insert(ck.clone(), c);
+        app.s.sel = vec!["pCube1".into()];
+        app.win.graph_editor = true;
+        app.windows_state.ge_scale = true;
+        app.windows_state.ge_keys = vec![(ck.clone(), 0), (ck.clone(), 2)];
+        let run = |app: &mut IncaApp, frame: &mut eframe::Frame, events: Vec<egui::Event>, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+            raw.time = Some(t);
+            raw.events = events;
+            app.windows_state.window_seen_now.clear();
+            let mut out = ctx.run_ui(raw, |ui| show(app, ui.ctx(), frame));
+            out.textures_delta.clear();
+            std::mem::swap(&mut app.windows_state.window_seen, &mut app.windows_state.window_seen_now);
+        };
+        for i in 0..5 {
+            run(&mut app, &mut frame, vec![], i as f64 * 0.1);
+        }
+        let key_pos = app.windows_state.ge_first_key_screen.expect("key on screen");
+        // Left-drag on a selected key must not scale or move it in Scale Keys mode.
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(key_pos)], 0.6);
+        run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: key_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.7);
+        let left_end = key_pos + egui::vec2(80.0, 80.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(left_end)], 0.8);
+        run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: left_end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 0.9);
+        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        assert_eq!(times, vec![1.0, 5.0, 10.0], "left drag moved or scaled keys");
+        // Middle-drag anywhere in the graph (not on a key) scales the selected keys.
+        let start = key_pos + egui::vec2(50.0, -40.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(start)], 1.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: start, button: egui::PointerButton::Middle, pressed: true, modifiers: Default::default() }], 1.1);
+        assert!(app.windows_state.ge_scaling, "middle press did not start scaling (start {start:?}, window {:?}, key {key_pos:?})", app.windows_state.ge_window_rect);
+        assert_eq!(app.windows_state.ge_drag_keys.len(), 2, "scale drag keys after press: {:?}", app.windows_state.ge_drag_keys);
+        assert!(app.windows_state.ge_scale_pivot.is_some(), "scale pivot missing");
+        let end = start + egui::vec2(120.0, 120.0);
+        run(&mut app, &mut frame, vec![egui::Event::PointerMoved(end)], 1.2);
+        assert!(app.windows_state.ge_scaling, "middle move ended scaling");
+        assert!((app.windows_state.ge_scale_factors.0 - std::f64::consts::E).abs() < 1e-3, "factor after middle move: {:?}", app.windows_state.ge_scale_factors);
+        assert_eq!(app.windows_state.ge_drag_keys.len(), 2, "scale drag keys after move: {:?}", app.windows_state.ge_drag_keys);
+        run(&mut app, &mut frame, vec![egui::Event::PointerButton { pos: end, button: egui::PointerButton::Middle, pressed: false, modifiers: Default::default() }], 1.3);
+        let keys = &app.s.anim.curves[&ck].keys;
+        let factor = std::f64::consts::E;
+        let expected_t = [5.5 + (1.0 - 5.5) * factor, 5.0, 5.5 + (10.0 - 5.5) * factor];
+        let expected_v = [10.0 + (0.0 - 10.0) * factor, 10.0, 10.0 + (20.0 - 10.0) * factor];
+        for (i, key) in keys.iter().enumerate() {
+            assert!((key.t - expected_t[i]).abs() < 1e-3, "key {i} time: {:?}", keys.iter().map(|k| k.t).collect::<Vec<_>>());
+            assert!((key.v - expected_v[i]).abs() < 1e-3, "key {i} value: {:?}", keys.iter().map(|k| k.v).collect::<Vec<_>>());
+        }
+        assert_eq!(app.windows_state.ge_keys.len(), 2, "scaled keys should stay selected");
+        assert!(!app.windows_state.ge_scaling, "scale drag did not finish");
     }
 
     #[test]

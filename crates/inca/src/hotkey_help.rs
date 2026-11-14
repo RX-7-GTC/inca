@@ -328,7 +328,7 @@ pub fn describe(id: &str) -> Option<&'static str> {
         "graphDeleteKey" => "Deletes the selected keys in the Graph Editor.",
         "graphCopy" => "Copies the selected keys in the Graph Editor.",
         "graphPaste" => "Pastes copied keys at the current time in the Graph Editor.",
-        "graphScaleKeys" => "Toggles scaling of selected keys in the Graph Editor.",
+        "graphScaleKeys" => "Toggles Scale Keys in the Graph Editor; middle-drag in the graph to scale selected keys.",
         "graphSelectKeys" => "Exits the Graph Editor scale mode.",
         "dopeFrameSelected" => "Frames the selected objects' keys in the Dope Sheet.",
         "dopeFrameAll" => "Frames every key in the Dope Sheet.",

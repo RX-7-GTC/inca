@@ -1194,13 +1194,13 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "graphCopy" => crate::windows::copy_selected_keys(app),
         "graphPaste" => crate::windows::paste_keys(app),
         "graphScaleKeys" => {
+            crate::windows::finish_graph_scale(app);
             app.windows_state.ge_scale = !app.windows_state.ge_scale;
-            app.windows_state.ge_scaling = false;
-            app.help = if app.windows_state.ge_scale { "Scale Keys: ON".into() } else { "Scale Keys: OFF".into() };
+            app.help = if app.windows_state.ge_scale { "Scale Keys: ON - middle-drag in the graph".into() } else { "Scale Keys: OFF".into() };
         }
         "graphSelectKeys" => {
+            crate::windows::finish_graph_scale(app);
             app.windows_state.ge_scale = false;
-            app.windows_state.ge_scaling = false;
         }
         "dopeFrameSelected" => crate::windows::dope_frame(app, true),
         "dopeFrameAll" => crate::windows::dope_frame(app, false),
