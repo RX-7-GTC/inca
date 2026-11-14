@@ -18,6 +18,104 @@ pub struct CbPick {
     pub max: Option<f64>,
 }
 
+/// One drawn Channel Box row. `channel_box` collects these while drawing so a drag can select
+/// every row between the press row and the row under the pointer.
+struct CbRow {
+    /// Unique row id: node id (or history node id) and attribute.
+    key: (String, String),
+    pick: CbPick,
+    label: Rect,
+    field: Option<Rect>,
+    numeric: bool,
+    locked: bool,
+}
+
+fn cb_is_picked(fields: &[CbPick], first: &NodeRef, attr: &str) -> bool {
+    fields.iter().any(|p| p.attr == attr && p.targets.first() == Some(first))
+}
+
+fn cb_text(kind: ChanKind, x: f64) -> String {
+    if kind == ChanKind::Int {
+        format!("{}", x.round() as i64)
+    } else {
+        fmt_num(x)
+    }
+}
+
+/// Apply typed Channel Box text (absolute or `+=` style) to every selected field.
+fn cb_apply_text(app: &mut IncaApp, fields: &[CbPick], text: &str) {
+    let text = text.trim();
+    let mut rel = None;
+    let mut abs = None;
+    for op in ['+', '-', '*', '/'] {
+        if let Some(rest) = text.strip_prefix(op).and_then(|r| r.strip_prefix('=')) {
+            rel = eval_expr(rest).map(|a| (op, a));
+            break;
+        }
+    }
+    if rel.is_none() {
+        abs = eval_expr(text.strip_prefix('=').unwrap_or(text));
+    }
+    if rel.is_none() && abs.is_none() {
+        return;
+    }
+    app.s.checkpoint("setAttr channel");
+    for p in fields {
+        for t in &p.targets {
+            let mut nv = if let Some((op, a)) = rel {
+                apply_rel(op, app.s.get_attr(t, &p.attr).and_then(|v| v.as_f64()).unwrap_or(0.0), a)
+            } else {
+                abs.unwrap_or(0.0)
+            };
+            if let Some(a) = p.min {
+                nv = nv.max(a);
+            }
+            if let Some(b) = p.max {
+                nv = nv.min(b);
+            }
+            app.s.set_attr(t, &p.attr, if p.int { json!(nv.round() as i64) } else { json!(nv) });
+            if app.s.time.auto_key {
+                if let NodeRef::Dag(id) = t {
+                    if app.s.anim.is_keyed(id, &p.attr) {
+                        app.s.set_key(id, &p.attr, None, None);
+                    }
+                }
+            }
+        }
+    }
+    app.echo(format!("// set {} selected field(s): {text}", fields.len()));
+}
+
+/// Row under `pos`, or the nearest one vertically. Names and fields use the same rows.
+fn cb_row_at(rows: &[CbRow], pos: egui::Pos2, numeric_only: bool) -> Option<usize> {
+    let mut best: Option<(f32, usize)> = None;
+    for (i, row) in rows.iter().enumerate() {
+        if numeric_only && !row.numeric {
+            continue;
+        }
+        let rect = if numeric_only { row.field.unwrap_or(row.label) } else { row.label };
+        let dy = if pos.y < rect.top() { rect.top() - pos.y } else if pos.y > rect.bottom() { pos.y - rect.bottom() } else { 0.0 };
+        if dy <= 0.0 {
+            return Some(i);
+        }
+        if best.is_none_or(|(bd, _)| dy < bd) {
+            best = Some((dy, i));
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// Picks between two row indices, keeping draw order. Fields only include unlocked numeric rows.
+fn cb_rows_range(rows: &[CbRow], anchor: &(String, String), current: usize, numeric_only: bool) -> (Vec<CbPick>, Option<(String, String)>) {
+    let Some(a) = rows.iter().position(|r| &r.key == anchor) else {
+        return (Vec::new(), None);
+    };
+    let (lo, hi) = (a.min(current), a.max(current));
+    let picks = rows[lo..=hi].iter().filter(|r| !numeric_only || (r.numeric && !r.locked)).map(|r| r.pick.clone()).collect();
+    let last = rows[lo..=hi].iter().rev().find(|r| !numeric_only || (r.numeric && !r.locked)).map(|r| r.key.clone());
+    (picks, last)
+}
+
 #[derive(Default)]
 pub struct PanelState {
     pub outliner_filter: String,
@@ -40,6 +138,20 @@ pub struct PanelState {
     /// virtual slider drag: (target, attribute, start value, int?)
     pub cb_drag: Option<Vec<(NodeRef, String, f64, bool, Option<f64>, Option<f64>)>>,
     cb_drag_x: f32,
+    /// Channel Box value fields picked by dragging/Shift/Ctrl. Typing into one of them edits all.
+    pub cb_fields: Vec<CbPick>,
+    cb_field_last: Option<(String, String)>,
+    /// Pending Shift-click field range: field key and whether Shift was held.
+    cb_field_click: Option<((String, String), bool)>,
+    /// Active Channel Box drag-select anchors: channel names and value fields.
+    cb_name_drag: Option<(String, String)>,
+    cb_field_drag: Option<(String, String)>,
+    /// Inline Channel Box value editor. `cb_edit_new` requests focus and select-all.
+    cb_editing: Option<(String, String)>,
+    cb_edit_text: String,
+    cb_edit_new: bool,
+    /// Last drawn Channel Box rows for the in-app UI tests: key, name rect, field rect.
+    pub cb_row_rects: Vec<(String, String, Rect, Rect)>,
     pub ae_tab: usize,
     pub ol: OutlinerOpts,
     /// Attribute Editor locked to a node (List > Auto Load off, or the lock button)
@@ -771,6 +883,16 @@ fn finish_edit(app: &mut IncaApp, targets: &[NodeRef], attr: &str, resp: &egui::
 }
 
 fn channel_row(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: &str, label: &str, kind: ChanKind, min: Option<f64>, max: Option<f64>) {
+    channel_row_impl(app, ui, targets, attr, label, kind, min, max, None);
+}
+
+/// Channel Box row: also records its rects so drags across rows can select names or fields.
+fn channel_row_cb(app: &mut IncaApp, ui: &mut egui::Ui, rows: &mut Vec<CbRow>, targets: &[NodeRef], attr: &str, label: &str, kind: ChanKind, min: Option<f64>, max: Option<f64>) {
+    channel_row_impl(app, ui, targets, attr, label, kind, min, max, Some(rows));
+}
+
+fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: &str, label: &str, kind: ChanKind, min: Option<f64>, max: Option<f64>, rows: Option<&mut Vec<CbRow>>) {
+    let selectable = rows.is_some();
     let Some(first) = targets.first() else { return };
     let Some(cur) = app.s.get_attr(first, attr) else { return };
     let id = app.s.ref_id(first);
@@ -783,8 +905,11 @@ fn channel_row(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: 
     };
     ui.horizontal(|ui| {
         let lw = 120.0;
-        let (rect, lresp) = ui.allocate_exact_size(egui::vec2(lw, 18.0), egui::Sense::click());
+        let sense = if selectable { egui::Sense::click_and_drag() } else { egui::Sense::click() };
+        let (rect, lresp) = ui.allocate_exact_size(egui::vec2(lw, 18.0), sense);
         let picked = app.panels.cb_pick.iter().any(|p| p.attr == attr && p.targets.first() == Some(first));
+        let field_selected = selectable && cb_is_picked(&app.panels.cb_fields, first, attr);
+        let field_key = (id.clone(), attr.to_string());
         let int = matches!(kind, ChanKind::Int | ChanKind::Bool | ChanKind::Enum(_));
         let me = CbPick { targets: targets.to_vec(), attr: attr.to_string(), int, min, max };
         if picked {
@@ -822,7 +947,20 @@ fn channel_row(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: 
             app.panels.cb_armed = true;
             app.help = "Middle-drag in a viewport to change the selected channels (virtual slider; Ctrl slower, Shift faster)".into();
         }
-        let fill = if locked {
+        if selectable && lresp.drag_started() {
+            app.panels.cb_name_drag = Some(field_key.clone());
+            app.panels.cb_sel = vec![attr.to_string()];
+            app.panels.cb_pick = vec![me.clone()];
+            app.panels.cb_last = Some(attr.to_string());
+            app.panels.cb_armed = true;
+            app.help = "Middle-drag in a viewport to change the selected channels (virtual slider; Ctrl slower, Shift faster)".into();
+            if let Some(fid) = ui.memory(|m| m.focused()) {
+                ui.memory_mut(|m| m.surrender_focus(fid));
+            }
+        }
+        let fill = if field_selected {
+            theme::HI
+        } else if locked {
             theme::LOCKED
         } else if driven {
             theme::DRIVEN.gamma_multiply(0.6)
@@ -834,7 +972,7 @@ fn channel_row(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: 
             theme::FIELD
         };
         let w = ui.available_width();
-        let resp = egui::Frame::NONE.fill(fill).show(ui, |ui| {
+        let frame = egui::Frame::NONE.fill(fill).show(ui, |ui| {
             ui.set_width(w);
             ui.add_enabled_ui(!locked, |ui| match kind {
                 ChanKind::Bool => {
@@ -872,80 +1010,188 @@ fn channel_row(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: 
                     r
                 }
                 _ => {
-                    let mut x = cur.as_f64().unwrap_or(0.0);
-                    // typed expressions: "2*3", or relative "+=2" "-=1" "*=2" "/=2" applied to each selected object's own value
-                    let rel: std::cell::Cell<Option<(char, f64)>> = std::cell::Cell::new(None);
-                    let x0 = x;
-                    let mut dv = egui::DragValue::new(&mut x).speed(if kind == ChanKind::Int { 0.1 } else { 0.02 }).max_decimals(3).custom_parser(|t| {
-                        let t = t.trim();
-                        for op in ['+', '-', '*', '/'] {
-                            if let Some(rest) = t.strip_prefix(op).and_then(|r| r.strip_prefix('=')) {
-                                let a = eval_expr(rest)?;
-                                rel.set(Some((op, a)));
-                                return Some(apply_rel(op, x0, a));
+                    let x = cur.as_f64().unwrap_or(0.0);
+                    if selectable {
+                        let editing = app.panels.cb_editing.as_ref().is_some_and(|(id, a)| id == &field_key.0 && a == &field_key.1);
+                        if editing {
+                            let edit_id = ui.make_persistent_id(("cb_edit", &field_key.0, &field_key.1));
+                            let mut text = app.panels.cb_edit_text.clone();
+                            let r = ui.add_sized(
+                                [w - 4.0, 18.0],
+                                egui::TextEdit::singleline(&mut text).id(edit_id).horizontal_align(egui::Align::RIGHT).margin(egui::Margin::symmetric(4, 2)),
+                            );
+                            app.panels.cb_edit_text = text;
+                            let still_editing = app.panels.cb_editing.as_ref() == Some(&field_key);
+                            if app.panels.cb_edit_new && still_editing {
+                                ui.memory_mut(|m| m.request_focus(edit_id));
+                                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), edit_id) {
+                                    let n = app.panels.cb_edit_text.chars().count();
+                                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::default(), egui::text::CCursor::new(n))));
+                                    state.store(ui.ctx(), edit_id);
+                                }
+                                app.panels.cb_edit_new = false;
+                            } else if still_editing && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                app.panels.cb_editing = None;
+                            } else if still_editing && (r.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                let fields = if field_selected && app.panels.cb_fields.len() > 1 { app.panels.cb_fields.clone() } else { vec![me.clone()] };
+                                cb_apply_text(app, &fields, &app.panels.cb_edit_text.clone());
+                                app.panels.cb_editing = None;
+                            }
+                            r
+                        } else {
+                            let text = cb_text(kind, x);
+                            let (rrect, r) = ui.allocate_exact_size(egui::vec2(w - 4.0, 18.0), egui::Sense::click_and_drag());
+                            let painter = ui.painter();
+                            if field_selected {
+                                painter.rect_filled(rrect, 2.0, theme::HI);
+                            }
+                            painter.text(
+                                rrect.right_center() - egui::vec2(5.0, 0.0),
+                                egui::Align2::RIGHT_CENTER,
+                                text,
+                                egui::FontId::proportional(12.0),
+                                if locked { theme::TEXT_DIM } else { theme::TEXT },
+                            );
+                            let border = if field_selected { Color32::from_rgb(0x9a, 0xc8, 0xe0) } else { theme::LINE };
+                            painter.rect_stroke(rrect, 2.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                            if r.hovered() && !locked {
+                                painter.rect_stroke(rrect, 2.0, egui::Stroke::new(1.0, theme::TEXT_DIM), egui::StrokeKind::Inside);
+                            }
+                            if r.clicked() {
+                                let m = ui.input(|i| i.modifiers);
+                                if m.shift {
+                                    app.panels.cb_field_click = Some((field_key.clone(), true));
+                                } else if m.ctrl || m.command {
+                                    if cb_is_picked(&app.panels.cb_fields, first, attr) {
+                                        app.panels.cb_fields.retain(|q| !(q.attr == attr && q.targets.first() == Some(first)));
+                                    } else {
+                                        app.panels.cb_fields.push(me.clone());
+                                    }
+                                    app.panels.cb_field_last = Some(field_key.clone());
+                                } else {
+                                    if !cb_is_picked(&app.panels.cb_fields, first, attr) {
+                                        app.panels.cb_fields = vec![me.clone()];
+                                    }
+                                    app.panels.cb_field_last = Some(field_key.clone());
+                                }
+                                app.panels.cb_edit_text = cb_text(kind, x);
+                                app.panels.cb_editing = Some(field_key.clone());
+                                app.panels.cb_edit_new = true;
+                            }
+                            if r.drag_started() {
+                                app.panels.cb_field_drag = Some(field_key.clone());
+                                app.panels.cb_fields = vec![me.clone()];
+                                app.panels.cb_field_last = Some(field_key.clone());
+                                app.panels.cb_editing = None;
+                                app.panels.cb_edit_new = false;
+                                if let Some(fid) = ui.memory(|m| m.focused()) {
+                                    ui.memory_mut(|m| m.surrender_focus(fid));
+                                }
+                            }
+                            if kind == ChanKind::Int && r.hovered() && !locked {
+                                let sc = wheel_notch(ui);
+                                if sc != 0.0 {
+                                    let mut nv = x + sc.signum() as f64;
+                                    if let Some(a) = min {
+                                        nv = nv.max(a);
+                                    }
+                                    if let Some(b) = max {
+                                        nv = nv.min(b);
+                                    }
+                                    app.s.checkpoint(&format!("setAttr {attr}"));
+                                    for t in targets {
+                                        app.s.set_attr(t, attr, json!(nv.round() as i64));
+                                    }
+                                }
+                            }
+                            r.on_hover_cursor(egui::CursorIcon::Text)
+                        }
+                    } else {
+                        let mut x = x;
+                        // typed expressions: "2*3", or relative "+=2" "-=1" "*=2" "/=2" applied to each selected object's own value
+                        let rel: std::cell::Cell<Option<(char, f64)>> = std::cell::Cell::new(None);
+                        let x0 = x;
+                        let mut dv = egui::DragValue::new(&mut x).speed(if kind == ChanKind::Int { 0.1 } else { 0.02 }).max_decimals(3).custom_parser(|t| {
+                            let t = t.trim();
+                            for op in ['+', '-', '*', '/'] {
+                                if let Some(rest) = t.strip_prefix(op).and_then(|r| r.strip_prefix('=')) {
+                                    let a = eval_expr(rest)?;
+                                    rel.set(Some((op, a)));
+                                    return Some(apply_rel(op, x0, a));
+                                }
+                            }
+                            eval_expr(t.strip_prefix('=').unwrap_or(t))
+                        });
+                        if kind == ChanKind::Int {
+                            dv = dv.fixed_decimals(0);
+                        }
+                        if let (Some(a), Some(b)) = (min, max) {
+                            dv = dv.range(a..=b);
+                        } else if let Some(a) = min {
+                            dv = dv.range(a..=f64::MAX);
+                        }
+                        let r = ui.add_sized([w - 4.0, 18.0], dv);
+                        // the wheel over an int channel steps it by one
+                        let mut stepped = false;
+                        if kind == ChanKind::Int && r.hovered() && !locked {
+                            let sc = wheel_notch(ui);
+                            if sc != 0.0 {
+                                x += sc.signum() as f64;
+                                if let Some(a) = min {
+                                    x = x.max(a);
+                                }
+                                if let Some(b) = max {
+                                    x = x.min(b);
+                                }
+                                stepped = true;
                             }
                         }
-                        eval_expr(t.strip_prefix('=').unwrap_or(t))
-                    });
-                    if kind == ChanKind::Int {
-                        dv = dv.fixed_decimals(0);
-                    }
-                    if let (Some(a), Some(b)) = (min, max) {
-                        dv = dv.range(a..=b);
-                    } else if let Some(a) = min {
-                        dv = dv.range(a..=f64::MAX);
-                    }
-                    let r = ui.add_sized([w - 4.0, 18.0], dv);
-                    // the wheel over an int channel steps it by one
-                    let mut stepped = false;
-                    if kind == ChanKind::Int && r.hovered() && !locked {
-                        let sc = wheel_notch(ui);
-                        if sc != 0.0 {
-                            x += sc.signum() as f64;
-                            if let Some(a) = min {
-                                x = x.max(a);
-                            }
-                            if let Some(b) = max {
-                                x = x.min(b);
-                            }
-                            stepped = true;
-                        }
-                    }
-                    if let (true, Some((op, a))) = (r.changed(), rel.get()) {
-                        app.s.checkpoint(&format!("setAttr {attr}"));
-                        for t in targets {
-                            let c = app.s.get_attr(t, attr).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            let nv = apply_rel(op, c, a);
-                            app.s.set_attr(t, attr, if kind == ChanKind::Int { json!(nv.round() as i64) } else { json!(nv) });
-                        }
-                        app.echo(format!("setAttr -r ... {attr} {op}= {}", fmt_num(a)));
-                    } else if r.changed() && !r.dragged() && picked && app.panels.cb_pick.len() > 1 {
-                        // a value typed into one of several picked channels goes into all of them
-                        app.s.checkpoint(&format!("setAttr {attr}"));
-                        for p in app.panels.cb_pick.clone() {
-                            for t in &p.targets {
-                                app.s.set_attr(t, &p.attr, if p.int { json!(x.round() as i64) } else { json!(x) });
-                            }
-                        }
-                        app.echo(format!("// set {} picked channels to {}", app.panels.cb_pick.len(), fmt_num(x)));
-                    } else if r.changed() || stepped {
-                        let v = if kind == ChanKind::Int { json!(x.round() as i64) } else { json!(x) };
-                        if stepped {
+                        if let (true, Some((op, a))) = (r.changed(), rel.get()) {
                             app.s.checkpoint(&format!("setAttr {attr}"));
                             for t in targets {
-                                app.s.set_attr(t, attr, v.clone());
+                                let c = app.s.get_attr(t, attr).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let nv = apply_rel(op, c, a);
+                                app.s.set_attr(t, attr, if kind == ChanKind::Int { json!(nv.round() as i64) } else { json!(nv) });
                             }
-                        } else {
-                            edit_channel(app, targets, attr, v, &r);
+                            app.echo(format!("setAttr -r ... {attr} {op}= {}", fmt_num(a)));
+                        } else if r.changed() && !r.dragged() && picked && app.panels.cb_pick.len() > 1 {
+                            // a value typed into one of several picked channels goes into all of them
+                            app.s.checkpoint(&format!("setAttr {attr}"));
+                            for p in app.panels.cb_pick.clone() {
+                                for t in &p.targets {
+                                    app.s.set_attr(t, &p.attr, if p.int { json!(x.round() as i64) } else { json!(x) });
+                                }
+                            }
+                            app.echo(format!("// set {} picked channels to {}", app.panels.cb_pick.len(), fmt_num(x)));
+                        } else if r.changed() || stepped {
+                            let v = if kind == ChanKind::Int { json!(x.round() as i64) } else { json!(x) };
+                            if stepped {
+                                app.s.checkpoint(&format!("setAttr {attr}"));
+                                for t in targets {
+                                    app.s.set_attr(t, attr, v.clone());
+                                }
+                            } else {
+                                edit_channel(app, targets, attr, v, &r);
+                            }
                         }
+                        finish_edit(app, targets, attr, &r);
+                        r
                     }
-                    finish_edit(app, targets, attr, &r);
-                    r
                 }
             })
             .inner
         });
-        let _ = resp;
+        if let Some(rows) = rows {
+            let numeric = matches!(kind, ChanKind::Float | ChanKind::Int);
+            rows.push(CbRow {
+                key: field_key.clone(),
+                pick: me.clone(),
+                label: rect,
+                field: Some(frame.response.rect),
+                numeric,
+                locked,
+            });
+        }
         lresp.context_menu(|ui| {
             let names: Vec<String> = targets.iter().map(|t| app.s.ref_name(t)).collect();
             if ui.button("Key Selected").clicked() {
@@ -980,14 +1226,112 @@ fn channel_row(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: 
     });
 }
 
+/// Resolve drag selections after the whole Channel Box has been drawn, using this frame's rows.
+fn finish_cb_rows(app: &mut IncaApp, ui: &egui::Ui, rows: &[CbRow]) {
+    if rows.is_empty() {
+        app.panels.cb_fields.clear();
+        app.panels.cb_field_last = None;
+        app.panels.cb_field_click = None;
+        app.panels.cb_name_drag = None;
+        app.panels.cb_field_drag = None;
+        app.panels.cb_editing = None;
+        app.panels.cb_edit_new = false;
+        app.panels.cb_row_rects.clear();
+        return;
+    }
+    let (pos, primary_down) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down()));
+    // Shift-click extends the field selection from the last selected field.
+    if let Some((key, shift)) = app.panels.cb_field_click.take() {
+        if shift {
+            if let Some(cur) = rows.iter().position(|r| r.key == key) {
+                let anchor = app.panels.cb_field_last.clone();
+                let (picks, last) = match anchor.as_ref().and_then(|a| rows.iter().position(|r| &r.key == a)) {
+                    Some(a) => cb_rows_range(rows, &rows[a].key, cur, true),
+                    None => (Vec::new(), None),
+                };
+                let (picks, last) = if picks.is_empty() {
+                    let only = rows.get(cur).filter(|r| r.numeric && !r.locked).map(|r| (vec![r.pick.clone()], Some(r.key.clone())));
+                    only.unwrap_or((Vec::new(), None))
+                } else {
+                    (picks, last)
+                };
+                if !picks.is_empty() {
+                    app.panels.cb_fields = picks;
+                    app.panels.cb_field_last = last;
+                }
+            }
+        }
+    }
+    // Drag over channel names selects the whole range for the MMB virtual slider.
+    if let Some(anchor) = app.panels.cb_name_drag.clone() {
+        if let Some(pos) = pos {
+            if let Some(cur) = cb_row_at(rows, pos, false) {
+                let a = rows.iter().position(|r| r.key == anchor).unwrap_or(cur);
+                let (lo, hi) = (a.min(cur), a.max(cur));
+                let picks: Vec<CbPick> = rows[lo..=hi].iter().map(|r| r.pick.clone()).collect();
+                let mut sel: Vec<String> = Vec::new();
+                for p in &picks {
+                    if !sel.contains(&p.attr) {
+                        sel.push(p.attr.clone());
+                    }
+                }
+                app.panels.cb_sel = sel;
+                app.panels.cb_pick = picks;
+                app.panels.cb_last = Some(rows[cur].pick.attr.clone());
+                app.panels.cb_armed = true;
+            }
+        }
+        if !primary_down {
+            app.panels.cb_name_drag = None;
+        }
+    }
+    // Drag over value fields selects them; releasing focuses the last one for typing.
+    if let Some(anchor) = app.panels.cb_field_drag.clone() {
+        if let Some(pos) = pos {
+            if let Some(cur) = cb_row_at(rows, pos, true) {
+                let (picks, last) = cb_rows_range(rows, &anchor, cur, true);
+                if !picks.is_empty() {
+                    app.panels.cb_fields = picks;
+                    app.panels.cb_field_last = last;
+                }
+            }
+        }
+        if !primary_down {
+            app.panels.cb_field_drag = None;
+            if let Some(last) = app.panels.cb_field_last.clone() {
+                if let Some(row) = rows.iter().find(|r| r.key == last && r.numeric && !r.locked) {
+                    let old = row.pick.targets.first().and_then(|t| app.s.get_attr(t, &row.pick.attr)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    app.panels.cb_edit_text = if row.pick.int { format!("{}", old.round() as i64) } else { fmt_num(old) };
+                    app.panels.cb_editing = Some(last);
+                    app.panels.cb_edit_new = true;
+                }
+            }
+        }
+    }
+    // Drop selections/editors whose rows are no longer displayed or editable.
+    app.panels.cb_fields.retain(|p| rows.iter().any(|r| r.numeric && !r.locked && r.pick.attr == p.attr && r.pick.targets.first() == p.targets.first()));
+    if let Some(key) = app.panels.cb_editing.clone() {
+        if !rows.iter().any(|r| r.key == key && r.numeric && !r.locked) {
+            app.panels.cb_editing = None;
+        }
+    }
+    app.panels.cb_row_rects = rows.iter().map(|r| (r.key.0.clone(), r.key.1.clone(), r.label, r.field.unwrap_or(r.label))).collect();
+}
+
 pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
     let Some(lead) = app.s.lead().cloned() else {
         ui.label(RichText::new("Nothing selected").color(theme::TEXT_DIM));
+        app.panels.cb_fields.clear();
+        app.panels.cb_editing = None;
+        app.panels.cb_name_drag = None;
+        app.panels.cb_field_drag = None;
+        app.panels.cb_row_rects.clear();
         return;
     };
     let Some(n) = app.s.node(&lead) else { return };
     let name = n.name.clone();
     let shape = n.shape_name.clone();
+    let mut cb_rows: Vec<CbRow> = Vec::new();
     // object name (editable)
     let mut nm = name.clone();
     let r = ui.add(egui::TextEdit::singleline(&mut nm).font(egui::TextStyle::Heading).desired_width(f32::INFINITY));
@@ -1000,7 +1344,7 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
     targets.extend(app.s.sel.iter().filter(|i| **i != lead).map(|i| NodeRef::Dag(i.clone())));
     for c in CHANNELS {
         let kind = if c == "visibility" { ChanKind::Bool } else { ChanKind::Float };
-        channel_row(app, ui, &targets, c, &ops::nice_name(c), kind, None, None);
+        channel_row_cb(app, ui, &mut cb_rows, &targets, c, &ops::nice_name(c), kind, None, None);
     }
     // added (dynamic) attributes, unless the SHAPES section lists them
     let sh_channels = app.s.shape_channels(&lead);
@@ -1016,7 +1360,7 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
             .collect()
     }).unwrap_or_default();
     for (k, kind) in extra {
-        channel_row(app, ui, &targets, &k, &ops::nice_name(&k), kind, None, None);
+        channel_row_cb(app, ui, &mut cb_rows, &targets, &k, &ops::nice_name(&k), kind, None, None);
     }
     // PUBLISHED (container interface attributes)
     let published: Vec<(String, ChanKind)> = app.s.node(&lead).map(|n| {
@@ -1034,7 +1378,7 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         theme::section_header(ui, "PUBLISHED");
         for (k, kind) in published {
-            channel_row(app, ui, &[NodeRef::Dag(lead.clone())], &k, &k, kind, None, None);
+            channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(lead.clone())], &k, &k, kind, None, None);
         }
     }
     // SHAPES
@@ -1051,7 +1395,7 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
                 _ => ChanKind::Float,
             };
             let (mn, mx) = if c == "smoothLevel" { (Some(0.0), Some(3.0)) } else { (None, None) };
-            channel_row(app, ui, &[NodeRef::Dag(lead.clone())], &c, &ops::nice_name(&c), kind, mn, mx);
+            channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(lead.clone())], &c, &ops::nice_name(&c), kind, mn, mx);
         }
     }
     // INPUTS (construction history, newest first); a deformer handle shows its deformer
@@ -1093,12 +1437,13 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
                     let r = NodeRef::History(lead.clone(), i);
                     for c in chans {
                         let label = c.label.map(String::from).unwrap_or_else(|| ops::nice_name(c.key));
-                        channel_row(app, ui, std::slice::from_ref(&r), c.key, &label, c.kind, c.min, c.max);
+                        channel_row_cb(app, ui, &mut cb_rows, std::slice::from_ref(&r), c.key, &label, c.kind, c.min, c.max);
                     }
                 }
             }
         }
     }
+    finish_cb_rows(app, ui, &cb_rows);
 }
 
 fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
@@ -2247,4 +2592,114 @@ fn tool_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
     }
     ui.separator();
     ui.checkbox(&mut app.history_on, "Construction history");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inca_core::params::Params;
+    use inca_core::scene::SelMode;
+
+    fn raw(events: Vec<egui::Event>, t: f64) -> egui::RawInput {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+        raw.time = Some(t);
+        raw.events = events;
+        raw
+    }
+
+    #[test]
+    fn channel_box_drag_selects_names_and_fields() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let rows = app.panels.cb_row_rects.clone();
+        let field = |attr: &str| rows.iter().find(|(_, a, _, _)| a == attr).map(|(_, _, _, f)| *f).expect("field rect");
+        let name = |attr: &str| rows.iter().find(|(_, a, _, _)| a == attr).map(|(_, _, r, _)| *r).expect("name rect");
+        let (fx, fy, fz) = (field("translateX"), field("translateY"), field("translateZ"));
+        let before: Vec<f64> = ["translateX", "translateY", "translateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
+        // Drag across the three value boxes.
+        run(&mut app, vec![egui::Event::PointerMoved(fx.center())], 0.6);
+        run(&mut app, vec![egui::Event::PointerButton { pos: fx.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.7);
+        run(&mut app, vec![egui::Event::PointerMoved(fy.center())], 0.8);
+        run(&mut app, vec![egui::Event::PointerMoved(fz.center())], 0.9);
+        run(&mut app, vec![egui::Event::PointerButton { pos: fz.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 1.0);
+        run(&mut app, vec![], 1.1);
+        let fields: Vec<String> = app.panels.cb_fields.iter().map(|p| p.attr.clone()).collect();
+        assert_eq!(fields, vec!["translateX", "translateY", "translateZ"], "field drag selected {fields:?}");
+        let during: Vec<f64> = ["translateX", "translateY", "translateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
+        assert_eq!(during, before, "dragging value fields changed the scene");
+        // The last selected field is focused, so typing goes into all three.
+        run(&mut app, vec![egui::Event::Text("7".into())], 1.2);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 1.3);
+        run(&mut app, vec![], 1.4);
+        let after: Vec<f64> = ["translateX", "translateY", "translateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
+        assert_eq!(after, vec![7.0, 7.0, 7.0], "typing into the last field did not update all selected fields");
+        // Drag across the channel names for the MMB virtual slider.
+        let (nx, nz) = (name("translateX"), name("translateZ"));
+        run(&mut app, vec![egui::Event::PointerMoved(nx.center())], 1.5);
+        run(&mut app, vec![egui::Event::PointerButton { pos: nx.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 1.6);
+        run(&mut app, vec![egui::Event::PointerMoved(nz.center())], 1.7);
+        run(&mut app, vec![egui::Event::PointerButton { pos: nz.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 1.8);
+        run(&mut app, vec![], 1.9);
+        let picks: Vec<String> = app.panels.cb_pick.iter().map(|p| p.attr.clone()).collect();
+        assert_eq!(picks, vec!["translateX", "translateY", "translateZ"], "name drag selected {picks:?}");
+        assert!(app.panels.cb_armed, "name drag did not arm the virtual slider");
+        // Clicking a different field edits only that field.
+        let rx = field("rotateX");
+        run(&mut app, vec![egui::Event::PointerMoved(rx.center())], 2.0);
+        run(&mut app, vec![egui::Event::PointerButton { pos: rx.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 2.1);
+        run(&mut app, vec![egui::Event::PointerButton { pos: rx.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 2.2);
+        run(&mut app, vec![], 2.3);
+        run(&mut app, vec![egui::Event::Text("3".into())], 2.4);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 2.5);
+        run(&mut app, vec![], 2.6);
+        assert_eq!(app.panels.cb_fields.len(), 1, "click should collapse the field selection");
+        assert_eq!(app.panels.cb_fields[0].attr, "rotateX");
+        let rotate_x = app.s.get_attr(&NodeRef::Dag(id.clone()), "rotateX").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let translate_x = app.s.get_attr(&NodeRef::Dag(id.clone()), "translateX").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        assert_eq!(rotate_x, 3.0, "single-field edit did not apply");
+        assert_eq!(translate_x, 7.0, "single-field edit changed another field");
+        // Relative expressions still apply to every selected field's own value.
+        run(&mut app, vec![egui::Event::PointerMoved(fx.center())], 3.0);
+        run(&mut app, vec![egui::Event::PointerButton { pos: fx.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 3.1);
+        run(&mut app, vec![egui::Event::PointerMoved(fy.center())], 3.2);
+        run(&mut app, vec![egui::Event::PointerMoved(fz.center())], 3.3);
+        run(&mut app, vec![egui::Event::PointerButton { pos: fz.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 3.4);
+        run(&mut app, vec![], 3.5);
+        run(&mut app, vec![egui::Event::Text("+=1".into())], 3.6);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 3.7);
+        run(&mut app, vec![], 3.8);
+        let relative: Vec<f64> = ["translateX", "translateY", "translateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
+        assert_eq!(relative, vec![8.0, 8.0, 8.0], "relative multi-field edit did not apply: {relative:?}");
+        // Shift-click selects a range of fields, then typing sets them all.
+        let rz = field("rotateZ");
+        run(&mut app, vec![egui::Event::PointerMoved(rx.center())], 4.0);
+        run(&mut app, vec![egui::Event::PointerButton { pos: rx.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 4.1);
+        run(&mut app, vec![egui::Event::PointerButton { pos: rx.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 4.2);
+        run(&mut app, vec![], 4.3);
+        run(&mut app, vec![egui::Event::ModifiersChanged(egui::Modifiers { shift: true, ..Default::default() })], 4.4);
+        run(&mut app, vec![egui::Event::PointerMoved(rz.center())], 4.5);
+        run(&mut app, vec![egui::Event::PointerButton { pos: rz.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers { shift: true, ..Default::default() } }], 4.6);
+        run(&mut app, vec![egui::Event::PointerButton { pos: rz.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers { shift: true, ..Default::default() } }], 4.7);
+        run(&mut app, vec![egui::Event::ModifiersChanged(egui::Modifiers::default())], 4.8);
+        run(&mut app, vec![], 4.9);
+        run(&mut app, vec![egui::Event::Text("5".into())], 5.0);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 5.1);
+        run(&mut app, vec![], 5.2);
+        let rotated: Vec<f64> = ["rotateX", "rotateY", "rotateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
+        assert_eq!(rotated, vec![5.0, 5.0, 5.0], "Shift-click range did not apply to all fields: {rotated:?}");
+    }
 }
