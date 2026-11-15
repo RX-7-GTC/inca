@@ -1851,7 +1851,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     visuals.x_color = Color32::from_rgb(230, 57, 62);
     visuals.y_color = Color32::from_rgb(92, 214, 92);
     visuals.z_color = Color32::from_rgb(74, 132, 255);
-    visuals.s_color = Color32::from_rgb(240, 225, 80);
+    visuals.s_color = Color32::from_rgb(220, 220, 220);
     // Maya tints the handle under the cursor and the remembered active handle yellow.
     visuals.highlight_color = Some(Color32::from_rgb(240, 225, 80));
     // JS `dragStep`: grid snap (X) snaps translation to the grid spacing; discrete move / rotate /
@@ -2051,8 +2051,12 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     let mut draw_base = base;
     draw_base.mode_override = None;
     if let Some(h) = solo {
-        draw_base.modes = EnumSet::only(h);
+        // Keep the full mode set so the arrow geometry (inner radius / length) matches the full
+        // gizmo; the override builds and draws only the active subgizmo.
         draw_base.mode_override = Some(h);
+        if matches!(h, GizmoMode::TranslateX | GizmoMode::TranslateY | GizmoMode::TranslateZ | GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ) {
+            draw_base.visuals.stroke_width = 4.0;
+        }
     }
     let mut draw_gizmo = Gizmo::new(draw_base);
     draw_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: solo.is_some() || resp.hovered(), drag_started: false, dragging: false }, &[visual_tf]);
@@ -2942,11 +2946,12 @@ mod tests {
         let proj = DMat4::perspective_rh(45.0_f64.to_radians(), 1.0, 0.1, 100.0);
         let mut visuals = GizmoVisuals::default();
         visuals.highlight_color = Some(Color32::from_rgb(240, 225, 80));
+        visuals.stroke_width = 4.0;
         let mut g = Gizmo::new(GizmoConfig {
             view_matrix: view.into(),
             projection_matrix: proj.into(),
             viewport: Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)),
-            modes: EnumSet::only(GizmoMode::TranslateX),
+            modes: GizmoMode::all_translate(),
             mode_override: Some(GizmoMode::TranslateX),
             pixels_per_point: 1.0,
             visuals,
