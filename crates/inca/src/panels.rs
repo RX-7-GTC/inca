@@ -3705,4 +3705,43 @@ mod tests {
             assert_eq!(v, 0.0, "MMB virtual slider moved {attr}");
         }
     }
+
+    #[test]
+    fn manipulator_mmb_drag_starts_at_the_object() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.set_attr(&NodeRef::Dag(id.clone()), "translateX", serde_json::json!(2.0));
+        app.tool = Tool::Move;
+        app.vp_state.active_handles[crate::vp_ui::mode_index(Tool::Move)] = Some(transform_gizmo_egui::prelude::GizmoMode::TranslateX);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let x = |app: &IncaApp| app.s.get_attr(&NodeRef::Dag(id.clone()), "translateX").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let vp = app.vps[app.active_vp].rect;
+        let press = vp.center() + egui::vec2(140.0, 120.0);
+        let moved = press + egui::vec2(20.0, 0.0);
+        run(&mut app, vec![egui::Event::PointerMoved(press)], 1.0);
+        run(&mut app, vec![egui::Event::PointerButton { pos: press, button: egui::PointerButton::Middle, pressed: true, modifiers: Default::default() }], 1.1);
+        run(&mut app, vec![], 1.15);
+        assert!((x(&app) - 2.0).abs() < 1e-6, "MMB press jumped the object to the cursor: {}", x(&app));
+        run(&mut app, vec![egui::Event::PointerMoved(moved)], 1.2);
+        run(&mut app, vec![egui::Event::PointerButton { pos: moved, button: egui::PointerButton::Middle, pressed: false, modifiers: Default::default() }], 1.3);
+        run(&mut app, vec![], 1.4);
+        let dx = x(&app) - 2.0;
+        assert!(dx.abs() < 1.0, "MMB axis drag jumped the object: 2 -> {}", x(&app));
+        assert!(dx.abs() > 0.001, "MMB axis drag did not move the object");
+        for attr in ["translateY", "translateZ"] {
+            let v = app.s.get_attr(&NodeRef::Dag(id.clone()), attr).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            assert_eq!(v, 0.0, "MMB axis drag moved {attr}");
+        }
+    }
 }

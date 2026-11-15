@@ -146,6 +146,11 @@ pub struct GizmoDrag {
     /// where the drag was pressed; the JS grid snap slides the start point's screen position by
     /// the mouse delta from here (`_dragPx0`), preserving the grab offset on the centre handle
     pub press_px: Pos2,
+    /// Forced-handle (MMB / Shift auto-axis) drags: transform-gizmo clamps the picked axis start
+    /// point to the arrow, then measures from the infinite axis line. The first result therefore
+    /// contains a jump from the object to the cursor; subtracting this one-shot bias makes the
+    /// drag start at the press point (later results are already incremental).
+    pub rebase: Option<DVec3>,
 }
 
 impl VpState {
@@ -1927,7 +1932,16 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     };
     let focused_before = g.is_focused();
     let mut result = g.update(interaction, &[tf]);
+    // Transform-gizmo's forced pick clamps the axis start point to the drawn arrow, while the
+    // update measures from the infinite axis line. The first result therefore contains a jump
+    // from the object to the cursor; remember it so the drag can start at the press point.
+    let mut first_bias = None;
     if auto_started {
+        if drag_handle.is_some_and(|m| m.is_translate()) {
+            if let Some(n) = result.as_ref().and_then(|(_, t)| t.first()) {
+                first_bias = Some(DVec3::from(n.translation) - DVec3::from(tf.translation));
+            }
+        }
         // apply the movement already dragged past the 6 px threshold in this same frame
         result = g.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), ..interaction }, &[tf]);
     }
@@ -2024,11 +2038,20 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     Some((id.clone(), i, DVec3::new(g("translateX"), g("translateY"), g("translateZ"))))
                 });
                 let (comps, weights, mirror) = if extrude.is_some() { (vec![], vec![], vec![]) } else { (comps, weights, mirror) };
-                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag: auto_origin.or(mmb_press), press_px: auto_origin.or(mmb_press).unwrap_or(cursor) });
+                let js_drag = auto_origin.or(mmb_press);
+                let rebase = if js_drag.is_some() && drag_handle.is_some_and(|m| m.is_translate()) {
+                    first_bias.or_else(|| new_tfs.first().map(|n| DVec3::from(n.translation) - DVec3::from(tf.translation)))
+                } else {
+                    None
+                };
+                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag, press_px: auto_origin.or(mmb_press).unwrap_or(cursor), rebase });
             }
             let d = app.vp_state.drag.as_mut().unwrap();
             if let Some(n) = new_tfs.first() {
                 d.cur = *n;
+                if let Some(bias) = d.rebase.take() {
+                    d.cur.translation = (DVec3::from(d.cur.translation) - bias).into();
+                }
             }
             // JS `middleDrag` maths for MMB / Shift auto-axis drags: rotate by dx * 0.5 degrees
             // around the active axis and scale by exp(dx * 0.01). Normal LMB handle drags keep
