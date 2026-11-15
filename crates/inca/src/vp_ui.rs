@@ -1609,21 +1609,6 @@ fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], 
     }
 }
 
-/// The screen point that marks a handle, used for plane / ring highlights.
-fn handle_anchor(handle: GizmoMode, p: Pos2, dirs: &[Option<egui::Vec2>; 3], size: f32) -> Option<Pos2> {
-    let d = |i: usize| dirs[i];
-    match handle {
-        GizmoMode::TranslateX | GizmoMode::ScaleX | GizmoMode::RotateX => d(0).map(|u| p + u * size * 0.9),
-        GizmoMode::TranslateY | GizmoMode::ScaleY | GizmoMode::RotateY => d(1).map(|u| p + u * size * 0.9),
-        GizmoMode::TranslateZ | GizmoMode::ScaleZ | GizmoMode::RotateZ => d(2).map(|u| p + u * size * 0.9),
-        // transform-gizmo's plane handles sit at the corner of the two axes they free
-        GizmoMode::TranslateXY | GizmoMode::ScaleXY => Some(p + (d(1)? + d(2)?) * size * 0.5),
-        GizmoMode::TranslateXZ | GizmoMode::ScaleXZ => Some(p + (d(0)? + d(2)?) * size * 0.5),
-        GizmoMode::TranslateYZ | GizmoMode::ScaleYZ => Some(p + (d(0)? + d(1)?) * size * 0.5),
-        _ => Some(p),
-    }
-}
-
 /// Whether a gizmo vertex color belongs to the X/Y/Z handle of `axis`.
 fn gizmo_color_is_axis(c: [f32; 4], axis: usize) -> bool {
     let (r, g, b) = (c[0], c[1], c[2]);
@@ -1685,9 +1670,7 @@ fn draw_active_handle(painter: &egui::Painter, draw: &GizmoDrawData, tool: Tool,
             }
         }
         GizmoMode::TranslateXY | GizmoMode::ScaleXY | GizmoMode::TranslateXZ | GizmoMode::ScaleXZ | GizmoMode::TranslateYZ | GizmoMode::ScaleYZ => {
-            if let Some(c) = handle_anchor(handle, p, &dirs, size) {
-                painter.circle_filled(c, 5.0, yellow);
-            }
+            // the active plane is redrawn as a yellow plane above the gizmo
         }
         GizmoMode::RotateView | GizmoMode::ScaleUniform => {
             // the view / uniform circles sit at the gizmo's outer radius
@@ -1760,6 +1743,14 @@ fn auto_axis(tool: Tool, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, ori
         }
     }
     best
+}
+
+fn paint_gizmo(painter: &egui::Painter, draw: GizmoDrawData) {
+    painter.add(egui::Mesh {
+        indices: draw.indices,
+        vertices: draw.vertices.into_iter().zip(draw.colors).map(|(p, [r, gg, b, a])| egui::epaint::Vertex { pos: p.into(), uv: Pos2::ZERO, color: egui::Rgba::from_rgba_premultiplied(r, gg, b, a).into() }).collect(),
+        ..Default::default()
+    });
 }
 
 fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter) -> bool {
@@ -2147,11 +2138,17 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         }
     }
     let hl_draw = draw.clone();
-    painter.add(egui::Mesh {
-        indices: draw.indices,
-        vertices: draw.vertices.into_iter().zip(draw.colors).map(|(p, [r, gg, b, a])| egui::epaint::Vertex { pos: p.into(), uv: Pos2::ZERO, color: egui::Rgba::from_rgba_premultiplied(r, gg, b, a).into() }).collect(),
-        ..Default::default()
-    });
+    paint_gizmo(painter, draw);
+    // Highlight a remembered/active plane handle by drawing that plane again in yellow.
+    if solo.is_none() {
+        if let Some(h) = active_draw.filter(|m| matches!(m, GizmoMode::TranslateXY | GizmoMode::TranslateXZ | GizmoMode::TranslateYZ | GizmoMode::ScaleXY | GizmoMode::ScaleXZ | GizmoMode::ScaleYZ)) {
+            let mut hl_base = base;
+            hl_base.mode_override = Some(h);
+            let mut hl_gizmo = Gizmo::new(hl_base);
+            hl_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: true, drag_started: false, dragging: false }, &[visual_tf]);
+            paint_gizmo(painter, hl_gizmo.draw());
+        }
+    }
     // the negative-axis arrows transform-gizmo doesn't draw, and the remembered active handle
     // kept tinted while the mouse is not over a handle (JS `showActiveAxis`)
     let rect = app.vps[idx].rect;
@@ -2995,6 +2992,34 @@ mod tests {
     use egui::vec2;
     use inca_core::params::Params;
     use inca_core::scene::Scene;
+
+    #[test]
+    fn active_plane_is_redrawn_yellow() {
+        let tf = Transform::from_scale_rotation_translation(DVec3::ONE, DQuat::IDENTITY, DVec3::ZERO);
+        let view = DMat4::look_at_rh(DVec3::new(0.0, 0.0, 10.0), DVec3::ZERO, DVec3::Y);
+        let proj = DMat4::perspective_rh(45.0_f64.to_radians(), 1.0, 0.1, 100.0);
+        let mut visuals = GizmoVisuals::default();
+        visuals.highlight_color = Some(Color32::from_rgb(240, 225, 80));
+        let mut g = Gizmo::new(GizmoConfig {
+            view_matrix: view.into(),
+            projection_matrix: proj.into(),
+            viewport: Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)),
+            modes: GizmoMode::all_translate(),
+            mode_override: Some(GizmoMode::TranslateYZ),
+            pixels_per_point: 1.0,
+            visuals,
+            ..Default::default()
+        });
+        g.update(GizmoInteraction { cursor_pos: (400.0, 300.0), hovered: true, drag_started: false, dragging: false }, &[tf]);
+        let draw = g.draw();
+        assert!(!draw.vertices.is_empty(), "plane highlight drew nothing");
+        for c in &draw.colors {
+            if c[3] < 0.1 {
+                continue;
+            }
+            assert!(c[0] > 0.5 && c[1] > 0.4 && c[2] < 0.4, "plane highlight was not yellow: {c:?}");
+        }
+    }
 
     #[test]
     fn plane_handles_report_the_locked_axis() {
