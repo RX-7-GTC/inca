@@ -1072,7 +1072,11 @@ fn cb_order(s: &inca_core::scene::Scene, first: &NodeRef) -> Vec<String> {
 
 /// MMB drag in a viewport with channels picked in the Channel Box: the virtual slider.
 pub fn virtual_slider(app: &mut IncaApp, resp: &egui::Response) -> bool {
-    if resp.drag_started_by(egui::PointerButton::Middle) && app.panels.cb_armed && !app.panels.cb_pick.is_empty() {
+    // Start on the MMB press itself. Waiting for egui's drag threshold lets the forced-axis
+    // manipulator run a frame first, which jumps the object to the press point and makes the
+    // slider start from there instead of from the object's real position.
+    let pressed = resp.hovered() && resp.ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+    if (pressed || resp.drag_started_by(egui::PointerButton::Middle)) && app.panels.cb_armed && !app.panels.cb_pick.is_empty() {
         // every picked channel, on every object its row edits (history inputs included); whole-number
         // channels step in whole numbers within their range
         let mut list = vec![];
@@ -3657,5 +3661,48 @@ mod tests {
         run(&mut app, vec![], 1.4);
         let values: Vec<f64> = ["translateX", "translateY", "translateZ"].iter().map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0)).collect();
         assert_eq!(values, vec![6.0, 6.0, 6.0], "AE multi-field edit did not apply: {values:?}");
+    }
+
+    #[test]
+    fn channel_box_virtual_slider_starts_at_the_press() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.set_attr(&NodeRef::Dag(id.clone()), "translateX", serde_json::json!(2.0));
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let name = |app: &IncaApp, attr: &str| app.panels.cb_row_rects.iter().find(|(_, a, _, _)| a == attr).map(|(_, _, r, _)| *r).expect("name rect");
+        let nx = name(&app, "translateX");
+        run(&mut app, vec![egui::Event::PointerMoved(nx.center())], 0.6);
+        run(&mut app, vec![egui::Event::PointerButton { pos: nx.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.7);
+        run(&mut app, vec![egui::Event::PointerButton { pos: nx.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 0.8);
+        run(&mut app, vec![], 0.9);
+        assert!(app.panels.cb_armed && !app.panels.cb_pick.is_empty(), "name click did not arm the virtual slider");
+        let before = app.s.get_attr(&NodeRef::Dag(id.clone()), "translateX").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let vp = app.vps[app.active_vp].rect;
+        let press = vp.center() + egui::vec2(140.0, 120.0);
+        let moved = press + egui::vec2(20.0, 0.0);
+        run(&mut app, vec![egui::Event::PointerMoved(press)], 1.0);
+        run(&mut app, vec![egui::Event::PointerButton { pos: press, button: egui::PointerButton::Middle, pressed: true, modifiers: Default::default() }], 1.1);
+        run(&mut app, vec![egui::Event::PointerMoved(moved)], 1.2);
+        run(&mut app, vec![egui::Event::PointerButton { pos: moved, button: egui::PointerButton::Middle, pressed: false, modifiers: Default::default() }], 1.3);
+        run(&mut app, vec![], 1.4);
+        let after = app.s.get_attr(&NodeRef::Dag(id.clone()), "translateX").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        assert!((after - before).abs() < 1.0, "MMB virtual slider jumped the object: {before} -> {after}");
+        assert!((after - before).abs() > 0.01, "MMB virtual slider did not move the object");
+        for attr in ["translateY", "translateZ"] {
+            let v = app.s.get_attr(&NodeRef::Dag(id.clone()), attr).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            assert_eq!(v, 0.0, "MMB virtual slider moved {attr}");
+        }
     }
 }
