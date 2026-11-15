@@ -317,9 +317,8 @@ fn cb_numeric_cell(
                 }
                 app.panels.cb_field_last = Some(key.clone());
             } else {
-                if !cb_is_picked(&app.panels.cb_fields, first, attr) {
-                    app.panels.cb_fields = vec![me.clone()];
-                }
+                // A plain click always collapses a multi-field selection to the clicked field.
+                app.panels.cb_fields = vec![me.clone()];
                 app.panels.cb_field_last = Some(key.clone());
             }
             app.panels.cb_edit_text = cb_text(kind, x, decimals);
@@ -327,9 +326,14 @@ fn cb_numeric_cell(
             app.panels.cb_edit_new = true;
         }
         if r.drag_started_by(egui::PointerButton::Primary) && !locked {
+            if app.panels.cb_editing.as_ref().is_some_and(|(i, a)| i != &key.0 || a != &key.1) {
+                commit_cb_edit(app);
+            }
             cb_clear_names(app);
             app.panels.cb_field_drag = Some(key.clone());
             app.panels.cb_drag_origin = ui.input(|i| i.pointer.press_origin());
+            // Like a plain click, the start of a field drag collapses the selection to that field;
+            // the marquee then extends it if the pointer leaves the pressed field.
             app.panels.cb_fields = vec![me.clone()];
             app.panels.cb_field_last = Some(key.clone());
             app.panels.cb_editing = None;
@@ -1525,16 +1529,21 @@ fn finish_cb_rows(app: &mut IncaApp, ui: &egui::Ui, rows: &[CbRow]) {
             theme::marquee(&ui.painter(), rect);
         }
     }
-    // Drag over value fields selects every field inside the marquee box.
+    // Drag over value fields selects every field inside the marquee box. While the pointer is
+    // still on the pressed field, keep the existing selection (a click with a little movement
+    // is not a marquee).
     if let Some(origin) = app.panels.cb_drag_origin {
-        if let (Some(pos), true) = (pos, app.panels.cb_field_drag.is_some()) {
+        if let (Some(pos), Some(anchor)) = (pos, app.panels.cb_field_drag.clone()) {
             let rect = Rect::from_two_pos(origin, pos);
-            let (picks, last) = cb_rows_in_box(rows, rect, true);
-            if !picks.is_empty() {
-                app.panels.cb_fields = picks;
-                app.panels.cb_field_last = last;
+            let inside_anchor = rows.iter().find(|r| r.key == anchor).and_then(|r| r.field).is_some_and(|f| f.contains(pos));
+            if !inside_anchor {
+                let (picks, last) = cb_rows_in_box(rows, rect, true);
+                if !picks.is_empty() {
+                    app.panels.cb_fields = picks;
+                    app.panels.cb_field_last = last;
+                }
+                theme::marquee(&ui.painter(), rect);
             }
-            theme::marquee(&ui.painter(), rect);
         }
     }
     if app.panels.cb_name_drag.is_some() && !primary_down {
@@ -3532,6 +3541,56 @@ mod tests {
         run(&mut app, vec![], 1.1);
         assert!(app.panels.cb_pick.is_empty(), "clicking the value field left the channel name selected");
         assert!(app.panels.cb_fields.iter().any(|p| p.attr == "translateX"), "clicking the value field did not select it");
+    }
+
+    #[test]
+    fn channel_box_clicking_a_selected_field_collapses_selection() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let rows = app.panels.cb_row_rects.clone();
+        let field = |attr: &str| rows.iter().find(|(_, a, _, _)| a == attr).map(|(_, _, _, f)| *f).expect("field");
+        let (fx, fy, fz) = (field("translateX"), field("translateY"), field("translateZ"));
+        let drag_select_all = |app: &mut IncaApp, run: &mut dyn FnMut(&mut IncaApp, Vec<egui::Event>, f64), t: f64| {
+            run(app, vec![egui::Event::PointerMoved(fx.center())], t);
+            run(app, vec![egui::Event::PointerButton { pos: fx.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], t + 0.1);
+            run(app, vec![egui::Event::PointerMoved(fy.center())], t + 0.2);
+            run(app, vec![egui::Event::PointerMoved(fz.center())], t + 0.3);
+            run(app, vec![egui::Event::PointerButton { pos: fz.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], t + 0.4);
+            run(app, vec![], t + 0.5);
+        };
+        drag_select_all(&mut app, &mut run, 0.6);
+        assert_eq!(app.panels.cb_fields.len(), 3, "drag selection did not select three fields");
+        // Clicking one of the selected fields collapses the selection to that field.
+        run(&mut app, vec![egui::Event::PointerMoved(fy.center())], 1.2);
+        run(&mut app, vec![egui::Event::PointerButton { pos: fy.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 1.3);
+        run(&mut app, vec![egui::Event::PointerButton { pos: fy.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 1.4);
+        run(&mut app, vec![], 1.5);
+        let attrs: Vec<String> = app.panels.cb_fields.iter().map(|p| p.attr.clone()).collect();
+        assert_eq!(attrs, vec!["translateY"], "clicking a selected field did not collapse the selection: {attrs:?}");
+        // A click with a few pixels of movement also collapses to the pressed field.
+        drag_select_all(&mut app, &mut run, 1.6);
+        assert_eq!(app.panels.cb_fields.len(), 3);
+        let jitter = fy.center() + egui::vec2(8.0, 0.0);
+        run(&mut app, vec![egui::Event::PointerMoved(fy.center())], 2.2);
+        run(&mut app, vec![egui::Event::PointerButton { pos: fy.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 2.3);
+        run(&mut app, vec![egui::Event::PointerMoved(jitter)], 2.4);
+        run(&mut app, vec![egui::Event::PointerButton { pos: jitter, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 2.5);
+        run(&mut app, vec![], 2.6);
+        let attrs: Vec<String> = app.panels.cb_fields.iter().map(|p| p.attr.clone()).collect();
+        assert_eq!(attrs, vec!["translateY"], "small drag on a selected field did not collapse the selection: {attrs:?}");
     }
 
     #[test]
