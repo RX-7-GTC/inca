@@ -14,7 +14,7 @@ use transform_gizmo_egui::prelude::*;
 
 /// Base on-screen manipulator size at settings scale 1.0. Maya's default reads a little larger
 /// than transform-gizmo's 75 px, while the user-facing size value stays 1.0.
-const MANIP_SIZE: f32 = 100.0;
+const MANIP_SIZE: f32 = 115.0;
 
 /// Camera navigation mode of an Alt+drag in progress (JS `onDown`).
 #[derive(Clone, Copy, PartialEq)]
