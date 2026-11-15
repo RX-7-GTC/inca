@@ -1884,7 +1884,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     visuals.x_color = Color32::from_rgb(230, 57, 62);
     visuals.y_color = Color32::from_rgb(92, 214, 92);
     visuals.z_color = Color32::from_rgb(74, 132, 255);
-    visuals.s_color = if mode_tool == Tool::Rotate { Color32::from_rgb(120, 190, 255) } else { Color32::from_rgb(220, 220, 220) };
+    visuals.s_color = match mode_tool {
+        Tool::Rotate => Color32::from_rgb(120, 190, 255),
+        Tool::Move => Color32::from_rgb(240, 225, 80),
+        _ => Color32::from_rgb(220, 220, 220),
+    };
     // Maya tints the handle under the cursor and the remembered active handle yellow.
     visuals.highlight_color = Some(Color32::from_rgb(240, 225, 80));
     // JS `dragStep`: grid snap (X) snaps translation to the grid spacing; discrete move / rotate /
@@ -2104,9 +2108,6 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         } else {
             draw_base.modes.remove(GizmoMode::TranslateView);
         }
-    } else if mode_tool == Tool::Move && snap {
-        // Maya shows the snapping centre handle as a yellow circle.
-        draw_base.visuals.s_color = Color32::from_rgb(240, 225, 80);
     }
     let mut draw_gizmo = Gizmo::new(draw_base);
     draw_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: solo.is_some() || resp.hovered(), drag_started: false, dragging: false }, &[visual_tf]);
