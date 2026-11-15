@@ -684,23 +684,16 @@ fn show_menu_popup_ui(
         app.open_menu = None;
         response.ctx.data_mut(|data| data.remove_by_type::<egui::menu::MenuState>());
     }
-    // Menus are Foreground layers, so this Middle shield sits below every menu popup but above
-    // the application panels. It catches clicks that would otherwise fall through the empty
-    // space between a menu and its submenu, while leaving the menu items themselves untouched.
-    let screen = response.ctx.content_rect();
-    let shield = egui::Rect::from_min_max(egui::pos2(screen.left(), response.rect.bottom()), screen.max);
-    if shield.height() > 0.0 {
-        let clicked = egui::Area::new(egui::Id::new("menu_click_shield"))
-            .order(egui::Order::Middle)
-            .fixed_pos(shield.min)
-            .constrain(false)
-            .movable(false)
-            .show(&response.ctx, |ui| {
-                ui.allocate_exact_size(shield.size(), egui::Sense::click()).1.clicked()
-            })
-            .inner;
-        if clicked {
-            app.open_menu = None;
+    // A primary press outside the menu dismisses it and must pass through to the panel or
+    // viewport so a marquee/drag can start immediately. The old full-screen click shield ate
+    // that press, so dragging in the viewport did nothing while the menu stayed open.
+    if response.ctx.input(|i| i.pointer.primary_pressed()) {
+        if let Some(p) = response.ctx.input(|i| i.pointer.interact_pos()) {
+            let over_menu = response.ctx.layer_id_at(p).is_some_and(|l| l.order == egui::Order::Foreground);
+            if !over_menu && p.y > response.rect.bottom() {
+                app.open_menu = None;
+                return None;
+            }
         }
     }
     let mut open = true;
@@ -834,6 +827,38 @@ pub fn hotbox(app: &mut IncaApp, ctx: &egui::Context) {
 mod tests {
     use super::*;
     use egui::{pos2, vec2, Rect};
+
+    #[test]
+    fn open_menu_does_not_eat_a_viewport_marquee() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = crate::app::IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        app.open_menu = Some(OpenMenu { source: MenuSource::ChannelBox, title: "Channels" });
+        let mut run = |app: &mut crate::app::IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 1000.0)));
+            raw.time = Some(t);
+            raw.events = events;
+            app.windows_state.window_seen_now.clear();
+            let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+            std::mem::swap(&mut app.windows_state.window_seen, &mut app.windows_state.window_seen_now);
+        };
+        for i in 0..3 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        assert!(app.open_menu.is_some(), "Channel Box menu did not open");
+        let start = pos2(700.0, 400.0);
+        run(&mut app, vec![egui::Event::PointerMoved(start), egui::Event::PointerButton { pos: start, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.4);
+        assert!(app.open_menu.is_none(), "viewport press did not dismiss the menu");
+        let end = pos2(850.0, 500.0);
+        run(&mut app, vec![egui::Event::PointerMoved(end)], 0.5);
+        assert!(app.vp_state.marquee.is_some(), "viewport marquee was blocked by the menu");
+        run(&mut app, vec![egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 0.6);
+    }
 
     fn titles() -> Vec<(&'static str, Rect)> {
         ["File", "Edit", "Create"]
