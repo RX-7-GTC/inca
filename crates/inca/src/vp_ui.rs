@@ -1597,7 +1597,7 @@ fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], 
     }
 }
 
-/// The screen point that marks a handle, used for the JS `showActiveAxis` highlight.
+/// The screen point that marks a handle, used for plane / ring highlights.
 fn handle_anchor(handle: GizmoMode, p: Pos2, dirs: &[Option<egui::Vec2>; 3], size: f32) -> Option<Pos2> {
     let d = |i: usize| dirs[i];
     match handle {
@@ -1612,9 +1612,37 @@ fn handle_anchor(handle: GizmoMode, p: Pos2, dirs: &[Option<egui::Vec2>; 3], siz
     }
 }
 
+/// Whether a gizmo vertex color belongs to the X/Y/Z handle of `axis`.
+fn gizmo_color_is_axis(c: [f32; 4], axis: usize) -> bool {
+    let (r, g, b) = (c[0], c[1], c[2]);
+    match axis {
+        0 => r > g * 2.0 && r > b * 2.0,
+        1 => g > r * 2.0 && g > b * 2.0,
+        _ => b > r * 2.0 && b > g * 2.0,
+    }
+}
+
+/// The screen distance along `u` at which the drawn gizmo axis arrow ends. The gizmo draws the
+/// real arrow; using its vertices keeps the active highlight exactly on top of it.
+fn gizmo_axis_tip(draw: &GizmoDrawData, p: Pos2, u: egui::Vec2, axis: usize) -> Option<f32> {
+    let mut tip: Option<f32> = None;
+    for (v, c) in draw.vertices.iter().zip(&draw.colors) {
+        if !gizmo_color_is_axis(*c, axis) {
+            continue;
+        }
+        let d = Pos2::new(v[0], v[1]) - p;
+        let t = d.dot(u);
+        if t <= 0.0 || (d - u * t).length() > 10.0 {
+            continue;
+        }
+        tip = Some(tip.map_or(t, |x| x.max(t)));
+    }
+    tip
+}
+
 /// Keep the remembered active handle highlighted while the mouse is not over a handle
 /// (the JS `showActiveAxis`, which tints the active TransformControls handle yellow).
-fn draw_active_handle(painter: &egui::Painter, handle: GizmoMode, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, size: f32) {
+fn draw_active_handle(painter: &egui::Painter, draw: &GizmoDrawData, tool: Tool, handle: GizmoMode, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, size: f32) {
     let Some((p, dirs)) = screen_axes(pivot, rot, cv, rect) else { return };
     let yellow = Color32::from_rgb(240, 225, 80);
     match handle {
@@ -1628,9 +1656,20 @@ fn draw_active_handle(painter: &egui::Painter, handle: GizmoMode, pivot: DVec3, 
         GizmoMode::TranslateX | GizmoMode::ScaleX | GizmoMode::TranslateY | GizmoMode::ScaleY | GizmoMode::TranslateZ | GizmoMode::ScaleZ => {
             let i = if matches!(handle, GizmoMode::TranslateX | GizmoMode::ScaleX) { 0 } else if matches!(handle, GizmoMode::TranslateY | GizmoMode::ScaleY) { 1 } else { 2 };
             let Some(u) = dirs[i] else { return };
-            // tint the shaft of the handle
-            painter.line_segment([p + u * (size * 0.25), p + u * (size * 0.92)], Stroke::new(5.0, Color32::from_rgba_unmultiplied(240, 225, 80, 90)));
-            painter.circle_filled(p + u * (size * 0.92), 4.0, yellow);
+            let Some(t) = gizmo_axis_tip(draw, p, u, i) else { return };
+            if t <= size * 0.25 {
+                return;
+            }
+            let tip = p + u * t;
+            if tool == Tool::Scale {
+                painter.rect_filled(Rect::from_center_size(tip, vec2(9.0, 9.0)), 0.0, yellow);
+            } else {
+                let head = 9.0;
+                let base = tip - u * head;
+                let perp = vec2(-u.y, u.x) * 5.0;
+                painter.line_segment([p + u * (size * 0.18), base], Stroke::new(4.0, yellow));
+                painter.add(egui::Shape::convex_polygon(vec![tip, base + perp, base - perp], yellow, Stroke::NONE));
+            }
         }
         GizmoMode::TranslateXY | GizmoMode::ScaleXY | GizmoMode::TranslateXZ | GizmoMode::ScaleXZ | GizmoMode::TranslateYZ | GizmoMode::ScaleYZ => {
             if let Some(c) = handle_anchor(handle, p, &dirs, size) {
@@ -1765,6 +1804,8 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     visuals.y_color = Color32::from_rgb(92, 214, 92);
     visuals.z_color = Color32::from_rgb(74, 132, 255);
     visuals.s_color = Color32::from_rgb(240, 225, 80);
+    // Maya tints the handle under the cursor and the remembered active handle yellow.
+    visuals.highlight_color = Some(Color32::from_rgb(240, 225, 80));
     let pointer = ui.input(|i| i.pointer.clone());
     let mods = ui.input(|i| i.modifiers);
     let ctrl = mods.ctrl || mods.command;
@@ -1976,21 +2017,21 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             }
         }
     }
+    let hl_draw = draw.clone();
     painter.add(egui::Mesh {
         indices: draw.indices,
         vertices: draw.vertices.into_iter().zip(draw.colors).map(|(p, [r, gg, b, a])| egui::epaint::Vertex { pos: p.into(), uv: Pos2::ZERO, color: egui::Rgba::from_rgba_premultiplied(r, gg, b, a).into() }).collect(),
         ..Default::default()
     });
-    let focused = g.is_focused();
     // the negative-axis arrows transform-gizmo doesn't draw, and the remembered active handle
     // kept tinted while the mouse is not over a handle (JS `showActiveAxis`)
     let rect = app.vps[idx].rect;
     if neg_axes.iter().any(|b| *b) && app.vp_state.drag.is_none() {
         draw_negative_handles(painter, mode_tool, &neg_axes, pivot, rot, cv, rect, resp.hovered().then_some(cursor), gizmo_size);
     }
-    if app.vp_state.drag.is_none() && !focused {
+    if app.vp_state.drag.is_none() {
         if let Some(h) = app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)) {
-            draw_active_handle(painter, h, pivot, rot, cv, rect, gizmo_size);
+            draw_active_handle(painter, &hl_draw, mode_tool, h, pivot, rot, cv, rect, gizmo_size);
         }
     }
     match result {
@@ -2818,6 +2859,22 @@ mod tests {
     use egui::vec2;
     use inca_core::params::Params;
     use inca_core::scene::Scene;
+
+    #[test]
+    fn active_axis_tip_follows_the_drawn_arrow() {
+        let red = [0.8, 0.04, 0.05, 0.7];
+        let blue = [0.05, 0.1, 0.9, 0.7];
+        let draw = GizmoDrawData {
+            vertices: vec![[0.0, 0.0], [40.0, 0.0], [75.0, 0.0], [75.0, 4.0], [75.0, -4.0], [80.0, 0.0], [90.0, 30.0]],
+            colors: vec![red, red, red, red, red, blue, red],
+            indices: vec![],
+        };
+        let p = pos2(0.0, 0.0);
+        let u = vec2(1.0, 0.0);
+        assert_eq!(gizmo_axis_tip(&draw, p, u, 0), Some(75.0), "axis tip came from the wrong vertex");
+        assert_eq!(gizmo_axis_tip(&draw, p, u, 2), Some(80.0), "the blue vertex on the axis line was missed");
+        assert_eq!(gizmo_axis_tip(&draw, p, u, 1), None, "a non-axis color was treated as the axis");
+    }
 
     #[test]
     fn active_handles_are_remembered_per_mode() {
