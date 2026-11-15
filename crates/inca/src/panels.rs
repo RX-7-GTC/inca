@@ -3754,6 +3754,35 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_click_activates_the_plane_handle() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.tool = Tool::Move;
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let y = app.vps[app.active_vp].rect.center() + egui::vec2(0.0, -60.0);
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+        run(&mut app, vec![egui::Event::ModifiersChanged(ctrl)], 1.0);
+        run(&mut app, vec![egui::Event::PointerMoved(y)], 1.05);
+        run(&mut app, vec![egui::Event::PointerButton { pos: y, button: egui::PointerButton::Primary, pressed: true, modifiers: ctrl }], 1.1);
+        run(&mut app, vec![egui::Event::PointerButton { pos: y, button: egui::PointerButton::Primary, pressed: false, modifiers: ctrl }], 1.2);
+        run(&mut app, vec![egui::Event::ModifiersChanged(egui::Modifiers::default())], 1.3);
+        run(&mut app, vec![], 1.4);
+        assert_eq!(app.vp_state.active_handles[crate::vp_ui::mode_index(Tool::Move)], Some(transform_gizmo_egui::prelude::GizmoMode::TranslateXZ), "Ctrl+click did not lock the Y axis");
+        assert!(app.vp_state.force_handle.is_none(), "Ctrl+click left the plane drag armed");
+    }
+
+    #[test]
     fn mmb_drag_does_not_lock_the_active_handle() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);

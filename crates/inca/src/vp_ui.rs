@@ -1695,9 +1695,47 @@ fn draw_active_handle(painter: &egui::Painter, draw: &GizmoDrawData, tool: Tool,
         }
         // Free rotate has no visible handle of its own in Maya.
         GizmoMode::Arcball => {}
-        _ => {
-            painter.circle_stroke(p, 10.0, Stroke::new(2.0, yellow));
+        // The Move centre is the square/circle indicator.
+        GizmoMode::TranslateView => {}
+    }
+}
+
+/// The axis locked by a plane handle. `TranslateXY` keeps X fixed (the YZ plane), etc.
+fn plane_lock_axis(handle: GizmoMode) -> Option<usize> {
+    match handle {
+        GizmoMode::TranslateXY | GizmoMode::ScaleXY => Some(0),
+        GizmoMode::TranslateXZ | GizmoMode::ScaleXZ => Some(1),
+        GizmoMode::TranslateYZ | GizmoMode::ScaleYZ => Some(2),
+        _ => None,
+    }
+}
+
+/// Maya's Move centre handle: a yellow square, or the square lying in the plane left free by a
+/// Ctrl+LMB axis lock. Snapping uses the native circle instead.
+fn draw_center_square(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, scale: f32, locked: Option<usize>) {
+    let yellow = Color32::from_rgb(240, 225, 80);
+    if let Some(axis) = locked {
+        let (a, b) = match axis {
+            0 => (DVec3::Y, DVec3::Z),
+            1 => (DVec3::X, DVec3::Z),
+            _ => (DVec3::X, DVec3::Y),
+        };
+        let upp = if cv.ortho {
+            cv.units_per_px()
+        } else {
+            cv.units_per_px() * (cv.depth(pivot) / cv.coi).max(0.05)
+        };
+        let half = upp * 8.0 * scale as f64;
+        let u = rot * a * half;
+        let v = rot * b * half;
+        let pts: Vec<Pos2> = [pivot + u + v, pivot - u + v, pivot - u - v, pivot + u - v].into_iter().filter_map(|p| cv.project(p, rect)).collect();
+        if pts.len() == 4 {
+            painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, yellow)));
         }
+    } else if let Some(p) = cv.project(pivot, rect) {
+        let half = 8.0 * scale;
+        painter.rect_stroke(Rect::from_center_size(p, vec2(half * 2.0, half * 2.0)), 0.0, Stroke::new(2.0, yellow), egui::StrokeKind::Inside);
+        painter.circle_filled(p, 1.5, yellow);
     }
 }
 
@@ -2039,6 +2077,12 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         }
     });
     app.vp_state.gizmo_solo[idx] = solo;
+    let active_draw = app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).or_else(|| app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)));
+    let plane_lock = if mode_tool == Tool::Move { active_draw.and_then(plane_lock_axis) } else { None };
+    let snap = app.snap_grid || app.snap_point || app.snap_curve || ui.input(|i| i.key_down(egui::Key::X) || i.key_down(egui::Key::V) || i.key_down(egui::Key::C));
+    let center_square = mode_tool == Tool::Move
+        && solo.map_or(true, |h| h == GizmoMode::TranslateView)
+        && (plane_lock.is_some() || (modes.contains(GizmoMode::TranslateView) && !snap));
     // The image was rendered before interaction, so during a drag it shows the previous drag
     // result. Draw the manipulator from that same transform instead of the new one.
     let visual_tf = if app.vp_state.drag.is_some() {
@@ -2057,6 +2101,17 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         if matches!(h, GizmoMode::TranslateX | GizmoMode::TranslateY | GizmoMode::TranslateZ | GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ) {
             draw_base.visuals.stroke_width = 4.0;
         }
+    }
+    if center_square {
+        if solo == Some(GizmoMode::TranslateView) {
+            draw_base.modes = EnumSet::new();
+            draw_base.mode_override = None;
+        } else {
+            draw_base.modes.remove(GizmoMode::TranslateView);
+        }
+    } else if mode_tool == Tool::Move && snap {
+        // Maya shows the snapping centre handle as a yellow circle.
+        draw_base.visuals.s_color = Color32::from_rgb(240, 225, 80);
     }
     let mut draw_gizmo = Gizmo::new(draw_base);
     draw_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: solo.is_some() || resp.hovered(), drag_started: false, dragging: false }, &[visual_tf]);
@@ -2103,8 +2158,10 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     if neg_axes.iter().any(|b| *b) && app.vp_state.drag.is_none() {
         draw_negative_handles(painter, mode_tool, &neg_axes, draw_pivot, draw_rot, cv, rect, resp.hovered().then_some(cursor), gizmo_size);
     }
+    if center_square {
+        draw_center_square(painter, draw_pivot, draw_rot, cv, rect, app.manip_size, plane_lock);
+    }
     if solo.is_none() {
-        let active_draw = app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).or_else(|| app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)));
         if let Some(h) = active_draw {
             draw_active_handle(painter, &hl_draw, mode_tool, h, draw_pivot, draw_rot, cv, rect, gizmo_size);
         }
@@ -2938,6 +2995,15 @@ mod tests {
     use egui::vec2;
     use inca_core::params::Params;
     use inca_core::scene::Scene;
+
+    #[test]
+    fn plane_handles_report_the_locked_axis() {
+        assert_eq!(plane_lock_axis(GizmoMode::TranslateXY), Some(0));
+        assert_eq!(plane_lock_axis(GizmoMode::TranslateXZ), Some(1));
+        assert_eq!(plane_lock_axis(GizmoMode::TranslateYZ), Some(2));
+        assert_eq!(plane_lock_axis(GizmoMode::ScaleXY), Some(0));
+        assert_eq!(plane_lock_axis(GizmoMode::TranslateX), None);
+    }
 
     #[test]
     fn solo_gizmo_draws_only_the_active_arrow() {
