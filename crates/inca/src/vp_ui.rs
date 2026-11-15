@@ -12,6 +12,10 @@ use std::hash::{Hash, Hasher};
 use transform_gizmo_egui::math::Transform;
 use transform_gizmo_egui::prelude::*;
 
+/// Base on-screen manipulator size at settings scale 1.0. Maya's default reads a little larger
+/// than transform-gizmo's 75 px, while the user-facing size value stays 1.0.
+const MANIP_SIZE: f32 = 100.0;
+
 /// Camera navigation mode of an Alt+drag in progress (JS `onDown`).
 #[derive(Clone, Copy, PartialEq)]
 pub enum NavMode {
@@ -1708,7 +1712,7 @@ fn draw_center_square(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &Ca
         } else {
             cv.units_per_px() * (cv.depth(pivot) / cv.coi).max(0.05)
         };
-        let half = upp * 8.0 * scale as f64;
+        let half = upp * (MANIP_SIZE as f64 * 0.107) * scale as f64;
         let u = rot * a * half;
         let v = rot * b * half;
         let pts: Vec<Pos2> = [pivot + u + v, pivot - u + v, pivot - u - v, pivot + u - v].into_iter().filter_map(|p| cv.project(p, rect)).collect();
@@ -1716,7 +1720,7 @@ fn draw_center_square(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &Ca
             painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, yellow)));
         }
     } else if let Some(p) = cv.project(pivot, rect) {
-        let half = 8.0 * scale;
+        let half = MANIP_SIZE * 0.107 * scale;
         painter.rect_stroke(Rect::from_center_size(p, vec2(half * 2.0, half * 2.0)), 0.0, Stroke::new(2.0, yellow), egui::StrokeKind::Inside);
         painter.circle_filled(p, 1.5, yellow);
     }
@@ -1829,7 +1833,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     // the active handle must be one of the shown handles (JS remembers one per mode)
     let mode_tool = if pivot_mode { Tool::Move } else { tool };
     let mi = mode_index(mode_tool);
-    let gizmo_size = 75.0 * app.manip_size;
+    let gizmo_size = MANIP_SIZE * app.manip_size;
     // negative-axis arrows (`manipNegativeHandles`): translate and scale only, never in pivot mode
     let neg_axes: [bool; 3] = if app.prefs.manip_negative_handles && !pivot_mode {
         match mode_tool {
@@ -1876,7 +1880,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         app.vp_state.mmb = None;
     }
     let g = &mut app.vp_state.gizmos[idx];
-    let mut visuals = GizmoVisuals { gizmo_size: 75.0 * app.manip_size, stroke_width: 3.0, ..Default::default() };
+    let mut visuals = GizmoVisuals { gizmo_size: MANIP_SIZE * app.manip_size, stroke_width: 3.0, ..Default::default() };
     visuals.x_color = Color32::from_rgb(230, 57, 62);
     visuals.y_color = Color32::from_rgb(92, 214, 92);
     visuals.z_color = Color32::from_rgb(74, 132, 255);
@@ -2130,7 +2134,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     if pivot_mode {
         if let Some(c) = cv.project(pivot, app.vps[idx].rect) {
             let blue = Color32::from_rgb(95, 211, 255);
-            let r = 14.0 * app.manip_size;
+            let r = MANIP_SIZE * 0.187 * app.manip_size;
             painter.circle_stroke(c, r, Stroke::new(2.0, blue));
             if app.snap_point || ui.input(|i| i.key_down(egui::Key::V)) {
                 painter.circle_stroke(c, r * 0.55, Stroke::new(2.0, blue));
