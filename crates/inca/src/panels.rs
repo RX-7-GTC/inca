@@ -63,6 +63,13 @@ fn cb_label(app: &IncaApp, attr: &str) -> String {
     }
 }
 
+fn cb_clear_names(app: &mut IncaApp) {
+    app.panels.cb_pick.clear();
+    app.panels.cb_sel.clear();
+    app.panels.cb_last = None;
+    app.panels.cb_armed = false;
+}
+
 fn cb_filter(app: &IncaApp) -> [bool; 4] {
     app.panels.cb_show.unwrap_or([true; 4])
 }
@@ -297,6 +304,8 @@ fn cb_numeric_cell(
             if app.panels.cb_editing.as_ref().is_some_and(|(i, a)| i != &key.0 || a != &key.1) {
                 commit_cb_edit(app);
             }
+            // Clicking a text box drops the channel-name selection (and the MMB slider arm).
+            cb_clear_names(app);
             let m = ui.input(|i| i.modifiers);
             if m.shift {
                 app.panels.cb_field_click = Some((key.clone(), true));
@@ -318,6 +327,7 @@ fn cb_numeric_cell(
             app.panels.cb_edit_new = true;
         }
         if r.drag_started_by(egui::PointerButton::Primary) && !locked {
+            cb_clear_names(app);
             app.panels.cb_field_drag = Some(key.clone());
             app.panels.cb_drag_origin = ui.input(|i| i.pointer.press_origin());
             app.panels.cb_fields = vec![me.clone()];
@@ -1271,6 +1281,9 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                     let mut b = cur.as_bool().unwrap_or(cur.as_f64().unwrap_or(0.0) != 0.0);
                     let lbl = if b { "on" } else { "off" };
                     let r = ui.checkbox(&mut b, lbl);
+                    if r.clicked() {
+                        cb_clear_names(app);
+                    }
                     if r.changed() {
                         let v = if attr == "visibility" { json!(b as i32) } else { json!(b) };
                         edit_channel(app, targets, attr, v, &r);
@@ -1282,6 +1295,9 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                     let mut i = cur.as_f64().map(|x| x as usize).or_else(|| cur.as_str().and_then(|s| opts.iter().position(|o| *o == s))).unwrap_or(0);
                     let before = i;
                     let r = egui::ComboBox::from_id_salt(("enum", attr, id.clone())).width(w - 8.0).selected_text(opts.get(i).copied().unwrap_or("?")).show_index(ui, &mut i, opts.len(), |k| opts[k].to_string());
+                    if r.clicked() {
+                        cb_clear_names(app);
+                    }
                     // the wheel steps through the options
                     if r.hovered() {
                         let sc = wheel_notch(ui);
@@ -1292,6 +1308,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                         }
                     }
                     if i != before {
+                        cb_clear_names(app);
                         let v = if cur.is_string() { json!(opts[i]) } else { json!(i) };
                         app.s.checkpoint(&format!("setAttr {attr}"));
                         for t in targets {
@@ -3508,6 +3525,13 @@ mod tests {
         assert!(app.panels.cb_fields.is_empty(), "clicking the channel name left the value field selected");
         assert!(app.panels.cb_editing.is_none(), "clicking the channel name left the value editor active");
         assert!(app.panels.cb_pick.iter().any(|p| p.attr == "translateX"), "clicking the channel name did not select it");
+        // The reverse: clicking the value field drops the channel-name selection.
+        let field = rows.iter().find(|(_, a, _, _)| a == "translateX").map(|(_, _, _, f)| *f).expect("translate X field");
+        run(&mut app, vec![egui::Event::PointerMoved(field.center()), egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.9);
+        run(&mut app, vec![egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 1.0);
+        run(&mut app, vec![], 1.1);
+        assert!(app.panels.cb_pick.is_empty(), "clicking the value field left the channel name selected");
+        assert!(app.panels.cb_fields.iter().any(|p| p.attr == "translateX"), "clicking the value field did not select it");
     }
 
     #[test]
