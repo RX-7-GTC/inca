@@ -1427,6 +1427,19 @@ impl eframe::App for IncaApp {
         self.windows_state.window_seen_now.clear();
         self.windows_state.timeline_rect = None;
         crate::marking::block_pointer(self, &ctx);
+        // Clicking anywhere outside a numeric Channel Box / Attribute Editor value field drops
+        // that multi-field selection. The field rects come from the previous frame.
+        if ctx.input(|i| i.pointer.primary_pressed()) {
+            if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !self.panels.cb_numeric_rects.iter().any(|r| r.contains(p)) {
+                    crate::panels::commit_cb_edit(self);
+                    self.panels.cb_fields.clear();
+                    if let Some(id) = ctx.memory(|m| m.focused()) {
+                        ctx.memory_mut(|m| m.surrender_focus(id));
+                    }
+                }
+            }
+        }
         // files dropped on the window open (.inca) or import (everything else)
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
         for p in dropped {

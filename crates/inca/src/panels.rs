@@ -122,6 +122,36 @@ fn cb_fill(app: &IncaApp, first: &NodeRef, attr: &str) -> Color32 {
     }
 }
 
+/// Commit the active field editor if its text changed, then close it. Used when the user clicks
+/// away from the value fields.
+pub(crate) fn commit_cb_edit(app: &mut IncaApp) {
+    if app.panels.cb_editing.is_none() {
+        return;
+    }
+    let fields = app.panels.cb_fields.clone();
+    if !fields.is_empty() {
+        let text = app.panels.cb_edit_text.trim().to_string();
+        let relative = matches!(text.as_bytes(), [b'+' | b'-' | b'*' | b'/', b'=', ..]);
+        let changed = if relative {
+            true
+        } else if let Some(v) = eval_expr(text.strip_prefix('=').unwrap_or(&text)) {
+            fields.iter().any(|p| {
+                p.targets.iter().any(|t| {
+                    let cur = app.s.get_attr(t, &p.attr).and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
+                    (cur - v).abs() > 1e-9
+                })
+            })
+        } else {
+            false
+        };
+        if changed {
+            cb_apply_text(app, &fields, &text);
+        }
+    }
+    app.panels.cb_editing = None;
+    app.panels.cb_edit_new = false;
+}
+
 /// Apply typed Channel Box text (absolute or `+=` style) to every selected field.
 fn cb_apply_text(app: &mut IncaApp, fields: &[CbPick], text: &str) {
     let text = text.trim();
@@ -263,6 +293,10 @@ fn cb_numeric_cell(
             painter.rect_stroke(rrect, 2.0, egui::Stroke::new(1.0, theme::TEXT_DIM), egui::StrokeKind::Inside);
         }
         if r.clicked() && !locked {
+            // Commit the previous field before switching editors, whichever row it is in.
+            if app.panels.cb_editing.as_ref().is_some_and(|(i, a)| i != &key.0 || a != &key.1) {
+                commit_cb_edit(app);
+            }
             let m = ui.input(|i| i.modifiers);
             if m.shift {
                 app.panels.cb_field_click = Some((key.clone(), true));
@@ -355,6 +389,9 @@ pub struct PanelState {
     /// Channel Box object name field: shown name and edit buffer.
     cb_name: (String, String),
     pub cb_name_rect: Option<Rect>,
+    /// Rects of the numeric value fields drawn last frame, used to drop field selection on
+    /// a click anywhere else.
+    pub cb_numeric_rects: Vec<Rect>,
     /// Channel Box menu settings: slider speed, name style, attribute type filters and sync.
     pub cb_speed: u8,
     pub cb_names: u8,
@@ -1507,6 +1544,7 @@ fn finish_cb_rows(app: &mut IncaApp, ui: &egui::Ui, rows: &[CbRow]) {
             app.panels.cb_editing = None;
         }
     }
+    app.panels.cb_numeric_rects = rows.iter().filter(|r| r.numeric && !r.locked).filter_map(|r| r.field).collect();
     app.panels.cb_row_rects = rows.iter().map(|r| (r.key.0.clone(), r.key.1.clone(), r.label, r.field.unwrap_or(r.label))).collect();
 }
 
@@ -3440,6 +3478,36 @@ mod tests {
             let key = inca_core::anim::Anim::key(&id, attr);
             assert!(app.s.anim.curves.get(&key).is_some_and(|c| c.keys.iter().any(|k| (k.t - 5.0).abs() < 1e-9)), "{attr} was not keyed");
         }
+    }
+
+    #[test]
+    fn channel_box_click_away_clears_field_selection() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let rows = app.panels.cb_row_rects.clone();
+        let label = rows.iter().find(|(_, a, _, _)| a == "translateX").map(|(_, _, r, _)| *r).expect("translate X label");
+        app.panels.cb_fields = vec![CbPick { targets: vec![NodeRef::Dag(id.clone())], attr: "translateX".into(), int: false, min: None, max: None }];
+        app.panels.cb_editing = Some((id.clone(), "translateX".into()));
+        app.panels.cb_edit_text = "0".into();
+        run(&mut app, vec![egui::Event::PointerMoved(label.center()), egui::Event::PointerButton { pos: label.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.6);
+        run(&mut app, vec![egui::Event::PointerButton { pos: label.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 0.7);
+        run(&mut app, vec![], 0.8);
+        assert!(app.panels.cb_fields.is_empty(), "clicking the channel name left the value field selected");
+        assert!(app.panels.cb_editing.is_none(), "clicking the channel name left the value editor active");
+        assert!(app.panels.cb_pick.iter().any(|p| p.attr == "translateX"), "clicking the channel name did not select it");
     }
 
     #[test]
