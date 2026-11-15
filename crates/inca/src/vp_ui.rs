@@ -1985,16 +1985,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     };
     let focused_before = g.is_focused();
     let mut result = g.update(interaction, &[tf]);
-    // Transform-gizmo's forced pick clamps the axis start point to the drawn arrow, while the
-    // update measures from the infinite axis line. The first result therefore contains a jump
-    // from the object to the cursor; remember it so the drag can start at the press point.
-    let mut first_bias = None;
     if auto_started {
-        if drag_handle.is_some_and(|m| m.is_translate()) {
-            if let Some(n) = result.as_ref().and_then(|(_, t)| t.first()) {
-                first_bias = Some(DVec3::from(n.translation) - DVec3::from(tf.translation));
-            }
-        }
         // apply the movement already dragged past the 6 px threshold in this same frame
         result = g.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), ..interaction }, &[tf]);
     }
@@ -2092,9 +2083,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                 });
                 let (comps, weights, mirror) = if extrude.is_some() { (vec![], vec![], vec![]) } else { (comps, weights, mirror) };
                 let js_drag = auto_origin.or(mmb_press);
-                let forced = js_drag.is_some() || app.vp_state.force_handle.is_some_and(|f| f.0 == idx);
+                // Auto-axis drags resolve their handle on the same frame as the first update;
+                // transform-gizmo's second update already measures from the press point there.
+                let forced = !auto_started && (js_drag.is_some() || app.vp_state.force_handle.is_some_and(|f| f.0 == idx));
                 let rebase = if forced && drag_handle.is_some_and(|m| m.is_translate()) {
-                    first_bias.or_else(|| new_tfs.first().map(|n| DVec3::from(n.translation) - DVec3::from(tf.translation)))
+                    new_tfs.first().map(|n| DVec3::from(n.translation) - DVec3::from(tf.translation))
                 } else {
                     None
                 };
