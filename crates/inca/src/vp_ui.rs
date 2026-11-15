@@ -2936,6 +2936,34 @@ mod tests {
     use inca_core::scene::Scene;
 
     #[test]
+    fn solo_gizmo_draws_only_the_active_arrow() {
+        let tf = Transform::from_scale_rotation_translation(DVec3::ONE, DQuat::IDENTITY, DVec3::ZERO);
+        let view = DMat4::look_at_rh(DVec3::new(0.0, 0.0, 10.0), DVec3::ZERO, DVec3::Y);
+        let proj = DMat4::perspective_rh(45.0_f64.to_radians(), 1.0, 0.1, 100.0);
+        let mut visuals = GizmoVisuals::default();
+        visuals.highlight_color = Some(Color32::from_rgb(240, 225, 80));
+        let mut g = Gizmo::new(GizmoConfig {
+            view_matrix: view.into(),
+            projection_matrix: proj.into(),
+            viewport: Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)),
+            modes: EnumSet::only(GizmoMode::TranslateX),
+            mode_override: Some(GizmoMode::TranslateX),
+            pixels_per_point: 1.0,
+            visuals,
+            ..Default::default()
+        });
+        g.update(GizmoInteraction { cursor_pos: (400.0, 300.0), hovered: true, drag_started: false, dragging: false }, &[tf]);
+        let draw = g.draw();
+        assert!(!draw.vertices.is_empty(), "solo gizmo drew nothing");
+        for c in &draw.colors {
+            if c[3] < 0.1 {
+                continue;
+            }
+            assert!(c[0] > 0.5 && c[1] > 0.4 && c[2] < 0.4, "solo gizmo drew a non-active handle: {c:?}");
+        }
+    }
+
+    #[test]
     fn active_axis_tip_follows_the_drawn_arrow() {
         let red = [0.8, 0.04, 0.05, 0.7];
         let blue = [0.05, 0.1, 0.9, 0.7];
