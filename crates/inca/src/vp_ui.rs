@@ -69,6 +69,12 @@ pub struct VpState {
     pub arc_anchor: Option<DVec3>,
     /// Inputs of the last rendered 3D image per viewport, so UI-only repaints can reuse it.
     pub render_keys: [Option<u64>; 4],
+    /// Transform used to draw the manipulator last frame. The viewport image is rendered before
+    /// interaction, so during a drag the object on screen is one frame behind the current drag
+    /// result; drawing the gizmo from the previous result keeps it attached to the rendered object.
+    pub gizmo_draw_tf: [Option<Transform>; 4],
+    /// While an MMB / Shift+MMB drag is active, only this handle is drawn.
+    pub gizmo_solo: [Option<GizmoMode>; 4],
     /// Tab+drag select in progress: the components it has already toggled, and the last point
     pub tab_drag: Option<(HashSet<String>, Option<Pos2>)>,
 }
@@ -94,6 +100,8 @@ impl Default for VpState {
             arc_drag: None,
             arc_anchor: None,
             render_keys: [None; 4],
+            gizmo_draw_tf: [None; 4],
+            gizmo_solo: [None; 4],
             tab_drag: None,
         }
     }
@@ -1717,6 +1725,7 @@ fn auto_axis(tool: Tool, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, ori
 }
 
 fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter) -> bool {
+    app.vp_state.gizmo_solo[idx] = None;
     let chan = channel_modes(app);
     if (!app.tool.is_manip() && chan.is_none()) || !app.vps[idx].show_manips {
         return false;
@@ -2021,13 +2030,33 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     if let Some(bias) = rebase {
         draw_tf.translation = (DVec3::from(draw_tf.translation) - bias).into();
     }
+    // MMB / Shift+MMB drags show only the active handle, as the JS version did.
+    let solo = app.vp_state.drag.as_ref().filter(|d| d.vp == idx && d.js_drag.is_some()).and_then(|d| d.handle).or_else(|| {
+        if js_drag.is_some() && interaction.drag_started {
+            drag_handle
+        } else {
+            None
+        }
+    });
+    app.vp_state.gizmo_solo[idx] = solo;
+    // The image was rendered before interaction, so during a drag it shows the previous drag
+    // result. Draw the manipulator from that same transform instead of the new one.
+    let visual_tf = if app.vp_state.drag.is_some() {
+        app.vp_state.gizmo_draw_tf[idx].unwrap_or(draw_tf)
+    } else {
+        draw_tf
+    };
+    let draw_pivot = DVec3::from(visual_tf.translation);
+    let draw_rot = DQuat::from(visual_tf.rotation);
     let mut draw_base = base;
     draw_base.mode_override = None;
+    if let Some(h) = solo {
+        draw_base.modes = EnumSet::only(h);
+        draw_base.mode_override = Some(h);
+    }
     let mut draw_gizmo = Gizmo::new(draw_base);
-    draw_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: resp.hovered(), drag_started: false, dragging: false }, &[draw_tf]);
+    draw_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: solo.is_some() || resp.hovered(), drag_started: false, dragging: false }, &[visual_tf]);
     let draw = draw_gizmo.draw();
-    let draw_pivot = DVec3::from(draw_tf.translation);
-    let draw_rot = DQuat::from(draw_tf.rotation);
     // manipulator guide: a faint line along the axis being dragged (Preferences can hide it)
     if app.prefs.manip_guides {
         if let Some(d) = app.vp_state.drag.as_ref().filter(|d| d.vp == idx) {
@@ -2070,9 +2099,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     if neg_axes.iter().any(|b| *b) && app.vp_state.drag.is_none() {
         draw_negative_handles(painter, mode_tool, &neg_axes, draw_pivot, draw_rot, cv, rect, resp.hovered().then_some(cursor), gizmo_size);
     }
-    let active_draw = app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).or_else(|| app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)));
-    if let Some(h) = active_draw {
-        draw_active_handle(painter, &hl_draw, mode_tool, h, draw_pivot, draw_rot, cv, rect, gizmo_size);
+    if solo.is_none() {
+        let active_draw = app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).or_else(|| app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)));
+        if let Some(h) = active_draw {
+            draw_active_handle(painter, &hl_draw, mode_tool, h, draw_pivot, draw_rot, cv, rect, gizmo_size);
+        }
     }
     match result {
         Some((_, new_tfs)) => {
@@ -2211,11 +2242,13 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     h.params.insert("translateY".into(), serde_json::json!(t.y));
                 }
                 app.s.set_history_param(&id, i, "translateZ", serde_json::json!(t.z));
+                let final_tf = app.vp_state.drag.as_ref().map(|d| d.cur).unwrap_or(tf);
                 if !interaction.dragging {
                     if let Some(d) = app.vp_state.drag.take() {
                         finish_drag(app, d);
                     }
                 }
+                app.vp_state.gizmo_draw_tf[idx] = Some(final_tf);
                 return true;
             }
             let d = app.vp_state.drag.as_mut().unwrap();
@@ -2287,22 +2320,28 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             ui.ctx().request_repaint();
             // The gizmo can return a final result on the release frame. Finish the drag here too,
             // otherwise the next press reuses this drag's start point and press position.
+            let final_tf = app.vp_state.drag.as_ref().map(|d| d.cur).unwrap_or(tf);
             if !interaction.dragging {
                 if let Some(d) = app.vp_state.drag.take() {
                     finish_drag(app, d);
                 }
             }
+            app.vp_state.gizmo_draw_tf[idx] = Some(final_tf);
             true
         }
         None => {
             if auto_pending || consume_primary {
+                app.vp_state.gizmo_draw_tf[idx] = Some(tf);
                 return true;
             }
             if let Some(d) = app.vp_state.drag.take() {
+                let final_tf = d.cur;
                 finish_drag(app, d);
+                app.vp_state.gizmo_draw_tf[idx] = Some(final_tf);
                 return true;
             }
             // a press on a handle belongs to the gizmo
+            app.vp_state.gizmo_draw_tf[idx] = Some(tf);
             focused_before && pointer.primary_down()
         }
     }

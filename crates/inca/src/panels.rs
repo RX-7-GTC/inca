@@ -3859,9 +3859,13 @@ mod tests {
         run(&mut app, vec![], 1.15);
         assert_eq!(xyz(&app), before, "Shift+MMB press jumped the object");
         run(&mut app, vec![egui::Event::PointerMoved(moved)], 1.2);
+        let solo = app.vp_state.gizmo_solo[crate::vp_ui::mode_index(Tool::Move)];
+        assert_eq!(solo, app.vp_state.active_handles[crate::vp_ui::mode_index(Tool::Move)], "Shift+MMB did not hide the other axes");
+        assert!(solo.is_some(), "Shift+MMB selected no axis");
         run(&mut app, vec![egui::Event::PointerButton { pos: moved, button: egui::PointerButton::Middle, pressed: false, modifiers: shift }], 1.3);
         run(&mut app, vec![egui::Event::ModifiersChanged(egui::Modifiers::default())], 1.35);
         run(&mut app, vec![], 1.4);
+        assert_eq!(app.vp_state.gizmo_solo[crate::vp_ui::mode_index(Tool::Move)], None, "Shift+MMB left only one axis showing");
         let after = xyz(&app);
         let moved_by: f64 = before.iter().zip(after).map(|(a, b)| (b - a).abs()).sum();
         assert!(moved_by < 1.0, "Shift+MMB auto-axis jumped: {before:?} -> {after:?}");
@@ -3930,11 +3934,13 @@ mod tests {
         let moved = press + egui::vec2(20.0, 0.0);
         run(&mut app, vec![egui::Event::PointerMoved(press)], 1.0);
         run(&mut app, vec![egui::Event::PointerButton { pos: press, button: egui::PointerButton::Middle, pressed: true, modifiers: Default::default() }], 1.1);
+        assert_eq!(app.vp_state.gizmo_solo[crate::vp_ui::mode_index(Tool::Move)], Some(transform_gizmo_egui::prelude::GizmoMode::TranslateX), "MMB did not hide the other axes");
         run(&mut app, vec![], 1.15);
         assert!((x(&app) - 2.0).abs() < 1e-6, "MMB press jumped the object to the cursor: {}", x(&app));
         run(&mut app, vec![egui::Event::PointerMoved(moved)], 1.2);
         run(&mut app, vec![egui::Event::PointerButton { pos: moved, button: egui::PointerButton::Middle, pressed: false, modifiers: Default::default() }], 1.3);
         run(&mut app, vec![], 1.4);
+        assert_eq!(app.vp_state.gizmo_solo[crate::vp_ui::mode_index(Tool::Move)], None, "MMB drag left only one axis showing");
         let dx = x(&app) - 2.0;
         assert!(dx.abs() < 1.0, "MMB axis drag jumped the object: 2 -> {}", x(&app));
         assert!(dx.abs() > 0.001, "MMB axis drag did not move the object");
