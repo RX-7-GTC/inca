@@ -3707,6 +3707,39 @@ mod tests {
     }
 
     #[test]
+    fn rotate_grey_area_free_rotates() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.tool = Tool::Rotate;
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let rotate = |app: &IncaApp| -> [f64; 3] {
+            ["rotateX", "rotateY", "rotateZ"].map(|a| app.s.get_attr(&NodeRef::Dag(id.clone()), a).and_then(|v| v.as_f64()).unwrap_or(0.0))
+        };
+        let before = rotate(&app);
+        let c = app.vps[app.active_vp].rect.center();
+        let end = c + egui::vec2(40.0, 20.0);
+        run(&mut app, vec![egui::Event::PointerMoved(c)], 0.6);
+        run(&mut app, vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.7);
+        run(&mut app, vec![egui::Event::PointerMoved(end)], 0.8);
+        run(&mut app, vec![egui::Event::PointerButton { pos: end, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 0.9);
+        run(&mut app, vec![], 1.0);
+        assert_eq!(app.vp_state.active_handles[crate::vp_ui::mode_index(Tool::Rotate)], Some(transform_gizmo_egui::prelude::GizmoMode::Arcball), "the grey area did not become the free-rotate handle");
+        let after = rotate(&app);
+        assert!(before.iter().zip(after).any(|(a, b)| (a - b).abs() > 0.01), "dragging the grey area did not rotate: {before:?} -> {after:?}");
+    }
+
+    #[test]
     fn manipulator_mmb_drag_starts_at_the_object() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);

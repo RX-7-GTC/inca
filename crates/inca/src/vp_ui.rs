@@ -1680,6 +1680,8 @@ fn draw_active_handle(painter: &egui::Painter, draw: &GizmoDrawData, tool: Tool,
             // the view / uniform circles sit at the gizmo's outer radius
             painter.circle_stroke(p, size + 8.0, Stroke::new(2.0, yellow));
         }
+        // Free rotate has no visible handle of its own in Maya.
+        GizmoMode::Arcball => {}
         _ => {
             painter.circle_stroke(p, 10.0, Stroke::new(2.0, yellow));
         }
@@ -1767,7 +1769,12 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         _ if pivot_mode => GizmoMode::all_translate(),
         _ if chan.is_some() => chan.unwrap().1,
         Tool::Move => GizmoMode::all_translate(),
-        Tool::Rotate => GizmoMode::all_rotate(),
+        Tool::Rotate => {
+            // Maya's free rotate: dragging the grey area inside the rings is a trackball.
+            let mut m = GizmoMode::all_rotate();
+            m.insert(GizmoMode::Arcball);
+            m
+        }
         _ => GizmoMode::all_scale(),
     };
     // JS `manipPlaneHandles`; Edit Pivot also drops the plane handles (and the centre)
@@ -2122,6 +2129,8 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                         d.cur.rotation = d.start.rotation;
                         d.cur.translation = d.start.translation;
                     }
+                    // Free rotate: keep the gizmo's trackball result instead of the dx maths.
+                    GizmoMode::Arcball => {}
                     _ => {}
                 }
             }
