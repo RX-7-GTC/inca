@@ -1437,8 +1437,10 @@ fn channel_modes(app: &IncaApp) -> Option<(Tool, EnumSet<GizmoMode>)> {
     kind.map(|k| (k, modes))
 }
 
-/// The manipulator handle under the cursor (probing each handle on its own).
-fn handle_at(config: &GizmoConfig, cursor: Pos2) -> Option<GizmoMode> {
+/// The manipulator handle under the cursor (probing each handle on its own). The temporary
+/// gizmo is updated with the current target transform first: `GizmoConfig` alone carries no
+/// translation/rotation, so picking against it directly would test a gizmo at the world origin.
+fn handle_at(config: &GizmoConfig, cursor: Pos2, tf: &Transform) -> Option<GizmoMode> {
     // planes / centre last: an axis drawn over a plane wins
     let mut order: Vec<GizmoMode> = config.modes.iter().collect();
     order.sort_by_key(|m| (m.axes().len(), matches!(m, GizmoMode::TranslateView | GizmoMode::RotateView | GizmoMode::ScaleUniform)));
@@ -1446,7 +1448,9 @@ fn handle_at(config: &GizmoConfig, cursor: Pos2) -> Option<GizmoMode> {
         let mut c = *config;
         c.modes = EnumSet::only(*m);
         c.mode_override = None;
-        Gizmo::new(c).pick_preview((cursor.x, cursor.y))
+        let mut g = Gizmo::new(c);
+        g.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: true, drag_started: false, dragging: false }, std::slice::from_ref(tf));
+        g.pick_preview((cursor.x, cursor.y))
     })
 }
 
@@ -1806,6 +1810,33 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     let mut active = app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)).or_else(|| modes.contains(default_handle).then_some(default_handle)).or_else(|| modes.iter().next());
     let ppp = ui.ctx().pixels_per_point();
     let space_world = app.space_world(tool);
+    let pointer = ui.input(|i| i.pointer.clone());
+    let mods = ui.input(|i| i.modifiers);
+    let ctrl = mods.ctrl || mods.command;
+    let cursor = pointer.hover_pos().unwrap_or_default();
+    let lmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Primary);
+    let mmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Middle) && !mods.alt;
+    let locked_pressed = app.lock_selection && lmb_pressed;
+    // A new press during an old drag (for example LMB right after an MMB drag) must finish the
+    // old drag and drop the gizmo's internal active subgizmo. Otherwise the new press keeps
+    // driving the previous handle and the manipulator looks stuck.
+    if (lmb_pressed && (app.vp_state.drag.is_some() || app.vp_state.mmb.is_some())) || (mmb_pressed && app.vp_state.drag.is_some()) {
+        if let Some(d) = app.vp_state.drag.take() {
+            finish_drag(app, d);
+        }
+        app.vp_state.mmb = None;
+        app.vp_state.force_handle = None;
+        app.vp_state.auto_drag = None;
+        app.vp_state.press_handle = None;
+        app.vp_state.gizmos[idx] = Gizmo::default();
+    }
+    // a forced / MMB drag ends with its button
+    if app.vp_state.force_handle.is_some_and(|(v, _, b)| v == idx && !pointer.button_down(b)) {
+        app.vp_state.force_handle = None;
+    }
+    if app.vp_state.mmb == Some(idx) && !pointer.button_down(egui::PointerButton::Middle) {
+        app.vp_state.mmb = None;
+    }
     let g = &mut app.vp_state.gizmos[idx];
     let mut visuals = GizmoVisuals { gizmo_size: 75.0 * app.manip_size, stroke_width: 3.0, ..Default::default() };
     visuals.x_color = Color32::from_rgb(230, 57, 62);
@@ -1814,17 +1845,6 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     visuals.s_color = Color32::from_rgb(240, 225, 80);
     // Maya tints the handle under the cursor and the remembered active handle yellow.
     visuals.highlight_color = Some(Color32::from_rgb(240, 225, 80));
-    let pointer = ui.input(|i| i.pointer.clone());
-    let mods = ui.input(|i| i.modifiers);
-    let ctrl = mods.ctrl || mods.command;
-    let cursor = pointer.hover_pos().unwrap_or_default();
-    // a forced / MMB drag ends with its button
-    if app.vp_state.force_handle.is_some_and(|(v, _, b)| v == idx && !pointer.button_down(b)) {
-        app.vp_state.force_handle = None;
-    }
-    if app.vp_state.mmb == Some(idx) && !pointer.button_down(egui::PointerButton::Middle) {
-        app.vp_state.mmb = None;
-    }
     // JS `dragStep`: grid snap (X) snaps translation to the grid spacing; discrete move / rotate /
     // scale each have their own step; holding J is a 15 degree rotate snap
     let key_x = mode_tool == Tool::Move && ui.input(|i| i.key_down(egui::Key::X));
@@ -1870,9 +1890,6 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     // A click / MMB press on a handle makes it the active one. Ctrl turns move/scale axes into
     // their drag plane and starts that drag at once; Shift on the centre (or Shift+MMB away from
     // a handle) picks the axis closest to the drag after 6 px, as the JS `middleDrag` does.
-    let lmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Primary);
-    let mmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Middle) && !mods.alt;
-    let locked_pressed = app.lock_selection && lmb_pressed;
     let mut consume_primary = false;
     let mut start_mmb = false;
     let mut start_auto = false;
@@ -1880,7 +1897,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     let mut press = None;
     let mut mmb_press = None;
     let hover = if lmb_pressed || mmb_pressed {
-        handle_at(g.config(), cursor).or_else(|| negative_handle_at(mode_tool, &neg_axes, pivot, rot, cv, app.vps[idx].rect, cursor, gizmo_size))
+        handle_at(g.config(), cursor, &tf).or_else(|| negative_handle_at(mode_tool, &neg_axes, pivot, rot, cv, app.vps[idx].rect, cursor, gizmo_size))
     } else {
         None
     };

@@ -3707,6 +3707,94 @@ mod tests {
     }
 
     #[test]
+    fn mmb_to_lmb_switch_uses_the_new_handle() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.tool = Tool::Move;
+        app.vp_state.active_handles[crate::vp_ui::mode_index(Tool::Move)] = Some(transform_gizmo_egui::prelude::GizmoMode::TranslateX);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let vp = app.vps[app.active_vp].rect;
+        let press = vp.center() + egui::vec2(140.0, 120.0);
+        run(&mut app, vec![egui::Event::PointerMoved(press)], 1.0);
+        run(&mut app, vec![egui::Event::PointerButton { pos: press, button: egui::PointerButton::Middle, pressed: true, modifiers: Default::default() }], 1.1);
+        run(&mut app, vec![egui::Event::PointerMoved(press + egui::vec2(20.0, 0.0))], 1.2);
+        // Switch to LMB on the Y arrow in the same frame as the MMB release.
+        let x_before = app.s.get_attr(&NodeRef::Dag(id.clone()), "translateX").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let cam = app.vps[app.active_vp].camera.clone();
+        let rect = app.vps[app.active_vp].rect;
+        let cv = crate::viewport::cam_view(&app.s, &cam, [rect.width(), rect.height()]);
+        let p = cv.project(app.s.world_pivot(&id), rect).expect("pivot on screen");
+        let py = cv.project(app.s.world_pivot(&id) + glam::DVec3::Y, rect).expect("Y axis on screen");
+        let u = (py - p).normalized();
+        let y = p + u * 60.0;
+        run(&mut app, vec![
+            egui::Event::PointerButton { pos: y, button: egui::PointerButton::Middle, pressed: false, modifiers: Default::default() },
+            egui::Event::PointerMoved(y),
+            egui::Event::PointerButton { pos: y, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ], 1.3);
+        run(&mut app, vec![egui::Event::PointerMoved(y + u * 20.0)], 1.4);
+        run(&mut app, vec![egui::Event::PointerButton { pos: y + u * 20.0, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 1.5);
+        run(&mut app, vec![], 1.6);
+        let x = app.s.get_attr(&NodeRef::Dag(id.clone()), "translateX").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let yv = app.s.get_attr(&NodeRef::Dag(id.clone()), "translateY").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        assert!((x - x_before).abs() < 1e-6, "LMB after MMB kept moving the old X handle: {x_before} -> {x}");
+        assert!(yv.abs() > 0.001, "LMB after MMB did not drag the Y handle: y={yv}");
+        assert_eq!(app.vp_state.active_handles[crate::vp_ui::mode_index(Tool::Move)], Some(transform_gizmo_egui::prelude::GizmoMode::TranslateY), "LMB after MMB did not select the Y handle");
+    }
+
+    #[test]
+    fn mmb_drag_does_not_lock_the_active_handle() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.tool = Tool::Move;
+        app.vp_state.active_handles[crate::vp_ui::mode_index(Tool::Move)] = Some(transform_gizmo_egui::prelude::GizmoMode::TranslateX);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..5 {
+            run(&mut app, vec![], i as f64 * 0.1);
+        }
+        let vp = app.vps[app.active_vp].rect;
+        let press = vp.center() + egui::vec2(140.0, 120.0);
+        let moved = press + egui::vec2(20.0, 0.0);
+        run(&mut app, vec![egui::Event::PointerMoved(press)], 1.0);
+        run(&mut app, vec![egui::Event::PointerButton { pos: press, button: egui::PointerButton::Middle, pressed: true, modifiers: Default::default() }], 1.1);
+        run(&mut app, vec![egui::Event::PointerMoved(moved)], 1.2);
+        run(&mut app, vec![egui::Event::PointerButton { pos: moved, button: egui::PointerButton::Middle, pressed: false, modifiers: Default::default() }], 1.3);
+        run(&mut app, vec![], 1.4);
+        assert!(app.vp_state.mmb.is_none(), "MMB drag left the middle-button drag armed");
+        assert!(app.vp_state.force_handle.is_none(), "MMB drag left a forced handle armed");
+        assert!(app.vp_state.drag.is_none(), "MMB drag left the gizmo drag active");
+        assert!(app.vp_state.gizmos[app.active_vp].config().mode_override.is_none(), "MMB drag left the gizmo locked to one handle");
+        // put the cube back under the gizmo centre, then click the Y arrow
+        app.s.set_attr(&NodeRef::Dag(id.clone()), "translateX", serde_json::json!(0.0));
+        run(&mut app, vec![], 1.5);
+        let y = vp.center() + egui::vec2(0.0, -60.0);
+        run(&mut app, vec![egui::Event::PointerMoved(y)], 1.6);
+        run(&mut app, vec![egui::Event::PointerButton { pos: y, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 1.7);
+        run(&mut app, vec![egui::Event::PointerButton { pos: y, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 1.8);
+        run(&mut app, vec![], 1.9);
+        assert_eq!(app.vp_state.active_handles[crate::vp_ui::mode_index(Tool::Move)], Some(transform_gizmo_egui::prelude::GizmoMode::TranslateY), "LMB could not change the active handle after an MMB drag");
+    }
+
+    #[test]
     fn rotate_grey_area_free_rotates() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
