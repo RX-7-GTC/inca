@@ -148,8 +148,8 @@ pub struct GizmoDrag {
     pub press_px: Pos2,
     /// Forced-handle (MMB / Shift auto-axis) drags: transform-gizmo clamps the picked axis start
     /// point to the arrow, then measures from the infinite axis line. The first result therefore
-    /// contains a jump from the object to the cursor; subtracting this one-shot bias makes the
-    /// drag start at the press point (later results are already incremental).
+    /// contains a jump from the object to the cursor; subtracting this one-shot bias keeps the
+    /// object at its real position. Later results are already incremental.
     pub rebase: Option<DVec3>,
 }
 
@@ -2007,7 +2007,27 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         // apply the movement already dragged past the 6 px threshold in this same frame
         result = g.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), ..interaction }, &[tf]);
     }
-    let draw = g.draw();
+    // The interaction gizmo can have its internal transform moved by the raw result (the
+    // off-handle axis pick starts with a jump), which would make its handles follow the cursor.
+    // Draw from a separate gizmo fed the object's real transform instead.
+    let js_drag = auto_origin.or(mmb_press);
+    let forced = !auto_started && (js_drag.is_some() || app.vp_state.force_handle.is_some_and(|f| f.0 == idx));
+    let rebase = if app.vp_state.drag.is_none() && forced && drag_handle.is_some_and(|m| m.is_translate()) {
+        result.as_ref().and_then(|(_, t)| t.first()).map(|n| DVec3::from(n.translation) - DVec3::from(tf.translation))
+    } else {
+        None
+    };
+    let mut draw_tf = result.as_ref().and_then(|(_, t)| t.first()).copied().unwrap_or(tf);
+    if let Some(bias) = rebase {
+        draw_tf.translation = (DVec3::from(draw_tf.translation) - bias).into();
+    }
+    let mut draw_base = base;
+    draw_base.mode_override = None;
+    let mut draw_gizmo = Gizmo::new(draw_base);
+    draw_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: resp.hovered(), drag_started: false, dragging: false }, &[draw_tf]);
+    let draw = draw_gizmo.draw();
+    let draw_pivot = DVec3::from(draw_tf.translation);
+    let draw_rot = DQuat::from(draw_tf.rotation);
     // manipulator guide: a faint line along the axis being dragged (Preferences can hide it)
     if app.prefs.manip_guides {
         if let Some(d) = app.vp_state.drag.as_ref().filter(|d| d.vp == idx) {
@@ -2048,12 +2068,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     // kept tinted while the mouse is not over a handle (JS `showActiveAxis`)
     let rect = app.vps[idx].rect;
     if neg_axes.iter().any(|b| *b) && app.vp_state.drag.is_none() {
-        draw_negative_handles(painter, mode_tool, &neg_axes, pivot, rot, cv, rect, resp.hovered().then_some(cursor), gizmo_size);
+        draw_negative_handles(painter, mode_tool, &neg_axes, draw_pivot, draw_rot, cv, rect, resp.hovered().then_some(cursor), gizmo_size);
     }
-    if app.vp_state.drag.is_none() {
-        if let Some(h) = app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)) {
-            draw_active_handle(painter, &hl_draw, mode_tool, h, pivot, rot, cv, rect, gizmo_size);
-        }
+    let active_draw = app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).or_else(|| app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)));
+    if let Some(h) = active_draw {
+        draw_active_handle(painter, &hl_draw, mode_tool, h, draw_pivot, draw_rot, cv, rect, gizmo_size);
     }
     match result {
         Some((_, new_tfs)) => {
@@ -2100,15 +2119,6 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     Some((id.clone(), i, DVec3::new(g("translateX"), g("translateY"), g("translateZ"))))
                 });
                 let (comps, weights, mirror) = if extrude.is_some() { (vec![], vec![], vec![]) } else { (comps, weights, mirror) };
-                let js_drag = auto_origin.or(mmb_press);
-                // Auto-axis drags resolve their handle on the same frame as the first update;
-                // transform-gizmo's second update already measures from the press point there.
-                let forced = !auto_started && (js_drag.is_some() || app.vp_state.force_handle.is_some_and(|f| f.0 == idx));
-                let rebase = if forced && drag_handle.is_some_and(|m| m.is_translate()) {
-                    new_tfs.first().map(|n| DVec3::from(n.translation) - DVec3::from(tf.translation))
-                } else {
-                    None
-                };
                 app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag, press_px: auto_origin.or(mmb_press).unwrap_or(cursor), rebase });
             }
             let d = app.vp_state.drag.as_mut().unwrap();
