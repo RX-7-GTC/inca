@@ -1698,9 +1698,17 @@ fn plane_lock_axis(handle: GizmoMode) -> Option<usize> {
 }
 
 /// Maya's Move centre handle: a yellow square, or the square lying in the plane left free by a
-/// Ctrl+LMB axis lock. Snapping uses the native circle instead.
-fn draw_center_square(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, scale: f32, locked: Option<usize>) {
-    let yellow = Color32::from_rgb(240, 225, 80);
+/// Ctrl+LMB axis lock. Snapping uses the native circle instead. The square is cyan while an axis
+/// is the selected handle.
+fn center_square_color(active: Option<GizmoMode>) -> Color32 {
+    if matches!(active, Some(GizmoMode::TranslateX | GizmoMode::TranslateY | GizmoMode::TranslateZ)) {
+        Color32::from_rgb(0, 200, 200)
+    } else {
+        Color32::from_rgb(240, 225, 80)
+    }
+}
+
+fn draw_center_square(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, scale: f32, locked: Option<usize>, color: Color32) {
     if let Some(axis) = locked {
         let (a, b) = match axis {
             0 => (DVec3::Y, DVec3::Z),
@@ -1717,12 +1725,12 @@ fn draw_center_square(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &Ca
         let v = rot * b * half;
         let pts: Vec<Pos2> = [pivot + u + v, pivot - u + v, pivot - u - v, pivot + u - v].into_iter().filter_map(|p| cv.project(p, rect)).collect();
         if pts.len() == 4 {
-            painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, yellow)));
+            painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, color)));
         }
     } else if let Some(p) = cv.project(pivot, rect) {
         let half = MANIP_SIZE * 0.107 * scale;
-        painter.rect_stroke(Rect::from_center_size(p, vec2(half * 2.0, half * 2.0)), 0.0, Stroke::new(2.0, yellow), egui::StrokeKind::Inside);
-        painter.circle_filled(p, 1.5, yellow);
+        painter.rect_stroke(Rect::from_center_size(p, vec2(half * 2.0, half * 2.0)), 0.0, Stroke::new(2.0, color), egui::StrokeKind::Inside);
+        painter.circle_filled(p, 1.5, color);
     }
 }
 
@@ -2082,6 +2090,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     let center_square = mode_tool == Tool::Move
         && solo.map_or(true, |h| h == GizmoMode::TranslateView)
         && (plane_lock.is_some() || (modes.contains(GizmoMode::TranslateView) && !snap));
+    let center_color = center_square_color(active_draw);
     // The image was rendered before interaction, so during a drag it shows the previous drag
     // result. Draw the manipulator from that same transform instead of the new one.
     let visual_tf = if app.vp_state.drag.is_some() {
@@ -2108,6 +2117,9 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         } else {
             draw_base.modes.remove(GizmoMode::TranslateView);
         }
+    }
+    if mode_tool == Tool::Move {
+        draw_base.visuals.s_color = center_color;
     }
     let mut draw_gizmo = Gizmo::new(draw_base);
     draw_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: solo.is_some() || resp.hovered(), drag_started: false, dragging: false }, &[visual_tf]);
@@ -2161,7 +2173,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         draw_negative_handles(painter, mode_tool, &neg_axes, draw_pivot, draw_rot, cv, rect, resp.hovered().then_some(cursor), gizmo_size);
     }
     if center_square {
-        draw_center_square(painter, draw_pivot, draw_rot, cv, rect, app.manip_size, plane_lock);
+        draw_center_square(painter, draw_pivot, draw_rot, cv, rect, app.manip_size, plane_lock, center_color);
     }
     if solo.is_none() {
         if let Some(h) = active_draw {
@@ -3023,6 +3035,18 @@ mod tests {
                 continue;
             }
             assert!(c[0] > 0.5 && c[1] > 0.4 && c[2] < 0.4, "plane highlight was not yellow: {c:?}");
+        }
+    }
+
+    #[test]
+    fn center_square_is_cyan_while_an_axis_is_selected() {
+        let cyan = Color32::from_rgb(0, 200, 200);
+        let yellow = Color32::from_rgb(240, 225, 80);
+        for axis in [GizmoMode::TranslateX, GizmoMode::TranslateY, GizmoMode::TranslateZ] {
+            assert_eq!(center_square_color(Some(axis)), cyan, "{axis:?} should deselect the centre");
+        }
+        for other in [None, Some(GizmoMode::TranslateView), Some(GizmoMode::TranslateXY)] {
+            assert_eq!(center_square_color(other), yellow, "{other:?} should keep the centre yellow");
         }
     }
 
