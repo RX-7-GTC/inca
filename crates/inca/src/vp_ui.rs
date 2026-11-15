@@ -1662,6 +1662,7 @@ fn draw_active_handle(painter: &egui::Painter, draw: &GizmoDrawData, tool: Tool,
             }
             let tip = p + u * t;
             if tool == Tool::Scale {
+                painter.line_segment([p + u * (size * 0.18), tip], Stroke::new(4.0, yellow));
                 painter.rect_filled(Rect::from_center_size(tip, vec2(9.0, 9.0)), 0.0, yellow);
             } else {
                 let head = 9.0;
