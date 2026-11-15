@@ -1613,80 +1613,6 @@ fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], 
     }
 }
 
-/// Whether a gizmo vertex color belongs to the X/Y/Z handle of `axis`.
-fn gizmo_color_is_axis(c: [f32; 4], axis: usize) -> bool {
-    let (r, g, b) = (c[0], c[1], c[2]);
-    match axis {
-        0 => r > g * 2.0 && r > b * 2.0,
-        1 => g > r * 2.0 && g > b * 2.0,
-        _ => b > r * 2.0 && b > g * 2.0,
-    }
-}
-
-/// The screen distance along `u` at which the drawn gizmo axis arrow ends. The gizmo draws the
-/// real arrow; using its vertices keeps the active highlight exactly on top of it.
-fn gizmo_axis_tip(draw: &GizmoDrawData, p: Pos2, u: egui::Vec2, axis: usize) -> Option<f32> {
-    let mut tip: Option<f32> = None;
-    for (v, c) in draw.vertices.iter().zip(&draw.colors) {
-        if !gizmo_color_is_axis(*c, axis) {
-            continue;
-        }
-        let d = Pos2::new(v[0], v[1]) - p;
-        let t = d.dot(u);
-        if t <= 0.0 || (d - u * t).length() > 10.0 {
-            continue;
-        }
-        tip = Some(tip.map_or(t, |x| x.max(t)));
-    }
-    tip
-}
-
-/// Keep the remembered active handle highlighted while the mouse is not over a handle
-/// (the JS `showActiveAxis`, which tints the active TransformControls handle yellow).
-fn draw_active_handle(painter: &egui::Painter, draw: &GizmoDrawData, tool: Tool, handle: GizmoMode, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, size: f32) {
-    let Some((p, dirs)) = screen_axes(pivot, rot, cv, rect) else { return };
-    let yellow = Color32::from_rgb(240, 225, 80);
-    match handle {
-        GizmoMode::RotateX | GizmoMode::RotateY | GizmoMode::RotateZ => {
-            let i = if handle == GizmoMode::RotateX { 0 } else if handle == GizmoMode::RotateY { 1 } else { 2 };
-            if let Some(u) = dirs[i] {
-                // the rotation ring is split per axis; mark where this axis crosses it
-                painter.circle_filled(p + u * size, 4.0, yellow);
-            }
-        }
-        GizmoMode::TranslateX | GizmoMode::ScaleX | GizmoMode::TranslateY | GizmoMode::ScaleY | GizmoMode::TranslateZ | GizmoMode::ScaleZ => {
-            let i = if matches!(handle, GizmoMode::TranslateX | GizmoMode::ScaleX) { 0 } else if matches!(handle, GizmoMode::TranslateY | GizmoMode::ScaleY) { 1 } else { 2 };
-            let Some(u) = dirs[i] else { return };
-            let Some(t) = gizmo_axis_tip(draw, p, u, i) else { return };
-            if t <= size * 0.25 {
-                return;
-            }
-            let tip = p + u * t;
-            if tool == Tool::Scale {
-                painter.line_segment([p + u * (size * 0.18), tip], Stroke::new(4.0, yellow));
-                painter.rect_filled(Rect::from_center_size(tip, vec2(9.0, 9.0)), 0.0, yellow);
-            } else {
-                let head = 9.0;
-                let base = tip - u * head;
-                let perp = vec2(-u.y, u.x) * 5.0;
-                painter.line_segment([p + u * (size * 0.18), base], Stroke::new(4.0, yellow));
-                painter.add(egui::Shape::convex_polygon(vec![tip, base + perp, base - perp], yellow, Stroke::NONE));
-            }
-        }
-        GizmoMode::TranslateXY | GizmoMode::ScaleXY | GizmoMode::TranslateXZ | GizmoMode::ScaleXZ | GizmoMode::TranslateYZ | GizmoMode::ScaleYZ => {
-            // the active plane is redrawn as a yellow plane above the gizmo
-        }
-        GizmoMode::RotateView | GizmoMode::ScaleUniform => {
-            // the view / uniform circles sit at the gizmo's outer radius
-            painter.circle_stroke(p, size + 8.0, Stroke::new(2.0, yellow));
-        }
-        // Free rotate has no visible handle of its own in Maya.
-        GizmoMode::Arcball => {}
-        // The Move centre is the square/circle indicator.
-        GizmoMode::TranslateView => {}
-    }
-}
-
 /// The axis locked by a plane handle. `TranslateXY` keeps X fixed (the YZ plane), etc.
 fn plane_lock_axis(handle: GizmoMode) -> Option<usize> {
     match handle {
@@ -2106,9 +2032,6 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         // Keep the full mode set so the arrow geometry (inner radius / length) matches the full
         // gizmo; the override builds and draws only the active subgizmo.
         draw_base.mode_override = Some(h);
-        if matches!(h, GizmoMode::TranslateX | GizmoMode::TranslateY | GizmoMode::TranslateZ | GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ) {
-            draw_base.visuals.stroke_width = 4.0;
-        }
     }
     if center_square {
         if solo == Some(GizmoMode::TranslateView) {
@@ -2154,11 +2077,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             }
         }
     }
-    let hl_draw = draw.clone();
     paint_gizmo(painter, draw);
-    // Highlight a remembered/active plane handle by drawing that plane again in yellow.
+    // Highlight a remembered/active handle by drawing it again in yellow above the full gizmo.
+    // Using the gizmo's own geometry keeps the selected shape identical to the hovered one.
     if solo.is_none() {
-        if let Some(h) = active_draw.filter(|m| matches!(m, GizmoMode::TranslateXY | GizmoMode::TranslateXZ | GizmoMode::TranslateYZ | GizmoMode::ScaleXY | GizmoMode::ScaleXZ | GizmoMode::ScaleYZ)) {
+        if let Some(h) = active_draw.filter(|m| !matches!(m, GizmoMode::TranslateView | GizmoMode::Arcball)) {
             let mut hl_base = base;
             hl_base.mode_override = Some(h);
             let mut hl_gizmo = Gizmo::new(hl_base);
@@ -2166,19 +2089,13 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             paint_gizmo(painter, hl_gizmo.draw());
         }
     }
-    // the negative-axis arrows transform-gizmo doesn't draw, and the remembered active handle
-    // kept tinted while the mouse is not over a handle (JS `showActiveAxis`)
+    // the negative-axis arrows transform-gizmo doesn't draw
     let rect = app.vps[idx].rect;
     if neg_axes.iter().any(|b| *b) && app.vp_state.drag.is_none() {
         draw_negative_handles(painter, mode_tool, &neg_axes, draw_pivot, draw_rot, cv, rect, resp.hovered().then_some(cursor), gizmo_size);
     }
     if center_square {
         draw_center_square(painter, draw_pivot, draw_rot, cv, rect, app.manip_size, plane_lock, center_color);
-    }
-    if solo.is_none() {
-        if let Some(h) = active_draw {
-            draw_active_handle(painter, &hl_draw, mode_tool, h, draw_pivot, draw_rot, cv, rect, gizmo_size);
-        }
     }
     match result {
         Some((_, new_tfs)) => {
@@ -3066,7 +2983,6 @@ mod tests {
         let proj = DMat4::perspective_rh(45.0_f64.to_radians(), 1.0, 0.1, 100.0);
         let mut visuals = GizmoVisuals::default();
         visuals.highlight_color = Some(Color32::from_rgb(240, 225, 80));
-        visuals.stroke_width = 4.0;
         let mut g = Gizmo::new(GizmoConfig {
             view_matrix: view.into(),
             projection_matrix: proj.into(),
@@ -3086,22 +3002,6 @@ mod tests {
             }
             assert!(c[0] > 0.5 && c[1] > 0.4 && c[2] < 0.4, "solo gizmo drew a non-active handle: {c:?}");
         }
-    }
-
-    #[test]
-    fn active_axis_tip_follows_the_drawn_arrow() {
-        let red = [0.8, 0.04, 0.05, 0.7];
-        let blue = [0.05, 0.1, 0.9, 0.7];
-        let draw = GizmoDrawData {
-            vertices: vec![[0.0, 0.0], [40.0, 0.0], [75.0, 0.0], [75.0, 4.0], [75.0, -4.0], [80.0, 0.0], [90.0, 30.0]],
-            colors: vec![red, red, red, red, red, blue, red],
-            indices: vec![],
-        };
-        let p = pos2(0.0, 0.0);
-        let u = vec2(1.0, 0.0);
-        assert_eq!(gizmo_axis_tip(&draw, p, u, 0), Some(75.0), "axis tip came from the wrong vertex");
-        assert_eq!(gizmo_axis_tip(&draw, p, u, 2), Some(80.0), "the blue vertex on the axis line was missed");
-        assert_eq!(gizmo_axis_tip(&draw, p, u, 1), None, "a non-axis color was treated as the axis");
     }
 
     #[test]
