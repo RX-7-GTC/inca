@@ -1871,6 +1871,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     // a handle) picks the axis closest to the drag after 6 px, as the JS `middleDrag` does.
     let lmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Primary);
     let mmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Middle) && !mods.alt;
+    let locked_pressed = app.lock_selection && lmb_pressed;
     let mut consume_primary = false;
     let mut start_mmb = false;
     let mut start_auto = false;
@@ -1917,6 +1918,10 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         } else {
             start_mmb = true;
         }
+    } else if locked_pressed {
+        // Lock Current Selection: LMB drags the active handle from anywhere, like MMB normally.
+        start_force = active;
+        press = active;
     }
     if let Some(h) = start_force {
         app.vp_state.force_handle = Some((idx, h, egui::PointerButton::Primary));
@@ -2087,7 +2092,8 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                 });
                 let (comps, weights, mirror) = if extrude.is_some() { (vec![], vec![], vec![]) } else { (comps, weights, mirror) };
                 let js_drag = auto_origin.or(mmb_press);
-                let rebase = if js_drag.is_some() && drag_handle.is_some_and(|m| m.is_translate()) {
+                let forced = js_drag.is_some() || app.vp_state.force_handle.is_some_and(|f| f.0 == idx);
+                let rebase = if forced && drag_handle.is_some_and(|m| m.is_translate()) {
                     first_bias.or_else(|| new_tfs.first().map(|n| DVec3::from(n.translation) - DVec3::from(tf.translation)))
                 } else {
                     None
