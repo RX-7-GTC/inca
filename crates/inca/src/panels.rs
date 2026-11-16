@@ -1479,52 +1479,13 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
             app.panels.cb_last = Some(attr.to_string());
             app.panels.cb_armed = true;
         }
-        lresp.context_menu(|ui| {
-            let names: Vec<String> = targets.iter().map(|t| app.s.ref_name(t)).collect();
-            let multi = channel_menu && !app.panels.cb_pick.is_empty();
-            if ui.button("Key Selected").clicked() {
-                if !multi || !key_selected_channels(app) {
-                    let m: String = names.iter().map(|n| format!("setKeyframe \"{n}.{attr}\";\n")).collect();
-                    let _ = app.run_mel("key", &m);
-                }
-                ui.close();
-            }
-            if ui.button("Delete Keys").clicked() {
-                if !multi {
-                    let m: String = names.iter().map(|n| format!("cutKey -at {attr} {n};\n")).collect();
-                    let _ = app.run_mel("cut keys", &m);
-                } else {
-                    delete_channel_keys(app);
-                }
-                ui.close();
-            }
-            if ui.button(if locked { "Unlock" } else { "Lock" }).clicked() {
-                if multi {
-                    lock_channels(app, !locked);
-                } else {
-                    app.s.checkpoint("lock");
-                    for t in targets {
-                        if let NodeRef::Dag(i) = t {
-                            if let Some(n) = app.s.nodes.get_mut(i) {
-                                n.locks.insert(attr.to_string(), json!(!locked));
-                            }
-                        }
-                    }
-                    app.s.touch();
-                }
-                ui.close();
-            }
-            if driven && ui.button("Break Connections").clicked() {
-                if multi {
-                    break_channel_connections(app);
-                } else {
-                    app.s.checkpoint("break connection");
-                    app.s.conns.retain(|c| !(c.dst == id && c.dst_attr == attr));
-                    app.s.touch();
-                }
-                ui.close();
-            }
-        });
+        if channel_menu {
+            lresp.context_menu(|ui| {
+                ui.label(RichText::new("Channels").strong().color(theme::TEXT_DIM));
+                ui.separator();
+                channels_menu(app, ui);
+            });
+        }
     });
 }
 
@@ -1825,109 +1786,113 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
 }
 
 /// Channels menu: keying and Graph Editor/Time Slider sync.
+/// The Channels menu, shared by the menu bar and the channel-name context menu.
+fn channels_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
+    use crate::menus::{menu_check, menu_item};
+    if menu_item(app, ui, "Key Selected") {
+        if !key_selected_channels(app) {
+            app.action("setKey");
+        }
+    }
+    if menu_item(app, ui, "Key All Keyable") {
+        let _ = app.run_mel("Key All Keyable", "setKeyframe;");
+    }
+    ui.separator();
+    if menu_item(app, ui, "Breakdown Selected") {
+        breakdown_channels(app, false);
+    }
+    if menu_item(app, ui, "Breakdown All") {
+        breakdown_channels(app, true);
+    }
+    ui.separator();
+    if menu_item(app, ui, "Mute Selected") {
+        mute_channels(app, true, false);
+    }
+    if menu_item(app, ui, "Mute All") {
+        mute_channels(app, true, true);
+    }
+    if menu_item(app, ui, "Unmute Selected") {
+        mute_channels(app, false, false);
+    }
+    if menu_item(app, ui, "Unmute All") {
+        mute_channels(app, false, true);
+    }
+    ui.separator();
+    if menu_check(app, ui, app.panels.cb_sync_graph, "Sync Selection in Graph Editor") {
+        app.panels.cb_sync_graph = !app.panels.cb_sync_graph;
+    }
+    if menu_check(app, ui, app.panels.cb_sync_timeline, "Sync Timeline Display") {
+        app.panels.cb_sync_timeline = !app.panels.cb_sync_timeline;
+    }
+    ui.separator();
+    if menu_item(app, ui, "Cut Selected") {
+        if copy_channel_keys(app) {
+            delete_channel_keys(app);
+        }
+    }
+    if menu_item(app, ui, "Copy Selected") {
+        copy_channel_keys(app);
+    }
+    if menu_item(app, ui, "Paste Selected") {
+        if !app.key_clip.is_empty() {
+            let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+            crate::timeline::paste_keys(app);
+            app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
+        }
+    }
+    if menu_item(app, ui, "Delete Selected") {
+        delete_channel_keys(app);
+    }
+    ui.separator();
+    if menu_item(app, ui, "Duplicate Values") {
+        duplicate_channel_values(app);
+    }
+    if menu_item(app, ui, "Freeze") {
+        app.action("freezeTransformations");
+    }
+    ui.separator();
+    if menu_item(app, ui, "Break Connections") {
+        break_channel_connections(app);
+    }
+    if menu_item(app, ui, "Select Connection") {
+        select_channel_connection(app);
+    }
+    ui.separator();
+    if menu_item(app, ui, "Lock Selected") {
+        lock_channels(app, true);
+    }
+    if menu_item(app, ui, "Unlock Selected") {
+        lock_channels(app, false);
+    }
+    ui.separator();
+    if menu_item(app, ui, "Hide Selected") {
+        hide_channels(app, false);
+    }
+    if menu_item(app, ui, "Lock and Hide Selected") {
+        hide_channels(app, true);
+    }
+    ui.separator();
+    if menu_item(app, ui, "Make Selected Nonkeyable") {
+        set_channel_keyable(app, false);
+    }
+    if menu_item(app, ui, "Make Selected Keyable") {
+        set_channel_keyable(app, true);
+    }
+    ui.separator();
+    if menu_item(app, ui, "Edit Expressions...") {
+        if let Some(lead) = app.s.lead().cloned() {
+            let attr = app.panels.cb_pick.first().map(|p| p.attr.clone()).unwrap_or_else(|| "translateX".into());
+            app.panels.expression_text = app.s.node(&lead).and_then(|n| n.expressions.get(&attr).cloned()).unwrap_or_default();
+            app.panels.expression_attr = attr;
+            app.win.expression_editor = true;
+        }
+    }
+}
+
 fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
     panel_bar(app, ui, MenuSource::ChannelBox, &["Channels", "Edit", "Object", "Show"], false, |app, ui, title| match title {
-        "Channels" => {
-            if menu_item(app, ui, "Key Selected") {
-                if !key_selected_channels(app) {
-                    app.action("setKey");
-                }
-            }
-            if menu_item(app, ui, "Key All Keyable") {
-                let _ = app.run_mel("Key All Keyable", "setKeyframe;");
-            }
-            ui.separator();
-            if menu_item(app, ui, "Breakdown Selected") {
-                breakdown_channels(app, false);
-            }
-            if menu_item(app, ui, "Breakdown All") {
-                breakdown_channels(app, true);
-            }
-            ui.separator();
-            if menu_item(app, ui, "Mute Selected") {
-                mute_channels(app, true, false);
-            }
-            if menu_item(app, ui, "Mute All") {
-                mute_channels(app, true, true);
-            }
-            if menu_item(app, ui, "Unmute Selected") {
-                mute_channels(app, false, false);
-            }
-            if menu_item(app, ui, "Unmute All") {
-                mute_channels(app, false, true);
-            }
-            ui.separator();
-            if menu_check(app, ui, app.panels.cb_sync_graph, "Sync Selection in Graph Editor") {
-                app.panels.cb_sync_graph = !app.panels.cb_sync_graph;
-            }
-            if menu_check(app, ui, app.panels.cb_sync_timeline, "Sync Timeline Display") {
-                app.panels.cb_sync_timeline = !app.panels.cb_sync_timeline;
-            }
-            ui.separator();
-            if menu_item(app, ui, "Cut Selected") {
-                if copy_channel_keys(app) {
-                    delete_channel_keys(app);
-                }
-            }
-            if menu_item(app, ui, "Copy Selected") {
-                copy_channel_keys(app);
-            }
-            if menu_item(app, ui, "Paste Selected") {
-                if !app.key_clip.is_empty() {
-                    let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
-                    crate::timeline::paste_keys(app);
-                    app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
-                }
-            }
-            if menu_item(app, ui, "Delete Selected") {
-                delete_channel_keys(app);
-            }
-            ui.separator();
-            if menu_item(app, ui, "Duplicate Values") {
-                duplicate_channel_values(app);
-            }
-            if menu_item(app, ui, "Freeze") {
-                app.action("freezeTransformations");
-            }
-            ui.separator();
-            if menu_item(app, ui, "Break Connections") {
-                break_channel_connections(app);
-            }
-            if menu_item(app, ui, "Select Connection") {
-                select_channel_connection(app);
-            }
-            ui.separator();
-            if menu_item(app, ui, "Lock Selected") {
-                lock_channels(app, true);
-            }
-            if menu_item(app, ui, "Unlock Selected") {
-                lock_channels(app, false);
-            }
-            ui.separator();
-            if menu_item(app, ui, "Hide Selected") {
-                hide_channels(app, false);
-            }
-            if menu_item(app, ui, "Lock and Hide Selected") {
-                hide_channels(app, true);
-            }
-            ui.separator();
-            if menu_item(app, ui, "Make Selected Nonkeyable") {
-                set_channel_keyable(app, false);
-            }
-            if menu_item(app, ui, "Make Selected Keyable") {
-                set_channel_keyable(app, true);
-            }
-            ui.separator();
-            if menu_item(app, ui, "Edit Expressions...") {
-                if let Some(lead) = app.s.lead().cloned() {
-                    let attr = app.panels.cb_pick.first().map(|p| p.attr.clone()).unwrap_or_else(|| "translateX".into());
-                    app.panels.expression_text = app.s.node(&lead).and_then(|n| n.expressions.get(&attr).cloned()).unwrap_or_default();
-                    app.panels.expression_attr = attr;
-                    app.win.expression_editor = true;
-                }
-            }
-        }
+        "Channels" => channels_menu(app, ui),
         "Edit" => {
             if menu_item(app, ui, "Set Driven Key...") {
                 app.action("setDrivenKeyWindow");
@@ -2478,15 +2443,23 @@ fn duplicate_channel_values(app: &mut IncaApp) {
 fn break_channel_connections(app: &mut IncaApp) {
     let picks = app.panels.cb_pick.clone();
     app.s.checkpoint("break channel connections");
+    let mut keys = 0;
     for p in picks {
         for t in &p.targets {
-            if let NodeRef::Dag(id) = t {
-                app.s.conns.retain(|c| !(c.dst == id.as_str() && c.dst_attr == p.attr));
+            let id = app.s.ref_id(t);
+            app.s.conns.retain(|c| !(c.dst == id.as_str() && c.dst_attr == p.attr));
+            let key = inca_core::anim::Anim::key(&id, &p.attr);
+            if app.s.anim.curves.shift_remove(&key).is_some_and(|c| !c.keys.is_empty()) {
+                keys += 1;
             }
         }
     }
     app.s.touch();
-    app.help = "Broke connections on the selected channels".into();
+    app.help = if keys > 0 {
+        format!("Broke connections and removed animation from {keys} channel(s)")
+    } else {
+        "Broke connections on the selected channels".into()
+    };
 }
 
 fn select_channel_connection(app: &mut IncaApp) {
@@ -4770,6 +4743,8 @@ mod tests {
         assert!(!app.s.anim.is_keyed(&id, "translateY"), "nonkeyable channel created a curve");
         set_channel_keyable(&mut app, true);
         assert!(key_selected_channels(&mut app), "keyable channel was not keyed");
+        break_channel_connections(&mut app);
+        assert!(!app.s.anim.is_keyed(&id, "translateY"), "Break Connections left the keyframe behind");
         app.panels.cb_pick = vec![pick("translateX")];
         app.panels.cb_sel = vec!["translateX".into()];
         hide_channels(&mut app, false);
