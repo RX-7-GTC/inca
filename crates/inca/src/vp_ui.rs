@@ -1613,6 +1613,29 @@ fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], 
     }
 }
 
+/// Previous-state feedback while dragging: the start transform's axes with square endpoints.
+fn draw_previous_state(painter: &egui::Painter, d: &GizmoDrag, cv: &CamView, rect: Rect, size: f32, point: f32) {
+    if point <= 0.0 {
+        return;
+    }
+    let pivot = DVec3::from(d.start.translation);
+    let rot = DQuat::from(d.start.rotation);
+    let Some((p, dirs)) = screen_axes(pivot, rot, cv, rect) else { return };
+    let colors = [
+        Color32::from_rgba_unmultiplied(230, 57, 62, 150),
+        Color32::from_rgba_unmultiplied(92, 214, 92, 150),
+        Color32::from_rgba_unmultiplied(74, 132, 255, 150),
+    ];
+    let len = size * 0.65;
+    for (i, u) in dirs.iter().enumerate() {
+        let Some(u) = u else { continue };
+        let e = p + *u * len;
+        painter.line_segment([p, e], Stroke::new(1.5, colors[i]));
+        let r = (point * 0.5).max(1.0);
+        painter.rect_filled(Rect::from_center_size(e, vec2(r * 2.0, r * 2.0)), 0.0, colors[i]);
+    }
+}
+
 /// Maya's Manipulator Visibility preference: hiding applies to the idle manipulator,
 /// not to a drag already in progress.
 fn manipulator_hidden(prefs: &crate::prefs::Prefs, ctrl: bool, shift: bool, dragging: bool) -> bool {
@@ -2076,6 +2099,9 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                 }
             }
         }
+    }
+    if let Some(d) = app.vp_state.drag.as_ref().filter(|d| d.vp == idx) {
+        draw_previous_state(painter, d, cv, app.vps[idx].rect, gizmo_size, app.prefs.manip_prev_size * app.manip_size);
     }
     // Edit Pivot: a blue ring around the pivot, kept while dragging; an inner ring while point snap is on
     if pivot_mode {
