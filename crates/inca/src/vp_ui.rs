@@ -1613,6 +1613,20 @@ fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], 
     }
 }
 
+/// Axes shown in previous-state feedback for a dragged handle. Single-axis handles show only
+/// that axis; plane handles show the two free axes; view/centre handles show all three.
+fn previous_state_axes(handle: Option<GizmoMode>) -> Vec<usize> {
+    match handle {
+        Some(GizmoMode::TranslateX | GizmoMode::ScaleX | GizmoMode::RotateX) => vec![0],
+        Some(GizmoMode::TranslateY | GizmoMode::ScaleY | GizmoMode::RotateY) => vec![1],
+        Some(GizmoMode::TranslateZ | GizmoMode::ScaleZ | GizmoMode::RotateZ) => vec![2],
+        Some(GizmoMode::TranslateXY | GizmoMode::ScaleXY) => vec![1, 2],
+        Some(GizmoMode::TranslateXZ | GizmoMode::ScaleXZ) => vec![0, 2],
+        Some(GizmoMode::TranslateYZ | GizmoMode::ScaleYZ) => vec![0, 1],
+        _ => vec![0, 1, 2],
+    }
+}
+
 /// Previous-state feedback while dragging: the start transform's axes with square endpoints.
 fn draw_previous_state(painter: &egui::Painter, d: &GizmoDrag, cv: &CamView, rect: Rect, size: f32, point: f32) {
     if point <= 0.0 {
@@ -1621,19 +1635,17 @@ fn draw_previous_state(painter: &egui::Painter, d: &GizmoDrag, cv: &CamView, rec
     let pivot = DVec3::from(d.start.translation);
     let rot = DQuat::from(d.start.rotation);
     let Some((p, dirs)) = screen_axes(pivot, rot, cv, rect) else { return };
-    let colors = [
-        Color32::from_rgba_unmultiplied(230, 57, 62, 150),
-        Color32::from_rgba_unmultiplied(92, 214, 92, 150),
-        Color32::from_rgba_unmultiplied(74, 132, 255, 150),
-    ];
+    let color = Color32::from_rgba_unmultiplied(190, 190, 190, 170);
     let len = size * 0.65;
-    for (i, u) in dirs.iter().enumerate() {
-        let Some(u) = u else { continue };
-        let e = p + *u * len;
-        painter.line_segment([p, e], Stroke::new(1.5, colors[i]));
-        let r = (point * 0.5).max(1.0);
-        painter.rect_filled(Rect::from_center_size(e, vec2(r * 2.0, r * 2.0)), 0.0, colors[i]);
+    let r = (point * 0.5).max(1.0);
+    for i in previous_state_axes(d.handle) {
+        let Some(u) = dirs[i] else { continue };
+        let e = p + u * len;
+        painter.line_segment([p, e], Stroke::new(1.5, color));
+        painter.rect_filled(Rect::from_center_size(e, vec2(r * 2.0, r * 2.0)), 0.0, color);
     }
+    // the previous pivot itself
+    painter.rect_filled(Rect::from_center_size(p, vec2(r * 2.0, r * 2.0)), 0.0, color);
 }
 
 /// Maya's Manipulator Visibility preference: hiding applies to the idle manipulator,
@@ -3039,6 +3051,17 @@ mod tests {
             }
             assert!(c[0] > 0.5 && c[1] > 0.4 && c[2] < 0.4, "solo gizmo drew a non-active handle: {c:?}");
         }
+    }
+
+    #[test]
+    fn previous_state_shows_only_the_dragged_axis() {
+        assert_eq!(previous_state_axes(Some(GizmoMode::TranslateX)), vec![0]);
+        assert_eq!(previous_state_axes(Some(GizmoMode::TranslateY)), vec![1]);
+        assert_eq!(previous_state_axes(Some(GizmoMode::TranslateZ)), vec![2]);
+        assert_eq!(previous_state_axes(Some(GizmoMode::TranslateXY)), vec![1, 2]);
+        assert_eq!(previous_state_axes(Some(GizmoMode::TranslateYZ)), vec![0, 1]);
+        assert_eq!(previous_state_axes(Some(GizmoMode::TranslateView)), vec![0, 1, 2]);
+        assert_eq!(previous_state_axes(None), vec![0, 1, 2]);
     }
 
     #[test]
