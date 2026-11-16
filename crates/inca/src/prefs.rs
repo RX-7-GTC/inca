@@ -43,6 +43,12 @@ pub struct Prefs {
     pub manip_plane_handles: bool,
     /// show the handles on the negative axes (JS `manipNegativeHandles`)
     pub manip_negative_handles: bool,
+    /// hide the manipulator while Ctrl is held
+    pub hide_manip_ctrl: bool,
+    /// hide the manipulator while Shift is held
+    pub hide_manip_shift: bool,
+    /// hide the manipulator while Ctrl+Shift is held
+    pub hide_manip_ctrl_shift: bool,
     /// viewport anti-aliasing samples: 1 (off) or 4
     pub msaa: u32,
     /// subtle menu/popup drop shadow
@@ -53,7 +59,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, follow_os_scale: false, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true, msaa: 4, menu_shadow: true, backend: "auto".into() }
+        Prefs { ui_scale: 1.0, follow_os_scale: false, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true, hide_manip_ctrl: false, hide_manip_shift: false, hide_manip_ctrl_shift: false, msaa: 4, menu_shadow: true, backend: "auto".into() }
     }
 }
 
@@ -358,6 +364,17 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             });
             row(ui, "Show negative axis handles", |ui| {
                 ui.checkbox(&mut app.prefs.manip_negative_handles, "");
+            });
+            theme::section_header(ui, "Manipulator Visibility");
+            ui.end_row();
+            row(ui, "Hide Manipulator: When Ctrl is held", |ui| {
+                ui.checkbox(&mut app.prefs.hide_manip_ctrl, "");
+            });
+            row(ui, "When Shift is held", |ui| {
+                ui.checkbox(&mut app.prefs.hide_manip_shift, "");
+            });
+            row(ui, "When Ctrl+Shift is held", |ui| {
+                ui.checkbox(&mut app.prefs.hide_manip_ctrl_shift, "");
             });
         }
         "Animation" => {

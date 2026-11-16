@@ -1613,6 +1613,12 @@ fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], 
     }
 }
 
+/// Maya's Manipulator Visibility preference: hiding applies to the idle manipulator,
+/// not to a drag already in progress.
+fn manipulator_hidden(prefs: &crate::prefs::Prefs, ctrl: bool, shift: bool, dragging: bool) -> bool {
+    !dragging && ((ctrl && prefs.hide_manip_ctrl) || (shift && prefs.hide_manip_shift) || (ctrl && shift && prefs.hide_manip_ctrl_shift))
+}
+
 /// The axis locked by a plane handle. `TranslateXY` keeps X fixed (the YZ plane), etc.
 fn plane_lock_axis(handle: GizmoMode) -> Option<usize> {
     match handle {
@@ -1790,6 +1796,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     let mods = ui.input(|i| i.modifiers);
     let ctrl = mods.ctrl || mods.command;
     let cursor = pointer.hover_pos().unwrap_or_default();
+    // Maya's Hide Manipulator preference hides the idle manipulator so clicks pass through
+    // to component/object selection. Do not abort a drag that is already underway.
+    if manipulator_hidden(&app.prefs, ctrl, mods.shift, app.vp_state.drag.is_some()) {
+        return false;
+    }
     let lmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Primary);
     let mmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Middle) && !mods.alt;
     let locked_pressed = app.lock_selection && lmb_pressed;
@@ -3002,6 +3013,23 @@ mod tests {
             }
             assert!(c[0] > 0.5 && c[1] > 0.4 && c[2] < 0.4, "solo gizmo drew a non-active handle: {c:?}");
         }
+    }
+
+    #[test]
+    fn manipulator_visibility_modifiers() {
+        let mut p = crate::prefs::Prefs::default();
+        assert!(!manipulator_hidden(&p, true, false, false));
+        p.hide_manip_ctrl = true;
+        assert!(manipulator_hidden(&p, true, false, false));
+        assert!(!manipulator_hidden(&p, false, true, false));
+        p.hide_manip_shift = true;
+        assert!(manipulator_hidden(&p, false, true, false));
+        p.hide_manip_ctrl = false;
+        p.hide_manip_shift = false;
+        p.hide_manip_ctrl_shift = true;
+        assert!(manipulator_hidden(&p, true, true, false));
+        assert!(!manipulator_hidden(&p, true, false, false));
+        assert!(!manipulator_hidden(&p, true, true, true));
     }
 
     #[test]
