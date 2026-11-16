@@ -8,6 +8,13 @@ use egui::RichText;
 use std::path::PathBuf;
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AttributePreset {
+    pub name: String,
+    pub kind: String,
+    pub values: Vec<(String, serde_json::Value)>,
+}
+
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Prefs {
     pub ui_scale: f32,
@@ -57,11 +64,13 @@ pub struct Prefs {
     pub menu_shadow: bool,
     /// "auto", "dx12", "vulkan", "metal" or "gl"; applied on restart
     pub backend: String,
+    /// Saved Attribute Editor attribute presets.
+    pub attr_presets: Vec<AttributePreset>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, follow_os_scale: false, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_prev_size: 4.0, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true, hide_manip_ctrl: false, hide_manip_shift: false, hide_manip_ctrl_shift: false, msaa: 4, menu_shadow: true, backend: "auto".into() }
+        Prefs { ui_scale: 1.0, follow_os_scale: false, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_prev_size: 4.0, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true, hide_manip_ctrl: false, hide_manip_shift: false, hide_manip_ctrl_shift: false, msaa: 4, menu_shadow: true, backend: "auto".into(), attr_presets: vec![] }
     }
 }
 

@@ -473,6 +473,8 @@ pub struct PanelState {
     pub ae_locked: Option<String>,
     /// (shown name, edited text) of the AE node field
     pub ae_name: (String, String),
+    /// Name typed into the Attribute Editor Presets menu.
+    pub ae_preset_name: String,
     pub ae_copies: Vec<(String, usize)>,
     /// outliner rows in display order (last frame), for Shift range selection and arrow keys
     pub ol_rows: Vec<String>,
@@ -3355,6 +3357,76 @@ fn shading_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical().id_salt("aescroll_snode").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
 }
 
+fn ae_preset_kind(app: &IncaApp, node: &NodeRef) -> Option<String> {
+    match node {
+        NodeRef::Dag(id) => app.s.node(id).map(|n| n.kind.clone()),
+        _ => None,
+    }
+}
+
+fn ae_capture_preset(app: &IncaApp, node: &NodeRef) -> Vec<(String, Value)> {
+    let NodeRef::Dag(id) = node else { return vec![] };
+    let mut attrs: Vec<String> = CHANNELS.iter().map(|c| c.to_string()).collect();
+    if let Some(n) = app.s.node(id) {
+        if let Some(e) = n.extra.as_object() {
+            attrs.extend(e.iter().filter(|(_, v)| v.is_number() || v.is_boolean()).map(|(k, _)| k.clone()));
+        }
+    }
+    attrs.extend(app.s.shape_channels(id));
+    attrs.sort();
+    attrs.dedup();
+    attrs
+        .into_iter()
+        .filter(|attr| !app.s.conns.iter().any(|c| c.dst == *id && c.dst_attr == *attr))
+        .filter_map(|attr| app.s.get_attr(node, &attr).map(|v| (attr, v)))
+        .collect()
+}
+
+fn ae_blend_value(cur: &Value, new: &Value, f: f64) -> Value {
+    match (cur, new) {
+        (Value::Number(a), Value::Number(b)) => {
+            match (a.as_f64(), b.as_f64()) {
+                (Some(a), Some(b)) => json!(a + (b - a) * f),
+                _ => new.clone(),
+            }
+        }
+        (Value::Bool(a), Value::Bool(b)) => json!(if f >= 0.5 { *b } else { *a }),
+        (Value::Array(a), Value::Array(b)) if a.len() == b.len() => {
+            json!(a.iter().zip(b).map(|(a, b)| ae_blend_value(a, b, f)).collect::<Vec<_>>())
+        }
+        _ => new.clone(),
+    }
+}
+
+fn ae_apply_preset(app: &mut IncaApp, node: &NodeRef, preset: &crate::prefs::AttributePreset, blend: Option<f64>) {
+    let NodeRef::Dag(_) = node else { return };
+    app.s.checkpoint("apply attribute preset");
+    for (attr, v) in &preset.values {
+        let value = match blend {
+            Some(f) => app.s.get_attr(node, attr).map(|cur| ae_blend_value(&cur, v, f)).unwrap_or_else(|| v.clone()),
+            None => v.clone(),
+        };
+        app.s.set_attr(node, attr, value);
+    }
+    app.s.touch();
+    app.help = format!("Applied preset \"{}\"", preset.name);
+}
+
+fn ae_save_preset(app: &mut IncaApp, node: &NodeRef, kind: &str, name: &str) {
+    let values = ae_capture_preset(app, node);
+    if values.is_empty() {
+        app.help = "No preset-able attributes on this node".into();
+        return;
+    }
+    let name = if name.trim().is_empty() { kind.to_string() } else { name.trim().to_string() };
+    if let Some(p) = app.prefs.attr_presets.iter_mut().find(|p| p.kind == kind && p.name == name) {
+        p.values = values;
+    } else {
+        app.prefs.attr_presets.push(crate::prefs::AttributePreset { name: name.clone(), kind: kind.to_string(), values });
+    }
+    app.help = format!("Saved {kind} preset \"{name}\"");
+}
+
 pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
     let target = ae_target(app);
@@ -3476,9 +3548,43 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         if ui.button("Focus").on_hover_text("Show the selected node").clicked() {
             app.panels.ae_locked = None;
         }
-        if ui.button("Presets").on_hover_text("Save and reuse attribute presets").clicked() {
-            app.help = "Attribute presets: save and reuse values from the Attribute Editor".into();
-        }
+        let preset_node = tabs[tab].1.clone();
+        let preset_kind = ae_preset_kind(app, &preset_node);
+        ui.add_enabled_ui(preset_kind.is_some(), |ui| {
+            let button = ui.menu_button("Presets", |ui| {
+                let Some(kind) = preset_kind.clone() else { return };
+                ui.menu_button(format!("Save {kind} Preset..."), |ui| {
+                    ui.label("Preset name");
+                    ui.text_edit_singleline(&mut app.panels.ae_preset_name);
+                    if ui.button("Save Attribute Preset").clicked() {
+                        let name = app.panels.ae_preset_name.clone();
+                        ae_save_preset(app, &preset_node, &kind, &name);
+                        ui.close();
+                    }
+                });
+                ui.separator();
+                let presets: Vec<crate::prefs::AttributePreset> = app.prefs.attr_presets.iter().filter(|p| p.kind == kind).cloned().collect();
+                if presets.is_empty() {
+                    ui.label(RichText::new("No presets").color(theme::TEXT_DIM));
+                } else {
+                    for p in presets {
+                        ui.menu_button(p.name.clone(), |ui| {
+                            if ui.button("Replace").clicked() {
+                                ae_apply_preset(app, &preset_node, &p, None);
+                                ui.close();
+                            }
+                            if ui.button("Blend 50%").clicked() {
+                                ae_apply_preset(app, &preset_node, &p, Some(0.5));
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+            });
+            if preset_kind.is_none() {
+                button.response.on_disabled_hover_text("Presets are available for scene nodes");
+            }
+        });
         let locked = app.panels.ae_locked.is_some();
         if lock_button(ui, locked).on_hover_text("Lock the Attribute Editor to the current node").clicked() {
             app.panels.ae_locked = if locked { None } else { Some(id.clone()) };
@@ -4292,6 +4398,27 @@ mod tests {
         run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 1.1);
         run(&mut app, vec![], 1.2);
         assert_eq!(app.s.name_of(&id), "renamedCube", "Channel Box name field did not rename the object");
+    }
+
+    #[test]
+    fn attribute_editor_presets_save_and_blend() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        let node = NodeRef::Dag(id.clone());
+        app.s.set_attr(&node, "translateX", json!(2.0));
+        let kind = ae_preset_kind(&app, &node).expect("node kind");
+        ae_save_preset(&mut app, &node, &kind, "Preset A");
+        assert!(app.prefs.attr_presets.iter().any(|p| p.name == "Preset A" && p.kind == kind));
+        app.s.set_attr(&node, "translateX", json!(5.0));
+        let preset = app.prefs.attr_presets.iter().find(|p| p.name == "Preset A").unwrap().clone();
+        ae_apply_preset(&mut app, &node, &preset, None);
+        assert_eq!(app.s.get_attr(&node, "translateX").and_then(|v| v.as_f64()), Some(2.0));
+        app.s.set_attr(&node, "translateX", json!(4.0));
+        ae_apply_preset(&mut app, &node, &preset, Some(0.5));
+        assert_eq!(app.s.get_attr(&node, "translateX").and_then(|v| v.as_f64()), Some(3.0));
     }
 
     #[test]
