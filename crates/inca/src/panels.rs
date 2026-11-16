@@ -4558,7 +4558,7 @@ mod tests {
         app.action("shadeAllLights");
         assert_eq!(app.vps[0].lights, crate::viewport::LightMode::All);
         app.action("shadeAllLights");
-        assert_eq!(app.vps[0].lights, crate::viewport::LightMode::Default);
+        assert_eq!(app.vps[0].lights, crate::viewport::LightMode::All, "the 7 hotkey should not toggle all-lights off");
     }
 
     #[test]

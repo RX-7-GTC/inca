@@ -1128,7 +1128,8 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             }
         }
         "shadeAllLights" => {
-            app.vps[vp].lights = if app.vps[vp].lights == LightMode::All { LightMode::Default } else { LightMode::All };
+            // Maya's 7 hotkey selects Use All Lights; it does not toggle back off.
+            app.vps[vp].lights = LightMode::All;
         }
         "shadeDefaultLights" => app.vps[vp].lights = LightMode::Default,
         "shadeFlatLights" => app.vps[vp].lights = LightMode::Flat,
