@@ -93,6 +93,34 @@ fn cb_shown(filter: [bool; 4], attr: &str) -> bool {
     }
 }
 
+fn cb_custom_shown(app: &IncaApp, attr: &str) -> bool {
+    match app.panels.cb_custom_active.and_then(|i| app.panels.cb_custom_entries.get(i)) {
+        Some((_, members)) => members.iter().any(|m| m == attr),
+        None => true,
+    }
+}
+
+fn create_custom_show_entry(app: &mut IncaApp) {
+    let Some(lead) = app.s.lead().cloned() else {
+        app.help = "Select an object first".into();
+        return;
+    };
+    let mut members: Vec<String> = app.panels.cb_pick.iter().map(|p| p.attr.clone()).collect();
+    members.sort();
+    members.dedup();
+    if members.is_empty() {
+        members = cb_order(&app.s, &NodeRef::Dag(lead));
+    }
+    let mut n = 1;
+    while app.panels.cb_custom_entries.iter().any(|(name, _)| name == &format!("Custom {n}")) {
+        n += 1;
+    }
+    let name = format!("Custom {n}");
+    app.panels.cb_custom_entries.push((name, members));
+    app.panels.cb_custom_active = Some(app.panels.cb_custom_entries.len() - 1);
+    app.help = "Created a custom attribute filter from the selected channels".into();
+}
+
 fn cb_text(kind: ChanKind, x: f64, decimals: Option<usize>) -> String {
     if kind == ChanKind::Int {
         format!("{}", x.round() as i64)
@@ -114,11 +142,15 @@ fn cb_locked(app: &IncaApp, first: &NodeRef, attr: &str) -> bool {
 fn cb_fill(app: &IncaApp, first: &NodeRef, attr: &str) -> Color32 {
     let id = app.s.ref_id(first);
     let keyed = app.s.anim.is_keyed(&id, attr);
+    let muted = app.s.anim.curve(&id, attr).is_some_and(|c| c.mute);
     let on_key = app.s.anim.on_key(&id, attr, app.s.time.current);
     let driven = app.s.conns.iter().any(|c| c.dst == id && c.dst_attr == attr);
+    let expressed = app.s.node(&id).is_some_and(|n| n.expressions.contains_key(attr));
     if cb_locked(app, first, attr) {
         theme::LOCKED
-    } else if driven {
+    } else if muted {
+        Color32::from_gray(0x4c)
+    } else if driven || expressed {
         theme::DRIVEN.gamma_multiply(0.6)
     } else if on_key {
         theme::KEY
@@ -410,6 +442,20 @@ pub struct PanelState {
     pub cb_speed: u8,
     pub cb_names: u8,
     pub cb_show: Option<[bool; 4]>,
+    /// Show Assets display mode: 0 = all published attributes, 1 = selected object's attributes.
+    pub cb_asset_mode: u8,
+    pub cb_asset_top: bool,
+    /// Custom Show > Attributes entries: name and member attribute names.
+    pub cb_custom_entries: Vec<(String, Vec<String>)>,
+    pub cb_custom_active: Option<usize>,
+    /// Attributes checked in the Delete Attributes window.
+    pub delete_attr_checked: std::collections::BTreeSet<String>,
+    /// Custom attribute being edited and its new long name.
+    pub edit_attr_name: String,
+    pub edit_attr_new: String,
+    /// Expression Editor target channel and source text.
+    pub expression_attr: String,
+    pub expression_text: String,
     pub cb_sync_graph: bool,
     pub cb_sync_timeline: bool,
     /// Last drawn Channel Box rows for the in-app UI tests: key, name rect, field rect.
@@ -1212,6 +1258,11 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
         NodeRef::Dag(i) => app.s.node(i).is_some_and(|n| n.is_locked(attr)),
         _ => false,
     };
+    let keyable = match first {
+        NodeRef::Dag(i) => app.s.node(i).is_none_or(|n| n.is_keyable(attr)),
+        _ => true,
+    };
+    let label_color = if keyable { theme::TEXT } else { theme::TEXT_DIM };
     ui.horizontal(|ui| {
         let lw = if attr == "rotateOrder" { 90.0 } else { 120.0 };
         let sense = if selectable { egui::Sense::click_and_drag() } else { egui::Sense::click() };
@@ -1224,7 +1275,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
         if picked {
             ui.painter().rect_filled(rect, 2.0, theme::HI.gamma_multiply(0.6));
         }
-        ui.painter().text(rect.right_center() - egui::vec2(4.0, 0.0), egui::Align2::RIGHT_CENTER, label, egui::FontId::proportional(12.0), theme::TEXT);
+        ui.painter().text(rect.right_center() - egui::vec2(4.0, 0.0), egui::Align2::RIGHT_CENTER, label, egui::FontId::proportional(12.0), label_color);
         if lresp.clicked() {
             // pick channels for the MMB virtual slider: click, Ctrl toggles, Shift adds a range
             let m = ui.input(|i| i.modifiers);
@@ -1609,8 +1660,34 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
     let mut targets: Vec<NodeRef> = vec![NodeRef::Dag(lead.clone())];
     targets.extend(app.s.sel.iter().filter(|i| **i != lead).map(|i| NodeRef::Dag(i.clone())));
     let filter = cb_filter(app);
+    // Published attributes of the enclosing asset, shown per the Show Assets options.
+    let asset = app.s.container_of(&lead);
+    let asset_rows: Vec<(String, ChanKind)> = asset.as_ref().and_then(|aid| app.s.node(aid).map(|n| {
+        n.published
+            .iter()
+            .filter(|(_, p)| app.panels.cb_asset_mode == 0 || app.s.sel.contains(&p.node))
+            .filter_map(|(name, _)| match app.s.get_attr(&NodeRef::Dag(aid.clone()), name) {
+                Some(Value::Bool(_)) => Some((name.clone(), ChanKind::Bool)),
+                Some(Value::Number(x)) if x.is_f64() => Some((name.clone(), ChanKind::Float)),
+                Some(Value::Number(_)) => Some((name.clone(), ChanKind::Int)),
+                _ => None,
+            })
+            .collect()
+    })).unwrap_or_default();
+    if app.panels.cb_asset_top {
+        if let (Some(aid), false) = (&asset, asset_rows.is_empty()) {
+            ui.add_space(4.0);
+            theme::section_header(ui, "ASSET");
+            for (k, kind) in &asset_rows {
+                if app.s.node(aid).is_some_and(|n| n.channel_hidden(k)) || !cb_custom_shown(app, k) {
+                    continue;
+                }
+                channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(aid.clone())], k, k, *kind, None, None);
+            }
+        }
+    }
     for c in CHANNELS {
-        if !cb_shown(filter, c) {
+        if !cb_shown(filter, c) || !cb_custom_shown(app, c) || app.s.node(&lead).is_some_and(|n| n.channel_hidden(c)) {
             continue;
         }
         let kind = if c == "visibility" { ChanKind::Bool } else { ChanKind::Float };
@@ -1631,6 +1708,9 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
             .collect()
     }).unwrap_or_default();
     for (k, kind) in extra {
+        if app.s.node(&lead).is_some_and(|n| n.channel_hidden(&k)) || !cb_custom_shown(app, &k) {
+            continue;
+        }
         let label = cb_label(app, &k);
         channel_row_cb(app, ui, &mut cb_rows, &targets, &k, &label, kind, None, None);
     }
@@ -1650,7 +1730,22 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         theme::section_header(ui, "PUBLISHED");
         for (k, kind) in published {
+            if app.s.node(&lead).is_some_and(|n| n.channel_hidden(&k)) || !cb_custom_shown(app, &k) {
+                continue;
+            }
             channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(lead.clone())], &k, &k, kind, None, None);
+        }
+    }
+    if !app.panels.cb_asset_top {
+        if let (Some(aid), false) = (&asset, asset_rows.is_empty()) {
+            ui.add_space(4.0);
+            theme::section_header(ui, "ASSET");
+            for (k, kind) in &asset_rows {
+                if app.s.node(aid).is_some_and(|n| n.channel_hidden(k)) || !cb_custom_shown(app, k) {
+                    continue;
+                }
+                channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(aid.clone())], k, k, *kind, None, None);
+            }
         }
     }
     // SHAPES
@@ -1660,6 +1755,9 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
         theme::section_header(ui, "SHAPES");
         ui.label(RichText::new(sn).color(theme::TEXT));
         for c in sh_channels {
+            if app.s.node(&lead).is_some_and(|n| n.channel_hidden(&c)) || !cb_custom_shown(app, &c) {
+                continue;
+            }
             let v = app.s.get_attr(&NodeRef::Dag(lead.clone()), &c);
             let kind = match v {
                 Some(Value::Bool(_)) => ChanKind::Bool,
@@ -1709,6 +1807,9 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
                 if let Some((_, _, chans)) = ops::info(&ty) {
                     let r = NodeRef::History(lead.clone(), i);
                     for c in chans {
+                        if !cb_custom_shown(app, c.key) {
+                            continue;
+                        }
                         let label = match app.panels.cb_names {
                             1 => c.key.to_string(),
                             2 => cb_short_name(c.key).to_string(),
@@ -1735,6 +1836,26 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             if menu_item(app, ui, "Key All Keyable") {
                 let _ = app.run_mel("Key All Keyable", "setKeyframe;");
+            }
+            ui.separator();
+            if menu_item(app, ui, "Breakdown Selected") {
+                breakdown_channels(app, false);
+            }
+            if menu_item(app, ui, "Breakdown All") {
+                breakdown_channels(app, true);
+            }
+            ui.separator();
+            if menu_item(app, ui, "Mute Selected") {
+                mute_channels(app, true, false);
+            }
+            if menu_item(app, ui, "Mute All") {
+                mute_channels(app, true, true);
+            }
+            if menu_item(app, ui, "Unmute Selected") {
+                mute_channels(app, false, false);
+            }
+            if menu_item(app, ui, "Unmute All") {
+                mute_channels(app, false, true);
             }
             ui.separator();
             if menu_check(app, ui, app.panels.cb_sync_graph, "Sync Selection in Graph Editor") {
@@ -1783,6 +1904,29 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             if menu_item(app, ui, "Unlock Selected") {
                 lock_channels(app, false);
             }
+            ui.separator();
+            if menu_item(app, ui, "Hide Selected") {
+                hide_channels(app, false);
+            }
+            if menu_item(app, ui, "Lock and Hide Selected") {
+                hide_channels(app, true);
+            }
+            ui.separator();
+            if menu_item(app, ui, "Make Selected Nonkeyable") {
+                set_channel_keyable(app, false);
+            }
+            if menu_item(app, ui, "Make Selected Keyable") {
+                set_channel_keyable(app, true);
+            }
+            ui.separator();
+            if menu_item(app, ui, "Edit Expressions...") {
+                if let Some(lead) = app.s.lead().cloned() {
+                    let attr = app.panels.cb_pick.first().map(|p| p.attr.clone()).unwrap_or_else(|| "translateX".into());
+                    app.panels.expression_text = app.s.node(&lead).and_then(|n| n.expressions.get(&attr).cloned()).unwrap_or_default();
+                    app.panels.expression_attr = attr;
+                    app.win.expression_editor = true;
+                }
+            }
         }
         "Edit" => {
             if menu_item(app, ui, "Set Driven Key...") {
@@ -1790,6 +1934,9 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             if menu_item(app, ui, "Graph Editor") {
                 app.win.graph_editor = true;
+            }
+            if menu_item(app, ui, "Channel Control...") {
+                app.win.channel_control = true;
             }
             if menu_item(app, ui, "Connection Editor") {
                 app.action("connectionEditor");
@@ -1804,8 +1951,40 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             if menu_item(app, ui, "Add Attribute...") {
                 app.action("addAttribute");
             }
+            if menu_item(app, ui, "Edit Attribute...") {
+                if let Some(lead) = app.s.lead().cloned() {
+                    let attr = app.panels.cb_pick.iter().find_map(|p| {
+                        let id = app.s.ref_id(p.targets.first()?);
+                        app.s.node(&id).and_then(|n| n.extra.as_object()).is_some_and(|e| e.contains_key(&p.attr)).then(|| p.attr.clone())
+                    }).or_else(|| app.s.node(&lead).and_then(|n| n.extra.as_object()).and_then(|e| e.keys().next().cloned()));
+                    if let Some(attr) = attr {
+                        app.panels.edit_attr_name = attr.clone();
+                        app.panels.edit_attr_new = attr;
+                        app.win.edit_attributes = true;
+                    } else {
+                        app.help = "The selected node has no custom attributes".into();
+                    }
+                }
+            }
+            if menu_item(app, ui, "Delete Attributes...") {
+                for p in app.panels.cb_pick.clone() {
+                    if let Some(t) = p.targets.first() {
+                        let id = app.s.ref_id(t);
+                        if app.s.node(&id).and_then(|n| n.extra.as_object()).is_some_and(|e| e.contains_key(&p.attr)) {
+                            app.panels.delete_attr_checked.insert(p.attr.clone());
+                        }
+                    }
+                }
+                app.win.delete_attributes = true;
+            }
             if menu_item(app, ui, "Publish to Asset") {
                 app.action("publishAttributes");
+            }
+            if menu_item(app, ui, "Unpublish from Asset") {
+                unpublish_channels(app);
+            }
+            if menu_item(app, ui, "Lock Unpublished Attributes") {
+                lock_unpublished_attributes(app);
             }
             ui.separator();
             if menu_item(app, ui, "Select Node") {
@@ -1862,19 +2041,334 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             });
             if menu_item(app, ui, "Show All") {
                 app.panels.cb_show = None;
+                app.panels.cb_custom_active = None;
             }
             if menu_item(app, ui, "Invert Shown") {
                 app.panels.cb_show = Some(cb_filter(app).map(|b| !b));
             }
             if menu_item(app, ui, "Clear Below") {
                 app.panels.cb_show = None;
+                app.panels.cb_custom_active = None;
             }
             if menu_item(app, ui, "Show Selected Type(s)") {
                 show_selected_channel_types(app);
             }
+            ui.separator();
+            if menu_item(app, ui, "Create Entry...") {
+                create_custom_show_entry(app);
+            }
+            let entries = app.panels.cb_custom_entries.clone();
+            if !entries.is_empty() {
+                ui.menu_button("Custom Entries", |ui| {
+                    if menu_check(app, ui, app.panels.cb_custom_active.is_none(), "Off") {
+                        app.panels.cb_custom_active = None;
+                    }
+                    for (i, (name, _)) in entries.iter().enumerate() {
+                        if menu_check(app, ui, app.panels.cb_custom_active == Some(i), name) {
+                            app.panels.cb_custom_active = Some(i);
+                        }
+                    }
+                });
+                ui.menu_button("Delete Entry...", |ui| {
+                    for (i, (name, _)) in entries.iter().enumerate() {
+                        if menu_item(app, ui, name) {
+                            app.panels.cb_custom_entries.remove(i);
+                            app.panels.cb_custom_active = None;
+                            break;
+                        }
+                    }
+                });
+            }
+            ui.separator();
+            ui.menu_button("Show Assets", |ui| {
+                if menu_check(app, ui, app.panels.cb_asset_mode == 0, "All Attributes") {
+                    app.panels.cb_asset_mode = 0;
+                }
+                if menu_check(app, ui, app.panels.cb_asset_mode == 1, "Selected Object Attributes") {
+                    app.panels.cb_asset_mode = 1;
+                }
+                ui.separator();
+                if menu_check(app, ui, app.panels.cb_asset_top, "Show at Top") {
+                    app.panels.cb_asset_top = !app.panels.cb_asset_top;
+                }
+            });
         }
         _ => {}
     });
+}
+
+/// Channel Control: keyable / display / lock state for every channel of the lead object.
+pub(crate) fn channel_control_window(app: &mut IncaApp, ui: &mut egui::Ui) {
+    let Some(lead) = app.s.lead().cloned() else {
+        ui.label(RichText::new("Select an object to edit its channels.").color(theme::TEXT_DIM));
+        return;
+    };
+    let Some(node) = app.s.node(&lead) else { return };
+    let name = node.name.clone();
+    let channels = cb_order(&app.s, &NodeRef::Dag(lead.clone()));
+    ui.label(RichText::new(format!("{name}:")).color(theme::TEXT));
+    ui.add_space(2.0);
+    let mut changes: Vec<(String, bool, bool, bool)> = vec![];
+    egui::Grid::new(("channel_control", lead.clone())).num_columns(4).spacing([10.0, 2.0]).striped(true).show(ui, |ui| {
+        ui.label(RichText::new("Channel").color(theme::TEXT_DIM));
+        ui.label(RichText::new("Keyable").color(theme::TEXT_DIM));
+        ui.label(RichText::new("Display").color(theme::TEXT_DIM));
+        ui.label(RichText::new("Locked").color(theme::TEXT_DIM));
+        ui.end_row();
+        for attr in &channels {
+            let mut keyable = node.is_keyable(attr);
+            let mut shown = !node.channel_hidden(attr);
+            let mut locked = node.is_locked(attr);
+            let before = (keyable, shown, locked);
+            ui.label(RichText::new(cb_label(app, attr)).color(if keyable { theme::TEXT } else { theme::TEXT_DIM }));
+            ui.checkbox(&mut keyable, "");
+            ui.checkbox(&mut shown, "");
+            ui.checkbox(&mut locked, "");
+            ui.end_row();
+            if before != (keyable, shown, locked) {
+                changes.push((attr.clone(), keyable, shown, locked));
+            }
+        }
+    });
+    if let Some(n) = app.s.nodes.get_mut(&lead) {
+        for (attr, keyable, shown, locked) in changes {
+            if keyable {
+                n.nonkeyable.remove(&attr);
+            } else {
+                n.nonkeyable.insert(attr.clone());
+            }
+            if shown {
+                n.hidden_channels.remove(&attr);
+            } else {
+                n.hidden_channels.insert(attr.clone());
+            }
+            n.locks.insert(attr, json!(locked));
+        }
+        app.s.touch();
+    }
+}
+
+/// Expression Editor: one arithmetic expression per channel, evaluated during animation updates.
+pub(crate) fn expression_editor_window(app: &mut IncaApp, ui: &mut egui::Ui) {
+    let Some(lead) = app.s.lead().cloned() else {
+        ui.label(RichText::new("Select an object with channels.").color(theme::TEXT_DIM));
+        return;
+    };
+    let Some(node) = app.s.node(&lead) else { return };
+    let name = node.name.clone();
+    let channels: Vec<String> = cb_order(&app.s, &NodeRef::Dag(lead.clone()));
+    if app.panels.expression_attr.is_empty() || !channels.contains(&app.panels.expression_attr) {
+        app.panels.expression_attr = channels.first().cloned().unwrap_or_else(|| "translateX".into());
+        app.panels.expression_text = node.expressions.get(&app.panels.expression_attr).cloned().unwrap_or_default();
+    }
+    ui.label(RichText::new(format!("Expression for {name}:")).color(theme::TEXT));
+    ui.add_space(2.0);
+    let old_attr = app.panels.expression_attr.clone();
+    egui::ComboBox::from_id_salt("expr_attr").selected_text(&app.panels.expression_attr).show_ui(ui, |ui| {
+        for attr in &channels {
+            if ui.selectable_label(*attr == app.panels.expression_attr, attr).clicked() {
+                app.panels.expression_attr = attr.clone();
+                app.panels.expression_text = app.s.node(&lead).and_then(|n| n.expressions.get(attr).cloned()).unwrap_or_default();
+            }
+        }
+    });
+    if old_attr != app.panels.expression_attr && app.panels.expression_text.is_empty() {
+        app.panels.expression_text = app.s.node(&lead).and_then(|n| n.expressions.get(&app.panels.expression_attr).cloned()).unwrap_or_default();
+    }
+    ui.add(egui::TextEdit::multiline(&mut app.panels.expression_text).desired_rows(3).desired_width(f32::INFINITY).hint_text("e.g. sin(time * 2) + translateY"));
+    ui.label(RichText::new("time/frame, channel names, + - * / % ^, sin, cos, abs, min, max, pow").color(theme::TEXT_DIM).size(10.5));
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui.button("Apply").clicked() {
+            let attr = app.panels.expression_attr.clone();
+            let src = app.panels.expression_text.trim().to_string();
+            app.s.checkpoint("expression");
+            if let Some(n) = app.s.nodes.get_mut(&lead) {
+                if src.is_empty() {
+                    n.expressions.shift_remove(&attr);
+                } else {
+                    n.expressions.insert(attr.clone(), src);
+                }
+                app.s.touch();
+            }
+            app.s.apply_anim();
+            app.help = format!("Applied expression to {name}.{attr}");
+        }
+        if ui.button("Remove").clicked() {
+            let attr = app.panels.expression_attr.clone();
+            app.s.checkpoint("remove expression");
+            if let Some(n) = app.s.nodes.get_mut(&lead) {
+                n.expressions.shift_remove(&attr);
+                app.s.touch();
+            }
+            app.panels.expression_text.clear();
+            app.help = format!("Removed expression from {name}.{attr}");
+        }
+        if ui.button("Close").clicked() {
+            app.win.expression_editor = false;
+        }
+    });
+}
+
+/// Delete Attributes window: remove dynamic attributes from the lead node.
+pub(crate) fn delete_attributes_window(app: &mut IncaApp, ui: &mut egui::Ui) {
+    let Some(lead) = app.s.lead().cloned() else {
+        ui.label(RichText::new("Select an object with custom attributes.").color(theme::TEXT_DIM));
+        return;
+    };
+    let Some(node) = app.s.node(&lead) else { return };
+    let name = node.name.clone();
+    let attrs: Vec<String> = node.extra.as_object().map(|e| e.keys().cloned().collect()).unwrap_or_default();
+    if attrs.is_empty() {
+        ui.label(RichText::new(format!("{name} has no custom attributes.")).color(theme::TEXT_DIM));
+        return;
+    }
+    app.panels.delete_attr_checked.retain(|a| attrs.contains(a));
+    ui.label(RichText::new(format!("Delete attributes from {name}:")).color(theme::TEXT));
+    ui.add_space(2.0);
+    for attr in &attrs {
+        let mut checked = app.panels.delete_attr_checked.contains(attr);
+        if ui.checkbox(&mut checked, attr).changed() {
+            if checked {
+                app.panels.delete_attr_checked.insert(attr.clone());
+            } else {
+                app.panels.delete_attr_checked.remove(attr);
+            }
+        }
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        let count = app.panels.delete_attr_checked.len();
+        if ui.add_enabled(count > 0, egui::Button::new(format!("Delete {count}"))).clicked() {
+            let mut script = String::new();
+            for attr in &app.panels.delete_attr_checked {
+                script.push_str(&format!("deleteAttr -at {name}.{attr};\n"));
+            }
+            let _ = app.run_mel("delete attributes", &script);
+            if let Some(lead) = app.s.lead().cloned() {
+                if let Some(n) = app.s.nodes.get_mut(&lead) {
+                    for attr in &app.panels.delete_attr_checked {
+                        n.expressions.shift_remove(attr);
+                        n.nonkeyable.remove(attr);
+                        n.hidden_channels.remove(attr);
+                        n.locks.remove(attr);
+                    }
+                }
+            }
+            app.panels.delete_attr_checked.clear();
+            app.win.delete_attributes = false;
+        }
+        if ui.button("Close").clicked() {
+            app.win.delete_attributes = false;
+        }
+    });
+}
+
+/// Edit Attribute window: rename a dynamic attribute and change its keyable flag.
+pub(crate) fn edit_attributes_window(app: &mut IncaApp, ui: &mut egui::Ui) {
+    let Some(lead) = app.s.lead().cloned() else {
+        ui.label(RichText::new("Select an object with custom attributes.").color(theme::TEXT_DIM));
+        return;
+    };
+    let Some(name) = app.s.node(&lead).map(|n| n.name.clone()) else { return };
+    let attrs: Vec<String> = app.s.node(&lead).and_then(|n| n.extra.as_object()).map(|e| e.keys().cloned().collect()).unwrap_or_default();
+    if attrs.is_empty() {
+        ui.label(RichText::new(format!("{name} has no custom attributes.")).color(theme::TEXT_DIM));
+        return;
+    }
+    if app.panels.edit_attr_name.is_empty() || !attrs.contains(&app.panels.edit_attr_name) {
+        app.panels.edit_attr_name = attrs[0].clone();
+        app.panels.edit_attr_new = attrs[0].clone();
+    }
+    ui.label(RichText::new(format!("Edit attribute on {name}:")).color(theme::TEXT));
+    ui.add_space(2.0);
+    egui::ComboBox::from_id_salt("edit_attr_pick").selected_text(&app.panels.edit_attr_name).show_ui(ui, |ui| {
+        for attr in &attrs {
+            if ui.selectable_label(*attr == app.panels.edit_attr_name, attr).clicked() {
+                app.panels.edit_attr_name = attr.clone();
+                app.panels.edit_attr_new = attr.clone();
+            }
+        }
+    });
+    egui::Grid::new("edit_attr_fields").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+        ui.label("Long Name");
+        ui.text_edit_singleline(&mut app.panels.edit_attr_new);
+        ui.end_row();
+        ui.label("Keyable");
+        let mut keyable = app.s.node(&lead).is_none_or(|n| n.is_keyable(&app.panels.edit_attr_name));
+        if ui.checkbox(&mut keyable, "").changed() {
+            if let Some(n) = app.s.nodes.get_mut(&lead) {
+                if keyable {
+                    n.nonkeyable.remove(&app.panels.edit_attr_name);
+                } else {
+                    n.nonkeyable.insert(app.panels.edit_attr_name.clone());
+                }
+                app.s.touch();
+            }
+        }
+        ui.end_row();
+    });
+    ui.separator();
+    ui.horizontal(|ui| {
+        let new = app.panels.edit_attr_new.trim().to_string();
+        let valid = !new.is_empty() && !new.contains('.') && !CHANNELS.contains(&new.as_str()) && (new == app.panels.edit_attr_name || !attrs.contains(&new));
+        if ui.add_enabled(valid, egui::Button::new("Apply")).clicked() {
+            let old = app.panels.edit_attr_name.clone();
+            rename_custom_attr(app, &lead, &old, &new);
+            app.panels.edit_attr_name = new;
+            app.panels.edit_attr_new = app.panels.edit_attr_name.clone();
+            app.win.edit_attributes = false;
+        }
+        if ui.button("Close").clicked() {
+            app.win.edit_attributes = false;
+        }
+    });
+}
+
+fn rename_custom_attr(app: &mut IncaApp, id: &str, old: &str, new: &str) {
+    if old == new {
+        return;
+    }
+    app.s.checkpoint("edit attribute");
+    {
+        let Some(n) = app.s.nodes.get_mut(id) else { return };
+        let Some(extra) = n.extra.as_object_mut() else { return };
+        let Some(v) = extra.remove(old) else { return };
+        extra.insert(new.to_string(), v);
+        if let Some(v) = n.locks.remove(old) {
+            n.locks.insert(new.to_string(), v);
+        }
+        if n.hidden_channels.remove(old) {
+            n.hidden_channels.insert(new.to_string());
+        }
+        if n.nonkeyable.remove(old) {
+            n.nonkeyable.insert(new.to_string());
+        }
+        if let Some(src) = n.expressions.shift_remove(old) {
+            n.expressions.insert(new.to_string(), src);
+        }
+    }
+    for node in app.s.nodes.values_mut() {
+        for p in node.published.values_mut() {
+            if p.node == id && p.attr == old {
+                p.attr = new.to_string();
+            }
+        }
+    }
+    let old_key = inca_core::anim::Anim::key(id, old);
+    if let Some(mut c) = app.s.anim.curves.shift_remove(&old_key) {
+        c.attr = new.to_string();
+        app.s.anim.curves.insert(inca_core::anim::Anim::key(id, new), c);
+    }
+    for c in &mut app.s.conns {
+        if c.src == id && c.src_attr == old {
+            c.src_attr = new.to_string();
+        }
+        if c.dst == id && c.dst_attr == old {
+            c.dst_attr = new.to_string();
+        }
+    }
+    app.s.touch();
 }
 
 /// Key the highlighted Channel Box channels at the current time. Returns false when none are picked.
@@ -1888,6 +2382,9 @@ pub(crate) fn key_selected_channels(app: &mut IncaApp) -> bool {
     for p in picks {
         for t in &p.targets {
             if let NodeRef::Dag(id) = t {
+                if app.s.node(id).is_some_and(|n| !n.is_keyable(&p.attr)) {
+                    continue;
+                }
                 app.s.set_key(id, &p.attr, None, None);
                 n += 1;
             }
@@ -2031,6 +2528,187 @@ fn lock_channels(app: &mut IncaApp, lock: bool) {
     app.help = if lock { "Locked selected channels".into() } else { "Unlocked selected channels".into() };
 }
 
+/// Picked channels, or every keyable channel of the selected objects when `all` is set.
+fn cb_action_picks(app: &IncaApp, all: bool, keyable_only: bool) -> Vec<CbPick> {
+    if !all {
+        return app
+            .panels
+            .cb_pick
+            .iter()
+            .filter(|p| !keyable_only || p.targets.iter().all(|t| match t {
+                NodeRef::Dag(id) => app.s.node(id).is_none_or(|n| n.is_keyable(&p.attr)),
+                _ => true,
+            }))
+            .cloned()
+            .collect();
+    }
+    let mut out = vec![];
+    for id in &app.s.sel {
+        let Some(n) = app.s.node(id) else { continue };
+        for attr in cb_order(&app.s, &NodeRef::Dag(id.clone())) {
+            if keyable_only && !n.is_keyable(&attr) {
+                continue;
+            }
+            out.push(CbPick { targets: vec![NodeRef::Dag(id.clone())], attr: attr.clone(), int: attr == "visibility", min: None, max: None });
+        }
+    }
+    out
+}
+
+fn breakdown_channels(app: &mut IncaApp, all: bool) {
+    let picks = cb_action_picks(app, all, true);
+    if picks.is_empty() {
+        app.help = "Select channel names to create breakdowns".into();
+        return;
+    }
+    app.s.checkpoint("breakdown keys");
+    let mut n = 0;
+    for p in picks {
+        for t in &p.targets {
+            if let NodeRef::Dag(id) = t {
+                if app.s.node(id).is_none_or(|n| n.is_keyable(&p.attr)) {
+                    app.s.set_key_ex(id, &p.attr, None, None, true);
+                    n += 1;
+                }
+            }
+        }
+    }
+    app.s.touch();
+    app.help = format!("Set {n} breakdown key(s) at the current frame");
+}
+
+fn mute_channels(app: &mut IncaApp, mute: bool, all: bool) {
+    app.s.checkpoint(if mute { "mute channels" } else { "unmute channels" });
+    let mut n = 0;
+    if all {
+        let sel = app.s.sel.clone();
+        for c in app.s.anim.curves.values_mut() {
+            if sel.contains(&c.node) && !c.keys.is_empty() && c.mute != mute {
+                c.mute = mute;
+                n += 1;
+            }
+        }
+    } else {
+        for p in app.panels.cb_pick.clone() {
+            for t in &p.targets {
+                if let NodeRef::Dag(id) = t {
+                    let key = inca_core::anim::Anim::key(id, &p.attr);
+                    if let Some(c) = app.s.anim.curves.get_mut(&key) {
+                        if !c.keys.is_empty() && c.mute != mute {
+                            c.mute = mute;
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    app.s.apply_anim();
+    app.s.touch();
+    app.help = match (mute, n) {
+        (true, 0) => "No selected animated channels to mute".into(),
+        (false, 0) => "No selected animated channels to unmute".into(),
+        (true, _) => format!("Muted {n} channel(s)"),
+        (false, _) => format!("Unmuted {n} channel(s)"),
+    };
+}
+
+fn hide_channels(app: &mut IncaApp, lock: bool) {
+    let picks = app.panels.cb_pick.clone();
+    commit_cb_edit(app);
+    app.s.checkpoint(if lock { "lock and hide channels" } else { "hide channels" });
+    for p in picks {
+        for t in &p.targets {
+            if let NodeRef::Dag(id) = t {
+                if let Some(n) = app.s.nodes.get_mut(id) {
+                    n.hidden_channels.insert(p.attr.clone());
+                    if lock {
+                        n.locks.insert(p.attr.clone(), json!(true));
+                    }
+                }
+            }
+        }
+    }
+    cb_clear_names(app);
+    app.panels.cb_fields.clear();
+    app.s.touch();
+    app.help = if lock { "Locked and hid the selected channel(s)".into() } else { "Hid the selected channel(s)".into() };
+}
+
+fn set_channel_keyable(app: &mut IncaApp, keyable: bool) {
+    let picks = app.panels.cb_pick.clone();
+    app.s.checkpoint(if keyable { "make channels keyable" } else { "make channels nonkeyable" });
+    for p in picks {
+        for t in &p.targets {
+            if let NodeRef::Dag(id) = t {
+                if let Some(n) = app.s.nodes.get_mut(id) {
+                    if keyable {
+                        n.nonkeyable.remove(&p.attr);
+                        n.hidden_channels.remove(&p.attr);
+                    } else {
+                        n.nonkeyable.insert(p.attr.clone());
+                    }
+                }
+            }
+        }
+    }
+    app.s.touch();
+    app.help = if keyable { "Made the selected channel(s) keyable".into() } else { "Made the selected channel(s) nonkeyable".into() };
+}
+
+fn unpublish_channels(app: &mut IncaApp) {
+    let picks = app.panels.cb_pick.clone();
+    let mut n = 0;
+    for p in picks {
+        for t in &p.targets {
+            let NodeRef::Dag(id) = t else { continue };
+            // A published row belongs directly to the asset; other rows resolve through the
+            // containing asset.
+            if app.s.nodes.get(id).is_some_and(|n| n.kind == "container" && n.published.contains_key(&p.attr)) {
+                if let Some(c) = app.s.nodes.get_mut(id) {
+                    c.published.shift_remove(&p.attr);
+                    n += 1;
+                }
+                continue;
+            }
+            let Some(cid) = app.s.container_of(id) else { continue };
+            let names: Vec<String> = app.s.nodes.get(&cid).map(|c| {
+                c.published.iter().filter_map(|(name, pa)| {
+                    (pa.node == *id && pa.attr == p.attr && app.s.published_ref(pa).as_ref() == Some(t)).then(|| name.clone())
+                }).collect()
+            }).unwrap_or_default();
+            if let Some(c) = app.s.nodes.get_mut(&cid) {
+                for name in names {
+                    c.published.shift_remove(&name);
+                    n += 1;
+                }
+            }
+        }
+    }
+    app.s.touch();
+    app.help = if n > 0 { format!("Unpublished {n} attribute(s) from the asset") } else { "The selected channel(s) are not published".into() };
+}
+
+fn lock_unpublished_attributes(app: &mut IncaApp) {
+    let ids = app.s.sel.clone();
+    let mut n = 0;
+    for id in ids {
+        let container = app.s.container_of(&id);
+        let attrs = cb_order(&app.s, &NodeRef::Dag(id.clone()));
+        let unpublished: Vec<String> = attrs
+            .into_iter()
+            .filter(|attr| container.as_ref().is_none_or(|c| app.s.published_name_for(c, &NodeRef::Dag(id.clone()), attr).is_none()))
+            .collect();
+        let Some(n_node) = app.s.nodes.get_mut(&id) else { continue };
+        for attr in unpublished {
+            n_node.locks.insert(attr, json!(true));
+            n += 1;
+        }
+    }
+    app.s.touch();
+    app.help = if n > 0 { format!("Locked {n} unpublished attribute(s)") } else { "No unpublished attributes to lock".into() };
+}
+
 fn show_selected_channel_types(app: &mut IncaApp) {
     let mut f = [false; 4];
     let mut any = false;
@@ -2050,6 +2728,7 @@ fn show_selected_channel_types(app: &mut IncaApp) {
         }
     }
     app.panels.cb_show = if any { Some(f) } else { None };
+    app.panels.cb_custom_active = None;
 }
 
 fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
@@ -3977,5 +4656,128 @@ mod tests {
             let v = app.s.get_attr(&NodeRef::Dag(id.clone()), attr).and_then(|v| v.as_f64()).unwrap_or(0.0);
             assert_eq!(v, 0.0, "MMB axis drag moved {attr}");
         }
+    }
+
+    #[test]
+    fn channel_box_unpublish_and_lock_unpublished() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let _ = app.run_mel("setup asset", "polyCube -n box; select -r box; container -n asset1; select -r box; container -e -publishName pubTx asset1; container -e -ba box.translateX pubTx asset1;");
+        let asset = app.s.find("asset1").expect("asset");
+        let cube = app.s.find("box").expect("box");
+        app.s.select(std::slice::from_ref(&cube), SelMode::Replace);
+        app.panels.cb_pick = vec![CbPick { targets: vec![NodeRef::Dag(asset.clone())], attr: "pubTx".into(), int: false, min: None, max: None }];
+        unpublish_channels(&mut app);
+        assert!(!app.s.node(&asset).unwrap().published.contains_key("pubTx"), "published attribute was not removed");
+        let _ = app.run_mel("republish", "select -r box; container -e -publishName pubTx asset1; container -e -ba box.translateX pubTx asset1;");
+        lock_unpublished_attributes(&mut app);
+        let n = app.s.node(&cube).unwrap();
+        assert!(!n.is_locked("translateX"), "published attribute was locked");
+        assert!(n.is_locked("translateY"), "unpublished attribute was not locked");
+    }
+
+    #[test]
+    fn channel_box_shows_asset_attributes_at_top() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let _ = app.run_mel("setup asset", "polyCube -n box; select -r box; container -n asset1; select -r box; container -e -publishName pubTx asset1; container -e -ba box.translateX pubTx asset1;");
+        let cube = app.s.find("box").expect("box");
+        app.s.select(std::slice::from_ref(&cube), SelMode::Replace);
+        let mut frame = eframe::Frame::_new_kittest();
+        for i in 0..3 {
+            let mut out = ctx.run_ui(raw(vec![], 1.0 + i as f64 * 0.1), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            out.textures_delta.clear();
+        }
+        assert!(app.panels.cb_row_rects.iter().any(|(_, a, _, _)| a == "pubTx"), "asset attribute is missing from the Channel Box");
+        app.panels.cb_asset_top = true;
+        let mut out = ctx.run_ui(raw(vec![], 1.4), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+        out.textures_delta.clear();
+        assert_eq!(app.panels.cb_row_rects.first().map(|(_, a, _, _)| a.as_str()), Some("pubTx"), "asset attributes are not at the top");
+    }
+
+    #[test]
+    fn channel_box_renames_custom_attribute_references() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.nodes.get_mut(&id).unwrap().extra = json!({ "foo": 2.0 });
+        app.s.set_key(&id, "foo", Some(4.0), Some(2.0));
+        app.s.nodes.get_mut(&id).unwrap().locks.insert("foo".into(), json!(true));
+        app.s.nodes.get_mut(&id).unwrap().hidden_channels.insert("foo".into());
+        app.s.nodes.get_mut(&id).unwrap().nonkeyable.insert("foo".into());
+        rename_custom_attr(&mut app, &id, "foo", "bar");
+        let n = app.s.node(&id).unwrap();
+        assert!(n.extra.as_object().is_some_and(|e| e.contains_key("bar") && !e.contains_key("foo")));
+        assert!(n.locks.contains_key("bar") && !n.locks.contains_key("foo"));
+        assert!(n.hidden_channels.contains("bar") && n.nonkeyable.contains("bar"));
+        assert!(app.s.anim.curve(&id, "bar").is_some_and(|c| c.find(4.0).is_some()), "animation curve lost its new name");
+    }
+
+    #[test]
+    fn channel_box_custom_show_entry_filters_rows() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.panels.cb_pick = vec![CbPick { targets: vec![NodeRef::Dag(id.clone())], attr: "translateX".into(), int: false, min: None, max: None }];
+        create_custom_show_entry(&mut app);
+        let mut frame = eframe::Frame::_new_kittest();
+        for i in 0..3 {
+            let mut out = ctx.run_ui(raw(vec![], 1.0 + i as f64 * 0.1), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            out.textures_delta.clear();
+        }
+        let rows: Vec<String> = app.panels.cb_row_rects.iter().map(|(_, a, _, _)| a.clone()).collect();
+        assert_eq!(rows, vec!["translateX"], "custom filter did not restrict the Channel Box");
+    }
+
+    #[test]
+    fn channel_box_breakdown_mute_keyable_and_hide() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.time.current = 5.0;
+        let pick = |attr: &str| CbPick { targets: vec![NodeRef::Dag(id.clone())], attr: attr.into(), int: attr == "visibility", min: None, max: None };
+        app.panels.cb_pick = vec![pick("translateX")];
+        app.panels.cb_sel = vec!["translateX".into()];
+        breakdown_channels(&mut app, false);
+        let key = inca_core::anim::Anim::key(&id, "translateX");
+        assert!(app.s.anim.curves.get(&key).is_some_and(|c| c.find(5.0).is_some_and(|i| c.keys[i].breakdown)), "breakdown key was not marked");
+        mute_channels(&mut app, true, false);
+        assert!(app.s.anim.curves.get(&key).is_some_and(|c| c.mute), "selected channel was not muted");
+        app.s.set_attr(&NodeRef::Dag(id.clone()), "translateX", json!(3.0));
+        app.s.apply_anim();
+        assert_eq!(app.s.get_attr(&NodeRef::Dag(id.clone()), "translateX").and_then(|v| v.as_f64()), Some(3.0), "muted curve drove the channel");
+        mute_channels(&mut app, false, false);
+        assert!(app.s.anim.curves.get(&key).is_some_and(|c| !c.mute), "selected channel was not unmuted");
+        app.panels.cb_pick = vec![pick("translateY")];
+        app.panels.cb_sel = vec!["translateY".into()];
+        set_channel_keyable(&mut app, false);
+        assert!(!key_selected_channels(&mut app), "nonkeyable channel was keyed");
+        assert!(!app.s.anim.is_keyed(&id, "translateY"), "nonkeyable channel created a curve");
+        set_channel_keyable(&mut app, true);
+        assert!(key_selected_channels(&mut app), "keyable channel was not keyed");
+        app.panels.cb_pick = vec![pick("translateX")];
+        app.panels.cb_sel = vec!["translateX".into()];
+        hide_channels(&mut app, false);
+        let mut frame = eframe::Frame::_new_kittest();
+        for i in 0..3 {
+            let mut out = ctx.run_ui(raw(vec![], 1.0 + i as f64 * 0.1), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            out.textures_delta.clear();
+        }
+        assert!(!app.panels.cb_row_rects.iter().any(|(_, a, _, _)| a == "translateX"), "hidden channel still has a row");
     }
 }

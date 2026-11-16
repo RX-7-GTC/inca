@@ -320,8 +320,14 @@ pub struct Node {
     pub use_outliner_color: bool,
     pub outliner_color: [f32; 3],
     pub locks: Map<String, Value>,
+    /// Attributes removed from the Channel Box by Hide Selected / Lock and Hide.
+    pub hidden_channels: BTreeSet<String>,
+    /// Attributes that cannot be keyframed (Channel Box > Make Nonkeyable).
+    pub nonkeyable: BTreeSet<String>,
     pub shape_name: Option<String>,
     pub extra: Value,
+    /// Per-channel expressions: attribute name -> expression source.
+    pub expressions: IndexMap<String, String>,
     pub shape: Shape,
     /// data we don't interpret yet (rigging) but keep so files round-trip
     pub passthrough: Map<String, Value>,
@@ -377,6 +383,12 @@ impl Node {
     }
     pub fn is_locked(&self, attr: &str) -> bool {
         self.locks.get(attr).and_then(|v| v.as_bool()).unwrap_or(false)
+    }
+    pub fn channel_hidden(&self, attr: &str) -> bool {
+        self.hidden_channels.contains(attr)
+    }
+    pub fn is_keyable(&self, attr: &str) -> bool {
+        !self.nonkeyable.contains(attr)
     }
 }
 
@@ -787,8 +799,11 @@ impl Scene {
             use_outliner_color: false,
             outliner_color: [1.0, 1.0, 1.0],
             locks: Map::new(),
+            hidden_channels: BTreeSet::new(),
+            nonkeyable: BTreeSet::new(),
             shape_name,
             extra: Value::Null,
+            expressions: IndexMap::new(),
             shape,
             passthrough: Map::new(),
             published: IndexMap::new(),
@@ -1806,12 +1821,21 @@ impl Scene {
 
     // ------------------------------------------------------------ animation
     pub fn set_key(&mut self, id: &str, attr: &str, t: Option<f64>, v: Option<f64>) {
+        self.set_key_ex(id, attr, t, v, false)
+    }
+
+    /// Set a key; `breakdown` marks it as a breakdown key.
+    pub fn set_key_ex(&mut self, id: &str, attr: &str, t: Option<f64>, v: Option<f64>, breakdown: bool) {
+        let attr = alias(attr);
+        if self.nodes.get(id).is_some_and(|n| !n.is_keyable(attr)) {
+            return;
+        }
         let t = t.unwrap_or(self.time.current);
         let v = v.unwrap_or_else(|| self.get_attr_f(id, attr));
         let (ti, to) = self.key_tangents.clone();
-        if let Some(c) = self.anim.curve_mut(id, alias(attr), true) {
+        if let Some(c) = self.anim.curve_mut(id, attr, true) {
             let existed = c.find(t).is_some();
-            let i = c.set_key(t, v, &to);
+            let i = if breakdown { c.set_breakdown(t, v, &to) } else { c.set_key(t, v, &to) };
             if let Some(k) = c.keys.get_mut(i).filter(|_| !existed) {
                 k.it = ti;
             }
@@ -1819,10 +1843,63 @@ impl Scene {
         self.touch();
     }
 
+    /// Evaluate per-channel expressions. A few passes let expressions that reference other
+    /// expressed channels settle without needing a dependency graph.
+    pub fn apply_expressions(&mut self) -> Vec<Id> {
+        let list: Vec<(Id, IndexMap<String, String>)> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| !n.expressions.is_empty())
+            .map(|(id, n)| (id.clone(), n.expressions.clone()))
+            .collect();
+        let time = self.time.current;
+        let mut moved = vec![];
+        for (id, exprs) in list {
+            let mut changed = false;
+            for _ in 0..3 {
+                let mut vars: HashMap<String, f64> = HashMap::new();
+                for c in CHANNELS {
+                    vars.insert(c.to_string(), self.get_attr_f(&id, c));
+                }
+                if let Some(e) = self.nodes.get(&id).and_then(|n| n.extra.as_object()) {
+                    for (k, v) in e {
+                        if let Some(x) = v.as_f64() {
+                            vars.insert(k.clone(), x);
+                        } else if let Some(b) = v.as_bool() {
+                            vars.insert(k.clone(), b as i32 as f64);
+                        }
+                    }
+                }
+                for c in self.shape_channels(&id) {
+                    vars.insert(c.clone(), self.get_attr_f(&id, &c));
+                }
+                let mut vals = vec![];
+                for (attr, src) in &exprs {
+                    if let Ok(v) = crate::expr::eval(src, &|name| vars.get(name).copied(), time) {
+                        vals.push((attr.clone(), v));
+                    }
+                }
+                for (attr, v) in vals {
+                    if (self.get_attr_f(&id, &attr) - v).abs() > 1e-12 {
+                        self.set_attr_ex(&NodeRef::Dag(id.clone()), &attr, json!(v), false);
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                moved.push(id);
+            }
+        }
+        if !moved.is_empty() {
+            self.touch();
+        }
+        moved
+    }
+
     /// Evaluate anim curves at the current time and push values into channels.
     pub fn apply_anim(&mut self) {
         let t = self.time.current;
-        let vals: Vec<(String, String, f64)> = self.anim.curves.values().filter(|c| !c.keys.is_empty()).map(|c| (c.node.clone(), c.attr.clone(), c.eval(t))).collect();
+        let vals: Vec<(String, String, f64)> = self.anim.curves.values().filter(|c| !c.keys.is_empty() && !c.mute).map(|c| (c.node.clone(), c.attr.clone(), c.eval(t))).collect();
         let mut moved: Vec<Id> = vec![];
         for (n, a, v) in vals {
             if self.nodes.contains_key(&n) {
@@ -1836,6 +1913,7 @@ impl Scene {
             }
         }
         moved.extend(self.eval_connections());
+        moved.extend(self.apply_expressions());
         moved.extend(self.eval_constraints());
         self.refresh_many(&moved);
     }
@@ -2328,6 +2406,15 @@ impl Scene {
         if !n.published.is_empty() {
             o.insert("published".into(), serde_json::to_value(&n.published).unwrap());
         }
+        if !n.hidden_channels.is_empty() {
+            o.insert("hiddenChannels".into(), json!(n.hidden_channels));
+        }
+        if !n.nonkeyable.is_empty() {
+            o.insert("nonkeyable".into(), json!(n.nonkeyable));
+        }
+        if !n.expressions.is_empty() {
+            o.insert("expressions".into(), serde_json::to_value(&n.expressions).unwrap());
+        }
         for (k, v) in &n.passthrough {
             o.insert(k.clone(), v.clone());
         }
@@ -2415,6 +2502,9 @@ impl Scene {
         n.use_outliner_color = d["useOutlinerColor"].as_bool().unwrap_or(false);
         n.outliner_color = serde_json::from_value(d["outlinerColor"].clone()).unwrap_or([1.0; 3]);
         n.locks = d["locks"].as_object().cloned().unwrap_or_default();
+        n.hidden_channels = serde_json::from_value(d["hiddenChannels"].clone()).unwrap_or_default();
+        n.nonkeyable = serde_json::from_value(d["nonkeyable"].clone()).unwrap_or_default();
+        n.expressions = serde_json::from_value(d["expressions"].clone()).unwrap_or_default();
         n.extra = d["extra"].clone();
         // duplicated/imported nodes get new ids, so published targets would be stale
         n.published = if fresh { IndexMap::new() } else { serde_json::from_value(d["published"].clone()).unwrap_or_default() };
@@ -3077,5 +3167,44 @@ mod tests {
         assert_eq!(s.comp_verts(&a), vec![0, 1]);
         s.redo().unwrap();
         assert_eq!(s.comp_verts(&a), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn muted_animation_is_not_evaluated() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_attr_f(&id, "translateX", 0.0);
+        s.set_key(&id, "translateX", Some(1.0), Some(5.0));
+        s.time.current = 1.0;
+        s.apply_anim();
+        assert!((s.get_attr_f(&id, "translateX") - 5.0).abs() < 1e-9);
+        let key = Anim::key(&id, "translateX");
+        s.anim.curves.get_mut(&key).unwrap().mute = true;
+        s.set_attr_f(&id, "translateX", 2.0);
+        s.apply_anim();
+        assert!((s.get_attr_f(&id, "translateX") - 2.0).abs() < 1e-9, "muted curve drove the channel");
+    }
+
+    #[test]
+    fn breakdown_and_nonkeyable_channels() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_key_ex(&id, "translateY", Some(3.0), Some(4.0), true);
+        let c = s.anim.curve(&id, "translateY").expect("breakdown curve");
+        assert!(c.find(3.0).is_some_and(|i| c.keys[i].breakdown));
+        s.nodes.get_mut(&id).unwrap().nonkeyable.insert("translateZ".into());
+        s.set_key(&id, "translateZ", Some(3.0), Some(1.0));
+        assert!(s.anim.curve(&id, "translateZ").is_none(), "nonkeyable channel was keyed");
+    }
+
+    #[test]
+    fn expressions_drive_channels() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_attr_f(&id, "translateX", 3.0);
+        s.nodes.get_mut(&id).unwrap().expressions.insert("translateY".into(), "translateX * 2 + time".into());
+        s.time.current = 4.0;
+        s.apply_expressions();
+        assert!((s.get_attr_f(&id, "translateY") - 10.0).abs() < 1e-9);
     }
 }

@@ -122,6 +122,10 @@ pub struct Windows {
     pub hypergraph: bool,
     pub connection_editor: bool,
     pub hik: bool,
+    pub channel_control: bool,
+    pub delete_attributes: bool,
+    pub edit_attributes: bool,
+    pub expression_editor: bool,
     pub rename: Option<String>,
     /// In-app notice shown after changing the rendering backend.
     pub backend_notice: Option<String>,

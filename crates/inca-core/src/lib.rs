@@ -10,6 +10,7 @@ pub mod ops;
 pub mod params;
 pub mod primitives;
 pub mod anim;
+pub mod expr;
 pub mod materials;
 pub mod sky;
 pub mod scene;

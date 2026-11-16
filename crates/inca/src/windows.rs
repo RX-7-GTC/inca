@@ -400,6 +400,50 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     } else {
         app.windows_state.ds_window_rect = None;
     }
+    if app.win.channel_control {
+        let mut open = true;
+        let _ = place_window(app, ctx, egui::Id::new("Channel Control"), true, |app, fix| {
+            let mut window = egui::Window::new("Channel Control").open(&mut open).default_size([420.0, 420.0]).constrain(false);
+            if let Some(p) = fix {
+                window = window.fixed_pos(p);
+            }
+            window.show(ctx, |ui| crate::panels::channel_control_window(app, ui))
+        });
+        app.win.channel_control = open && app.win.channel_control;
+    }
+    if app.win.delete_attributes {
+        let mut open = true;
+        let _ = place_window(app, ctx, egui::Id::new("Delete Attributes"), true, |app, fix| {
+            let mut window = egui::Window::new("Delete Attributes").open(&mut open).default_size([300.0, 360.0]).constrain(false);
+            if let Some(p) = fix {
+                window = window.fixed_pos(p);
+            }
+            window.show(ctx, |ui| crate::panels::delete_attributes_window(app, ui))
+        });
+        app.win.delete_attributes = open && app.win.delete_attributes;
+    }
+    if app.win.edit_attributes {
+        let mut open = true;
+        let _ = place_window(app, ctx, egui::Id::new("Edit Attribute"), true, |app, fix| {
+            let mut window = egui::Window::new("Edit Attribute").open(&mut open).default_size([320.0, 220.0]).constrain(false);
+            if let Some(p) = fix {
+                window = window.fixed_pos(p);
+            }
+            window.show(ctx, |ui| crate::panels::edit_attributes_window(app, ui))
+        });
+        app.win.edit_attributes = open && app.win.edit_attributes;
+    }
+    if app.win.expression_editor {
+        let mut open = true;
+        let _ = place_window(app, ctx, egui::Id::new("Expression Editor"), true, |app, fix| {
+            let mut window = egui::Window::new("Expression Editor").open(&mut open).default_size([420.0, 260.0]).constrain(false);
+            if let Some(p) = fix {
+                window = window.fixed_pos(p);
+            }
+            window.show(ctx, |ui| crate::panels::expression_editor_window(app, ui))
+        });
+        app.win.expression_editor = open && app.win.expression_editor;
+    }
     let mut open = app.win.render_view;
     let is_open = open;
     let _ = place_window(app, ctx, egui::Id::new("Render View"), is_open, |app, fix| {

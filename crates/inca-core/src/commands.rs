@@ -1197,12 +1197,13 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "setKeyframe" => {
             let t = a.f(&["t", "time"]);
             let v = a.f(&["v", "value"]);
+            let bd = a.flags.iter().any(|(f, _)| f == "bd" || f == "breakdown");
             let attrs: Vec<String> = a.flags.iter().filter(|(f, _)| f == "at" || f == "attribute").filter_map(|(_, v)| v.first().map(|x| x.str())).collect();
             let mut n = 0;
             for tgt in a.strings() {
                 if let Some((obj, attr)) = tgt.split_once('.') {
                     if let Some(id) = s.find(obj) {
-                        s.set_key(&id, attr, t, v);
+                        s.set_key_ex(&id, attr, t, v, bd);
                         n += 1;
                     }
                 }
@@ -1210,9 +1211,22 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             if n == 0 {
                 let ts: Vec<Id> = if a.strings().is_empty() { s.sel.clone() } else { a.strings().iter().filter_map(|x| s.find(x)).collect() };
                 for id in ts {
-                    let list: Vec<String> = if attrs.is_empty() { CHANNELS.iter().map(|c| c.to_string()).collect() } else { attrs.clone() };
+                    let mut list: Vec<String> = if attrs.is_empty() {
+                        CHANNELS.iter().map(|c| c.to_string()).collect()
+                    } else {
+                        attrs.clone()
+                    };
+                    if attrs.is_empty() {
+                        if let Some(n) = s.node(&id).and_then(|n| n.extra.as_object()) {
+                            list.extend(n.keys().filter(|k| n.get(*k).is_some_and(|v| v.is_number() || v.is_boolean())).cloned());
+                        }
+                        list.extend(s.shape_channels(&id));
+                        list.sort();
+                        list.dedup();
+                    }
+                    let list: Vec<String> = list.into_iter().filter(|c| s.nodes.get(&id).is_none_or(|n| n.is_keyable(alias(c)))).collect();
                     for at in list {
-                        s.set_key(&id, &at, t, v);
+                        s.set_key_ex(&id, &at, t, v, bd);
                         n += 1;
                     }
                 }

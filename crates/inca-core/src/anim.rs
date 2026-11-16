@@ -25,6 +25,9 @@ pub struct Key {
     pub is: f64,
     #[serde(default)]
     pub os: f64,
+    /// A breakdown key: moved with its neighbours rather than independently.
+    #[serde(default)]
+    pub breakdown: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -36,11 +39,14 @@ pub struct AnimCurve {
     pub pre: String,
     #[serde(default = "constant")]
     pub post: String,
+    /// Muted animation curves are not evaluated during playback.
+    #[serde(default)]
+    pub mute: bool,
 }
 
 impl AnimCurve {
     pub fn new(node: &str, attr: &str) -> Self {
-        AnimCurve { node: node.into(), attr: attr.into(), keys: vec![], pre: constant(), post: constant() }
+        AnimCurve { node: node.into(), attr: attr.into(), keys: vec![], pre: constant(), post: constant(), mute: false }
     }
     pub fn find(&self, t: f64) -> Option<usize> {
         self.keys.iter().position(|k| (k.t - t).abs() < 1e-4)
@@ -51,9 +57,14 @@ impl AnimCurve {
             return i;
         }
         let ot = if tangent == "step" { "step" } else { tangent };
-        self.keys.push(Key { t, v, it: tangent.into(), ot: ot.into(), is: 0.0, os: 0.0 });
+        self.keys.push(Key { t, v, it: tangent.into(), ot: ot.into(), is: 0.0, os: 0.0, breakdown: false });
         self.sort();
         self.find(t).unwrap()
+    }
+    pub fn set_breakdown(&mut self, t: f64, v: f64, tangent: &str) -> usize {
+        let i = self.set_key(t, v, tangent);
+        self.keys[i].breakdown = true;
+        i
     }
     pub fn sort(&mut self) {
         self.keys.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));

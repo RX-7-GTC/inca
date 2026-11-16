@@ -116,7 +116,9 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
     for k in key_times {
         if k >= t0 && k <= t1 {
             let x = x_of(k).round();
-            p.rect_filled(Rect::from_min_size(pos2(x - 1.0, rect.max.y - 22.0), vec2((px_per as f32 * 0.18).max(2.0), 22.0)), 0.0, Color32::from_rgb(0xd7, 0x3b, 0x3e));
+            let breakdown = app.s.anim.curves.values().any(|c| c.keys.iter().any(|key| key.breakdown && (key.t - k).abs() < 1e-6));
+            let color = if breakdown { Color32::from_rgb(0x54, 0xc8, 0x60) } else { Color32::from_rgb(0xd7, 0x3b, 0x3e) };
+            p.rect_filled(Rect::from_min_size(pos2(x - 1.0, rect.max.y - 22.0), vec2((px_per as f32 * 0.18).max(2.0), 22.0)), 0.0, color);
         }
     }
     // current time: grey frame band, white line, label box
