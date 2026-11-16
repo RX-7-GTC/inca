@@ -442,6 +442,8 @@ pub struct PanelState {
     pub cb_speed: u8,
     pub cb_names: u8,
     pub cb_show: Option<[bool; 4]>,
+    /// Decimal places for Channel Box numeric values; `None` keeps Maya's trimmed display.
+    pub cb_precision: Option<usize>,
     /// Show Assets display mode: 0 = all published attributes, 1 = selected object's attributes.
     pub cb_asset_mode: u8,
     pub cb_asset_top: bool,
@@ -1248,6 +1250,7 @@ fn channel_row_cb(app: &mut IncaApp, ui: &mut egui::Ui, rows: &mut Vec<CbRow>, t
 
 fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: &str, label: &str, kind: ChanKind, min: Option<f64>, max: Option<f64>, mut rows: Option<&mut Vec<CbRow>>) {
     let selectable = rows.is_some();
+    let decimals = if rows.is_some() { app.panels.cb_precision } else { None };
     let Some(first) = targets.first() else { return };
     let Some(cur) = app.s.get_attr(first, attr) else { return };
     let id = app.s.ref_id(first);
@@ -1381,7 +1384,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                     let x = cur.as_f64().unwrap_or(0.0);
                     if selectable {
                         let rows = rows.as_deref_mut().expect("selectable channel rows");
-                        cb_numeric_cell(app, ui, w - 4.0, targets, attr, kind, min, max, None, rows, rect)
+                        cb_numeric_cell(app, ui, w - 4.0, targets, attr, kind, min, max, decimals, rows, rect)
                     } else {
                         let mut x = x;
                         // typed expressions: "2*3", or relative "+=2" "-=1" "*=2" "/=2" applied to each selected object's own value
@@ -1971,9 +1974,21 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
+                ui.menu_button("Change Precision", |ui| {
+                    if menu_check(app, ui, app.panels.cb_precision.is_none(), "Default") {
+                        app.panels.cb_precision = None;
+                    }
+                    for d in 0..=6 {
+                        if menu_check(app, ui, app.panels.cb_precision == Some(d), &format!("{d} decimal{}", if d == 1 { "" } else { "s" })) {
+                            app.panels.cb_precision = Some(d);
+                        }
+                    }
+                });
                 if menu_item(app, ui, "Reset Settings") {
                     app.panels.cb_speed = 0;
                     app.panels.cb_show = None;
+                    app.panels.cb_custom_active = None;
+                    app.panels.cb_precision = None;
                 }
             });
             ui.menu_button("Channel Names", |ui| {
@@ -4691,6 +4706,35 @@ mod tests {
         assert!(n.locks.contains_key("bar") && !n.locks.contains_key("foo"));
         assert!(n.hidden_channels.contains("bar") && n.nonkeyable.contains("bar"));
         assert!(app.s.anim.curve(&id, "bar").is_some_and(|c| c.find(4.0).is_some()), "animation curve lost its new name");
+    }
+
+    #[test]
+    fn channel_box_precision_controls_value_text() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.set_attr(&NodeRef::Dag(id.clone()), "translateX", json!(1.23456));
+        app.panels.cb_precision = Some(2);
+        let mut frame = eframe::Frame::_new_kittest();
+        for i in 0..3 {
+            let mut out = ctx.run_ui(raw(vec![], 1.0 + i as f64 * 0.1), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            out.textures_delta.clear();
+        }
+        let field = app.panels.cb_row_rects.iter().find(|(_, a, _, _)| a == "translateX").map(|(_, _, _, f)| *f).expect("translate field");
+        for (t, ev) in [
+            (1.4, vec![egui::Event::PointerMoved(field.center())]),
+            (1.5, vec![egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }]),
+            (1.6, vec![egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]),
+            (1.7, vec![]),
+        ] {
+            let mut out = ctx.run_ui(raw(ev, t), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            out.textures_delta.clear();
+        }
+        assert_eq!(app.panels.cb_edit_text, "1.23", "precision was not applied to the field");
     }
 
     #[test]
