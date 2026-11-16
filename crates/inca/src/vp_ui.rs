@@ -1421,7 +1421,7 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
 /// Transform channels picked in the Channel Box (all translate, all rotate or all scale): the
 /// manipulator shows just those axes, as in Maya.
 fn channel_modes(app: &IncaApp) -> Option<(Tool, EnumSet<GizmoMode>)> {
-    if !app.panels.cb_armed || app.panels.cb_sel.is_empty() || app.s.comp_mode.is_some() {
+    if !app.panels.cb_armed || app.panels.cb_manips.unwrap_or(2).min(2) < 2 || app.panels.cb_sel.is_empty() || app.s.comp_mode.is_some() {
         return None;
     }
     let mut kind = None;

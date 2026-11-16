@@ -70,6 +70,23 @@ fn cb_clear_names(app: &mut IncaApp) {
     app.panels.cb_armed = false;
 }
 
+fn cb_manip_mode(app: &IncaApp) -> u8 {
+    app.panels.cb_manips.unwrap_or(2).min(2)
+}
+
+/// Arm the virtual slider unless No Manips is selected.
+fn cb_arm(app: &mut IncaApp) {
+    app.panels.cb_armed = cb_manip_mode(app) != 0;
+}
+
+fn shown_node_name(app: &IncaApp, name: &str) -> String {
+    if app.panels.cb_hide_namespace {
+        name.rsplit(':').next().unwrap_or(name).to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 fn cb_filter(app: &IncaApp) -> [bool; 4] {
     app.panels.cb_show.unwrap_or([true; 4])
 }
@@ -460,6 +477,12 @@ pub struct PanelState {
     pub expression_text: String,
     pub cb_sync_graph: bool,
     pub cb_sync_timeline: bool,
+    /// Channel Box manipulator mode: 0 = No Manips, 1 = Invisible, 2 = Standard. `None` = Standard.
+    pub cb_manips: Option<u8>,
+    /// Hyperbolic attribute-adjustment mapping for the virtual slider.
+    pub cb_hyperbolic: bool,
+    /// Hide namespace prefixes in displayed object names.
+    pub cb_hide_namespace: bool,
     /// Last drawn Channel Box rows for the in-app UI tests: key, name rect, field rect.
     pub cb_row_rects: Vec<(String, String, Rect, Rect)>,
     pub ae_tab: usize,
@@ -685,7 +708,8 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
         return;
     }
     let Some(n) = app.s.node(id) else { return };
-    let name = n.name.clone();
+    let full_name = n.name.clone();
+    let name = shown_node_name(app, &full_name);
     let icon = kind_icon(n);
     let startup = n.startup();
     let template = app.s.is_templated_display(id);
@@ -809,7 +833,7 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
         }
     }
     if resp.double_clicked() && !startup && !on_exp {
-        app.panels.renaming = Some((id.to_string(), name.clone()));
+        app.panels.renaming = Some((id.to_string(), full_name.clone()));
     }
     if resp.drag_started() && !startup {
         let moving: Vec<String> = if app.s.sel.iter().any(|s| s == id) { app.s.sel.clone() } else { vec![id.to_string()] };
@@ -836,7 +860,7 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
         }
         if ui.button("Rename").clicked() {
             if !startup {
-                app.panels.renaming = Some((id.to_string(), name.clone()));
+                app.panels.renaming = Some((id.to_string(), full_name.clone()));
             }
             ui.close();
         }
@@ -1149,7 +1173,14 @@ pub fn virtual_slider(app: &mut IncaApp, resp: &egui::Response) -> bool {
         app.panels.cb_drag_x += resp.drag_delta().x;
         // 0.05 used to be Slow; it is now Fast, with much finer medium and slow settings.
         let speed = cb_adjust_speed(app);
-        let d = app.panels.cb_drag_x as f64 * speed * if m.ctrl || m.command { 0.1 } else if m.shift { 10.0 } else { 1.0 };
+        let raw = app.panels.cb_drag_x as f64;
+        let mapped = if app.panels.cb_hyperbolic {
+            let sign = if raw < 0.0 { -1.0 } else { 1.0 };
+            sign * raw.abs() * (1.0 + raw.abs() / 300.0)
+        } else {
+            raw
+        };
+        let d = mapped * speed * if m.ctrl || m.command { 0.1 } else if m.shift { 10.0 } else { 1.0 };
         for (r, a, start, int, lo, hi) in &list {
             let mut x = start + d;
             if let Some(lo) = lo {
@@ -1309,7 +1340,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                 p.cb_pick = vec![me.clone()];
             }
             app.panels.cb_last = Some(attr.to_string());
-            app.panels.cb_armed = true;
+            cb_arm(app);
             app.help = "Middle-drag in a viewport to change the selected channels (virtual slider; Ctrl slower, Shift faster)".into();
         }
         if selectable && lresp.drag_started_by(egui::PointerButton::Primary) {
@@ -1318,7 +1349,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
             app.panels.cb_sel = vec![attr.to_string()];
             app.panels.cb_pick = vec![me.clone()];
             app.panels.cb_last = Some(attr.to_string());
-            app.panels.cb_armed = true;
+            cb_arm(app);
             app.help = "Middle-drag in a viewport to change the selected channels (virtual slider; Ctrl slower, Shift faster)".into();
             if let Some(fid) = ui.memory(|m| m.focused()) {
                 ui.memory_mut(|m| m.surrender_focus(fid));
@@ -1482,7 +1513,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                 app.panels.cb_pick = vec![me.clone()];
             }
             app.panels.cb_last = Some(attr.to_string());
-            app.panels.cb_armed = true;
+            cb_arm(app);
         }
         if channel_menu {
             lresp.context_menu(|ui| {
@@ -1545,7 +1576,7 @@ fn finish_cb_rows(app: &mut IncaApp, ui: &egui::Ui, rows: &[CbRow]) {
                 app.panels.cb_sel = sel;
                 app.panels.cb_pick = picks;
                 app.panels.cb_last = last.map(|(_, a)| a);
-                app.panels.cb_armed = true;
+                cb_arm(app);
             }
             theme::marquee(&ui.painter(), rect);
         }
@@ -1606,7 +1637,8 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
         return;
     };
     let Some(n) = app.s.node(&lead) else { return };
-    let name = n.name.clone();
+    let full_name = n.name.clone();
+    let name = shown_node_name(app, &full_name);
     let shape = n.shape_name.clone();
     let mut cb_rows: Vec<CbRow> = Vec::new();
     // object name (editable; keep the edit buffer between frames so typing is not reset)
@@ -1618,7 +1650,7 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
     if r.lost_focus() {
         let new = app.panels.cb_name.1.trim().to_string();
         if !new.is_empty() && new != name {
-            let _ = app.run_mel("rename", &format!("rename {name} \"{new}\";"));
+            let _ = app.run_mel("rename", &format!("rename {full_name} \"{new}\";"));
             return;
         }
     }
@@ -1895,7 +1927,7 @@ fn channels_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
 }
 
 fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
-    use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
+    use crate::menus::{menu_check, menu_item, menu_radio, panel_bar, MenuSource};
     panel_bar(app, ui, MenuSource::ChannelBox, &["Channels", "Edit", "Object", "Show"], false, |app, ui, title| match title {
         "Channels" => channels_menu(app, ui),
         "Edit" => {
@@ -1976,6 +2008,26 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
+                if menu_check(app, ui, app.panels.cb_hyperbolic, "Hyperbolic") {
+                    app.panels.cb_hyperbolic = !app.panels.cb_hyperbolic;
+                }
+                if menu_check(app, ui, !app.panels.cb_hide_namespace, "Show Namespace") {
+                    app.panels.cb_hide_namespace = !app.panels.cb_hide_namespace;
+                }
+                ui.separator();
+                let mode = cb_manip_mode(app);
+                if menu_radio(app, ui, mode == 0, "No Manips") {
+                    app.panels.cb_manips = Some(0);
+                    app.panels.cb_armed = false;
+                }
+                if menu_radio(app, ui, mode == 1, "Invisible Manips") {
+                    app.panels.cb_manips = Some(1);
+                    cb_arm(app);
+                }
+                if menu_radio(app, ui, mode == 2, "Standard Manips") {
+                    app.panels.cb_manips = None;
+                    cb_arm(app);
+                }
                 ui.menu_button("Change Precision", |ui| {
                     if menu_check(app, ui, app.panels.cb_precision.is_none(), "Default") {
                         app.panels.cb_precision = None;
@@ -1986,11 +2038,16 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
-                if menu_item(app, ui, "Reset Settings") {
+                if menu_item(app, ui, "Reset to Default") {
                     app.panels.cb_speed = 0;
+                    app.panels.cb_names = 0;
                     app.panels.cb_show = None;
                     app.panels.cb_custom_active = None;
                     app.panels.cb_precision = None;
+                    app.panels.cb_manips = None;
+                    app.panels.cb_hyperbolic = false;
+                    app.panels.cb_hide_namespace = false;
+                    cb_arm(app);
                 }
             });
             ui.menu_button("Channel Names", |ui| {
@@ -4398,6 +4455,27 @@ mod tests {
         run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 1.1);
         run(&mut app, vec![], 1.2);
         assert_eq!(app.s.name_of(&id), "renamedCube", "Channel Box name field did not rename the object");
+    }
+
+    #[test]
+    fn channel_box_settings_manips_and_namespace() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        app.panels.cb_manips = Some(0);
+        cb_arm(&mut app);
+        assert!(!app.panels.cb_armed, "No Manips armed the virtual slider");
+        app.panels.cb_manips = Some(1);
+        cb_arm(&mut app);
+        assert!(app.panels.cb_armed, "Invisible Manips did not arm the virtual slider");
+        app.panels.cb_manips = None;
+        cb_arm(&mut app);
+        assert!(app.panels.cb_armed);
+        app.panels.cb_hide_namespace = true;
+        assert_eq!(shown_node_name(&app, "asset:pCube1"), "pCube1");
+        app.panels.cb_hide_namespace = false;
+        assert_eq!(shown_node_name(&app, "asset:pCube1"), "asset:pCube1");
     }
 
     #[test]
