@@ -4536,6 +4536,32 @@ mod tests {
     }
 
     #[test]
+    fn shading_modes_turn_off_use_all_lights() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        app.active_vp = 0;
+        app.vps[0].shade = crate::viewport::ShadeMode::Textured;
+        app.vps[0].lights = crate::viewport::LightMode::All;
+        app.action("shadeSmooth");
+        assert_eq!(app.vps[0].shade, crate::viewport::ShadeMode::Shaded);
+        assert_eq!(app.vps[0].lights, crate::viewport::LightMode::Default);
+        app.vps[0].lights = crate::viewport::LightMode::All;
+        app.action("shadeTextured");
+        assert_eq!(app.vps[0].shade, crate::viewport::ShadeMode::Textured);
+        assert_eq!(app.vps[0].lights, crate::viewport::LightMode::Default);
+        app.vps[0].lights = crate::viewport::LightMode::All;
+        app.action("shadeWire");
+        assert_eq!(app.vps[0].shade, crate::viewport::ShadeMode::Wire);
+        assert_eq!(app.vps[0].lights, crate::viewport::LightMode::Default);
+        app.action("shadeAllLights");
+        assert_eq!(app.vps[0].lights, crate::viewport::LightMode::All);
+        app.action("shadeAllLights");
+        assert_eq!(app.vps[0].lights, crate::viewport::LightMode::Default);
+    }
+
+    #[test]
     fn right_panel_widths_are_remembered_per_tab() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);

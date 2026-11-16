@@ -1109,10 +1109,27 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             }
         }
         "toggleBackface" => app.set_backface(!app.backface),
-        "shadeWire" => app.vps[vp].shade = ShadeMode::Wire,
-        "shadeSmooth" => app.vps[vp].shade = ShadeMode::Shaded,
-        "shadeTextured" => app.vps[vp].shade = ShadeMode::Textured,
-        "shadeAllLights" => app.vps[vp].lights = LightMode::All,
+        "shadeWire" => {
+            app.vps[vp].shade = ShadeMode::Wire;
+            if app.vps[vp].lights == LightMode::All {
+                app.vps[vp].lights = LightMode::Default;
+            }
+        }
+        "shadeSmooth" => {
+            app.vps[vp].shade = ShadeMode::Shaded;
+            if app.vps[vp].lights == LightMode::All {
+                app.vps[vp].lights = LightMode::Default;
+            }
+        }
+        "shadeTextured" => {
+            app.vps[vp].shade = ShadeMode::Textured;
+            if app.vps[vp].lights == LightMode::All {
+                app.vps[vp].lights = LightMode::Default;
+            }
+        }
+        "shadeAllLights" => {
+            app.vps[vp].lights = if app.vps[vp].lights == LightMode::All { LightMode::Default } else { LightMode::All };
+        }
         "shadeDefaultLights" => app.vps[vp].lights = LightMode::Default,
         "shadeFlatLights" => app.vps[vp].lights = LightMode::Flat,
         "smoothOff" | "smoothCage" | "smoothOn" => {

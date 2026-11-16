@@ -410,13 +410,22 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         let mut backface = app.backface;
         if menu_radio(app, ui, app.vps[idx].shade == ShadeMode::Wire, "Wireframe  4") {
             app.vps[idx].shade = ShadeMode::Wire;
+            if app.vps[idx].lights == LightMode::All {
+                app.vps[idx].lights = LightMode::Default;
+            }
         }
         if menu_radio(app, ui, app.vps[idx].shade == ShadeMode::Shaded, "Smooth Shade All  5") {
             app.vps[idx].shade = ShadeMode::Shaded;
+            if app.vps[idx].lights == LightMode::All {
+                app.vps[idx].lights = LightMode::Default;
+            }
         }
         // JS "Bounding Box" also switches to wireframe in this release
         if menu_selectable(app, ui, false, "Bounding Box") {
             app.vps[idx].shade = ShadeMode::Wire;
+            if app.vps[idx].lights == LightMode::All {
+                app.vps[idx].lights = LightMode::Default;
+            }
         }
         ui.separator();
         if menu_check(app, ui, app.vps[idx].wire_on_shaded, "Wireframe on Shaded") {
@@ -432,6 +441,9 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         let tex = app.vps[idx].shade == ShadeMode::Textured;
         if menu_check(app, ui, tex, "Hardware Texturing  6") {
             app.vps[idx].shade = if !tex { ShadeMode::Textured } else { ShadeMode::Shaded };
+            if app.vps[idx].lights == LightMode::All {
+                app.vps[idx].lights = LightMode::Default;
+            }
         }
         if backface != app.backface {
             app.set_backface(backface);
@@ -643,15 +655,24 @@ fn panel_toolbar(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
     separator(ui);
     if ib(ui, "wireframe", "Wireframe (4)", v.shade == ShadeMode::Wire) {
         v.shade = ShadeMode::Wire;
+        if v.lights == LightMode::All {
+            v.lights = LightMode::Default;
+        }
     }
-    if ib(ui, "smoothShade", "Smooth shade all (5)", v.shade == ShadeMode::Shaded) {
+    if ib(ui, "smoothShade", "Smooth shade all (5)", v.shade != ShadeMode::Wire) {
         v.shade = ShadeMode::Shaded;
+        if v.lights == LightMode::All {
+            v.lights = LightMode::Default;
+        }
     }
     if ib(ui, "wireOnShaded", "Wireframe on shaded", v.wire_on_shaded) {
         v.wire_on_shaded = !v.wire_on_shaded;
     }
     if ib(ui, "textured", "Textured (6)", v.shade == ShadeMode::Textured) {
         v.shade = if v.shade == ShadeMode::Textured { ShadeMode::Shaded } else { ShadeMode::Textured };
+        if v.lights == LightMode::All {
+            v.lights = LightMode::Default;
+        }
     }
     if ib(ui, "useLights", "Use all lights (7)", v.lights == LightMode::All) {
         v.lights = if v.lights == LightMode::All { LightMode::Default } else { LightMode::All };
