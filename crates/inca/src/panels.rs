@@ -505,6 +505,8 @@ pub struct PanelState {
     /// the outliner was clicked last, so arrow keys walk it
     pub ol_active: bool,
     pub ol_scroll: bool,
+    /// Selected display layer for `Add to Selected Layers` / `Remove From Selected Layers`.
+    pub active_layer: Option<String>,
 }
 
 /// Outliner icon for a node (the JS KIND_ICON, lights by type).
@@ -1924,6 +1926,13 @@ fn channels_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             app.win.expression_editor = true;
         }
     }
+    ui.separator();
+    if menu_item(app, ui, "Add to Selected Layers") {
+        layer_members(app, true);
+    }
+    if menu_item(app, ui, "Remove From Selected Layers") {
+        layer_members(app, false);
+    }
 }
 
 fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
@@ -2575,6 +2584,35 @@ fn lock_channels(app: &mut IncaApp, lock: bool) {
     app.help = if lock { "Locked selected channels".into() } else { "Unlocked selected channels".into() };
 }
 
+fn layer_members(app: &mut IncaApp, add: bool) {
+    let Some(lid) = app.panels.active_layer.clone() else {
+        app.help = "Select a display layer in the Layer Editor first".into();
+        return;
+    };
+    let Some(layer) = app.s.layers.iter().find(|l| l.id == lid).map(|l| l.name.clone()) else {
+        app.panels.active_layer = None;
+        app.help = "The selected display layer no longer exists".into();
+        return;
+    };
+    app.s.checkpoint(if add { "add to display layer" } else { "remove from display layer" });
+    let ids = app.s.sel.clone();
+    for id in ids {
+        if let Some(n) = app.s.nodes.get_mut(&id) {
+            if add {
+                n.layer = Some(lid.clone());
+            } else if n.layer.as_deref() == Some(lid.as_str()) {
+                n.layer = None;
+            }
+        }
+    }
+    app.s.touch();
+    app.help = if add {
+        format!("Added selected objects to layer {layer}")
+    } else {
+        format!("Removed selected objects from layer {layer}")
+    };
+}
+
 /// Picked channels, or every keyable channel of the selected objects when `all` is set.
 fn cb_action_picks(app: &IncaApp, all: bool, keyable_only: bool) -> Vec<CbPick> {
     if !all {
@@ -2814,8 +2852,10 @@ fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     app.s.layers[i].mode = next.into();
                     app.s.touch();
                 }
-                let r = ui.selectable_label(false, &l.name);
+                let active = app.panels.active_layer.as_deref() == Some(l.id.as_str());
+                let r = ui.selectable_label(active, &l.name);
                 if r.clicked() {
+                    app.panels.active_layer = Some(l.id.clone());
                     let ids: Vec<String> = app.s.nodes.values().filter(|n| n.layer.as_deref() == Some(l.id.as_str())).map(|n| n.id.clone()).collect();
                     app.select_names(&ids, SelMode::Replace);
                 }
@@ -4455,6 +4495,23 @@ mod tests {
         run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 1.1);
         run(&mut app, vec![], 1.2);
         assert_eq!(app.s.name_of(&id), "renamedCube", "Channel Box name field did not rename the object");
+    }
+
+    #[test]
+    fn channel_box_add_and_remove_selected_layer() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let lid = app.s.new_id("l");
+        app.s.layers.push(inca_core::scene::Layer { id: lid.clone(), name: "Layer 1".into(), visible: true, mode: "normal".into(), color: None, extra: Default::default() });
+        app.panels.active_layer = Some(lid.clone());
+        layer_members(&mut app, true);
+        assert_eq!(app.s.node(&id).unwrap().layer.as_deref(), Some(lid.as_str()));
+        layer_members(&mut app, false);
+        assert_eq!(app.s.node(&id).unwrap().layer, None);
     }
 
     #[test]
