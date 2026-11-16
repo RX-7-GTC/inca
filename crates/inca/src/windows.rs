@@ -601,9 +601,15 @@ fn floating(app: &mut IncaApp, ctx: &egui::Context) {
         let mut open = true;
         let gen = app.detach_gen.get(id).copied().unwrap_or(0);
         let pos = app.detach_pos.get(id).copied().unwrap_or(egui::pos2(pos[0], pos[1]));
+        // Each right-side tab remembers its own floating size as well.
+        let wid = if id == "rightpanel" {
+            egui::Id::new(("floating_panel_v3", id, gen, app.right_tab))
+        } else {
+            egui::Id::new(("floating_panel_v3", id, gen))
+        };
         let mut window = egui::Window::new(title)
             // v3: discard any size persisted before the range-bar width feedback fix.
-            .id(egui::Id::new(("floating_panel_v3", id, gen)))
+            .id(wid)
             .default_pos(pos)
             .default_size(size)
             .resizable(true)

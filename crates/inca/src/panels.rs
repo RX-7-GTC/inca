@@ -4401,6 +4401,32 @@ mod tests {
     }
 
     #[test]
+    fn right_panel_widths_are_remembered_per_tab() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, t: f64| {
+            let mut out = ctx.run_ui(raw(vec![], t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        for i in 0..3 { run(&mut app, i as f64 * 0.1); }
+        let cb_id = egui::Id::new(("rightpanel", crate::app::RightTab::ChannelBox));
+        let cb_width = egui::containers::panel::PanelState::load(&ctx, cb_id).expect("Channel Box panel state").size().x;
+        app.right_tab = crate::app::RightTab::AttributeEditor;
+        for i in 0..3 { run(&mut app, 1.0 + i as f64 * 0.1); }
+        let ae_id = egui::Id::new(("rightpanel", crate::app::RightTab::AttributeEditor));
+        let ae_width = egui::containers::panel::PanelState::load(&ctx, ae_id).expect("Attribute Editor panel state").size().x;
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        for i in 0..3 { run(&mut app, 2.0 + i as f64 * 0.1); }
+        let cb_again = egui::containers::panel::PanelState::load(&ctx, cb_id).expect("Channel Box panel state").size().x;
+        assert!(ae_width > cb_width, "tab min widths should differ: CB {cb_width}, AE {ae_width}");
+        assert!((cb_again - cb_width).abs() < 1.0, "Channel Box width changed after visiting the AE: {cb_width} -> {cb_again}");
+    }
+
+    #[test]
     fn attribute_editor_presets_save_and_blend() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);

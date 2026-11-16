@@ -131,7 +131,7 @@ pub struct Windows {
     pub backend_notice: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum RightTab {
     ChannelBox,
     AttributeEditor,
@@ -1540,7 +1540,9 @@ impl eframe::App for IncaApp {
         }
         if self.show_right && !self.detached.contains("rightpanel") {
             let min_w = right_panel_min_width(self.right_tab);
-            egui::Panel::right("rightpanel").default_size(min_w).min_size(min_w).frame(theme::panel_frame()).show(ui, |ui| {
+            // Separate panel IDs give every right-side tab its own remembered width.
+            let panel_id = egui::Id::new(("rightpanel", self.right_tab));
+            egui::Panel::right(panel_id).default_size(min_w).min_size(min_w).frame(theme::panel_frame()).show(ui, |ui| {
                 panel_grip_top(self, ui, "rightpanel");
                 panels::right_panel(self, ui);
             });
