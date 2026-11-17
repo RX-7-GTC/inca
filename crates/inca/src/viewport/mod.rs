@@ -28,6 +28,37 @@ pub const C_DOT: [f32; 3] = [74.0 / 255.0, 138.0 / 255.0, 214.0 / 255.0];
 /// objects driven by the selection (JS COLORS.affected)
 pub const C_AFFECTED: [f32; 4] = [0.78, 0.235, 0.82, 1.0];
 
+/// The wire colour assigned to a display layer (`None` when the layer has no colour).
+fn layer_wire_color(layer: Option<&inca_core::scene::Layer>) -> Option<[f32; 4]> {
+    let a = layer?.color.as_ref()?.as_array()?;
+    if a.len() < 3 {
+        return None;
+    }
+    let mut c = [a[0].as_f64()? as f32, a[1].as_f64()? as f32, a[2].as_f64()? as f32];
+    if c.iter().any(|x| *x > 1.0) {
+        for x in &mut c {
+            *x /= 255.0;
+        }
+    }
+    Some([c[0].clamp(0.0, 1.0), c[1].clamp(0.0, 1.0), c[2].clamp(0.0, 1.0), 1.0])
+}
+
+/// The twelve edges of a world-space bounding box (layer Level of Detail = Bounding Box).
+fn bbox_lines(min: DVec3, max: DVec3, c: [f32; 4]) -> Vec<LineVertex> {
+    let p = |i: usize| {
+        DVec3::new(
+            if i & 1 == 0 { min.x } else { max.x },
+            if i & 2 == 0 { min.y } else { max.y },
+            if i & 4 == 0 { min.z } else { max.z },
+        )
+    };
+    let mut out = vec![];
+    for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
+        push_line(&mut out, p(a), p(b), c);
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShadeMode {
     Wire,
@@ -1348,14 +1379,28 @@ pub fn build_draws(
         if !vp.shows(n) || (vp.beauty && !matches!(n.shape, Shape::Mesh(_))) {
             continue;
         }
+        // Display layer per-object overrides: shading/texturing, bounding-box LOD and colour.
+        let layer = s.layer_for(&id);
+        let bbox_mode = layer.is_some_and(|l| l.lod == "bbox");
+        let shaded = layer.is_none_or(|l| l.shading);
+        let textured = vp.shade == ShadeMode::Textured && layer.is_none_or(|l| l.texturing);
+        let layer_col = layer_wire_color(layer);
         let wm = s.world_matrix(&id).as_mat4();
         let selected = vp.show_sel_highlight && s.sel.iter().any(|x| x == &id || s.is_ancestor(x, &id));
         let is_lead = vp.show_sel_highlight && lead.as_ref().is_some_and(|l| l == &id || s.is_ancestor(l, &id));
         let template = s.is_templated_display(&id);
         let is_affected = !selected && affected.contains(&id);
-        let sel_col = if template && selected { C_TEMPLATE_SEL } else if template { C_TEMPLATE } else if is_lead { C_LEAD } else if selected { C_SEL } else if is_affected { C_AFFECTED } else { C_WIRE };
+        let sel_col = if template && selected { C_TEMPLATE_SEL } else if template { C_TEMPLATE } else if is_lead { C_LEAD } else if selected { C_SEL } else if is_affected { C_AFFECTED } else { layer_col.unwrap_or(C_WIRE) };
         match &n.shape {
             Shape::Mesh(m) => {
+                if bbox_mode {
+                    let b = s.world_bbox(&id);
+                    if !b.is_empty() {
+                        let c = if template || selected || is_affected { sel_col } else { layer_col.unwrap_or(C_WIRE) };
+                        draws.push(DrawCmd { pass: Pass::Lines, geo: Geo::TransientLines(bbox_lines(b.min, b.max, c)), u: DrawUniform::new(Mat4::IDENTITY) });
+                    }
+                    continue;
+                }
                 let key = mesh_key(s, &id, smooth_divisions);
                 if g.mesh_key(&id) != Some(key) || live.contains(&id) {
                     if let Some(pm) = display_mesh(s, &id, smooth_cache, smooth_divisions) {
@@ -1379,16 +1424,17 @@ pub fn build_draws(
                 // Render Stats flags (JS defaults mesh.castShadow/receiveShadow to true)
                 let cast_shadows = n.extra.get("castShadows").and_then(|v| v.as_bool()).unwrap_or(true);
                 let receive_shadows = n.extra.get("receiveShadows").and_then(|v| v.as_bool()).unwrap_or(true);
-                // templates draw as wireframe only, whatever the shading mode
-                if vp.shade != ShadeMode::Wire && !template {
-                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness).spec_tint(pbr.spec_color, pbr.metalness).ior(pbr.ior as f32).textured(vp.shade == ShadeMode::Textured).shadows(cast_shadows, receive_shadows).coat(pbr.coat, pbr.coat_roughness).sheen(pbr.sheen_color, pbr.sheen);
+                // templates draw as wireframe only, whatever the shading mode; a layer can
+                // also switch its objects to unshaded (wireframe) display
+                if vp.shade != ShadeMode::Wire && !template && shaded {
+                    let mut u = DrawUniform::new(wm).spec(pbr.specular, pbr.roughness).spec_tint(pbr.spec_color, pbr.metalness).ior(pbr.ior as f32).textured(textured).shadows(cast_shadows, receive_shadows).coat(pbr.coat, pbr.coat_roughness).sheen(pbr.sheen_color, pbr.sheen);
                     if pbr.unlit {
                         u = u.unlit();
                     }
                     let xray = vp.xray || n.xray;
                     // three.js sets `material.transparent` when an alpha map is assigned, even
                     // with opacity 1, so those meshes use the sorted transparent pass.
-                    let alpha_map = !xray && vp.shade == ShadeMode::Textured && mesh_has_alpha_map(s, m);
+                    let alpha_map = !xray && textured && mesh_has_alpha_map(s, m);
                     // Standard Surface transmission (JS `material.transmission`): three.js draws
                     // these after the opaque scene and samples the refracted screen colour.
                     match mesh_pass(&pbr, xray, alpha_map) {
@@ -1407,7 +1453,7 @@ pub fn build_draws(
                         _ => draws.push(DrawCmd { pass: Pass::Mesh, geo: Geo::MeshTris(id.clone()), u }),
                     }
                 }
-                let show_wire = !vp.beauty && (vp.shade == ShadeMode::Wire || vp.wire_on_shaded || selected || in_comp || is_affected || template);
+                let show_wire = !vp.beauty && (vp.shade == ShadeMode::Wire || vp.wire_on_shaded || selected || in_comp || is_affected || template || !shaded);
                 if show_wire {
                     let c = if in_comp {
                         C_HILITE
@@ -1415,7 +1461,7 @@ pub fn build_draws(
                         sel_col
                     } else {
                         // JS `WIRE_MATS.wire` = 0x10106e (wireframe on shaded, unselected)
-                        [0.0627451, 0.0627451, 0.43137255, 1.0]
+                        layer_col.unwrap_or([0.0627451, 0.0627451, 0.43137255, 1.0])
                     };
                     // wires of back-facing faces are culled in the shader from the cached
                     // per-edge normals (the JS `cullable`), so no per-frame Edge rebuild

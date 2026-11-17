@@ -505,8 +505,22 @@ pub struct PanelState {
     /// the outliner was clicked last, so arrow keys walk it
     pub ol_active: bool,
     pub ol_scroll: bool,
-    /// Selected display layer for `Add to Selected Layers` / `Remove From Selected Layers`.
-    pub active_layer: Option<String>,
+    /// Layer Editor tab: 0 = Display, 1 = Anim.
+    pub layer_tab: u8,
+    /// Display layers highlighted in the Layer Editor.
+    pub layer_sel: Vec<String>,
+    /// Anchor for Shift-click ranges in the Layer Editor.
+    pub layer_anchor: Option<String>,
+    /// Inline layer-name edit: (layer id, edit buffer).
+    pub layer_rename: Option<(String, String)>,
+    /// The inline layer-name edit has not received focus yet.
+    pub layer_rename_new: bool,
+    /// Layer whose colour palette popup is open.
+    pub layer_color_popup: Option<String>,
+    /// Options > Make New Layers Current.
+    pub layer_make_current: bool,
+    /// Options > Add New Objects to Current Layer.
+    pub layer_add_new: bool,
 }
 
 /// Outliner icon for a node (the JS KIND_ICON, lights by type).
@@ -2585,31 +2599,46 @@ fn lock_channels(app: &mut IncaApp, lock: bool) {
 }
 
 fn layer_members(app: &mut IncaApp, add: bool) {
-    let Some(lid) = app.panels.active_layer.clone() else {
+    let lids = layer_targets(app);
+    if lids.is_empty() {
         app.help = "Select a display layer in the Layer Editor first".into();
         return;
-    };
-    let Some(layer) = app.s.layers.iter().find(|l| l.id == lid).map(|l| l.name.clone()) else {
-        app.panels.active_layer = None;
-        app.help = "The selected display layer no longer exists".into();
-        return;
-    };
+    }
+    layer_members_to(app, &lids, add);
+}
+
+/// Selected layers, or the current layer when nothing is highlighted.
+fn layer_targets(app: &IncaApp) -> Vec<String> {
+    let mut lids: Vec<String> = app.panels.layer_sel.iter().filter(|id| app.s.layers.iter().any(|l| &l.id == *id)).cloned().collect();
+    if lids.is_empty() {
+        if let Some(c) = &app.s.current_layer {
+            if app.s.layers.iter().any(|l| &l.id == c) {
+                lids.push(c.clone());
+            }
+        }
+    }
+    lids
+}
+
+fn layer_members_to(app: &mut IncaApp, lids: &[String], add: bool) {
+    let Some(lid) = lids.first() else { return };
+    let label = app.s.layers.iter().find(|l| &l.id == lid).map(|l| l.name.clone()).unwrap_or_default();
     app.s.checkpoint(if add { "add to display layer" } else { "remove from display layer" });
     let ids = app.s.sel.clone();
     for id in ids {
         if let Some(n) = app.s.nodes.get_mut(&id) {
             if add {
                 n.layer = Some(lid.clone());
-            } else if n.layer.as_deref() == Some(lid.as_str()) {
+            } else if n.layer.as_ref().is_some_and(|x| lids.contains(x)) {
                 n.layer = None;
             }
         }
     }
     app.s.touch();
     app.help = if add {
-        format!("Added selected objects to layer {layer}")
+        format!("Added selected objects to layer {label}")
     } else {
-        format!("Removed selected objects from layer {layer}")
+        format!("Removed selected objects from layer {label}")
     };
 }
 
@@ -2817,72 +2846,656 @@ fn show_selected_channel_types(app: &mut IncaApp) {
 }
 
 fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Display Layers").strong());
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("＋").on_hover_text("Create a new layer and assign the selected objects").clicked() {
-                let _ = app.run_mel("create layer", "createDisplayLayer;");
+    use crate::icons;
+    use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
+    app.panels.layer_sel.retain(|id| app.s.layers.iter().any(|l| &l.id == id));
+    if app.panels.layer_rename.as_ref().is_some_and(|(id, _)| !app.s.layers.iter().any(|l| &l.id == id)) {
+        app.panels.layer_rename = None;
+    }
+    if app.panels.layer_color_popup.as_ref().is_some_and(|id| !app.s.layers.iter().any(|l| &l.id == id)) {
+        app.panels.layer_color_popup = None;
+    }
+    if app.s.current_layer.as_ref().is_some_and(|id| !app.s.layers.iter().any(|l| &l.id == id)) {
+        app.s.current_layer = None;
+    }
+    egui::Frame::NONE.fill(theme::BG2).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.add_space(3.0);
+            // Match the shelf tabs: zero-width strokes in every state so hover never changes
+            // the tab width, transparent inactive fill, active tab filled with the panel BG.
+            let w = &mut ui.visuals_mut().widgets;
+            w.inactive.bg_stroke = egui::Stroke::NONE;
+            w.hovered.bg_stroke = egui::Stroke::NONE;
+            w.active.bg_stroke = egui::Stroke::NONE;
+            w.open.bg_stroke = egui::Stroke::NONE;
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for (i, name) in ["Display", "Anim"].iter().enumerate() {
+                let on = app.panels.layer_tab as usize == i;
+                let id = ui.next_auto_id();
+                let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
+                let color = if on || hovered { Color32::WHITE } else { Color32::from_gray(0xbd) };
+                let t = RichText::new(*name).size(11.0).color(color);
+                let b = egui::Button::new(t)
+                    .fill(if on { theme::BG } else { Color32::TRANSPARENT })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 });
+                if ui.add(b).clicked() {
+                    app.panels.layer_tab = i as u8;
+                }
             }
         });
     });
+    if app.panels.layer_tab == 1 {
+        app.panels.layer_color_popup = None;
+        ui.label(RichText::new("Animation layers are not implemented yet.").color(theme::TEXT_DIM));
+        return;
+    }
+    let has_layers = !app.panels.layer_sel.is_empty();
+    // Maya places the menus on the left and the four layer buttons on the right of the same row.
+    ui.horizontal(|ui| {
+        panel_bar(app, ui, MenuSource::LayerEditor, &["Layers", "Options", "Help"], true, |app, ui, title| match title {
+            "Layers" => {
+                if menu_item(app, ui, "Create Empty Layer") {
+                    layer_create(app, false);
+                }
+                if menu_item(app, ui, "Create Layer from Selected") {
+                    layer_create(app, true);
+                }
+                ui.separator();
+                if menu_item(app, ui, "Select Objects in Selected Layers") {
+                    layer_select_objects(app);
+                }
+                if menu_item(app, ui, "Add Selected Objects to Selected Layers") {
+                    layer_members(app, true);
+                }
+                if menu_item(app, ui, "Remove Selected Objects from Selected Layers") {
+                    layer_members(app, false);
+                }
+                ui.separator();
+                ui.add_enabled(false, egui::Button::new("Membership...")).on_disabled_hover_text("Relationship Editor is not implemented in this build");
+                ui.add_enabled(false, egui::Button::new("Attributes...")).on_disabled_hover_text("Layer Attribute Editor is not implemented in this build");
+                ui.separator();
+                if menu_item(app, ui, "Delete Selected Layers") {
+                    let lids = app.panels.layer_sel.clone();
+                    layer_delete(app, &lids);
+                }
+                if menu_item(app, ui, "Delete Unused Layers") {
+                    layer_delete_unused(app);
+                }
+                ui.separator();
+                ui.menu_button("Set All Layers", |ui| layer_set_entries(app, ui, LayerScope::All));
+                ui.menu_button("Set Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::Selected));
+                ui.menu_button("Set Only Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::OnlySelected));
+                ui.separator();
+                if menu_item(app, ui, "Sort Layers Alphabetically") {
+                    layer_sort(app, true);
+                }
+                if menu_item(app, ui, "Sort Layers Chronologically") {
+                    layer_sort(app, false);
+                }
+            }
+            "Options" => {
+                if menu_check(app, ui, app.panels.layer_make_current, "Make New Layers Current") {
+                    app.panels.layer_make_current = !app.panels.layer_make_current;
+                }
+                if menu_check(app, ui, app.panels.layer_add_new, "Add New Objects to Current Layer") {
+                    app.panels.layer_add_new = !app.panels.layer_add_new;
+                    app.s.add_new_to_current = app.panels.layer_add_new;
+                }
+                if menu_check(app, ui, !app.panels.cb_hide_namespace, "Show Namespace") {
+                    app.panels.cb_hide_namespace = !app.panels.cb_hide_namespace;
+                }
+            }
+            "Help" => {
+                if menu_item(app, ui, "Layer Editor Help") {
+                    app.help = "V hides the layer, P hides it during playback, and the T column cycles normal, template and reference. Use the toolbar to create, reorder, populate, select from and delete layers.".into();
+                }
+            }
+            _ => {}
+        });
+        let right = ui.max_rect().right() - 3.0;
+        let top = ui.min_rect().top();
+        let w = 4.0 * 24.0 + 3.0 * 2.0;
+        let rect = egui::Rect::from_min_size(egui::pos2(right - w, top), egui::vec2(w, 20.0));
+        let mut tools = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::right_to_left(egui::Align::Center)));
+        tools.spacing_mut().item_spacing.x = 2.0;
+        if icons::button_ex(&mut tools, "layerFromSel", "Create a layer from selected objects", false, 24.0, 20.0, true).clicked() {
+            layer_create(app, true);
+        }
+        if icons::button_ex(&mut tools, "layerNew", "Create an empty layer", false, 24.0, 20.0, true).clicked() {
+            layer_create(app, false);
+        }
+        if icons::button_ex(&mut tools, "layerDown", "Move selected layers down", false, 24.0, 20.0, has_layers).clicked() {
+            layer_move(app, false);
+        }
+        if icons::button_ex(&mut tools, "layerUp", "Move selected layers up", false, 24.0, 20.0, has_layers).clicked() {
+            layer_move(app, true);
+        }
+    });
     let layers = app.s.layers.clone();
     egui::ScrollArea::vertical().id_salt("layers").show(ui, |ui| {
-        for (i, l) in layers.iter().enumerate() {
-            ui.horizontal(|ui| {
-                let mut vis = l.visible;
-                if ui.add(egui::Button::new(if vis { "V" } else { " " }).selected(vis).min_size(egui::vec2(18.0, 16.0))).on_hover_text("Visibility").clicked() {
-                    vis = !vis;
-                    app.s.checkpoint("layer visibility");
-                    app.s.layers[i].visible = vis;
-                    app.s.touch();
-                }
-                let mode = l.mode.clone();
-                let next = match mode.as_str() {
-                    "normal" => "template",
-                    "template" => "reference",
-                    _ => "normal",
-                };
-                let tag = match mode.as_str() {
-                    "template" => "T",
-                    "reference" => "R",
-                    _ => " ",
-                };
-                if ui.add(egui::Button::new(tag).min_size(egui::vec2(18.0, 16.0))).on_hover_text("Normal / Template / Reference").clicked() {
-                    app.s.checkpoint("layer mode");
-                    app.s.layers[i].mode = next.into();
-                    app.s.touch();
-                }
-                let active = app.panels.active_layer.as_deref() == Some(l.id.as_str());
-                let r = ui.selectable_label(active, &l.name);
-                if r.clicked() {
-                    app.panels.active_layer = Some(l.id.clone());
-                    let ids: Vec<String> = app.s.nodes.values().filter(|n| n.layer.as_deref() == Some(l.id.as_str())).map(|n| n.id.clone()).collect();
-                    app.select_names(&ids, SelMode::Replace);
-                }
-                r.context_menu(|ui| {
-                    if ui.button("Add Selected Objects").clicked() {
-                        let names: Vec<String> = app.s.sel.iter().map(|i| app.s.name_of(i)).collect();
-                        let _ = app.run_mel("layer members", &format!("editDisplayLayerMembers {} {};", l.name, names.join(" ")));
-                        ui.close();
-                    }
-                    if ui.button("Delete Layer").clicked() {
-                        app.s.checkpoint("delete layer");
-                        let lid = l.id.clone();
-                        app.s.layers.retain(|x| x.id != lid);
-                        for n in app.s.nodes.values_mut() {
-                            if n.layer.as_deref() == Some(lid.as_str()) {
-                                n.layer = None;
-                            }
-                        }
-                        app.s.touch();
-                        ui.close();
-                    }
-                });
-            });
+        for l in &layers {
+            layer_row(app, ui, l);
         }
         if layers.is_empty() {
             ui.label(RichText::new("No layers").color(theme::TEXT_DIM));
         }
+    });
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerScope {
+    All,
+    Selected,
+    OnlySelected,
+}
+
+/// Maya-style display layer colour presets (the `Color` column palette).
+const LAYER_PALETTE: [[u8; 3]; 24] = [
+    [0, 0, 0],
+    [64, 64, 64],
+    [128, 128, 128],
+    [192, 192, 192],
+    [255, 255, 255],
+    [128, 0, 0],
+    [255, 0, 0],
+    [255, 128, 128],
+    [255, 128, 0],
+    [255, 255, 0],
+    [128, 128, 0],
+    [0, 128, 0],
+    [0, 255, 0],
+    [128, 255, 128],
+    [0, 128, 128],
+    [0, 255, 255],
+    [0, 0, 128],
+    [0, 0, 255],
+    [128, 128, 255],
+    [64, 0, 128],
+    [128, 0, 255],
+    [255, 0, 255],
+    [128, 64, 0],
+    [160, 120, 80],
+];
+
+/// True when the layer has an explicit colour (otherwise the swatch shows the empty slash).
+fn layer_has_color(color: &Option<Value>) -> bool {
+    matches!(color, Some(Value::Array(a)) if a.len() >= 3 && a.iter().take(3).all(|v| v.is_number()))
+}
+
+/// Maya's empty layer colour is drawn as an empty box with a diagonal slash, not a grey fill.
+fn layer_swatch_color(color: &Option<Value>) -> Color32 {
+    if !layer_has_color(color) {
+        return Color32::TRANSPARENT;
+    }
+    let Some(Value::Array(a)) = color else { return Color32::TRANSPARENT };
+    let mut c = [0.0f32; 3];
+    for (i, v) in a.iter().take(3).enumerate() {
+        c[i] = v.as_f64().unwrap_or(0.0) as f32;
+    }
+    if c.iter().any(|x| *x > 1.0) {
+        for x in &mut c {
+            *x /= 255.0;
+        }
+    }
+    Color32::from_rgb((c[0].clamp(0.0, 1.0) * 255.0) as u8, (c[1].clamp(0.0, 1.0) * 255.0) as u8, (c[2].clamp(0.0, 1.0) * 255.0) as u8)
+}
+
+fn layer_set_color(app: &mut IncaApp, id: &str, rgb: [f32; 3]) {
+    app.s.checkpoint("layer color");
+    if let Some(l) = app.s.layers.iter_mut().find(|l| l.id == id) {
+        l.color = Some(json!([rgb[0] as f64, rgb[1] as f64, rgb[2] as f64]));
+    }
+    app.s.touch();
+}
+
+fn layer_clear_color(app: &mut IncaApp, id: &str) {
+    app.s.checkpoint("layer color");
+    if let Some(l) = app.s.layers.iter_mut().find(|l| l.id == id) {
+        l.color = None;
+    }
+    app.s.touch();
+}
+
+fn layer_create(app: &mut IncaApp, from_selection: bool) {
+    app.s.checkpoint("create display layer");
+    let id = app.s.new_id("l");
+    let name = app.s.unique_name("layer1");
+    let created = app.s.id_counter;
+    app.s.layers.push(inca_core::scene::Layer {
+        id: id.clone(),
+        name,
+        visible: true,
+        mode: "normal".into(),
+        color: None,
+        playback: true,
+        enabled: true,
+        shading: true,
+        texturing: true,
+        lod: "full".into(),
+        anim_playback: true,
+        created,
+        extra: Default::default(),
+    });
+    if from_selection {
+        for oid in app.s.sel.clone() {
+            if let Some(n) = app.s.nodes.get_mut(&oid) {
+                n.layer = Some(id.clone());
+            }
+        }
+    }
+    if app.panels.layer_make_current || !app.s.current_layer.as_ref().is_some_and(|id| app.s.layers.iter().any(|l| &l.id == id)) {
+        app.s.current_layer = Some(id.clone());
+    }
+    app.panels.layer_sel = vec![id.clone()];
+    app.panels.layer_anchor = Some(id.clone());
+    app.panels.layer_rename = None;
+    app.s.touch();
+    let lname = app.s.layers.iter().find(|l| l.id == id).map(|l| l.name.clone()).unwrap_or_default();
+    app.help = if from_selection {
+        format!("Created layer {lname} from the selected objects")
+    } else {
+        format!("Created layer {lname}")
+    };
+}
+
+fn layer_select_objects(app: &mut IncaApp) {
+    let lids = layer_targets(app);
+    if lids.is_empty() {
+        app.help = "Select a display layer in the Layer Editor first".into();
+        return;
+    }
+    let ids: Vec<String> = app.s.nodes.values().filter(|n| n.layer.as_ref().is_some_and(|l| lids.contains(l))).map(|n| n.id.clone()).collect();
+    app.select_names(&ids, SelMode::Replace);
+    app.help = format!("Selected {} object(s) in the selected layer(s)", ids.len());
+}
+
+fn layer_empty(app: &mut IncaApp, lid: &str) {
+    app.s.checkpoint("empty display layer");
+    for n in app.s.nodes.values_mut() {
+        if n.layer.as_deref() == Some(lid) {
+            n.layer = None;
+        }
+    }
+    app.s.touch();
+    app.help = "Emptied the display layer".into();
+}
+
+fn layer_delete(app: &mut IncaApp, lids: &[String]) {
+    if lids.is_empty() {
+        app.help = "Select a display layer in the Layer Editor first".into();
+        return;
+    }
+    app.s.checkpoint("delete display layers");
+    let removed: Vec<String> = app.s.layers.iter().filter(|l| lids.contains(&l.id)).map(|l| l.name.clone()).collect();
+    app.s.layers.retain(|l| !lids.contains(&l.id));
+    for name in &removed {
+        if !app.s.nodes.values().any(|n| &n.name == name) {
+            app.s.names.remove(name);
+        }
+    }
+    for n in app.s.nodes.values_mut() {
+        if n.layer.as_ref().is_some_and(|l| lids.contains(l)) {
+            n.layer = None;
+        }
+    }
+    if app.s.current_layer.as_ref().is_some_and(|l| lids.contains(l)) {
+        app.s.current_layer = None;
+    }
+    app.panels.layer_sel.retain(|l| !lids.contains(l));
+    app.panels.layer_anchor = None;
+    app.s.touch();
+    app.help = format!("Deleted {} display layer(s); their objects were kept", removed.len());
+}
+
+fn layer_delete_unused(app: &mut IncaApp) {
+    let used: std::collections::HashSet<String> = app.s.nodes.values().filter_map(|n| n.layer.clone()).collect();
+    let lids: Vec<String> = app.s.layers.iter().filter(|l| !used.contains(&l.id)).map(|l| l.id.clone()).collect();
+    if lids.is_empty() {
+        app.help = "No unused display layers".into();
+        return;
+    }
+    layer_delete(app, &lids);
+    app.help = format!("Deleted {} unused display layer(s)", lids.len());
+}
+
+fn layer_sort(app: &mut IncaApp, alphabetical: bool) {
+    app.s.checkpoint("sort display layers");
+    if alphabetical {
+        app.s.layers.sort_by_key(|l| l.name.to_lowercase());
+    } else {
+        app.s.layers.sort_by_key(|l| l.created);
+    }
+    app.s.touch();
+    app.help = if alphabetical { "Sorted layers alphabetically".into() } else { "Sorted layers chronologically".into() };
+}
+
+/// Move the highlighted layers one step up or down in the displayed list.
+fn layer_move(app: &mut IncaApp, up: bool) {
+    let targets = layer_targets(app);
+    if targets.is_empty() {
+        app.help = "Select a display layer in the Layer Editor first".into();
+        return;
+    }
+    app.s.checkpoint(if up { "move display layers up" } else { "move display layers down" });
+    let n = app.s.layers.len();
+    if up {
+        for i in 1..n {
+            if targets.contains(&app.s.layers[i].id) && !targets.contains(&app.s.layers[i - 1].id) {
+                app.s.layers.swap(i - 1, i);
+            }
+        }
+    } else {
+        for i in (0..n.saturating_sub(1)).rev() {
+            if targets.contains(&app.s.layers[i].id) && !targets.contains(&app.s.layers[i + 1].id) {
+                app.s.layers.swap(i, i + 1);
+            }
+        }
+    }
+    app.s.touch();
+    app.help = if up { "Moved the selected layer(s) up".into() } else { "Moved the selected layer(s) down".into() };
+}
+
+fn layer_update(app: &mut IncaApp, id: &str, label: &str, f: impl FnOnce(&mut inca_core::scene::Layer)) {
+    app.s.checkpoint(label);
+    if let Some(l) = app.s.layers.iter_mut().find(|l| l.id == id) {
+        f(l);
+    }
+    app.s.touch();
+}
+
+fn layer_apply(app: &mut IncaApp, scope: LayerScope, label: &str, on: impl Fn(&mut inca_core::scene::Layer), off: impl Fn(&mut inca_core::scene::Layer)) {
+    let targets = layer_targets(app);
+    if scope != LayerScope::All && targets.is_empty() {
+        app.help = "Select a display layer in the Layer Editor first".into();
+        return;
+    }
+    app.s.checkpoint(label);
+    for l in &mut app.s.layers {
+        if scope == LayerScope::All || targets.contains(&l.id) {
+            on(l);
+        } else if scope == LayerScope::OnlySelected {
+            off(l);
+        }
+    }
+    app.s.touch();
+    app.help = label.into();
+}
+
+fn layer_set_entries(app: &mut IncaApp, ui: &mut egui::Ui, scope: LayerScope) {
+    use crate::menus::menu_item;
+    let item = |app: &mut IncaApp, ui: &mut egui::Ui, label: &str, set: fn(&mut inca_core::scene::Layer), inverse: fn(&mut inca_core::scene::Layer)| {
+        if menu_item(app, ui, label) {
+            layer_apply(app, scope, label, set, inverse);
+        }
+    };
+    item(app, ui, "Visible", |l| l.visible = true, |l| l.visible = false);
+    item(app, ui, "Invisible", |l| l.visible = false, |l| l.visible = true);
+    ui.separator();
+    item(app, ui, "Normal", |l| l.mode = "normal".into(), |l| l.mode = "normal".into());
+    item(app, ui, "Template", |l| l.mode = "template".into(), |l| l.mode = "normal".into());
+    item(app, ui, "Reference", |l| l.mode = "reference".into(), |l| l.mode = "normal".into());
+    ui.separator();
+    item(app, ui, "Visible Playback", |l| l.playback = true, |l| l.playback = false);
+    item(app, ui, "Invisible Playback", |l| l.playback = false, |l| l.playback = true);
+    ui.separator();
+    item(app, ui, "Full Detail", |l| l.lod = "full".into(), |l| l.lod = "full".into());
+    item(app, ui, "Bounding Box", |l| l.lod = "bbox".into(), |l| l.lod = "full".into());
+    ui.separator();
+    item(app, ui, "Shaded", |l| l.shading = true, |l| l.shading = true);
+    item(app, ui, "Unshaded", |l| l.shading = false, |l| l.shading = true);
+    ui.separator();
+    item(app, ui, "Textured", |l| l.texturing = true, |l| l.texturing = true);
+    item(app, ui, "Untextured", |l| l.texturing = false, |l| l.texturing = true);
+    ui.separator();
+    item(app, ui, "Playback On", |l| l.anim_playback = true, |l| l.anim_playback = true);
+    item(app, ui, "Playback Off", |l| l.anim_playback = false, |l| l.anim_playback = true);
+}
+
+fn layer_context_menu(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
+    use crate::menus::menu_item;
+    let id = lid.to_string();
+    if menu_item(app, ui, "Add Selected Objects") {
+        layer_members_to(app, std::slice::from_ref(&id), true);
+    }
+    if menu_item(app, ui, "Remove Selected Objects") {
+        layer_members_to(app, std::slice::from_ref(&id), false);
+    }
+    if menu_item(app, ui, "Select Objects") {
+        let ids: Vec<String> = app.s.nodes.values().filter(|n| n.layer.as_deref() == Some(lid)).map(|n| n.id.clone()).collect();
+        app.select_names(&ids, SelMode::Replace);
+        app.help = format!("Selected {} object(s) in the layer", ids.len());
+    }
+    ui.separator();
+    ui.menu_button("Set All Layers", |ui| layer_set_entries(app, ui, LayerScope::All));
+    ui.menu_button("Set Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::Selected));
+    ui.menu_button("Set Only Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::OnlySelected));
+    ui.separator();
+    if menu_item(app, ui, "Empty the Layer") {
+        layer_empty(app, lid);
+    }
+    if menu_item(app, ui, "Delete Layer") {
+        layer_delete(app, std::slice::from_ref(&id));
+    }
+    ui.separator();
+    ui.add_enabled(false, egui::Button::new("Membership...")).on_disabled_hover_text("Relationship Editor is not implemented in this build");
+    ui.add_enabled(false, egui::Button::new("Attributes...")).on_disabled_hover_text("Layer Attribute Editor is not implemented in this build");
+}
+
+fn layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
+    let Some(old) = app.s.layers.iter().find(|l| l.id == id).map(|l| l.name.clone()) else { return };
+    let want = new.trim();
+    if want.is_empty() || want == old {
+        return;
+    }
+    app.s.checkpoint("rename display layer");
+    if !app.s.nodes.values().any(|n| n.name == old) {
+        app.s.names.remove(&old);
+    }
+    let name = app.s.unique_name(want);
+    if let Some(l) = app.s.layers.iter_mut().find(|l| l.id == id) {
+        l.name = name;
+    }
+    app.s.touch();
+}
+
+/// A small fixed-size V/P/T toggle. Painted by hand so hovering changes only the fill and
+/// stroke colours, never the button's shape. The letter shows the state; an unselected layer
+/// keeps the neutral boxes, while the highlighted layer gets the blue selected fill.
+fn layer_toggle(ui: &mut egui::Ui, text: &str, selected: bool, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 16.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let fill = if selected {
+        if hovered { Color32::from_rgb(0x73, 0x92, 0xab) } else { Color32::from_rgb(0x5d, 0x7a, 0x8f) }
+    } else if hovered {
+        Color32::from_gray(0x48)
+    } else {
+        Color32::from_gray(0x2e)
+    };
+    let edge = if selected {
+        Color32::from_rgb(0x81, 0xa9, 0xc4)
+    } else if hovered {
+        Color32::from_gray(0x93)
+    } else {
+        Color32::from_gray(0x55)
+    };
+    ui.painter().rect_filled(rect, 2.0, fill);
+    ui.painter().rect_stroke(rect.shrink(0.5), 2.0, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+    let text = text.trim();
+    if !text.is_empty() {
+        let color = if selected { Color32::from_gray(0x16) } else { Color32::from_gray(0xef) };
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(11.0), color);
+    }
+    resp.on_hover_text(tip)
+}
+
+fn layer_row(app: &mut IncaApp, ui: &mut egui::Ui, l: &inca_core::scene::Layer) {
+    let selected = app.panels.layer_sel.iter().any(|x| x == &l.id);
+    let current = app.s.current_layer.as_deref() == Some(l.id.as_str());
+    let renaming = app.panels.layer_rename.as_ref().is_some_and(|(id, _)| id == &l.id);
+    let fill = if selected { Color32::from_rgb(0x3b, 0x55, 0x72) } else { Color32::TRANSPARENT };
+    egui::Frame::NONE.fill(fill).inner_margin(egui::Margin::symmetric(1, 1)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            let vis = layer_toggle(ui, if l.visible { "V" } else { " " }, selected, "Visible");
+            if vis.clicked() {
+                let id = l.id.clone();
+                layer_update(app, &id, "layer visibility", |l| l.visible = !l.visible);
+            }
+            let play = layer_toggle(ui, if l.playback { "P" } else { " " }, selected, "Visible during playback");
+            if play.clicked() {
+                let id = l.id.clone();
+                layer_update(app, &id, "layer playback visibility", |l| l.playback = !l.playback);
+            }
+            let mode_tag = match l.mode.as_str() {
+                "template" => "T",
+                "reference" => "R",
+                _ => " ",
+            };
+            let mode = layer_toggle(ui, mode_tag, selected, "Normal / Template / Reference");
+            if mode.clicked() {
+                let id = l.id.clone();
+                layer_update(app, &id, "layer display type", |l| {
+                    l.mode = match l.mode.as_str() {
+                        "normal" => "template",
+                        "template" => "reference",
+                        _ => "normal",
+                    }
+                    .into();
+                });
+            }
+            let (swatch, swatch_resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+            // The empty swatch keeps its own dark background even on a highlighted row; it must
+            // not pick up the blue layer-selection colour.
+            let swatch_fill = if layer_has_color(&l.color) { layer_swatch_color(&l.color) } else { theme::BG_DARK };
+            ui.painter().rect_filled(swatch, 2.0, swatch_fill);
+            ui.painter().rect_stroke(swatch, 2.0, egui::Stroke::new(1.0, Color32::from_gray(0x99)), egui::StrokeKind::Inside);
+            if !layer_has_color(&l.color) {
+                ui.painter().line_segment(
+                    [egui::pos2(swatch.left() + 2.0, swatch.bottom() - 2.0), egui::pos2(swatch.right() - 2.0, swatch.top() + 2.0)],
+                    egui::Stroke::new(1.0, Color32::from_gray(0xb4)),
+                );
+            }
+            let swatch_resp = swatch_resp.on_hover_text("Layer color presets");
+            if swatch_resp.clicked() {
+                app.panels.layer_color_popup = if app.panels.layer_color_popup.as_deref() == Some(l.id.as_str()) {
+                    None
+                } else {
+                    Some(l.id.clone())
+                };
+            }
+            let mut open = app.panels.layer_color_popup.as_deref() == Some(l.id.as_str());
+            if open {
+                let mut picked: Option<[f32; 3]> = None;
+                let mut use_default = false;
+                egui::Popup::from_response(&swatch_resp)
+                    .open_bool(&mut open)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .gap(2.0)
+                    .show(|ui| {
+                        ui.label(RichText::new("Layer Color").strong());
+                        for row in LAYER_PALETTE.chunks(8) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                for c in row {
+                                    let (r, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                                    let color = Color32::from_rgb(c[0], c[1], c[2]);
+                                    let current_color = layer_swatch_color(&l.color);
+                                    ui.painter().rect_filled(r, 2.0, color);
+                                    let selected = current_color == color;
+                                    ui.painter().rect_stroke(
+                                        r,
+                                        2.0,
+                                        egui::Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { Color32::WHITE } else { Color32::from_gray(0x22) }),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    if resp.clicked() {
+                                        picked = Some([c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]);
+                                    }
+                                }
+                            });
+                        }
+                        if ui.button("Default").clicked() {
+                            use_default = true;
+                        }
+                    });
+                if let Some(c) = picked {
+                    layer_set_color(app, &l.id, c);
+                    app.panels.layer_color_popup = None;
+                } else if use_default {
+                    layer_clear_color(app, &l.id);
+                    app.panels.layer_color_popup = None;
+                } else if !open {
+                    app.panels.layer_color_popup = None;
+                }
+            }
+            if renaming {
+                let mut edit = app.panels.layer_rename.take().unwrap();
+                let resp = ui.add(egui::TextEdit::singleline(&mut edit.1).desired_width(ui.available_width()));
+                if app.panels.layer_rename_new {
+                    resp.request_focus();
+                    app.panels.layer_rename_new = false;
+                }
+                if resp.lost_focus() {
+                    if !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        let id = edit.0.clone();
+                        layer_rename_commit(app, &id, &edit.1);
+                    }
+                } else {
+                    app.panels.layer_rename = Some(edit);
+                }
+                return;
+            }
+            let display = if app.panels.cb_hide_namespace {
+                l.name.rsplit(':').next().unwrap_or(&l.name).to_string()
+            } else {
+                l.name.clone()
+            };
+            // The name field spans the rest of the row, so the empty area to its right also
+            // selects the layer (Maya selects anywhere in the row). Paint the text ourselves
+            // so it stays left-aligned inside that full-width hit area.
+            let (name_rect, name) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(1.0), 16.0), egui::Sense::click());
+            let color = if current { Color32::WHITE } else { Color32::from_gray(0xcf) };
+            ui.painter().text(
+                egui::pos2(name_rect.left() + 2.0, name_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                &display,
+                egui::FontId::proportional(12.0),
+                color,
+            );
+            if name.clicked() {
+                let mods = ui.input(|i| i.modifiers);
+                if mods.shift {
+                    let anchor = app.panels.layer_anchor.clone().unwrap_or_else(|| l.id.clone());
+                    let (a, b) = (app.s.layers.iter().position(|x| x.id == anchor), app.s.layers.iter().position(|x| x.id == l.id));
+                    if let (Some(a), Some(b)) = (a, b) {
+                        app.panels.layer_sel = app.s.layers[a.min(b)..=a.max(b)].iter().map(|x| x.id.clone()).collect();
+                    }
+                } else if mods.ctrl || mods.command {
+                    if selected {
+                        app.panels.layer_sel.retain(|x| x != &l.id);
+                    } else {
+                        app.panels.layer_sel.push(l.id.clone());
+                    }
+                } else {
+                    app.panels.layer_sel = vec![l.id.clone()];
+                }
+                app.panels.layer_anchor = Some(l.id.clone());
+                app.s.current_layer = Some(l.id.clone());
+            }
+            if name.double_clicked() {
+                app.panels.layer_rename = Some((l.id.clone(), l.name.clone()));
+                app.panels.layer_rename_new = true;
+            }
+            if name.secondary_clicked() && !selected {
+                app.panels.layer_sel = vec![l.id.clone()];
+                app.panels.layer_anchor = Some(l.id.clone());
+                app.s.current_layer = Some(l.id.clone());
+            }
+            name.context_menu(|ui| layer_context_menu(app, ui, &l.id));
+        });
     });
 }
 
@@ -4498,6 +5111,116 @@ mod tests {
     }
 
     #[test]
+    fn display_layer_toolbar_actions() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        layer_create(&mut app, true);
+        assert_eq!(app.s.layers.len(), 1);
+        let lid = app.s.layers[0].id.clone();
+        assert_eq!(app.s.node(&id).unwrap().layer, Some(lid.clone()));
+        assert_eq!(app.s.current_layer, Some(lid.clone()));
+        assert_eq!(app.panels.layer_sel, vec![lid.clone()]);
+        app.s.select(&[], SelMode::Replace);
+        layer_select_objects(&mut app);
+        assert_eq!(app.s.sel, vec![id.clone()], "Select Objects in Selected Layers did not select the layer contents");
+        layer_create(&mut app, false);
+        assert_eq!(app.s.layers.len(), 2);
+        layer_delete_unused(&mut app);
+        assert_eq!(app.s.layers.len(), 1, "Delete Unused Layers kept the empty layer");
+        layer_empty(&mut app, &lid);
+        assert!(app.s.node(&id).unwrap().layer.is_none());
+        app.panels.layer_sel = vec![lid.clone()];
+        let lids = app.panels.layer_sel.clone();
+        layer_delete(&mut app, &lids);
+        assert!(app.s.layers.is_empty());
+        assert_eq!(app.s.node(&id).unwrap().name, "pCube1");
+    }
+
+    #[test]
+    fn layer_set_only_selected_and_add_new_objects() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        layer_create(&mut app, false);
+        let l1 = app.s.layers[0].id.clone();
+        layer_create(&mut app, false);
+        let l2 = app.s.layers[1].id.clone();
+        app.panels.layer_sel = vec![l1.clone()];
+        layer_apply(&mut app, LayerScope::OnlySelected, "Visible", |l| l.visible = true, |l| l.visible = false);
+        assert!(app.s.layers[0].visible);
+        assert!(!app.s.layers[1].visible, "Set Only Selected Layers did not hide the others");
+        layer_apply(&mut app, LayerScope::Selected, "Bounding Box", |l| l.lod = "bbox".into(), |l| l.lod = "full".into());
+        assert_eq!(app.s.layers[0].lod, "bbox");
+        assert_eq!(app.s.layers[1].lod, "full");
+        app.panels.layer_add_new = true;
+        app.s.add_new_to_current = true;
+        app.s.current_layer = Some(l1.clone());
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        assert_eq!(app.s.node(&id).unwrap().layer, Some(l1));
+        assert_eq!(app.s.node(&id).unwrap().layer, app.s.current_layer);
+        let _ = l2;
+    }
+
+    #[test]
+    fn layer_rename_keeps_names_unique() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        layer_create(&mut app, false);
+        layer_create(&mut app, false);
+        let lid = app.s.layers[0].id.clone();
+        let taken = app.s.layers[1].name.clone();
+        layer_rename_commit(&mut app, &lid, &taken);
+        assert_ne!(app.s.layers[0].name, taken, "rename reused another layer's name");
+        layer_rename_commit(&mut app, &lid, "Characters");
+        assert_eq!(app.s.layers[0].name, "Characters");
+    }
+
+    #[test]
+    fn layer_move_reorders_the_list() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        layer_create(&mut app, false);
+        layer_create(&mut app, false);
+        layer_create(&mut app, false);
+        let last = app.s.layers[2].id.clone();
+        app.panels.layer_sel = vec![last.clone()];
+        layer_move(&mut app, true);
+        assert_eq!(app.s.layers[1].id, last);
+        layer_move(&mut app, true);
+        assert_eq!(app.s.layers[0].id, last);
+        layer_move(&mut app, true);
+        assert_eq!(app.s.layers[0].id, last, "the top layer moved past the start");
+        layer_move(&mut app, false);
+        assert_eq!(app.s.layers[1].id, last);
+    }
+
+    #[test]
+    fn layer_color_and_default_round_trip() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        layer_create(&mut app, false);
+        let lid = app.s.layers[0].id.clone();
+        layer_set_color(&mut app, &lid, [1.0, 0.0, 0.0]);
+        assert_eq!(app.s.layers[0].color, Some(json!([1.0, 0.0, 0.0])));
+        assert_eq!(layer_swatch_color(&app.s.layers[0].color), Color32::from_rgb(255, 0, 0));
+        layer_clear_color(&mut app, &lid);
+        assert!(app.s.layers[0].color.is_none());
+        assert!(!layer_has_color(&app.s.layers[0].color));
+        assert_eq!(layer_swatch_color(&app.s.layers[0].color), Color32::TRANSPARENT);
+    }
+
+    #[test]
     fn channel_box_add_and_remove_selected_layer() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
@@ -4506,8 +5229,23 @@ mod tests {
         let id = app.s.create_mesh("polyCube", &Params::new(), None);
         app.s.select(std::slice::from_ref(&id), SelMode::Replace);
         let lid = app.s.new_id("l");
-        app.s.layers.push(inca_core::scene::Layer { id: lid.clone(), name: "Layer 1".into(), visible: true, mode: "normal".into(), color: None, extra: Default::default() });
-        app.panels.active_layer = Some(lid.clone());
+        app.s.layers.push(inca_core::scene::Layer {
+            id: lid.clone(),
+            name: "Layer 1".into(),
+            visible: true,
+            mode: "normal".into(),
+            color: None,
+            playback: true,
+            enabled: true,
+            shading: true,
+            texturing: true,
+            lod: "full".into(),
+            anim_playback: true,
+            created: 1,
+            extra: Default::default(),
+        });
+        app.panels.layer_sel = vec![lid.clone()];
+        app.s.current_layer = Some(lid.clone());
         layer_members(&mut app, true);
         assert_eq!(app.s.node(&id).unwrap().layer.as_deref(), Some(lid.as_str()));
         layer_members(&mut app, false);

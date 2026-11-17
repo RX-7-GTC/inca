@@ -14,6 +14,7 @@ pub enum MenuSource {
     Outliner,
     AttrEditor,
     ChannelBox,
+    LayerEditor,
     RenderView,
     UvEditor,
     Hypershade,

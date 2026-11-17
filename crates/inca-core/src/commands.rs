@@ -2448,7 +2448,22 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let nm = a.s(&["n", "name"]).unwrap_or("layer1".into());
             let id = s.new_id("l");
             let nm = s.unique_name(&nm);
-            s.layers.push(Layer { id: id.clone(), name: nm.clone(), visible: true, mode: "normal".into(), color: None, extra: Default::default() });
+            let created = s.id_counter;
+            s.layers.push(Layer {
+                id: id.clone(),
+                name: nm.clone(),
+                visible: true,
+                mode: "normal".into(),
+                color: None,
+                playback: true,
+                enabled: true,
+                shading: true,
+                texturing: true,
+                lod: "full".into(),
+                anim_playback: true,
+                created,
+                extra: Default::default(),
+            });
             if !a.has(&["e", "empty"]) {
                 for o in targets(s, &a) {
                     if let Some(n) = s.nodes.get_mut(&o) {

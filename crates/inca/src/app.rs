@@ -1459,6 +1459,8 @@ impl eframe::App for IncaApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
         self.tick_playback(&ctx);
+        // Layer `P` flags hide their objects only while the timeline is playing.
+        self.s.playing = self.playing;
         let dt = ctx.input(|i| i.unstable_dt);
         if dt > 0.0 && dt < 0.25 {
             // ~1 s time constant, so the HUD does not jump on every frame; ignore long

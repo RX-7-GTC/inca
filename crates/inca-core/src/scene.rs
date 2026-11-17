@@ -403,6 +403,27 @@ pub struct Layer {
     pub mode: String,
     #[serde(default)]
     pub color: Option<Value>,
+    /// Visible during playback (the `P` column).
+    #[serde(default = "yes")]
+    pub playback: bool,
+    /// Layer overrides are applied; off makes the layer behave as if unassigned.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Draw objects shaded (off = wireframe).
+    #[serde(default = "yes")]
+    pub shading: bool,
+    /// Apply textures in Textured mode.
+    #[serde(default = "yes")]
+    pub texturing: bool,
+    /// "full" | "bbox"
+    #[serde(default = "full_lod")]
+    pub lod: String,
+    /// Animate objects in the layer during playback.
+    #[serde(default = "yes")]
+    pub anim_playback: bool,
+    /// Creation order, used by Sort Layers Chronologically (0 for older files).
+    #[serde(default)]
+    pub created: u64,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -411,6 +432,9 @@ fn yes() -> bool {
 }
 fn normal() -> String {
     "normal".into()
+}
+fn full_lod() -> String {
+    "full".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -531,6 +555,12 @@ pub struct Scene {
     pub places: IndexMap<Id, Place2D>,
     pub default_mat: Id,
     pub layers: Vec<Layer>,
+    /// The layer new objects are assigned to when `add_new_to_current` is on.
+    pub current_layer: Option<Id>,
+    /// Layer Editor option: assign newly created objects to the current layer.
+    pub add_new_to_current: bool,
+    /// Playback state mirrored from the app so `is_visible` can apply layer `P` flags.
+    pub playing: bool,
     pub anim: Anim,
     pub conns: Vec<Conn>,
     pub constraints: Vec<Constraint>,
@@ -589,6 +619,9 @@ impl Scene {
             places: IndexMap::new(),
             default_mat: String::new(),
             layers: vec![],
+            current_layer: None,
+            add_new_to_current: false,
+            playing: false,
             anim: Anim::default(),
             conns: vec![],
             constraints: vec![],
@@ -784,6 +817,7 @@ impl Scene {
             Shape::Group => None,
             _ => Some(self.unique_name(&shape_name_for(&name))),
         };
+        let layer = if self.add_new_to_current { self.current_layer.clone() } else { None };
         let node = Node {
             id: id.clone(),
             name,
@@ -792,7 +826,7 @@ impl Scene {
             children: vec![],
             xf: Xform::default(),
             visible: true,
-            layer: None,
+            layer,
             template: false,
             selectable: true,
             xray: false,
@@ -2553,6 +2587,7 @@ impl Scene {
         self.texs.clear();
         self.places.clear();
         self.layers.clear();
+        self.current_layer = None;
         self.anim = Anim::default();
         self.conns.clear();
         self.constraints.clear();
@@ -2603,6 +2638,9 @@ impl Scene {
             self.init_default_materials();
         }
         self.layers = serde_json::from_value(data["layers"].clone()).unwrap_or_default();
+        for l in &self.layers {
+            self.names.insert(l.name.clone());
+        }
         let mut by_id: HashMap<String, Id> = HashMap::new();
         for d in data["nodes"].as_array().unwrap() {
             let parent = d["parent"].as_str().and_then(|p| by_id.get(p).cloned());
@@ -2633,6 +2671,12 @@ impl Scene {
         *self = Scene { project: self.project.take(), ..Scene::new() };
     }
 
+    /// The effective display layer of a node, ignoring disabled layers.
+    pub fn layer_for(&self, id: &str) -> Option<&Layer> {
+        let lid = self.nodes.get(id)?.layer.as_ref()?;
+        self.layers.iter().find(|l| &l.id == lid && l.enabled)
+    }
+
     /// Visible = node + all ancestors visible and the display layer visible.
     pub fn is_visible(&self, id: &str) -> bool {
         let mut c = Some(id.to_string());
@@ -2641,8 +2685,8 @@ impl Scene {
             if !n.visible {
                 return false;
             }
-            if let Some(l) = &n.layer {
-                if self.layers.iter().any(|x| &x.id == l && !x.visible) {
+            if let Some(layer) = n.layer.as_ref().and_then(|l| self.layers.iter().find(|x| &x.id == l)) {
+                if layer.enabled && (!layer.visible || (!layer.playback && self.playing)) {
                     return false;
                 }
             }
@@ -2657,7 +2701,9 @@ impl Scene {
         let mut c = Some(id.to_string());
         while let Some(i) = c {
             let Some(n) = self.nodes.get(&i) else { return false };
-            if n.template || n.layer.as_ref().is_some_and(|l| self.layers.iter().any(|x| &x.id == l && x.mode == "template")) {
+            if n.template
+                || n.layer.as_ref().is_some_and(|l| self.layers.iter().any(|x| &x.id == l && x.enabled && x.mode == "template"))
+            {
                 return true;
             }
             c = n.parent.clone();
@@ -2673,7 +2719,7 @@ impl Scene {
                 return true;
             }
             if let Some(l) = &n.layer {
-                if self.layers.iter().any(|x| &x.id == l && x.mode != "normal") {
+                if self.layers.iter().any(|x| &x.id == l && x.enabled && x.mode != "normal") {
                     return true;
                 }
             }
@@ -3206,5 +3252,65 @@ mod tests {
         s.time.current = 4.0;
         s.apply_expressions();
         assert!((s.get_attr_f(&id, "translateY") - 10.0).abs() < 1e-9);
+    }
+
+    fn test_layer(s: &mut Scene, name: &str) -> Id {
+        let id = s.new_id("l");
+        let created = s.id_counter;
+        s.layers.push(Layer {
+            id: id.clone(),
+            name: name.into(),
+            visible: true,
+            mode: "normal".into(),
+            color: None,
+            playback: true,
+            enabled: true,
+            shading: true,
+            texturing: true,
+            lod: "full".into(),
+            anim_playback: true,
+            created,
+            extra: Default::default(),
+        });
+        id
+    }
+
+    #[test]
+    fn display_layer_visibility_playback_and_overrides() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let lid = test_layer(&mut s, "layer1");
+        s.nodes.get_mut(&id).unwrap().layer = Some(lid);
+        assert!(s.is_visible(&id));
+        s.layers[0].visible = false;
+        assert!(!s.is_visible(&id));
+        // Enable Overrides off ignores every layer setting
+        s.layers[0].enabled = false;
+        assert!(s.is_visible(&id));
+        s.layers[0].enabled = true;
+        s.layers[0].visible = true;
+        s.layers[0].playback = false;
+        assert!(s.is_visible(&id), "P off hid the layer while stopped");
+        s.playing = true;
+        assert!(!s.is_visible(&id), "P off did not hide the layer during playback");
+        s.playing = false;
+        s.layers[0].mode = "template".into();
+        assert!(s.is_templated_display(&id));
+        assert!(s.is_template(&id));
+        s.layers[0].enabled = false;
+        assert!(!s.is_templated_display(&id));
+        assert!(!s.is_template(&id));
+    }
+
+    #[test]
+    fn new_objects_join_the_current_layer() {
+        let mut s = Scene::new();
+        let lid = test_layer(&mut s, "layer1");
+        s.current_layer = Some(lid.clone());
+        let before = s.create_mesh("polyCube", &Params::new(), None);
+        assert!(s.node(&before).unwrap().layer.is_none(), "layer off: new object was assigned");
+        s.add_new_to_current = true;
+        let after = s.create_mesh("polyCube", &Params::new(), None);
+        assert_eq!(s.node(&after).unwrap().layer, Some(lid));
     }
 }
