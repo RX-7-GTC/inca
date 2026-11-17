@@ -281,7 +281,7 @@ pub fn normalize_keymap(map: Keymap) -> Keymap {
         }
         let (scope, chord) = parse_key(&k);
         // Older builds stored Edit Pivot as one "Insert / hold D" chord. Split it into the
-        // Maya defaults: Insert on press, D on release.
+        // Maya defaults: Insert on press, D on both key-down and key-up.
         if chord == "Insert / hold D" && action_parts(&v).0 == "pivotEdit" {
             let insert = scope_key(scope, "Insert");
             let d = scope_key(scope, "D");
@@ -289,8 +289,14 @@ pub fn normalize_keymap(map: Keymap) -> Keymap {
                 out.insert(insert, action_value("pivotEdit", true, false));
             }
             if !out.contains_key(&d) {
-                out.insert(d, action_value("pivotEdit", false, true));
+                out.insert(d, action_value("pivotEdit", true, true));
             }
+            continue;
+        }
+        // Older custom sets may still have D release-only; Edit Pivot needs both directions.
+        let (action, press, release) = action_parts(&v);
+        if action == "pivotEdit" && chord == "D" && !press && release {
+            out.insert(scope_key(scope, "D"), action_value("pivotEdit", true, true));
             continue;
         }
         out.insert(scope_key(scope, &canonical_chord(chord)), v);
@@ -394,13 +400,13 @@ fn default_scope(id: &str) -> Scope {
     }
 }
 
-/// Default directions for the built-in Maya hotkeys. Snapping keys are held, so they are
-/// assigned to both press and release; D holds the pivot, so it is release-only.
+/// Default directions for the built-in Maya hotkeys. Snapping keys and Edit Pivot's D are held,
+/// so they use both key-down and key-up.
 fn default_directions(id: &str, chord: &str) -> (bool, bool) {
     if is_snap_action(id) {
         (true, true)
     } else if id == "pivotEdit" && chord == "D" {
-        (false, true)
+        (true, true)
     } else {
         (true, false)
     }
@@ -408,7 +414,7 @@ fn default_directions(id: &str, chord: &str) -> (bool, bool) {
 
 /// Extra default chords for actions whose Maya default is more than one key.
 fn extra_defaults_for_action(id: &str) -> &'static [(&'static str, bool, bool)] {
-    if id == "pivotEdit" { &[("D", false, true)] } else { &[] }
+    if id == "pivotEdit" { &[("D", true, true)] } else { &[] }
 }
 
 fn extra_default(c: &str) -> Option<(&'static str, bool, bool)> {
@@ -2419,11 +2425,21 @@ mod tests {
         map.insert("viewport:Insert / hold D".into(), "release:pivotEdit".into());
         let map = normalize_keymap(map);
         assert_eq!(map.get("Insert").map(String::as_str), Some("pivotEdit"));
-        assert_eq!(map.get("D").map(String::as_str), Some("release:pivotEdit"));
+        assert_eq!(map.get("D").map(String::as_str), Some("both:pivotEdit"));
         assert_eq!(map.get("viewport:Insert").map(String::as_str), Some("pivotEdit"));
-        assert_eq!(map.get("viewport:D").map(String::as_str), Some("release:pivotEdit"));
+        assert_eq!(map.get("viewport:D").map(String::as_str), Some("both:pivotEdit"));
         assert!(!map.contains_key("Insert / hold D"));
         assert!(!map.contains_key("viewport:Insert / hold D"));
+    }
+
+    #[test]
+    fn normalize_upgrades_release_only_edit_pivot_d() {
+        let mut map = Keymap::new();
+        map.insert("D".into(), "release:pivotEdit".into());
+        map.insert("viewport:D".into(), "release:pivotEdit".into());
+        let map = normalize_keymap(map);
+        assert_eq!(map.get("D").map(String::as_str), Some("both:pivotEdit"));
+        assert_eq!(map.get("viewport:D").map(String::as_str), Some("both:pivotEdit"));
     }
 
     #[test]
@@ -2433,7 +2449,7 @@ mod tests {
         assert_eq!(default_directions("snapPoint", "V"), (true, true));
         assert_eq!(default_directions("copy", "Ctrl+C"), (true, false));
         assert_eq!(default_directions("pivotEdit", "Insert"), (true, false));
-        assert_eq!(default_directions("pivotEdit", "D"), (false, true));
+        assert_eq!(default_directions("pivotEdit", "D"), (true, true));
         assert_eq!(crate::actions::hotkey_label("pivotEdit"), "Insert");
         assert_eq!(default_scope("snapGrid"), Scope::Viewport);
         assert_eq!(default_scope("snapCurve"), Scope::Viewport);

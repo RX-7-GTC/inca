@@ -225,8 +225,9 @@ pub struct IncaApp {
     pub manip_size: f32,
     /// Edit Pivot: the move manipulator moves pivots instead of objects
     pub pivot_mode: bool,
-    /// Key holding Edit Pivot: key, and the pivot mode to restore on release.
-    pub pivot_hold: Option<(egui::Key, bool)>,
+    /// Key holding Edit Pivot: key, the pivot mode to restore on release, press time, and
+    /// whether both press and release are bound (tap toggles, hold is temporary).
+    pub pivot_hold: Option<(egui::Key, bool, f64, bool)>,
     /// Key holding a snap toggle: key, action, and the state to restore on release.
     pub snap_hold: Option<(egui::Key, String, bool)>,
     /// Last known window focus, so hold keys are only released on an actual focus loss.
@@ -1116,7 +1117,7 @@ impl IncaApp {
     /// Restore the pivot mode after a hold key. Focus loss or an early return can swallow the
     /// key-up event.
     fn end_pivot_hold(&mut self) {
-        if let Some((_, was_on)) = self.pivot_hold.take() {
+        if let Some((_, was_on, _, _)) = self.pivot_hold.take() {
             self.pivot_mode = was_on;
         }
     }
@@ -1226,11 +1227,11 @@ impl IncaApp {
             match e {
                 egui::Event::Key { key, pressed: true, modifiers, repeat: false, .. } => {
                     // Edit Pivot and snapping are hold commands: tap toggles, hold is temporary.
-                    if let Some((id, _press, release)) = crate::hotkey_editor::hold_binding(self, key, modifiers, scope) {
+                    if let Some((id, press, release)) = crate::hotkey_editor::hold_binding(self, key, modifiers, scope) {
                         if release {
                             if id == "pivotEdit" {
                                 if self.pivot_hold.is_none() {
-                                    self.pivot_hold = Some((key, self.pivot_mode));
+                                    self.pivot_hold = Some((key, self.pivot_mode, now, press));
                                     self.pivot_mode = true;
                                 }
                             } else if self.snap_hold.is_none() {
@@ -1249,9 +1250,10 @@ impl IncaApp {
                     }
                 }
                 egui::Event::Key { key, pressed: false, repeat: false, .. } => {
-                    if let Some((hold, was_on)) = self.pivot_hold {
+                    if let Some((hold, was_on, t0, both)) = self.pivot_hold {
                         if hold == key {
-                            self.pivot_mode = was_on;
+                            let tap = both && now - t0 < 0.25;
+                            self.pivot_mode = if tap { !was_on } else { was_on };
                             self.pivot_hold = None;
                             continue;
                         }
@@ -1588,6 +1590,40 @@ mod tests {
         raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
         raw.events = events;
         raw
+    }
+
+    #[test]
+    fn edit_pivot_d_taps_toggle_and_holds_restore() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.keymap.clear();
+        let (id, press, release) = crate::hotkey_editor::hold_binding(&app, egui::Key::D, egui::Modifiers::default(), crate::hotkey_editor::Scope::Application)
+            .expect("D is bound to Edit Pivot");
+        assert_eq!(id, "pivotEdit");
+        assert!(press && release, "D should run on both press and release");
+        assert!(!app.pivot_mode);
+
+        let run = |ctx: &egui::Context, app: &mut IncaApp, t: f64, pressed: bool| {
+            let mut raw = raw_with(vec![key_event(egui::Key::D, false, pressed)]);
+            raw.time = Some(t);
+            let mut out = ctx.run_ui(raw, |ui| app.hotkeys(ui.ctx()));
+            out.textures_delta.clear();
+        };
+        // A quick tap toggles pivot mode on, then another tap toggles it off.
+        run(&ctx, &mut app, 1.0, true);
+        assert!(app.pivot_mode);
+        run(&ctx, &mut app, 1.1, false);
+        assert!(app.pivot_mode, "quick tap should toggle pivot mode on");
+        run(&ctx, &mut app, 2.0, true);
+        run(&ctx, &mut app, 2.1, false);
+        assert!(!app.pivot_mode, "second tap should toggle pivot mode off");
+        // Holding the key enables pivot mode temporarily and restores it on release.
+        run(&ctx, &mut app, 3.0, true);
+        assert!(app.pivot_mode);
+        run(&ctx, &mut app, 3.5, false);
+        assert!(!app.pivot_mode, "held key should restore the previous pivot mode");
     }
 
     #[test]
