@@ -517,6 +517,10 @@ pub struct PanelState {
     pub layer_rename_new: bool,
     /// Layer whose colour palette popup is open.
     pub layer_color_popup: Option<String>,
+    /// Custom RGB chosen in the layer colour popup (0..1 per channel).
+    pub layer_custom_rgb: [f32; 3],
+    /// Layer whose full colour picker window is open.
+    pub layer_picker: Option<String>,
     /// Options > Make New Layers Current.
     pub layer_make_current: bool,
     /// Options > Add New Objects to Current Layer.
@@ -3058,6 +3062,105 @@ fn layer_clear_color(app: &mut IncaApp, id: &str) {
     app.s.touch();
 }
 
+fn color32_of(color: &[f32; 3]) -> Color32 {
+    Color32::from_rgb(
+        (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+}
+
+fn parse_hex(s: &str) -> Option<[f32; 3]> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
+}
+
+/// Full colour-picker body: wheel/sliders plus a pasteable HEX field. Mutates `color` live and
+/// returns whether it changed this frame.
+pub(crate) fn color_picker_body(ui: &mut egui::Ui, id: egui::Id, color: &mut [f32; 3]) -> bool {
+    ui.spacing_mut().slider_width = 320.0;
+    let row_top = ui.cursor().min;
+    let mut c = color32_of(color);
+    let mut changed = egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque);
+    if changed {
+        *color = [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
+    }
+
+    // HEX goes on the picker's own numeric row, to the right of the R/G/B fields.
+    let hex_id = id.with("hex");
+    let mut buf = ui.data(|d| d.get_temp::<String>(hex_id)).unwrap_or_default();
+    let row_h = ui.spacing().interact_size.y;
+    let hex_rect = egui::Rect::from_min_size(
+        egui::pos2(row_top.x + 250.0, row_top.y),
+        egui::vec2(68.0, row_h),
+    );
+    let resp = ui.put(hex_rect, egui::TextEdit::singleline(&mut buf).hint_text("#RRGGBB"));
+    if resp.changed() {
+        if let Some(rgb) = parse_hex(&buf) {
+            *color = rgb;
+            changed = true;
+        }
+    }
+    if !resp.has_focus() {
+        buf = format!(
+            "#{:02X}{:02X}{:02X}",
+            (color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (color[2].clamp(0.0, 1.0) * 255.0).round() as u8
+        );
+    }
+    ui.data_mut(|d| d.insert_temp(hex_id, buf));
+    changed
+}
+
+/// Colour swatch that opens the shared picker window (wheel + HEX field). One picker at a time.
+pub(crate) fn color_edit(ui: &mut egui::Ui, id: egui::Id, color: &mut [f32; 3]) -> bool {
+    let open_id = egui::Id::new("inca_color_picker_open");
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 18.0), egui::Sense::click());
+    ui.painter().rect_filled(rect, 2.0, color32_of(color));
+    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, Color32::from_gray(0x22)), egui::StrokeKind::Inside);
+    let resp = resp.on_hover_text("Color picker");
+    let mut open = ui.data(|d| d.get_temp::<Option<egui::Id>>(open_id).flatten()) == Some(id);
+    if resp.clicked() {
+        open = !open;
+        ui.data_mut(|d| {
+            if open {
+                d.insert_temp(open_id, Some(id));
+            } else {
+                d.remove_temp::<Option<egui::Id>>(open_id);
+            }
+        });
+    }
+    let mut changed = false;
+    if open {
+        let mut keep = true;
+        let frame = egui::Frame::window(ui.style()).shadow(egui::epaint::Shadow::NONE);
+        let screen = ui.ctx().content_rect();
+        let x = (rect.left() - 360.0).clamp(screen.left() + 20.0, (screen.right() - 360.0).max(screen.left() + 20.0));
+        egui::Window::new("Color")
+            .frame(frame)
+            .id(id.with("color_picker"))
+            .collapsible(false)
+            .resizable(false)
+            .min_width(320.0)
+            .default_pos(egui::pos2(x, rect.top()))
+            .open(&mut keep)
+            .show(ui.ctx(), |ui| {
+                changed = color_picker_body(ui, id, color);
+            });
+        if !keep {
+            ui.data_mut(|d| d.remove_temp::<Option<egui::Id>>(open_id));
+        }
+    }
+    changed
+}
+
 fn layer_create(app: &mut IncaApp, from_selection: bool) {
     app.s.checkpoint("create display layer");
     let id = app.s.new_id("l");
@@ -3380,19 +3483,31 @@ fn layer_row(app: &mut IncaApp, ui: &mut egui::Ui, l: &inca_core::scene::Layer) 
             }
             let swatch_resp = swatch_resp.on_hover_text("Layer color presets");
             if swatch_resp.clicked() {
-                app.panels.layer_color_popup = if app.panels.layer_color_popup.as_deref() == Some(l.id.as_str()) {
-                    None
-                } else {
-                    Some(l.id.clone())
-                };
+                let opening = app.panels.layer_color_popup.as_deref() != Some(l.id.as_str());
+                app.panels.layer_color_popup = if opening { Some(l.id.clone()) } else { None };
+                if opening {
+                    let c = layer_swatch_color(&l.color);
+                    app.panels.layer_custom_rgb = if layer_has_color(&l.color) {
+                        [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0]
+                    } else {
+                        [1.0; 3]
+                    };
+                    app.panels.layer_picker = None;
+                }
             }
             let mut open = app.panels.layer_color_popup.as_deref() == Some(l.id.as_str());
             if open {
                 let mut picked: Option<[f32; 3]> = None;
+                let mut custom: Option<[f32; 3]> = None;
                 let mut use_default = false;
+                let picker_here = app.panels.layer_picker.as_deref() == Some(l.id.as_str());
                 egui::Popup::from_response(&swatch_resp)
                     .open_bool(&mut open)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .close_behavior(if picker_here {
+                        egui::PopupCloseBehavior::IgnoreClicks
+                    } else {
+                        egui::PopupCloseBehavior::CloseOnClickOutside
+                    })
                     .gap(2.0)
                     .show(|ui| {
                         ui.label(RichText::new("Layer Color").strong());
@@ -3417,18 +3532,60 @@ fn layer_row(app: &mut IncaApp, ui: &mut egui::Ui, l: &inca_core::scene::Layer) 
                                 }
                             });
                         }
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Custom:").strong());
+                            let c = app.panels.layer_custom_rgb;
+                            let (sw, resp) = ui.allocate_exact_size(egui::vec2(24.0, 18.0), egui::Sense::click());
+                            let rgb = Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
+                            ui.painter().rect_filled(sw, 2.0, rgb);
+                            ui.painter().rect_stroke(sw, 2.0, egui::Stroke::new(1.0, Color32::from_gray(0x22)), egui::StrokeKind::Inside);
+                            if resp.on_hover_text("Open the color picker").clicked() {
+                                app.panels.layer_picker = if picker_here { None } else { Some(l.id.clone()) };
+                            }
+                            if ui.button("Set").clicked() {
+                                custom = Some(c);
+                            }
+                        });
                         if ui.button("Default").clicked() {
                             use_default = true;
                         }
                     });
+                if app.panels.layer_picker.as_deref() == Some(l.id.as_str()) {
+                    let mut keep = true;
+                    let frame = egui::Frame::window(ui.style()).shadow(egui::epaint::Shadow::NONE);
+                    let screen = ui.ctx().content_rect();
+                    let x = (swatch.left() - 380.0).clamp(screen.left() + 20.0, (screen.right() - 360.0).max(screen.left() + 20.0));
+                    egui::Window::new("Layer Color")
+                        .frame(frame)
+                        .id(egui::Id::new("layer_color_picker"))
+                        .collapsible(false)
+                        .resizable(false)
+                        .min_width(320.0)
+                        .default_pos(egui::pos2(x, swatch.top() - 30.0))
+                        .open(&mut keep)
+                        .show(ui.ctx(), |ui| {
+                            color_picker_body(ui, egui::Id::new("layer_color_picker"), &mut app.panels.layer_custom_rgb);
+                        });
+                    if !keep {
+                        app.panels.layer_picker = None;
+                    }
+                }
                 if let Some(c) = picked {
                     layer_set_color(app, &l.id, c);
                     app.panels.layer_color_popup = None;
+                    app.panels.layer_picker = None;
+                } else if let Some(c) = custom {
+                    layer_set_color(app, &l.id, c);
+                    app.panels.layer_color_popup = None;
+                    app.panels.layer_picker = None;
                 } else if use_default {
                     layer_clear_color(app, &l.id);
                     app.panels.layer_color_popup = None;
+                    app.panels.layer_picker = None;
                 } else if !open {
                     app.panels.layer_color_popup = None;
+                    app.panels.layer_picker = None;
                 }
             }
             if renaming {
@@ -3578,7 +3735,8 @@ fn field_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, spec: FieldSp
                     c[i] = a.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
                 }
             }
-            if ui.color_edit_button_rgb(&mut c).changed() {
+            let color_id = egui::Id::new(("attr_color", spec.key, format!("{r:?}")));
+            if color_edit(ui, color_id, &mut c) {
                 if !app.panels.editing {
                     app.s.checkpoint(&format!("set {}", spec.key));
                 }
@@ -3739,7 +3897,7 @@ fn ramp_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef) {
     if let Some((pos, rgb, interp)) = entries.get_mut(selected) {
         ui.horizontal(|ui| {
             ui.label("Selected Color");
-            changed |= ui.color_edit_button_rgb(rgb).changed();
+            changed |= color_edit(ui, egui::Id::new(("ramp_color", app.s.ref_id(r))), rgb);
             ui.label("Position");
             changed |= ui.add(egui::DragValue::new(pos).range(0.0..=1.0).speed(0.01).max_decimals(3)).changed();
         });
@@ -3778,7 +3936,7 @@ pub fn attr_map_editor(app: &mut IncaApp, ui: &mut egui::Ui, r: &NodeRef, keys: 
                     let is_color = k.to_lowercase().contains("color") || k.contains("transparency") || k.contains("incandescence") || k == "opacity";
                     let changed = if is_color {
                         ui.allocate_ui_with_layout(egui::vec2(152.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            ui.color_edit_button_rgb(&mut c).changed()
+                            color_edit(ui, egui::Id::new(("ae_color", format!("{r:?}"), k)), &mut c)
                         }).inner
                     } else {
                         ui.allocate_ui_with_layout(egui::vec2(152.0, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -4515,7 +4673,7 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
                 let mut outliner_color = app.s.node(id).map(|n| n.outliner_color).unwrap_or([1.0; 3]);
                 ui.horizontal(|ui| {
                     ui.label("Outliner Color");
-                    let changed = ui.color_edit_button_rgb(&mut outliner_color).changed();
+                    let changed = color_edit(ui, egui::Id::new(("outliner_color", id)), &mut outliner_color);
                     if changed {
                         if !app.panels.outliner_color_editing {
                             app.s.checkpoint("outliner color");

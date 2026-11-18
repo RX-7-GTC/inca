@@ -22,7 +22,10 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 
-# Local patch: draw a Maya-style rotation arc instead of transform-gizmo's
-# accumulating sector fill (which becomes opaque after several full turns).
+# Local patches:
+# - transform-gizmo: draw a Maya-style rotation arc instead of its accumulating sector fill,
+#   and Maya-style scale/translate handles.
+# - egui: fixed-width colour-picker number fields so U8/F mode does not resize the row.
 [patch.crates-io]
 transform-gizmo = { path = "vendor/transform-gizmo" }
+egui = { path = "vendor/egui" }

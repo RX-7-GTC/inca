@@ -1763,7 +1763,7 @@ fn render_settings(app: &mut IncaApp, ui: &mut egui::Ui) {
         });
         ui.end_row();
         ui.label("Background");
-        ui.color_edit_button_rgb(&mut bg);
+        crate::panels::color_edit(ui, egui::Id::new("render_background"), &mut bg);
         ui.end_row();
         ui.label("Transparent background");
         ui.checkbox(&mut transparent, "");

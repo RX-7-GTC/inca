@@ -2,6 +2,8 @@
 vendor/*
 !vendor/transform-gizmo/
 !vendor/transform-gizmo/**
+!vendor/egui/
+!vendor/egui/**
 .claude/
 *.pdf
 inca-outreach-plan.md
