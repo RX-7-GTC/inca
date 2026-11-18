@@ -138,8 +138,10 @@ impl Gizmo {
         {
             subgizmo.set_focused(true);
 
-            // If we started dragging from one of the subgizmos, mark it as active.
-            if interaction.drag_started || force_active {
+            // If we started dragging from one of the subgizmos, mark it as active. A mode override
+            // alone only focuses it: that lets a caller draw a selected handle in the highlight
+            // colour without also switching on the active/drag visual.
+            if interaction.drag_started || (force_active && interaction.dragging) {
                 self.active_subgizmo_id = Some(subgizmo.id());
                 self.target_start_transforms = targets.to_vec();
                 self.gizmo_start_transform = self.config.as_transform();

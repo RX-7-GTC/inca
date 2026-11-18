@@ -5,6 +5,7 @@ use crate::theme;
 use crate::viewport::{self, CamView, Comp, LightMode, ShadeMode};
 use egui::{pos2, vec2, Color32, Pos2, Rect, RichText, Sense, Stroke};
 use glam::{DMat4, DQuat, DVec3};
+use inca_core::math::quat_from_euler_deg;
 use inca_core::mesh::epair;
 use inca_core::scene::{CompMode, SelMode, Shape};
 use std::collections::HashSet;
@@ -15,6 +16,10 @@ use transform_gizmo_egui::prelude::*;
 /// Base on-screen manipulator size at settings scale 1.0. Maya's default reads a little larger
 /// than transform-gizmo's 75 px, while the user-facing size value stays 1.0.
 const MANIP_SIZE: f32 = 115.0;
+/// Hover colour for manipulator handles: a pale yellow that stays distinct from the selected one.
+const MANIP_HOVER: Color32 = Color32::from_rgb(255, 245, 170);
+/// Colour of the remembered / active handle.
+const MANIP_SELECTED: Color32 = Color32::from_rgb(240, 225, 80);
 
 /// Camera navigation mode of an Alt+drag in progress (JS `onDown`).
 #[derive(Clone, Copy, PartialEq)]
@@ -141,6 +146,8 @@ pub struct GizmoDrag {
     pub start: Transform,
     pub cur: Transform,
     pub objects: Vec<(String, DMat4)>,
+    /// object local scales at drag start, for signed scale edits without matrix decomposition
+    pub local_scales: Vec<DVec3>,
     pub comps: Vec<(String, Vec<u32>, DragGeom)>,
     pub tool: Tool,
     /// Edit Pivot drag: start world pivots of the objects
@@ -784,10 +791,12 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
                 app.vp_state.nav = None;
             }
             ui.ctx().request_repaint();
+            gizmo(app, ui, idx, resp, cv, painter, false);
             return;
         }
     }
     if mods.alt {
+        gizmo(app, ui, idx, resp, cv, painter, false);
         return;
     }
     // ---- B + LMB drag sets the Soft Selection radius (Maya)
@@ -823,7 +832,7 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
         app.panels.cb_armed = false;
     }
     // ---- manipulator
-    let gizmo_used = gizmo(app, ui, idx, resp, cv, painter);
+    let gizmo_used = gizmo(app, ui, idx, resp, cv, painter, true);
     if gizmo_used {
         return;
     }
@@ -1620,7 +1629,7 @@ fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], 
         let hot = cursor.is_some_and(|c| dist_to_segment(c, a, b) < 7.0);
         let mut color = colors[i];
         if hot {
-            color = Color32::from_rgb(255, 235, 80);
+            color = MANIP_HOVER;
         }
         painter.line_segment([a, b], Stroke::new(if hot { 4.0 } else { 2.5 }, color));
         if tool == Tool::Scale {
@@ -1634,7 +1643,226 @@ fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], 
     }
 }
 
-/// Axes shown in previous-state feedback for a dragged handle. Single-axis handles show only
+/// Maya's rotate feedback: two grey sticks from the pivot (the fixed start angle and the rotating
+/// current angle) with the swept pie filled between them.
+fn draw_rotate_pie(painter: &egui::Painter, d: &GizmoDrag, cv: &CamView, rect: Rect, size: f32, point: f32) {
+    let Some(handle) = d.handle else { return };
+    let axis = match handle {
+        GizmoMode::RotateX => DQuat::from(d.start.rotation) * DVec3::X,
+        GizmoMode::RotateY => DQuat::from(d.start.rotation) * DVec3::Y,
+        GizmoMode::RotateZ => DQuat::from(d.start.rotation) * DVec3::Z,
+        GizmoMode::RotateView => cv.fwd,
+        _ => return,
+    }
+    .normalize();
+    let pivot = DVec3::from(d.start.translation);
+    let Some(p) = cv.project(pivot, rect) else { return };
+    let helper = if axis.dot(DVec3::Y).abs() < 0.9 { DVec3::Y } else { DVec3::X };
+    let u = axis.cross(helper).normalize();
+    let v = axis.cross(u).normalize();
+    // Match the vendor ring radius exactly instead of estimating it from the screen direction.
+    let scale_factor = {
+        let model = DMat4::from_scale_rotation_translation(DVec3::from(d.start.scale), DQuat::from(d.start.rotation), pivot);
+        let mvp = cv.view_proj() * model;
+        (mvp.w_axis.w as f32) / (cv.proj.x_axis.x as f32) / rect.width() * 2.0
+    };
+    let radius = (scale_factor * (size + if handle == GizmoMode::RotateView { 8.0 } else { 0.0 })) as f64;
+    // The grab point fixes the start stick. Intersect the press ray with the ring plane for
+    // sub-pixel angle precision at every zoom level (sampling the ring was visibly coarse).
+    let start = {
+        let ray = cv.ray(d.press_px, rect);
+        let denom = ray.dir.dot(axis);
+        if denom.abs() < 1e-9 {
+            0.0
+        } else {
+            let t = (pivot - ray.origin).dot(axis) / denom;
+            let w = ray.origin + ray.dir * t - pivot;
+            w.dot(v).atan2(w.dot(u)) as f32
+        }
+    };
+    let delta = DQuat::from(d.cur.rotation) * DQuat::from(d.start.rotation).inverse();
+    let mut sweep = 2.0 * DVec3::new(delta.x, delta.y, delta.z).dot(axis).atan2(delta.w);
+    if sweep > std::f64::consts::PI {
+        sweep -= std::f64::consts::TAU;
+    } else if sweep < -std::f64::consts::PI {
+        sweep += std::f64::consts::TAU;
+    }
+    let sweep = sweep as f32;
+    let color = Color32::from_rgba_unmultiplied(190, 190, 190, 170);
+    let ring = |a: f32| cv.project(pivot + (u * a.cos() as f64 + v * a.sin() as f64) * radius, rect);
+    let (Some(start_pos), Some(end_pos)) = (ring(start), ring(start + sweep)) else { return };
+    painter.line_segment([p, start_pos], Stroke::new(1.5, color));
+    painter.line_segment([p, end_pos], Stroke::new(1.5, color));
+    let r = (point * 0.5).max(1.0);
+    painter.rect_filled(Rect::from_center_size(p, vec2(r * 2.0, r * 2.0)), 0.0, color);
+    painter.rect_filled(Rect::from_center_size(start_pos, vec2(r * 2.0, r * 2.0)), 0.0, color);
+    painter.rect_filled(Rect::from_center_size(end_pos, vec2(r * 2.0, r * 2.0)), 0.0, color);
+    if sweep.abs() > 0.02 && start_pos.distance(end_pos) > 1.0 {
+        let steps = ((sweep.abs() / 0.08) as usize).clamp(2, 48);
+        let mut pts = Vec::with_capacity(steps + 2);
+        pts.push(p);
+        for i in 0..=steps {
+            if let Some(q) = ring(start + sweep * i as f32 / steps as f32) {
+                pts.push(q);
+            }
+        }
+        if pts.len() > 2 {
+            painter.add(egui::Shape::convex_polygon(pts, Color32::from_rgba_unmultiplied(240, 225, 80, 46), Stroke::NONE));
+        }
+    }
+}
+
+fn draw_cube_at(painter: &egui::Painter, center: DVec3, rot: DQuat, cv: &CamView, rect: Rect, half_px: f32, color: Color32) {
+    let scale_factor = {
+        let model = DMat4::from_scale_rotation_translation(DVec3::ONE, rot, center);
+        let mvp = cv.view_proj() * model;
+        (mvp.w_axis.w as f32) / (cv.proj.x_axis.x as f32) / rect.width() * 2.0
+    };
+    let half = (scale_factor * half_px) as f64;
+    let corners = [
+        DVec3::new(-1.0, -1.0, -1.0),
+        DVec3::new(1.0, -1.0, -1.0),
+        DVec3::new(1.0, 1.0, -1.0),
+        DVec3::new(-1.0, 1.0, -1.0),
+        DVec3::new(-1.0, -1.0, 1.0),
+        DVec3::new(1.0, -1.0, 1.0),
+        DVec3::new(1.0, 1.0, 1.0),
+        DVec3::new(-1.0, 1.0, 1.0),
+    ];
+    let mut pts = [None; 8];
+    for (i, c) in corners.iter().enumerate() {
+        pts[i] = cv.project(center + rot * (*c * half), rect);
+    }
+    if pts.iter().any(Option::is_none) {
+        return;
+    }
+    let mut min = (f32::MAX, f32::MAX);
+    let mut max = (f32::MIN, f32::MIN);
+    for p in pts.iter().flatten() {
+        min = (min.0.min(p.x), min.1.min(p.y));
+        max = (max.0.max(p.x), max.1.max(p.y));
+    }
+    if max.0 - min.0 > 80.0 || max.1 - min.1 > 80.0 {
+        return;
+    }
+    let light = (cv.up + cv.right * 0.25 - cv.fwd * 0.75).normalize();
+    let shade = |f: f64| {
+        let k = (0.82 + 0.18 * f.max(0.0)) as f32;
+        Color32::from_rgb((color.r() as f32 * k) as u8, (color.g() as f32 * k) as u8, (color.b() as f32 * k) as u8)
+    };
+    let faces = [
+        (DVec3::Z, [4, 5, 6, 7]),
+        (DVec3::NEG_Z, [1, 0, 3, 2]),
+        (DVec3::X, [1, 2, 6, 5]),
+        (DVec3::NEG_X, [0, 4, 7, 3]),
+        (DVec3::Y, [3, 7, 6, 2]),
+        (DVec3::NEG_Y, [0, 1, 5, 4]),
+    ];
+    for (normal, idx) in faces {
+        let n = rot * normal;
+        let face_center = center + n * half;
+        if n.dot(cv.eye - face_center) <= 0.0 {
+            continue;
+        }
+        let poly: Vec<Pos2> = idx.iter().filter_map(|&i| pts[i]).collect();
+        if poly.len() == 4 {
+            painter.add(egui::Shape::convex_polygon(poly, shade(n.dot(light)), Stroke::NONE));
+        }
+    }
+}
+
+fn draw_scale_center_cube(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, scale: f32, color: Color32) {
+    draw_cube_at(painter, pivot, rot, cv, rect, MANIP_SIZE * 0.045 * scale, color);
+}
+
+/// Maya-style scale axes: a coloured shaft ending in a cube.
+fn draw_scale_axis_cubes(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, size: f32, scale: f32, active: Option<GizmoMode>, axes: [bool; 3], dragged_axes: [bool; 3], factors: [f64; 3]) {
+    let Some(p) = cv.project(pivot, rect) else { return };
+    let scale_factor = {
+        let model = DMat4::from_scale_rotation_translation(DVec3::ONE, rot, pivot);
+        let mvp = cv.view_proj() * model;
+        (mvp.w_axis.w as f32) / (cv.proj.x_axis.x as f32) / rect.width() * 2.0
+    };
+    let start_len = (scale_factor * (size * 0.2 + 1.5)) as f64;
+    let base_len = (scale_factor * (size - 6.0)) as f64;
+    let colors = [Color32::from_rgb(230, 57, 62), Color32::from_rgb(92, 214, 92), Color32::from_rgb(74, 132, 255)];
+    let modes = [GizmoMode::ScaleX, GizmoMode::ScaleY, GizmoMode::ScaleZ];
+    let half = MANIP_SIZE * 0.045 * scale;
+    for i in 0..3 {
+        if !axes[i] {
+            continue;
+        }
+        let world_axis = rot * [DVec3::X, DVec3::Y, DVec3::Z][i];
+        let Some(q) = cv.project(pivot + world_axis, rect) else { continue };
+        if q.distance(p) < 2.0 {
+            continue;
+        }
+        let factor = factors[i];
+        let center = pivot + world_axis * (base_len * factor);
+        let Some(e) = cv.project(center, rect) else { continue };
+        let color = if active == Some(modes[i]) { MANIP_SELECTED } else { colors[i] };
+        if dragged_axes[i] {
+            if factor > 1.0 + 1e-3 {
+                // Only the part beyond the old grey handle is shown in yellow.
+                if let (Some(a), Some(b)) = (cv.project(pivot + world_axis * base_len, rect), cv.project(center, rect)) {
+                    painter.line_segment([a, b], Stroke::new(2.0, color));
+                }
+            } else if factor < 0.0 {
+                if let (Some(a), Some(b)) = (cv.project(pivot + world_axis * (-start_len), rect), cv.project(center, rect)) {
+                    painter.line_segment([a, b], Stroke::new(2.0, color));
+                }
+            }
+        } else {
+            if let Some(a) = cv.project(pivot + world_axis * (if factor < 0.0 { -start_len } else { start_len }), rect) {
+                painter.line_segment([a, e], Stroke::new(2.0, color));
+            }
+        }
+        draw_cube_at(painter, center, rot, cv, rect, half, color);
+    }
+}
+
+fn scale_center_color(active: Option<GizmoMode>) -> Color32 {
+    if active == Some(GizmoMode::ScaleUniform) {
+        MANIP_SELECTED
+    } else {
+        Color32::from_rgb(0, 200, 200)
+    }
+}
+
+/// The old scale axis while its cube is being dragged: a grey stick from the pivot to the
+/// original handle position, with a square head there.
+/// Draw the old scale axes as grey sticks with square heads.
+fn draw_scale_old_axes(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, size: f32, point: f32, axes: &[usize]) {
+    let Some(p) = cv.project(pivot, rect) else { return };
+    let scale_factor = {
+        let model = DMat4::from_scale_rotation_translation(DVec3::ONE, rot, pivot);
+        let mvp = cv.view_proj() * model;
+        (mvp.w_axis.w as f32) / (cv.proj.x_axis.x as f32) / rect.width() * 2.0
+    };
+    let start_len = (scale_factor * (size * 0.2 + 1.5)) as f64;
+    let base_len = (scale_factor * (size - 6.0)) as f64;
+    let gray = Color32::from_rgba_unmultiplied(190, 190, 190, 170);
+    let r = (point * 0.5).max(1.0);
+    for &i in axes {
+        let world_axis = rot * [DVec3::X, DVec3::Y, DVec3::Z][i];
+        let Some(q) = cv.project(pivot + world_axis, rect) else { continue };
+        if q.distance(p) < 2.0 {
+            continue;
+        }
+        let (Some(a), Some(e)) = (cv.project(pivot + world_axis * start_len, rect), cv.project(pivot + world_axis * base_len, rect)) else { continue };
+        painter.line_segment([a, e], Stroke::new(1.5, gray));
+        painter.rect_filled(Rect::from_center_size(e, vec2(r * 2.0, r * 2.0)), 0.0, gray);
+    }
+}
+
+/// The old scale axes while a drag is active.
+fn draw_scale_previous(painter: &egui::Painter, d: &GizmoDrag, cv: &CamView, rect: Rect, size: f32, point: f32) {
+    let pivot = DVec3::from(d.start.translation);
+    let rot = DQuat::from(d.start.rotation);
+    draw_scale_old_axes(painter, pivot, rot, cv, rect, size, point, &previous_state_axes(d.handle));
+}
+
+
 /// that axis; plane handles show the two free axes; view/centre handles show all three.
 fn previous_state_axes(handle: Option<GizmoMode>) -> Vec<usize> {
     match handle {
@@ -1753,7 +1981,15 @@ fn paint_gizmo(painter: &egui::Painter, draw: GizmoDrawData) {
     });
 }
 
-fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter) -> bool {
+/// Orientation from the rotation channels, ignoring negative scale signs.
+fn rotation_without_scale(app: &IncaApp, id: &str) -> DQuat {
+    let Some(n) = app.s.node(id) else { return DQuat::IDENTITY };
+    let ra = quat_from_euler_deg(n.xf.ra, "xyz");
+    let local = n.xf.jo_quat() * ra * quat_from_euler_deg(n.xf.r, &n.xf.ro) * ra.inverse();
+    app.s.parent_world(id).to_scale_rotation_translation().1 * local
+}
+
+fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter, interact: bool) -> bool {
     app.vp_state.gizmo_solo[idx] = None;
     let chan = channel_modes(app);
     if (!app.tool.is_manip() && chan.is_none()) || !app.vps[idx].show_manips {
@@ -1805,7 +2041,13 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         (c / n.max(1) as f64, rot)
     } else {
         let lead = objects.last().unwrap();
-        let rot = if app.space_world(tool) && tool != Tool::Scale { DQuat::IDENTITY } else { app.s.world_matrix(lead).to_scale_rotation_translation().1 };
+        let rot = if tool == Tool::Scale {
+            rotation_without_scale(app, lead)
+        } else if app.space_world(tool) {
+            DQuat::IDENTITY
+        } else {
+            app.s.world_matrix(lead).to_scale_rotation_translation().1
+        };
         (app.s.world_pivot(lead), rot)
     };
     let mut modes = match tool {
@@ -1833,7 +2075,8 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     // negative-axis arrows (`manipNegativeHandles`): translate and scale only, never in pivot mode
     let neg_axes: [bool; 3] = if app.prefs.manip_negative_handles && !pivot_mode {
         match mode_tool {
-            Tool::Scale => [modes.contains(GizmoMode::ScaleX), modes.contains(GizmoMode::ScaleY), modes.contains(GizmoMode::ScaleZ)],
+            // Maya's Scale tool has positive-axis cubes only.
+            Tool::Scale => [false; 3],
             Tool::Move => [modes.contains(GizmoMode::TranslateX), modes.contains(GizmoMode::TranslateY), modes.contains(GizmoMode::TranslateZ)],
             _ => [false; 3],
         }
@@ -1857,9 +2100,9 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     if manipulator_hidden(&app.prefs, ctrl, mods.shift, app.vp_state.drag.is_some()) {
         return false;
     }
-    let lmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Primary);
-    let mmb_pressed = resp.hovered() && pointer.button_pressed(egui::PointerButton::Middle) && !mods.alt;
-    let locked_pressed = app.lock_selection && lmb_pressed;
+    let lmb_pressed = interact && resp.hovered() && pointer.button_pressed(egui::PointerButton::Primary);
+    let mmb_pressed = interact && resp.hovered() && pointer.button_pressed(egui::PointerButton::Middle) && !mods.alt;
+    let locked_pressed = interact && app.lock_selection && lmb_pressed;
     // A new press during an old drag (for example LMB right after an MMB drag) must finish the
     // old drag and drop the gizmo's internal active subgizmo. Otherwise the new press keeps
     // driving the previous handle and the manipulator looks stuck.
@@ -1890,8 +2133,9 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         Tool::Move => Color32::from_rgb(240, 225, 80),
         _ => Color32::from_rgb(220, 220, 220),
     };
-    // Maya tints the handle under the cursor and the remembered active handle yellow.
-    visuals.highlight_color = Some(Color32::from_rgb(240, 225, 80));
+    // The interaction gizmo (drawn while rotating) keeps the strong yellow; the drawing gizmo
+    // below overrides this to pale yellow so hover and selected stay distinct.
+    visuals.highlight_color = Some(MANIP_SELECTED);
     // JS `dragStep`: grid snap (X) snaps translation to the grid spacing; discrete move / rotate /
     // scale each have their own step; holding J is a 15 degree rotate snap
     let key_x = mode_tool == Tool::Move && ui.input(|i| i.key_down(egui::Key::X));
@@ -2044,9 +2288,9 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     let drag_handle = app.vp_state.force_handle.filter(|f| f.0 == idx).map(|f| f.1).or(if app.vp_state.mmb == Some(idx) { active } else { app.vp_state.press_handle });
     let interaction = GizmoInteraction {
         cursor_pos: if auto_started { (auto_cursor.x, auto_cursor.y) } else { (cursor.x, cursor.y) },
-        hovered: !auto_pending && (resp.hovered() || app.vp_state.drag.is_some() || app.vp_state.mmb == Some(idx) || app.vp_state.force_handle.is_some_and(|f| f.0 == idx)),
-        drag_started: !auto_pending && (lmb_pressed || (app.vp_state.mmb == Some(idx) && pointer.button_pressed(egui::PointerButton::Middle)) || auto_started),
-        dragging: !auto_pending && (pointer.button_down(egui::PointerButton::Primary) || app.vp_state.mmb == Some(idx)),
+        hovered: interact && !auto_pending && (resp.hovered() || app.vp_state.drag.is_some() || app.vp_state.mmb == Some(idx) || app.vp_state.force_handle.is_some_and(|f| f.0 == idx)),
+        drag_started: interact && !auto_pending && (lmb_pressed || (app.vp_state.mmb == Some(idx) && pointer.button_pressed(egui::PointerButton::Middle)) || auto_started),
+        dragging: interact && !auto_pending && (pointer.button_down(egui::PointerButton::Primary) || app.vp_state.mmb == Some(idx)),
     };
     let focused_before = g.is_focused();
     let mut result = g.update(interaction, &[tf]);
@@ -2077,13 +2321,32 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         }
     });
     app.vp_state.gizmo_solo[idx] = solo;
+    // Handle under the cursor for the idle hover tint. During a press/drag the pressed-state
+    // drawing takes over instead.
+    let hover_handle = if interact && resp.hovered() && app.vp_state.drag.is_none() && !interaction.dragging {
+        handle_at(g.config(), cursor, &tf)
+    } else {
+        None
+    };
     let active_draw = app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).or_else(|| app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)));
     let plane_lock = if mode_tool == Tool::Move { active_draw.and_then(plane_lock_axis) } else { None };
     let snap = app.snap_grid || app.snap_point || app.snap_curve || ui.input(|i| i.key_down(egui::Key::X) || i.key_down(egui::Key::V) || i.key_down(egui::Key::C));
-    let center_square = mode_tool == Tool::Move
+    let move_center = mode_tool == Tool::Move
         && solo.map_or(true, |h| h == GizmoMode::TranslateView)
         && (plane_lock.is_some() || (modes.contains(GizmoMode::TranslateView) && !snap));
-    let center_color = center_square_color(active_draw);
+    let scale_center = mode_tool == Tool::Scale && solo.map_or(true, |h| h == GizmoMode::ScaleUniform);
+    let center_square = move_center || scale_center;
+    let center_color = if scale_center {
+        if hover_handle == Some(GizmoMode::ScaleUniform) {
+            MANIP_HOVER
+        } else {
+            scale_center_color(active_draw.or(active))
+        }
+    } else if hover_handle == Some(GizmoMode::TranslateView) {
+        MANIP_HOVER
+    } else {
+        center_square_color(active_draw)
+    };
     // The image was rendered before interaction, so during a drag it shows the previous drag
     // result. Draw the manipulator from that same transform instead of the new one.
     let visual_tf = if app.vp_state.drag.is_some() {
@@ -2093,19 +2356,57 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     };
     let draw_pivot = DVec3::from(visual_tf.translation);
     let draw_rot = DQuat::from(visual_tf.rotation);
+    let scale_drag_mode = if mode_tool == Tool::Scale {
+        app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).filter(|m| matches!(m, GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ))
+    } else {
+        None
+    };
+    let scale_pressed = if mode_tool == Tool::Scale && scale_drag_mode.is_none() && pointer.button_down(egui::PointerButton::Primary) {
+        app.vp_state.press_handle.filter(|m| matches!(m, GizmoMode::ScaleX | GizmoMode::ScaleY | GizmoMode::ScaleZ))
+    } else {
+        None
+    };
+    let scale_custom_axis = scale_drag_mode.or(scale_pressed);
+    let scale_uniform_drag = if mode_tool == Tool::Scale {
+        app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).filter(|m| *m == GizmoMode::ScaleUniform)
+    } else {
+        None
+    };
+    let scale_plane_drag = if mode_tool == Tool::Scale {
+        app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).filter(|m| matches!(m, GizmoMode::ScaleXY | GizmoMode::ScaleXZ | GizmoMode::ScaleYZ))
+    } else {
+        None
+    };
     let mut draw_base = base;
     draw_base.mode_override = None;
+    draw_base.visuals.highlight_color = Some(MANIP_HOVER);
     if let Some(h) = solo {
         // Keep the full mode set so the arrow geometry (inner radius / length) matches the full
         // gizmo; the override builds and draws only the active subgizmo.
-        draw_base.mode_override = Some(h);
+        if mode_tool != Tool::Scale {
+            draw_base.mode_override = Some(h);
+        }
+    }
+    if let Some(h) = scale_custom_axis {
+        draw_base.modes.remove(h);
+    }
+    if scale_uniform_drag.is_some() {
+        for m in [GizmoMode::ScaleX, GizmoMode::ScaleY, GizmoMode::ScaleZ] {
+            draw_base.modes.remove(m);
+        }
+    }
+    if let Some(h) = scale_plane_drag {
+        for i in previous_state_axes(Some(h)) {
+            draw_base.modes.remove([GizmoMode::ScaleX, GizmoMode::ScaleY, GizmoMode::ScaleZ][i]);
+        }
     }
     if center_square {
-        if solo == Some(GizmoMode::TranslateView) {
+        if solo == Some(GizmoMode::TranslateView) || solo == Some(GizmoMode::ScaleUniform) {
             draw_base.modes = EnumSet::new();
             draw_base.mode_override = None;
         } else {
             draw_base.modes.remove(GizmoMode::TranslateView);
+            draw_base.modes.remove(GizmoMode::ScaleUniform);
         }
     }
     if mode_tool == Tool::Move {
@@ -2113,9 +2414,15 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     }
     let mut draw_gizmo = Gizmo::new(draw_base);
     draw_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: solo.is_some() || resp.hovered(), drag_started: false, dragging: false }, &[visual_tf]);
-    let draw = draw_gizmo.draw();
+    let draw = if mode_tool == Tool::Rotate && app.vp_state.drag.as_ref().is_some_and(|d| d.vp == idx) {
+        // The interaction gizmo holds the active swept-arc state; the fresh drawing gizmo would
+        // only show the idle rings.
+        g.draw()
+    } else {
+        draw_gizmo.draw()
+    };
     // manipulator guide: a faint line along the axis being dragged (Preferences can hide it)
-    if app.prefs.manip_guides {
+    if app.prefs.manip_guides && mode_tool != Tool::Rotate {
         if let Some(d) = app.vp_state.drag.as_ref().filter(|d| d.vp == idx) {
             let axis = match d.handle {
                 Some(GizmoMode::TranslateX | GizmoMode::ScaleX | GizmoMode::RotateX) => Some(DVec3::X),
@@ -2133,7 +2440,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             }
         }
     }
-    if let Some(d) = app.vp_state.drag.as_ref().filter(|d| d.vp == idx) {
+    if let Some(d) = app.vp_state.drag.as_ref().filter(|d| d.vp == idx && d.tool == Tool::Move) {
         draw_previous_state(painter, d, cv, app.vps[idx].rect, gizmo_size, app.prefs.manip_prev_size * app.manip_size);
     }
     // Edit Pivot: a blue ring around the pivot, kept while dragging; an inner ring while point snap is on
@@ -2148,12 +2455,63 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         }
     }
     paint_gizmo(painter, draw);
+    if mode_tool == Tool::Rotate {
+        if let Some(d) = app.vp_state.drag.as_ref().filter(|d| d.vp == idx) {
+            draw_rotate_pie(painter, d, cv, app.vps[idx].rect, gizmo_size, app.prefs.manip_prev_size * app.manip_size);
+        }
+    }
+    if mode_tool == Tool::Scale {
+        let drag = app.vp_state.drag.as_ref().filter(|d| d.vp == idx && d.tool == Tool::Scale);
+        let factors = drag.map_or([1.0; 3], |d| {
+            let s = DVec3::from(d.start.scale);
+            let c = DVec3::from(d.cur.scale);
+            let f = |c: f64, s: f64| {
+                if s.abs() < 1e-9 {
+                    1.0
+                } else {
+                    let f = c / s;
+                    if f.abs() < 0.02 { 0.02 * if f < 0.0 { -1.0 } else { 1.0 } } else { f }
+                }
+            };
+            [f(c.x, s.x), f(c.y, s.y), f(c.z, s.z)]
+        });
+        if let Some(d) = drag {
+            draw_scale_previous(painter, d, cv, app.vps[idx].rect, gizmo_size, app.prefs.manip_prev_size * app.manip_size);
+        } else if let Some(h) = scale_pressed {
+            draw_scale_old_axes(painter, draw_pivot, draw_rot, cv, app.vps[idx].rect, gizmo_size, app.prefs.manip_prev_size * app.manip_size, &previous_state_axes(Some(h)));
+        }
+        if let Some(h) = scale_custom_axis {
+            let dragged = [
+                h == GizmoMode::ScaleX,
+                h == GizmoMode::ScaleY,
+                h == GizmoMode::ScaleZ,
+            ];
+            draw_scale_axis_cubes(painter, draw_pivot, draw_rot, cv, app.vps[idx].rect, gizmo_size, app.manip_size, Some(h), dragged, dragged, factors);
+        }
+        if scale_uniform_drag.is_some() {
+            // Uniform scaling moves all three axis cubes in or out together.
+            draw_scale_axis_cubes(painter, draw_pivot, draw_rot, cv, app.vps[idx].rect, gizmo_size, app.manip_size, Some(GizmoMode::ScaleUniform), [true; 3], [true; 3], factors);
+        }
+        if let Some(h) = scale_plane_drag {
+            // A plane drag moves the two free axes' cubes like a single-axis drag.
+            let mut free = [false; 3];
+            for i in previous_state_axes(Some(h)) {
+                free[i] = true;
+            }
+            draw_scale_axis_cubes(painter, draw_pivot, draw_rot, cv, app.vps[idx].rect, gizmo_size, app.manip_size, Some(h), free, free, factors);
+        }
+    }
     // Highlight a remembered/active handle by drawing it again in yellow above the full gizmo.
     // Using the gizmo's own geometry keeps the selected shape identical to the hovered one.
-    if solo.is_none() {
-        if let Some(h) = active_draw.filter(|m| !matches!(m, GizmoMode::TranslateView | GizmoMode::Arcball)) {
+    // Skip it while the cursor is on that handle so the pale hover tint stays visible.
+    if solo.is_none() && scale_custom_axis.is_none() && !(mode_tool == Tool::Rotate && app.vp_state.drag.as_ref().is_some_and(|d| d.vp == idx)) {
+        if let Some(h) = active_draw
+            .filter(|m| !matches!(m, GizmoMode::TranslateView | GizmoMode::ScaleUniform | GizmoMode::Arcball))
+            .filter(|m| hover_handle != Some(*m))
+        {
             let mut hl_base = base;
             hl_base.mode_override = Some(h);
+            hl_base.visuals.highlight_color = Some(MANIP_SELECTED);
             let mut hl_gizmo = Gizmo::new(hl_base);
             hl_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: true, drag_started: false, dragging: false }, &[visual_tf]);
             paint_gizmo(painter, hl_gizmo.draw());
@@ -2164,7 +2522,9 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     if neg_axes.iter().any(|b| *b) && app.vp_state.drag.is_none() {
         draw_negative_handles(painter, mode_tool, &neg_axes, draw_pivot, draw_rot, cv, rect, resp.hovered().then_some(cursor), gizmo_size);
     }
-    if center_square {
+    if scale_center {
+        draw_scale_center_cube(painter, draw_pivot, draw_rot, cv, rect, app.manip_size, center_color);
+    } else if center_square {
         draw_center_square(painter, draw_pivot, draw_rot, cv, rect, app.manip_size, plane_lock, center_color);
     }
     match result {
@@ -2212,7 +2572,8 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     Some((id.clone(), i, DVec3::new(g("translateX"), g("translateY"), g("translateZ"))))
                 });
                 let (comps, weights, mirror) = if extrude.is_some() { (vec![], vec![], vec![]) } else { (comps, weights, mirror) };
-                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag, press_px: auto_origin.or(mmb_press).unwrap_or(cursor), rebase });
+                let local_scales: Vec<DVec3> = objs.iter().map(|(o, _)| app.s.node(o).map(|n| DVec3::from(n.xf.s)).unwrap_or(DVec3::ONE)).collect();
+                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, local_scales, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag, press_px: auto_origin.or(mmb_press).unwrap_or(cursor), rebase });
             }
             let d = app.vp_state.drag.as_mut().unwrap();
             if let Some(n) = new_tfs.first() {
@@ -2316,6 +2677,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             let d = app.vp_state.drag.as_mut().unwrap();
             let delta = tf_matrix(&d.cur) * tf_matrix(&d.start).inverse();
             let objs = d.objects.clone();
+            let local_scales = d.local_scales.clone();
             let pivots = d.pivots.clone();
             let comps: Vec<(String, Vec<u32>, DragGeom)> = d.comps.iter().map(|(a, b, c)| match c {
                 DragGeom::Mesh(pm) => (a.clone(), b.clone(), DragGeom::Mesh(pm.clone())),
@@ -2330,8 +2692,21 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     }
                 }
                 None => {
-                    for (id, start) in objs {
-                        app.s.set_world_matrix(&id, delta * start);
+                    if mode_tool == Tool::Scale && comps.is_empty() {
+                        // Apply signed scale directly to the local channels. Going through the
+                        // world matrix forces the negative sign onto X during decomposition.
+                        let factor = DVec3::from(d.cur.scale) / DVec3::from(d.start.scale);
+                        for ((id, _), base) in objs.iter().zip(&local_scales) {
+                            if let Some(n) = app.s.nodes.get_mut(id) {
+                                n.xf.s = [base.x * factor.x, base.y * factor.y, base.z * factor.z];
+                                n.rev += 1;
+                            }
+                            app.s.refresh_dependents(id);
+                        }
+                    } else {
+                        for (id, start) in objs {
+                            app.s.set_world_matrix(&id, delta * start);
+                        }
                     }
                 }
             }
@@ -3333,5 +3708,85 @@ mod tests {
         let tip = cv.project(pivot + DVec3::Y, vp.rect).unwrap();
         let drag = (tip - origin) * 4.0;
         assert_eq!(auto_axis(Tool::Scale, pivot, DQuat::IDENTITY, &cv, vp.rect, origin, origin + drag), GizmoMode::ScaleY);
+    }
+
+    #[test]
+    fn uniform_scale_follows_horizontal_drag() {
+        let (cv, rect) = {
+            let mut s = Scene::new();
+            let id = s.create_mesh("polyCube", &Params::new(), None);
+            let mut vp = viewport::Viewport::new("persp");
+            vp.rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+            let b = s.world_bbox(&id);
+            viewport::frame_box(&mut s, "persp", &b, 800.0 / 600.0);
+            (viewport::cam_view(&s, "persp", [800.0, 600.0]), vp.rect)
+        };
+        let q = cv.project(DVec3::ZERO, rect).unwrap();
+        let tf = Transform::from_scale_rotation_translation(DVec3::ONE, DQuat::IDENTITY, DVec3::ZERO);
+        let drag = |dx: f32| {
+            let mut g = Gizmo::default();
+            g.update_config(GizmoConfig {
+                view_matrix: cv.view.into(),
+                projection_matrix: cv.proj.into(),
+                viewport: rect,
+                modes: GizmoMode::all_scale(),
+                mode_override: Some(GizmoMode::ScaleUniform),
+                orientation: GizmoOrientation::Local,
+                ..Default::default()
+            });
+            assert!(g.update(GizmoInteraction { cursor_pos: (q.x, q.y), hovered: true, drag_started: true, dragging: true }, std::slice::from_ref(&tf)).is_some());
+            let (_, out) = g.update(GizmoInteraction { cursor_pos: (q.x + dx, q.y), hovered: true, drag_started: false, dragging: true }, std::slice::from_ref(&tf)).unwrap();
+            out[0].scale
+        };
+        let right = drag(90.0);
+        assert!(right.x > 1.0 && right.x < 2.0, "dragging right must grow gently: {right:?}");
+        assert!(
+            (right.x - right.y).abs() < 1e-9 && (right.x - right.z).abs() < 1e-9,
+            "all three axes must scale together: {right:?}"
+        );
+        let left = drag(-90.0);
+        assert!(left.x > 0.0 && left.x < 1.0, "dragging left must shrink: {left:?}");
+        // past the pivot the factor goes negative and the object flips
+        let negative = drag(-240.0);
+        assert!(negative.x < 0.0, "dragging past zero must go negative: {negative:?}");
+        assert!(
+            (negative.x - negative.y).abs() < 1e-9 && (negative.x - negative.z).abs() < 1e-9,
+            "all three axes must stay uniform: {negative:?}"
+        );
+    }
+
+    #[test]
+    fn plane_scale_crosses_zero() {
+        let (cv, rect) = {
+            let mut s = Scene::new();
+            let id = s.create_mesh("polyCube", &Params::new(), None);
+            let mut vp = viewport::Viewport::new("persp");
+            vp.rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+            let b = s.world_bbox(&id);
+            viewport::frame_box(&mut s, "persp", &b, 800.0 / 600.0);
+            (viewport::cam_view(&s, "persp", [800.0, 600.0]), vp.rect)
+        };
+        let o = cv.project(DVec3::ZERO, rect).unwrap();
+        // ScaleXY sits at the X normal (the Y/Z corner); its drag axis is that diagonal.
+        let d = (cv.project(DVec3::Y + DVec3::Z, rect).unwrap() - o).normalized();
+        let tf = Transform::from_scale_rotation_translation(DVec3::ONE, DQuat::IDENTITY, DVec3::ZERO);
+        let mut g = Gizmo::default();
+        g.update_config(GizmoConfig {
+            view_matrix: cv.view.into(),
+            projection_matrix: cv.proj.into(),
+            viewport: rect,
+            modes: GizmoMode::all_scale(),
+            mode_override: Some(GizmoMode::ScaleXY),
+            orientation: GizmoOrientation::Local,
+            ..Default::default()
+        });
+        let press = o + d * 30.0;
+        assert!(g.update(GizmoInteraction { cursor_pos: (press.x, press.y), hovered: true, drag_started: true, dragging: true }, std::slice::from_ref(&tf)).is_some());
+        let drag = o - d * 60.0;
+        let (_, out) = g.update(GizmoInteraction { cursor_pos: (drag.x, drag.y), hovered: true, drag_started: false, dragging: true }, std::slice::from_ref(&tf)).unwrap();
+        let s = out[0].scale;
+        assert!((s.x - 1.0).abs() < 1e-6, "fixed axis must not scale: {s:?}");
+        assert!(s.y < 0.0, "free axes must go negative: {s:?}");
+        assert!((s.y - s.z).abs() < 1e-6, "both free axes take the same ratio: {s:?}");
     }
 }

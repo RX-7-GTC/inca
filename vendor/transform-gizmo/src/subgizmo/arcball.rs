@@ -58,7 +58,9 @@ impl SubGizmoKind for Arcball {
             let a = (a - origin).normalize();
             let b = (b - origin).normalize();
 
-            DQuat::from_axis_angle(a.cross(b).normalize(), a.dot(b).acos() * 10.0)
+            // The far-plane mapping makes screen drags feel much heavier than Maya's trackball;
+            // scale the angle up and invert the axis to match Maya's free-rotate direction.
+            DQuat::from_axis_angle(b.cross(a).normalize(), a.dot(b).acos() * 80.0)
         } else {
             DQuat::IDENTITY
         };

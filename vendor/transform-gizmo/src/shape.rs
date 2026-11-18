@@ -120,6 +120,7 @@ impl ShapeBuilder {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn arrow(&self, from: DVec3, to: DVec3, stroke: impl Into<Stroke>) -> Mesh {
         let stroke = stroke.into();
         let arrow_start = world_to_screen(self.viewport, self.mvp, from);
