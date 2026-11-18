@@ -413,6 +413,20 @@ fn cb_numeric_cell(
     r
 }
 
+/// Draft of the Edit Layer dialog: applied as one undo step on Save.
+#[derive(Clone)]
+pub struct LayerEditDraft {
+    pub id: String,
+    pub name: String,
+    pub mode: String,
+    pub visible: bool,
+    pub playback: bool,
+    pub color: Option<[f32; 3]>,
+    /// `false` = Index palette, `true` = RGB picker.
+    pub rgb: bool,
+    pub focus_name: bool,
+}
+
 #[derive(Default)]
 pub struct PanelState {
     pub outliner_filter: String,
@@ -521,6 +535,8 @@ pub struct PanelState {
     pub layer_custom_rgb: [f32; 3],
     /// Layer whose full colour picker window is open.
     pub layer_picker: Option<String>,
+    /// Edit Layer dialog draft, when open.
+    pub layer_edit: Option<LayerEditDraft>,
     /// Options > Make New Layers Current.
     pub layer_make_current: bool,
     /// Options > Add New Objects to Current Layer.
@@ -2862,6 +2878,7 @@ fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     if app.s.current_layer.as_ref().is_some_and(|id| !app.s.layers.iter().any(|l| &l.id == id)) {
         app.s.current_layer = None;
     }
+    layer_edit_dialog(app, ui.ctx());
     egui::Frame::NONE.fill(theme::BG2).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -2953,7 +2970,7 @@ fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             "Help" => {
                 if menu_item(app, ui, "Layer Editor Help") {
-                    app.help = "V hides the layer, P hides it during playback, and the T column cycles normal, template and reference. Use the toolbar to create, reorder, populate, select from and delete layers.".into();
+                    app.help = "V hides the layer, P hides it during playback, and the T column cycles normal, template and reference. Double-click a layer to edit its name, type, visibility and colour. Use the toolbar to create, reorder, populate, select from and delete layers.".into();
                 }
             }
             _ => {}
@@ -3370,6 +3387,15 @@ fn layer_context_menu(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
         app.select_names(&ids, SelMode::Replace);
         app.help = format!("Selected {} object(s) in the layer", ids.len());
     }
+    if menu_item(app, ui, "Edit Layer...") {
+        layer_open_edit(app, lid);
+    }
+    if menu_item(app, ui, "Rename...") {
+        if let Some(l) = app.s.layers.iter().find(|l| l.id == lid) {
+            app.panels.layer_rename = Some((lid.to_string(), l.name.clone()));
+            app.panels.layer_rename_new = true;
+        }
+    }
     ui.separator();
     ui.menu_button("Set All Layers", |ui| layer_set_entries(app, ui, LayerScope::All));
     ui.menu_button("Set Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::Selected));
@@ -3393,6 +3419,12 @@ fn layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
         return;
     }
     app.s.checkpoint("rename display layer");
+    layer_apply_rename(app, id, want);
+    app.s.touch();
+}
+
+fn layer_apply_rename(app: &mut IncaApp, id: &str, want: &str) {
+    let Some(old) = app.s.layers.iter().find(|l| l.id == id).map(|l| l.name.clone()) else { return };
     if !app.s.nodes.values().any(|n| n.name == old) {
         app.s.names.remove(&old);
     }
@@ -3400,7 +3432,178 @@ fn layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
     if let Some(l) = app.s.layers.iter_mut().find(|l| l.id == id) {
         l.name = name;
     }
+}
+
+/// Open the Edit Layer dialog for a display layer.
+fn layer_open_edit(app: &mut IncaApp, id: &str) {
+    let Some(l) = app.s.layers.iter().find(|l| l.id == id) else { return };
+    let color = if layer_has_color(&l.color) {
+        let c = layer_swatch_color(&l.color);
+        Some([c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0])
+    } else {
+        None
+    };
+    app.panels.layer_edit = Some(LayerEditDraft {
+        id: l.id.clone(),
+        name: l.name.clone(),
+        mode: l.mode.clone(),
+        visible: l.visible,
+        playback: l.playback,
+        color,
+        rgb: false,
+        focus_name: true,
+    });
+}
+
+/// Apply the Edit Layer dialog as a single undo step.
+fn layer_apply_edit(app: &mut IncaApp, d: &LayerEditDraft) {
+    let Some(l) = app.s.layers.iter().find(|l| l.id == d.id) else { return };
+    let old_name = l.name.clone();
+    let new_name = d.name.trim();
+    let name_changed = !new_name.is_empty() && new_name != old_name;
+    let color_now = if layer_has_color(&l.color) {
+        let c = layer_swatch_color(&l.color);
+        Some([c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0])
+    } else {
+        None
+    };
+    let color_changed = match (color_now, d.color) {
+        (None, None) => false,
+        (Some(a), Some(b)) => (0..3).any(|i| (a[i] - b[i]).abs() > 1.0 / 512.0),
+        _ => true,
+    };
+    if !(name_changed || color_changed || l.mode != d.mode || l.visible != d.visible || l.playback != d.playback) {
+        return;
+    }
+    app.s.checkpoint("edit display layer");
+    if name_changed {
+        layer_apply_rename(app, &d.id, new_name);
+    }
+    if let Some(l) = app.s.layers.iter_mut().find(|l| l.id == d.id) {
+        l.mode = d.mode.clone();
+        l.visible = d.visible;
+        l.playback = d.playback;
+        l.color = d.color.map(|c| json!([c[0] as f64, c[1] as f64, c[2] as f64]));
+    }
     app.s.touch();
+}
+
+/// Maya's Edit Layer window: name, display type, visible/playback and Index/RGB colour.
+fn layer_edit_dialog(app: &mut IncaApp, ctx: &egui::Context) {
+    let Some(mut draft) = app.panels.layer_edit.clone() else { return };
+    if !app.s.layers.iter().any(|l| l.id == draft.id) {
+        app.panels.layer_edit = None;
+        return;
+    }
+    let mut open = true;
+    let mut save = false;
+    let mut cancel = false;
+    let center = ctx.content_rect().center();
+    let mut window = egui::Window::new("Edit Layer")
+        .id(egui::Id::new("layer_edit_window"))
+        .collapsible(false)
+        .resizable(false);
+    // Centre on every open; once open the user can drag it and that position holds for the session.
+    if draft.focus_name {
+        window = window.current_pos(egui::pos2(center.x - 180.0, center.y - 140.0));
+    }
+    window
+        .open(&mut open)
+        .show(ctx, |ui| {
+            egui::Grid::new("layer_edit_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Name");
+                let resp = ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(170.0));
+                if draft.focus_name {
+                    resp.request_focus();
+                    draft.focus_name = false;
+                }
+                ui.end_row();
+                ui.label("Display Type");
+                egui::ComboBox::from_id_salt("layer_edit_type")
+                    .selected_text(match draft.mode.as_str() {
+                        "template" => "Template",
+                        "reference" => "Reference",
+                        _ => "Normal",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (k, label) in [("normal", "Normal"), ("template", "Template"), ("reference", "Reference")] {
+                            ui.selectable_value(&mut draft.mode, k.into(), label);
+                        }
+                    });
+                ui.end_row();
+                ui.label("Visible");
+                ui.checkbox(&mut draft.visible, "");
+                ui.end_row();
+                ui.label("Visible During Playback");
+                ui.checkbox(&mut draft.playback, "");
+                ui.end_row();
+                ui.label("Color");
+                egui::ComboBox::from_id_salt("layer_edit_color_mode")
+                    .selected_text(if draft.rgb { "RGB" } else { "Index" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut draft.rgb, false, "Index");
+                        ui.selectable_value(&mut draft.rgb, true, "RGB");
+                    });
+                ui.end_row();
+            });
+            if draft.rgb {
+                ui.horizontal(|ui| {
+                    let mut c = draft.color.unwrap_or([1.0; 3]);
+                    if color_edit(ui, egui::Id::new("layer_edit_rgb"), &mut c) {
+                        draft.color = Some(c);
+                    }
+                    if ui.button("Default").clicked() {
+                        draft.color = None;
+                    }
+                });
+            } else {
+                ui.add_space(2.0);
+                for row in LAYER_PALETTE.chunks(8) {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        for c in row {
+                            let (r, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+                            let color = Color32::from_rgb(c[0], c[1], c[2]);
+                            ui.painter().rect_filled(r, 2.0, color);
+                            let picked = draft.color.is_some_and(|x| {
+                                (x[0] - c[0] as f32 / 255.0).abs() < 0.002
+                                    && (x[1] - c[1] as f32 / 255.0).abs() < 0.002
+                                    && (x[2] - c[2] as f32 / 255.0).abs() < 0.002
+                            });
+                            ui.painter().rect_stroke(
+                                r,
+                                2.0,
+                                egui::Stroke::new(if picked { 2.0 } else { 1.0 }, if picked { Color32::WHITE } else { Color32::from_gray(0x22) }),
+                                egui::StrokeKind::Inside,
+                            );
+                            if resp.clicked() {
+                                draft.color = Some([c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]);
+                            }
+                        }
+                    });
+                }
+                if ui.button("Default").clicked() {
+                    draft.color = None;
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    save = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    if save {
+        layer_apply_edit(app, &draft);
+        app.panels.layer_edit = None;
+    } else if cancel || !open {
+        app.panels.layer_edit = None;
+    } else {
+        app.panels.layer_edit = Some(draft);
+    }
 }
 
 /// A small fixed-size V/P/T toggle. Painted by hand so hovering changes only the fill and
@@ -3643,8 +3846,7 @@ fn layer_row(app: &mut IncaApp, ui: &mut egui::Ui, l: &inca_core::scene::Layer) 
                 app.s.current_layer = Some(l.id.clone());
             }
             if name.double_clicked() {
-                app.panels.layer_rename = Some((l.id.clone(), l.name.clone()));
-                app.panels.layer_rename_new = true;
+                layer_open_edit(app, &l.id);
             }
             if name.secondary_clicked() && !selected {
                 app.panels.layer_sel = vec![l.id.clone()];
@@ -5338,6 +5540,34 @@ mod tests {
         assert_ne!(app.s.layers[0].name, taken, "rename reused another layer's name");
         layer_rename_commit(&mut app, &lid, "Characters");
         assert_eq!(app.s.layers[0].name, "Characters");
+    }
+
+    #[test]
+    fn layer_edit_applies_name_type_visibility_and_color() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        layer_create(&mut app, false);
+        let lid = app.s.layers[0].id.clone();
+        let draft = LayerEditDraft {
+            id: lid.clone(),
+            name: "Props".into(),
+            mode: "template".into(),
+            visible: false,
+            playback: false,
+            color: Some([1.0, 0.5, 0.25]),
+            rgb: true,
+            focus_name: false,
+        };
+        layer_apply_edit(&mut app, &draft);
+        let l = app.s.layers.iter().find(|l| l.id == lid).unwrap();
+        assert_eq!(l.name, "Props");
+        assert_eq!(l.mode, "template");
+        assert!(!l.visible);
+        assert!(!l.playback);
+        assert!(layer_has_color(&l.color));
+        assert!(l.shading, "unrelated layer fields must be preserved");
     }
 
     #[test]
