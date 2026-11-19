@@ -184,6 +184,12 @@ fn row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.end_row();
 }
 
+/// Boolean preference row: the checkbox carries its own label, Maya-style.
+fn bool_row(ui: &mut egui::Ui, label: &str, value: &mut bool) {
+    ui.checkbox(value, label);
+    ui.end_row();
+}
+
 fn combo(ui: &mut egui::Ui, id: &str, cur: &mut usize, opts: &[&str]) {
     egui::ComboBox::from_id_salt(id).selected_text(opts[(*cur).min(opts.len() - 1)]).show_ui(ui, |ui| {
         for (i, o) in opts.iter().enumerate() {
@@ -244,31 +250,22 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             row(ui, "Interface scaling", |ui| {
                 ui.add(egui::Slider::new(&mut app.prefs.ui_scale, 0.8..=1.5).step_by(0.05));
             });
-            row(ui, "Follow OS display scaling", |ui| {
-                ui.checkbox(&mut app.prefs.follow_os_scale, "");
-            });
+            bool_row(ui, "Follow OS display scaling", &mut app.prefs.follow_os_scale);
             row(ui, "Default menu set", |ui| {
                 let names: Vec<&str> = MENU_SETS.iter().map(|m| m.0).collect();
                 combo(ui, "pms", &mut app.prefs.menu_set, &names);
                 app.menu_set = MENU_SETS[app.prefs.menu_set.min(4)].1;
             });
-            row(ui, "Show tooltips", |ui| {
-                ui.checkbox(&mut app.prefs.tooltips, "");
-            });
-            row(ui, "Drop shadow", |ui| {
-                ui.checkbox(&mut app.prefs.menu_shadow, "");
-            });
-            row(ui, "Ask before quitting with unsaved changes", |ui| {
-                ui.checkbox(&mut app.prefs.confirm_quit, "");
-            });
+            bool_row(ui, "Show tooltips", &mut app.prefs.tooltips);
+            bool_row(ui, "Drop shadow", &mut app.prefs.menu_shadow);
+            bool_row(ui, "Ask before quitting with unsaved changes", &mut app.prefs.confirm_quit);
         }
         "UI Elements" => {
             theme::section_header(ui, "Visible UI Elements");
             ui.end_row();
             for (k, l) in crate::workspace::ELEMENTS {
                 let mut on = app.shown(k);
-                ui.label(*l);
-                if ui.checkbox(&mut on, "").changed() {
+                if ui.checkbox(&mut on, *l).changed() {
                     app.set_shown(k, on);
                 }
                 ui.end_row();
@@ -281,9 +278,7 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
                 let names: Vec<&str> = crate::viewport::BG_MODES.to_vec();
                 combo(ui, "pbg", &mut app.bg_mode, &names);
             });
-            row(ui, "Allow tumbling orthographic views", |ui| {
-                ui.checkbox(&mut app.prefs.ortho_tumble, "");
-            });
+            bool_row(ui, "Allow tumbling orthographic views", &mut app.prefs.ortho_tumble);
             theme::section_header(ui, "Grid");
             ui.end_row();
             row(ui, "Length and width", |ui| {
@@ -302,8 +297,7 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             ui.end_row();
             let h = &mut app.hud;
             for (l, v) in [("Poly count", &mut h.poly_count), ("Frame rate", &mut h.fps), ("Current frame", &mut h.frame), ("Camera names", &mut h.cam_names), ("View axis", &mut h.view_axis)] {
-                ui.label(l);
-                ui.checkbox(v, "");
+                ui.checkbox(v, l);
                 ui.end_row();
             }
         }
@@ -364,32 +358,18 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             row(ui, "Global scale", |ui| {
                 ui.add(egui::Slider::new(&mut app.manip_size, 0.2..=4.0));
             });
-            row(ui, "Show manipulator guides", |ui| {
-                ui.checkbox(&mut app.prefs.manip_guides, "");
-            });
+            bool_row(ui, "Show manipulator guides", &mut app.prefs.manip_guides);
             row(ui, "Previous state size", |ui| {
                 ui.add(egui::Slider::new(&mut app.prefs.manip_prev_size, 0.0..=16.0).max_decimals(1));
             });
-            row(ui, "Show manipulator in active view only", |ui| {
-                ui.checkbox(&mut app.prefs.manip_active_only, "");
-            });
-            row(ui, "Show plane handles", |ui| {
-                ui.checkbox(&mut app.prefs.manip_plane_handles, "");
-            });
-            row(ui, "Show negative axis handles", |ui| {
-                ui.checkbox(&mut app.prefs.manip_negative_handles, "");
-            });
+            bool_row(ui, "Show manipulator in active view only", &mut app.prefs.manip_active_only);
+            bool_row(ui, "Show plane handles", &mut app.prefs.manip_plane_handles);
+            bool_row(ui, "Show negative axis handles", &mut app.prefs.manip_negative_handles);
             theme::section_header(ui, "Manipulator Visibility");
             ui.end_row();
-            row(ui, "Hide Manipulator: When Ctrl is held", |ui| {
-                ui.checkbox(&mut app.prefs.hide_manip_ctrl, "");
-            });
-            row(ui, "When Shift is held", |ui| {
-                ui.checkbox(&mut app.prefs.hide_manip_shift, "");
-            });
-            row(ui, "When Ctrl+Shift is held", |ui| {
-                ui.checkbox(&mut app.prefs.hide_manip_ctrl_shift, "");
-            });
+            bool_row(ui, "Hide Manipulator: When Ctrl is held", &mut app.prefs.hide_manip_ctrl);
+            bool_row(ui, "When Shift is held", &mut app.prefs.hide_manip_shift);
+            bool_row(ui, "When Ctrl+Shift is held", &mut app.prefs.hide_manip_ctrl_shift);
         }
         "Animation" => {
             theme::section_header(ui, "Tangents");
@@ -427,9 +407,7 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             });
             theme::section_header(ui, "Construction History");
             ui.end_row();
-            row(ui, "Construction history on by default", |ui| {
-                ui.checkbox(&mut app.history_on, "");
-            });
+            bool_row(ui, "Construction history on by default", &mut app.history_on);
         }
         "Settings" => {
             theme::section_header(ui, "Working Units");
@@ -463,9 +441,7 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
         "Save" => {
             theme::section_header(ui, "Auto Save");
             ui.end_row();
-            row(ui, "Enable auto save", |ui| {
-                ui.checkbox(&mut app.autosave.0, "");
-            });
+            bool_row(ui, "Enable auto save", &mut app.autosave.0);
             row(ui, "Interval", |ui| {
                 ui.add(egui::DragValue::new(&mut app.autosave.1).speed(0.2).range(1.0..=600.0).suffix(" minutes"));
             });
@@ -474,9 +450,7 @@ fn category(app: &mut IncaApp, ui: &mut egui::Ui) {
             });
             theme::section_header(ui, "Save");
             ui.end_row();
-            row(ui, "Incremental save", |ui| {
-                ui.checkbox(&mut app.prefs.incremental_save, "");
-            });
+            bool_row(ui, "Incremental save", &mut app.prefs.incremental_save);
         }
         _ => {}
     });
