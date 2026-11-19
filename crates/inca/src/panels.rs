@@ -625,6 +625,9 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
             if menu_check(app, ui, o.sort_alpha, "Sort Alphabetical") {
                 o.sort_alpha = !o.sort_alpha;
             }
+            if menu_check(app, ui, !app.panels.cb_hide_namespace, "Show Namespace") {
+                app.panels.cb_hide_namespace = !app.panels.cb_hide_namespace;
+            }
             if menu_check(app, ui, o.ignore_outliner_color, "Ignore 'Use Outliner Color'") {
                 o.ignore_outliner_color = !o.ignore_outliner_color;
             }
@@ -743,6 +746,76 @@ fn plain_row(ui: &mut egui::Ui, depth: usize, icon: &str, text: &str, col: Color
     resp
 }
 
+/// Move `moving` next to `target` among its siblings (drag between Outliner rows).
+/// Returns false when nothing could move.
+fn outliner_reorder(app: &mut IncaApp, moving: &[String], target: &str, after: bool) -> bool {
+    let Some(t) = app.s.node(target) else { return false };
+    let parent = t.parent.clone();
+    let mut ids: Vec<String> = moving
+        .iter()
+        .filter(|i| i.as_str() != target && app.s.node(i).is_some())
+        .cloned()
+        .collect();
+    ids.sort();
+    ids.dedup();
+    // Drop children of other moved nodes, and ancestors of the target (invalid parents).
+    let kept: Vec<String> = ids
+        .iter()
+        .filter(|i| !ids.iter().any(|j| j != *i && app.s.is_ancestor(j, i)))
+        .filter(|i| !app.s.is_ancestor(i, target))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return false;
+    }
+    app.s.checkpoint("reorder in outliner");
+    for mid in &kept {
+        app.s.reparent(mid, parent.as_deref(), None);
+    }
+    let siblings = app.s.children(parent.as_deref()).to_vec();
+    let Some(pos) = siblings.iter().position(|s| s == target) else { return false };
+    let mut at = if after { pos + 1 } else { pos };
+    for mid in &kept {
+        app.s.reparent(mid, parent.as_deref(), Some(at));
+        at += 1;
+    }
+    true
+}
+
+/// Text for the Outliner drag preview: packs names up to `DRAG_LINE` characters, breaking only
+/// between names. An individual name longer than the line is ellipsized, never cut mid-name.
+/// Only the first few names are shown so a large selection cannot grow the tooltip forever.
+fn outliner_drag_text(names: &[String]) -> String {
+    const DRAG_LINE: usize = 32;
+    const MAX_NAMES: usize = 10;
+    let shown = &names[..names.len().min(MAX_NAMES)];
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for name in shown {
+        let name = if name.chars().count() > DRAG_LINE {
+            format!("{}…", name.chars().take(DRAG_LINE - 1).collect::<String>())
+        } else {
+            name.clone()
+        };
+        if line.is_empty() {
+            line = name;
+        } else if line.chars().count() + 2 + name.chars().count() <= DRAG_LINE {
+            line.push_str(", ");
+            line.push_str(&name);
+        } else {
+            lines.push(std::mem::take(&mut line));
+            line = name;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if names.len() > MAX_NAMES {
+        lines.push(format!("… +{} more", names.len() - MAX_NAMES));
+    }
+    lines.join("\n")
+}
+
 fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, filter: &str, rows: &mut Vec<String>) {
     if !matches_filter(app, id, filter) {
         return;
@@ -783,8 +856,13 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
     }
     let x0 = r.min.x + 4.0 + depth as f32 * 16.0;
     let exp_rect = egui::Rect::from_min_size(egui::pos2(x0, r.min.y), egui::vec2(12.0, ROW_H));
-    // drop target: dragging selected rows onto this one parents them here
-    let drop_here = resp.dnd_hover_payload::<Vec<String>>().is_some_and(|p| !p.iter().any(|x| x == id));
+    // Drop zones: top/bottom quarter reorders siblings, the middle reparents.
+    let drop_payload = resp.dnd_hover_payload::<Vec<String>>();
+    let drop_ok = drop_payload.as_ref().is_some_and(|p| !p.iter().any(|x| x == id));
+    let drop_zone = drop_ok.then(|| {
+        let rel = ui.ctx().pointer_latest_pos().map(|p| (p.y - r.top()) / r.height()).unwrap_or(0.5);
+        if rel < 0.25 { 0 } else if rel > 0.75 { 2 } else { 1 }
+    });
     let bg = if selected {
         Some(theme::HI)
     } else if resp.hovered() {
@@ -795,8 +873,18 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
     if let Some(c) = bg {
         ui.painter().rect_filled(r, 0.0, c);
     }
-    if drop_here {
-        ui.painter().rect_stroke(r, 0.0, egui::Stroke::new(1.0, Color32::from_rgb(0x8f, 0xd0, 0xff)), egui::StrokeKind::Inside);
+    let drop_color = Color32::from_rgb(0x8f, 0xd0, 0xff);
+    match drop_zone {
+        Some(0) => {
+            ui.painter().line_segment([r.left_top(), r.right_top()], egui::Stroke::new(2.0, drop_color));
+        }
+        Some(2) => {
+            ui.painter().line_segment([r.left_bottom(), r.right_bottom()], egui::Stroke::new(2.0, drop_color));
+        }
+        Some(1) => {
+            ui.painter().rect_stroke(r, 0.0, egui::Stroke::new(1.0, drop_color), egui::StrokeKind::Inside);
+        }
+        _ => {}
     }
     let dim = if hidden { 110 } else { 255 };
     if has_kids {
@@ -883,15 +971,31 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
         if let (Some(p), Some(ids)) = (ui.ctx().pointer_latest_pos(), egui::DragAndDrop::payload::<Vec<String>>(ui.ctx())) {
             let names: Vec<String> = ids.iter().map(|i| app.s.name_of(i)).collect();
             egui::Area::new(egui::Id::new("ol-drag")).fixed_pos(p + egui::vec2(12.0, 6.0)).order(egui::Order::Tooltip).show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(names.join(", ")));
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.add(egui::Label::new(outliner_drag_text(&names)).wrap_mode(egui::TextWrapMode::Extend));
+                });
             });
         }
     }
     if let Some(ids) = resp.dnd_release_payload::<Vec<String>>() {
-        let moving: Vec<String> = ids.iter().filter(|i| i.as_str() != id && app.s.node(i).is_some_and(|n| !n.startup())).map(|i| app.s.name_of(i)).collect();
-        if !moving.is_empty() && !startup {
-            let _ = app.run_mel("parent", &format!("parent {} {name};", moving.join(" ")));
-            app.panels.expanded.insert(id.to_string());
+        if !startup {
+            let rel = ui.ctx().pointer_latest_pos().map(|p| (p.y - r.top()) / r.height()).unwrap_or(0.5);
+            let moving: Vec<String> = ids
+                .iter()
+                .filter(|i| i.as_str() != id && app.s.node(i).is_some_and(|n| !n.startup()))
+                .cloned()
+                .collect();
+            if !moving.is_empty() {
+                if (0.25..=0.75).contains(&rel) {
+                    app.s.checkpoint("parent in outliner");
+                    for mid in &moving {
+                        app.s.reparent(mid, Some(id), None);
+                    }
+                    app.panels.expanded.insert(id.to_string());
+                } else {
+                    outliner_reorder(app, &moving, id, rel > 0.75);
+                }
+            }
         }
     }
     resp.context_menu(|ui| {
@@ -5715,6 +5819,45 @@ mod tests {
         assert!(!l.playback);
         assert!(layer_has_color(&l.color));
         assert!(l.shading, "unrelated layer fields must be preserved");
+    }
+
+    #[test]
+    fn outliner_reorder_moves_siblings() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let p = app.s.create_group("grp", None);
+        let a = app.s.create_group("a", Some(p.as_str()));
+        let b = app.s.create_group("b", Some(p.as_str()));
+        let c = app.s.create_group("c", Some(p.as_str()));
+        let names = |app: &IncaApp| -> Vec<String> { app.s.children(Some(p.as_str())).iter().map(|i| app.s.name_of(i)).collect() };
+        outliner_reorder(&mut app, std::slice::from_ref(&c), &a, false);
+        assert_eq!(names(&app), vec!["c", "a", "b"]);
+        outliner_reorder(&mut app, std::slice::from_ref(&c), &b, true);
+        assert_eq!(names(&app), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn outliner_drag_preview_keeps_names_intact() {
+        let names = vec![
+            "pCube1".to_string(),
+            "pCylinder1".to_string(),
+            "a_very_long_object_name_that_will_not_fit".to_string(),
+        ];
+        let text = outliner_drag_text(&names);
+        for line in text.lines() {
+            assert!(line.chars().count() <= 32, "line too long: {line}");
+            assert!(!line.starts_with('…') && !line.ends_with("…,…"), "mid-name break: {line}");
+        }
+        assert!(text.contains("pCube1, pCylinder1"), "{text}");
+        assert!(text.ends_with('…'), "long name must be ellipsized: {text}");
+        assert!(!text.contains('\n') || !text.lines().last().unwrap().contains(','), "the long name should be alone on its line");
+
+        let many: Vec<String> = (0..20).map(|i| format!("pCube{i}")).collect();
+        let text = outliner_drag_text(&many);
+        assert!(text.contains("+10 more"), "{text}");
+        assert!(text.lines().count() <= 8, "the preview must stay bounded: {text}");
     }
 
     #[test]
