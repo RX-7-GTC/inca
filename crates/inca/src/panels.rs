@@ -541,6 +541,12 @@ pub struct PanelState {
     pub layer_attrs: Option<String>,
     /// Layer whose Membership window is open.
     pub layer_membership: Option<String>,
+    /// Objects selected in the Membership editor's object pane.
+    pub membership_sel: Vec<String>,
+    /// Search filter for the Membership editor's object pane.
+    pub membership_filter: String,
+    /// Expanded display layers in the Membership editor's Layers pane.
+    pub membership_layers_open: std::collections::HashSet<String>,
     /// Options > Make New Layers Current.
     pub layer_make_current: bool,
     /// Options > Add New Objects to Current Layer.
@@ -3739,13 +3745,33 @@ fn layer_open_attrs(app: &mut IncaApp, id: &str) {
 fn layer_open_membership(app: &mut IncaApp, id: &str) {
     if app.s.layers.iter().any(|l| l.id == id) {
         app.panels.layer_membership = Some(id.to_string());
+        app.panels.membership_sel.clear();
+        app.panels.membership_filter.clear();
+        app.panels.membership_layers_open.insert(id.to_string());
     }
 }
 
-fn layer_set_member(app: &mut IncaApp, lid: &str, nid: &str, member: bool) {
-    app.s.checkpoint("layer membership");
-    if let Some(n) = app.s.nodes.get_mut(nid) {
-        n.layer = if member { Some(lid.to_string()) } else { None };
+/// Connect or disconnect several objects in one undo step. Objects already on another layer are
+/// moved when adding; removing only touches objects that belong to this layer.
+fn layer_set_members(app: &mut IncaApp, lid: &str, ids: &[String], member: bool) {
+    let ids: Vec<String> = ids
+        .iter()
+        .filter(|id| {
+            app.s.node(id).is_some_and(|n| {
+                let is_member = n.layer.as_deref() == Some(lid);
+                if member { !is_member } else { is_member }
+            })
+        })
+        .cloned()
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    app.s.checkpoint(if member { "add objects to display layer" } else { "remove objects from display layer" });
+    for id in ids {
+        if let Some(n) = app.s.nodes.get_mut(&id) {
+            n.layer = if member { Some(lid.to_string()) } else { None };
+        }
     }
     app.s.touch();
 }
@@ -3812,48 +3838,216 @@ fn layer_attrs_dialog(app: &mut IncaApp, ctx: &egui::Context) {
     }
 }
 
-/// Membership editor: tick the objects that belong to a display layer.
+/// Relationship Editor: Layers on the left, scene objects on the right, with + / - to connect
+/// the selected objects to the selected display layer.
 fn layer_membership_dialog(app: &mut IncaApp, ctx: &egui::Context) {
-    let Some(id) = app.panels.layer_membership.clone() else { return };
-    let Some(name) = app.s.layers.iter().find(|l| l.id == id).map(|l| l.name.clone()) else {
+    let Some(lid) = app.panels.layer_membership.clone() else { return };
+    let Some(layer_name) = app.s.layers.iter().find(|l| l.id == lid).map(|l| l.name.clone()) else {
         app.panels.layer_membership = None;
         return;
     };
-    let mut nodes: Vec<(String, String, bool)> = app
-        .s
-        .nodes
-        .values()
-        .map(|n| (n.id.clone(), n.name.clone(), n.layer.as_deref() == Some(id.as_str())))
-        .collect();
-    nodes.sort_by(|a, b| a.1.cmp(&b.1));
-    let total = nodes.len();
+    let layers: Vec<(String, String, Option<serde_json::Value>)> = app.s.layers.iter().map(|l| (l.id.clone(), l.name.clone(), l.color.clone())).collect();
     let mut open = true;
-    let mut toggle: Option<(String, bool)> = None;
+    let mut add: Option<Vec<String>> = None;
+    let mut remove: Option<Vec<String>> = None;
     let center = ctx.content_rect().center();
-    egui::Window::new("Layer Membership")
-        .id(egui::Id::new("layer_membership_window"))
-        .collapsible(false)
-        .resizable(false)
-        .default_pos(egui::pos2(center.x - 150.0, center.y - 180.0))
+    let selected_count = app.panels.membership_sel.len();
+    egui::Window::new("Relationship Editor")
+        .id(egui::Id::new("layer_membership_editor"))
+        .default_size([640.0, 470.0])
+        .resizable(true)
+        .default_pos(egui::pos2(center.x - 320.0, center.y - 235.0))
         .open(&mut open)
         .show(ctx, |ui| {
-            ui.label(RichText::new(&name).strong());
-            ui.label(RichText::new(format!("{total} objects")).color(theme::TEXT_DIM));
-            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                ui.set_min_width(240.0);
-                for (nid, nname, member) in &nodes {
-                    let mut m = *member;
-                    if ui.checkbox(&mut m, nname).changed() {
-                        toggle = Some((nid.clone(), m));
-                    }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Display layers").strong());
+                let can = selected_count > 0;
+                if ui.add_enabled(can, egui::Button::new("+")).on_hover_text("Add selected objects to the layer").clicked() {
+                    add = Some(app.panels.membership_sel.clone());
                 }
+                if ui.add_enabled(can, egui::Button::new("-")).on_hover_text("Remove selected objects from the layer").clicked() {
+                    remove = Some(app.panels.membership_sel.clone());
+                }
+                ui.separator();
+                ui.label(RichText::new(format!("{layer_name} — {selected_count} selected")).color(theme::TEXT_DIM));
+            });
+            ui.separator();
+            let pane_h = 340.0;
+            ui.columns(2, |cols| {
+                cols[0].vertical(|ui| {
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Layers").strong()));
+                    egui::ScrollArea::vertical().id_salt("membership_layers").max_height(pane_h).auto_shrink([false, false]).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        for (id, lname, color) in &layers {
+                            let selected = app.panels.layer_membership.as_deref() == Some(id.as_str());
+                            let expanded = app.panels.membership_layers_open.contains(id);
+                            let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+                            if selected {
+                                ui.painter().rect_filled(r, 0.0, theme::HI);
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(r, 0.0, Color32::from_gray(0x4d));
+                            }
+                            let exp = egui::Rect::from_min_size(egui::pos2(r.min.x + 4.0, r.center().y - 6.0), egui::vec2(12.0, 12.0));
+                            let exp_hot = resp.hovered() && ui.ctx().pointer_hover_pos().is_some_and(|p| exp.contains(p));
+                            ui.painter().rect_filled(exp, 1.0, if exp_hot { Color32::from_gray(0x55) } else { Color32::from_gray(0x30) });
+                            ui.painter().rect_stroke(exp, 1.0, egui::Stroke::new(1.0, Color32::from_gray(0x88)), egui::StrokeKind::Inside);
+                            let ec = exp.center();
+                            ui.painter().line_segment([egui::pos2(ec.x - 3.0, ec.y), egui::pos2(ec.x + 3.0, ec.y)], egui::Stroke::new(1.0, theme::TEXT));
+                            if !expanded {
+                                ui.painter().line_segment([egui::pos2(ec.x, ec.y - 3.0), egui::pos2(ec.x, ec.y + 3.0)], egui::Stroke::new(1.0, theme::TEXT));
+                            }
+                            let sw = egui::Rect::from_center_size(egui::pos2(r.min.x + 26.0, r.center().y), egui::vec2(12.0, 12.0));
+                            let c = layer_swatch_color(color);
+                            if c == Color32::TRANSPARENT {
+                                ui.painter().rect_stroke(sw, 1.0, egui::Stroke::new(1.0, Color32::from_gray(0x99)), egui::StrokeKind::Inside);
+                            } else {
+                                ui.painter().rect_filled(sw, 1.0, c);
+                            }
+                            ui.painter().text(egui::pos2(r.min.x + 38.0, r.center().y), egui::Align2::LEFT_CENTER, lname, egui::FontId::proportional(12.0), if selected { Color32::WHITE } else { theme::TEXT });
+                            let on_exp = resp.interact_pointer_pos().is_some_and(|p| exp.contains(p));
+                            if resp.clicked() {
+                                if on_exp {
+                                    if expanded {
+                                        app.panels.membership_layers_open.remove(id);
+                                    } else {
+                                        app.panels.membership_layers_open.insert(id.clone());
+                                    }
+                                } else {
+                                    app.panels.layer_membership = Some(id.clone());
+                                    app.panels.membership_sel.clear();
+                                }
+                            }
+                            if expanded {
+                                let mut members: Vec<(String, String)> = app
+                                    .s
+                                    .nodes
+                                    .values()
+                                    .filter(|n| n.layer.as_deref() == Some(id.as_str()))
+                                    .map(|n| (n.id.clone(), n.name.clone()))
+                                    .collect();
+                                members.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                                for (mid, mname) in members {
+                                    let (cr, cresp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+                                    let sel = app.panels.membership_sel.iter().any(|s| s == &mid);
+                                    if sel {
+                                        ui.painter().rect_filled(cr, 0.0, theme::HI);
+                                    } else if cresp.hovered() {
+                                        ui.painter().rect_filled(cr, 0.0, Color32::from_gray(0x4d));
+                                    }
+                                    let lx = r.min.x + 10.0;
+                                    let cy = cr.center().y;
+                                    let line = egui::Stroke::new(1.0, Color32::from_gray(0x77));
+                                    ui.painter().line_segment([egui::pos2(lx, r.bottom()), egui::pos2(lx, cy)], line);
+                                    ui.painter().line_segment([egui::pos2(lx, cy), egui::pos2(lx + 8.0, cy)], line);
+                                    ui.painter().circle_filled(egui::pos2(lx + 9.0, cy), 2.0, Color32::from_gray(0xa0));
+                                    if let Some(n) = app.s.node(&mid) {
+                                        let icon = kind_icon(n);
+                                        crate::icons::paint(ui, egui::Rect::from_min_size(egui::pos2(r.min.x + 22.0, cy - 7.5), egui::vec2(15.0, 15.0)), icon, Color32::from_white_alpha(255));
+                                    }
+                                    let display = shown_node_name(app, &mname);
+                                    ui.painter().text(egui::pos2(r.min.x + 40.0, cy), egui::Align2::LEFT_CENTER, display, egui::FontId::proportional(12.0), if sel { Color32::WHITE } else { theme::TEXT });
+                                    if cresp.clicked() {
+                                        app.panels.layer_membership = Some(id.clone());
+                                        app.panels.membership_sel = vec![mid];
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+                cols[1].vertical(|ui| {
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Objects").strong()));
+                    ui.add(egui::TextEdit::singleline(&mut app.panels.membership_filter).hint_text("Search...").desired_width(f32::INFINITY));
+                    let filter = app.panels.membership_filter.trim().to_lowercase().replace('*', "");
+                    egui::ScrollArea::vertical().id_salt("membership_objects").max_height(pane_h).auto_shrink([false, false]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.set_min_width(ui.available_width());
+                        for root in app.s.roots.clone() {
+                            membership_obj_row(app, ui, &root, 0, &filter, &lid);
+                        }
+                    });
+                });
             });
         });
     if !open {
         app.panels.layer_membership = None;
+        app.panels.membership_sel.clear();
+        app.panels.membership_filter.clear();
+    } else {
+        if let Some(ids) = add {
+            layer_set_members(app, &lid, &ids, true);
+        }
+        if let Some(ids) = remove {
+            layer_set_members(app, &lid, &ids, false);
+        }
     }
-    if let Some((nid, member)) = toggle {
-        layer_set_member(app, &id, &nid, member);
+}
+
+/// One object row in the Membership editor's tree. Selection is local to the editor; a dot marks
+/// objects already connected to the layer.
+fn membership_obj_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, filter: &str, lid: &str) {
+    if !matches_filter(app, id, filter) {
+        return;
+    }
+    let Some(n) = app.s.node(id) else { return };
+    let full_name = n.name.clone();
+    let name = shown_node_name(app, &full_name);
+    let icon = kind_icon(n);
+    let member = n.layer.as_deref() == Some(lid);
+    let mut kids = n.children.clone();
+    if app.panels.ol.sort_alpha {
+        kids.sort_by_key(|k| app.s.name_of(k).to_lowercase());
+    }
+    let has_kids = !kids.is_empty();
+    let open = has_kids && (app.panels.expanded.contains(id) || !filter.is_empty());
+    let selected = app.panels.membership_sel.iter().any(|s| s == id);
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::click());
+    if selected {
+        ui.painter().rect_filled(r, 0.0, theme::HI);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(r, 0.0, Color32::from_gray(0x4d));
+    }
+    let x0 = r.min.x + 4.0 + depth as f32 * 14.0;
+    let exp_rect = egui::Rect::from_min_size(egui::pos2(x0, r.min.y), egui::vec2(12.0, ROW_H));
+    if has_kids {
+        let c = exp_rect.center();
+        let pts = if open {
+            vec![c + egui::vec2(-3.5, -2.0), c + egui::vec2(3.5, -2.0), c + egui::vec2(0.0, 2.5)]
+        } else {
+            vec![c + egui::vec2(-2.0, -3.5), c + egui::vec2(2.5, 0.0), c + egui::vec2(-2.0, 3.5)]
+        };
+        ui.painter().add(egui::Shape::convex_polygon(pts, theme::TEXT, egui::Stroke::NONE));
+    }
+    crate::icons::paint(ui, egui::Rect::from_min_size(egui::pos2(x0 + 12.0, r.center().y - 7.5), egui::vec2(15.0, 15.0)), icon, Color32::from_white_alpha(255));
+    ui.painter().text(egui::pos2(x0 + 32.0, r.center().y), egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(12.0), if selected { Color32::WHITE } else { theme::TEXT });
+    if member {
+        ui.painter().circle_filled(egui::pos2(r.right() - 8.0, r.center().y), 3.0, Color32::from_rgb(0x7f, 0xd0, 0x9a));
+    }
+    let on_exp = resp.interact_pointer_pos().is_some_and(|p| exp_rect.contains(p));
+    if resp.clicked() {
+        if on_exp && has_kids {
+            if open {
+                app.panels.expanded.remove(id);
+            } else {
+                app.panels.expanded.insert(id.to_string());
+            }
+        } else {
+            let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            if ctrl {
+                if selected {
+                    app.panels.membership_sel.retain(|s| s != id);
+                } else {
+                    app.panels.membership_sel.push(id.to_string());
+                }
+            } else {
+                app.panels.membership_sel = vec![id.to_string()];
+            }
+        }
+    }
+    if open {
+        for k in kids {
+            membership_obj_row(app, ui, &k, depth + 1, filter, lid);
+        }
     }
 }
 
@@ -5869,10 +6063,16 @@ mod tests {
         let nid = app.s.create_mesh("polyCube", &Params::new(), None);
         layer_create(&mut app, false);
         let lid = app.s.layers[0].id.clone();
-        layer_set_member(&mut app, &lid, &nid, true);
+        layer_set_members(&mut app, &lid, std::slice::from_ref(&nid), true);
         assert_eq!(app.s.node(&nid).unwrap().layer.as_deref(), Some(lid.as_str()));
-        layer_set_member(&mut app, &lid, &nid, false);
+        layer_set_members(&mut app, &lid, std::slice::from_ref(&nid), false);
         assert!(app.s.node(&nid).unwrap().layer.is_none());
+        // removing from a different layer must not clear this object's membership
+        layer_create(&mut app, false);
+        let other = app.s.layers[1].id.clone();
+        layer_set_members(&mut app, &lid, std::slice::from_ref(&nid), true);
+        layer_set_members(&mut app, &other, std::slice::from_ref(&nid), false);
+        assert_eq!(app.s.node(&nid).unwrap().layer.as_deref(), Some(lid.as_str()));
     }
 
     #[test]
