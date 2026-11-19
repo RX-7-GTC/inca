@@ -537,8 +537,10 @@ pub struct PanelState {
     pub layer_picker: Option<String>,
     /// Edit Layer dialog draft, when open.
     pub layer_edit: Option<LayerEditDraft>,
-    /// Layer whose Attributes window is open.
-    pub layer_attrs: Option<String>,
+    /// Display layer shown in the Attribute Editor (until the scene selection changes).
+    pub ae_layer: Option<String>,
+    /// Scene selection captured when the layer was loaded into the AE.
+    pub ae_layer_sel: Vec<String>,
     /// Layer whose Membership window is open.
     pub layer_membership: Option<String>,
     /// Objects selected in the Membership editor's object pane.
@@ -2993,7 +2995,6 @@ fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         app.s.current_layer = None;
     }
     layer_edit_dialog(app, ui.ctx());
-    layer_attrs_dialog(app, ui.ctx());
     layer_membership_dialog(app, ui.ctx());
     egui::Frame::NONE.fill(theme::BG2).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -3059,7 +3060,7 @@ fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 if menu_item(app, ui, "Attributes...") {
                     let id = app.panels.layer_sel.first().cloned().or_else(|| app.s.current_layer.clone());
                     if let Some(id) = id {
-                        layer_open_attrs(app, &id);
+                        layer_open_attributes(app, &id);
                     }
                 }
                 ui.separator();
@@ -3538,7 +3539,7 @@ fn layer_context_menu(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
         layer_open_membership(app, lid);
     }
     if menu_item(app, ui, "Attributes...") {
-        layer_open_attrs(app, lid);
+        layer_open_attributes(app, lid);
     }
 }
 
@@ -3736,9 +3737,15 @@ fn layer_edit_dialog(app: &mut IncaApp, ctx: &egui::Context) {
     }
 }
 
-fn layer_open_attrs(app: &mut IncaApp, id: &str) {
+/// Load a display layer into the Attribute Editor and switch the right dock to it.
+fn layer_open_attributes(app: &mut IncaApp, id: &str) {
     if app.s.layers.iter().any(|l| l.id == id) {
-        app.panels.layer_attrs = Some(id.to_string());
+        app.panels.ae_layer = Some(id.to_string());
+        app.panels.ae_layer_sel = app.s.sel.clone();
+        app.panels.ae_locked = None;
+        app.right_tab = crate::app::RightTab::AttributeEditor;
+        app.show_right = true;
+        app.panels.ae_tab_scroll = 0.0;
     }
 }
 
@@ -3776,64 +3783,131 @@ fn layer_set_members(app: &mut IncaApp, lid: &str, ids: &[String], member: bool)
     app.s.touch();
 }
 
-/// Maya's layer Attribute Editor: the extra layer attributes not shown in the Edit Layer window.
-fn layer_attrs_dialog(app: &mut IncaApp, ctx: &egui::Context) {
-    let Some(id) = app.panels.layer_attrs.clone() else { return };
-    let Some((name, number)) = app.s.layers.iter().enumerate().find(|(_, l)| l.id == id).map(|(i, l)| (l.name.clone(), i + 1)) else {
-        app.panels.layer_attrs = None;
+/// Display layer attributes inside the Attribute Editor panel.
+fn layer_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
+    let Some(name) = app.s.layers.iter().find(|l| l.id == lid).map(|l| l.name.clone()) else { return };
+    if app.panels.ae_name.0 != name {
+        app.panels.ae_name = (name.clone(), name.clone());
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("displayLayer:").color(theme::TEXT_DIM));
+        let w = (ui.available_width() - 130.0).max(40.0);
+        let te = ui.add(egui::TextEdit::singleline(&mut app.panels.ae_name.1).desired_width(w));
+        if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let new = app.panels.ae_name.1.trim().to_string();
+            if !new.is_empty() && new != name {
+                app.s.checkpoint("rename display layer");
+                layer_apply_rename(app, lid, &new);
+                app.s.touch();
+            }
+        }
+        if ui.button("Focus").on_hover_text("Show the layer in the Layer Editor").clicked() {
+            app.panels.layer_tab = 0;
+            app.panels.layer_sel = vec![lid.to_string()];
+        }
+    });
+    let h = ui.available_height() - 26.0;
+    egui::ScrollArea::vertical().id_salt("layer_aescroll").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| {
+        layer_ae_body(app, ui, lid);
+    });
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui.add_sized([88.0, 20.0], egui::Button::new("Select")).on_hover_text("Select the objects in this layer").clicked() {
+            let ids: Vec<String> = app.s.nodes.values().filter(|n| n.layer.as_deref() == Some(lid)).map(|n| n.id.clone()).collect();
+            app.select_names(&ids, SelMode::Replace);
+        }
+        if ui.add_sized([72.0, 20.0], egui::Button::new("Close")).clicked() {
+            app.show_right = false;
+            app.panels.ae_layer = None;
+        }
+    });
+}
+
+fn layer_ae_body(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
+    let Some((number, mut enabled, mut shading, mut texturing, mut anim_playback, mut visible, mut lod, mut mode, mut color)) = app
+        .s
+        .layers
+        .iter()
+        .enumerate()
+        .find(|(_, l)| l.id == lid)
+        .map(|(i, l)| {
+            let color = if layer_has_color(&l.color) {
+                let c = layer_swatch_color(&l.color);
+                Some([c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0])
+            } else {
+                None
+            };
+            (i + 1, l.enabled, l.shading, l.texturing, l.anim_playback, l.visible, l.lod.clone(), l.mode.clone(), color)
+        })
+    else {
         return;
     };
-    let Some(l) = app.s.layers.iter().find(|l| l.id == id) else { return };
-    let (mut enabled, mut shading, mut texturing, mut anim_playback) = (l.enabled, l.shading, l.texturing, l.anim_playback);
-    let mut lod = l.lod.clone();
-    let mut open = true;
     let mut changed = false;
-    let center = ctx.content_rect().center();
-    egui::Window::new("Layer Attributes")
-        .id(egui::Id::new("layer_attrs_window"))
-        .collapsible(false)
-        .resizable(false)
-        .default_pos(egui::pos2(center.x - 150.0, center.y - 140.0))
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.label(RichText::new(&name).strong());
-            ui.add_space(2.0);
-            egui::Grid::new("layer_attrs_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Enable Overrides");
-                changed |= ui.checkbox(&mut enabled, "").changed();
-                ui.end_row();
-                ui.label("Level of Detail");
-                egui::ComboBox::from_id_salt("layer_attrs_lod")
-                    .selected_text(if lod == "bbox" { "Bounding Box" } else { "Full" })
-                    .show_ui(ui, |ui| {
-                        changed |= ui.selectable_value(&mut lod, "full".into(), "Full").changed();
-                        changed |= ui.selectable_value(&mut lod, "bbox".into(), "Bounding Box").changed();
-                    });
-                ui.end_row();
-                ui.label("Shading");
-                changed |= ui.checkbox(&mut shading, "").changed();
-                ui.end_row();
-                ui.label("Texturing");
-                changed |= ui.checkbox(&mut texturing, "").changed();
-                ui.end_row();
-                ui.label("Playback");
-                changed |= ui.checkbox(&mut anim_playback, "").changed();
-                ui.end_row();
-                ui.label("Number");
-                ui.label(number.to_string());
-                ui.end_row();
+    theme::section_header(ui, "Display Layer Attributes");
+    egui::Grid::new("layer_ae_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        ui.label("Enable Overrides");
+        changed |= ui.checkbox(&mut enabled, "").on_hover_text("Turn off to make the layer behave as if unassigned").changed();
+        ui.end_row();
+        ui.label("Display Type");
+        egui::ComboBox::from_id_salt("layer_ae_type")
+            .selected_text(match mode.as_str() {
+                "template" => "Template",
+                "reference" => "Reference",
+                _ => "Normal",
+            })
+            .show_ui(ui, |ui| {
+                changed |= ui.selectable_value(&mut mode, "normal".into(), "Normal").changed();
+                changed |= ui.selectable_value(&mut mode, "template".into(), "Template").changed();
+                changed |= ui.selectable_value(&mut mode, "reference".into(), "Reference").changed();
             });
+        ui.end_row();
+        ui.label("Level of Detail");
+        egui::ComboBox::from_id_salt("layer_ae_lod")
+            .selected_text(if lod == "bbox" { "Bounding Box" } else { "Full" })
+            .show_ui(ui, |ui| {
+                changed |= ui.selectable_value(&mut lod, "full".into(), "Full").changed();
+                changed |= ui.selectable_value(&mut lod, "bbox".into(), "Bounding Box").changed();
+            });
+        ui.end_row();
+        ui.label("Shading");
+        changed |= ui.checkbox(&mut shading, "").changed();
+        ui.end_row();
+        ui.label("Texturing");
+        changed |= ui.checkbox(&mut texturing, "").changed();
+        ui.end_row();
+        ui.label("Playback");
+        changed |= ui.checkbox(&mut anim_playback, "").on_hover_text("Animate the layer's objects during playback").changed();
+        ui.end_row();
+        ui.label("Visible");
+        changed |= ui.checkbox(&mut visible, "").changed();
+        ui.end_row();
+        ui.label("Color");
+        ui.horizontal(|ui| {
+            let mut c = color.unwrap_or([1.0; 3]);
+            if color_edit(ui, egui::Id::new("layer_ae_color"), &mut c) {
+                color = Some(c);
+                changed = true;
+            }
+            if ui.button("Default").clicked() {
+                color = None;
+                changed = true;
+            }
         });
-    if !open {
-        app.panels.layer_attrs = None;
-    }
+        ui.end_row();
+        ui.label("Number");
+        ui.label(number.to_string());
+        ui.end_row();
+    });
     if changed {
-        layer_update(app, &id, "layer attributes", |l| {
+        layer_update(app, lid, "layer attributes", |l| {
             l.enabled = enabled;
             l.shading = shading;
             l.texturing = texturing;
             l.anim_playback = anim_playback;
+            l.visible = visible;
             l.lod = lod;
+            l.mode = mode;
+            l.color = color.map(|c| json!([c[0] as f64, c[1] as f64, c[2] as f64]));
         });
     }
 }
@@ -4955,6 +5029,7 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             if menu_item(app, ui, "Load Selected Attributes") {
                 app.panels.ae_locked = None;
+                app.panels.ae_layer = None;
             }
         }
         "Selected" => {
@@ -4999,6 +5074,14 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
     });
+    if let Some(lid) = app.panels.ae_layer.clone() {
+        if !app.s.layers.iter().any(|l| l.id == lid) || app.s.sel != app.panels.ae_layer_sel {
+            app.panels.ae_layer = None;
+        } else {
+            layer_attribute_editor(app, ui, &lid);
+            return;
+        }
+    }
     if app.snode_sel.is_some() {
         shading_attribute_editor(app, ui);
         return;
@@ -5129,6 +5212,7 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         if b(ui, "Load Attributes", w * 1.4) {
             app.panels.ae_locked = None;
+            app.panels.ae_layer = None;
         }
         if b(ui, "Copy Tab", w) {
             app.panels.ae_copies.push((id.clone(), tab));
@@ -5985,6 +6069,20 @@ mod tests {
         assert_ne!(app.s.layers[0].name, taken, "rename reused another layer's name");
         layer_rename_commit(&mut app, &lid, "Characters");
         assert_eq!(app.s.layers[0].name, "Characters");
+    }
+
+    #[test]
+    fn layer_attributes_load_into_the_attribute_editor() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        layer_create(&mut app, false);
+        let lid = app.s.layers[0].id.clone();
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        layer_open_attributes(&mut app, &lid);
+        assert_eq!(app.panels.ae_layer.as_deref(), Some(lid.as_str()));
+        assert_eq!(app.right_tab, crate::app::RightTab::AttributeEditor);
     }
 
     #[test]
