@@ -537,6 +537,10 @@ pub struct PanelState {
     pub layer_picker: Option<String>,
     /// Edit Layer dialog draft, when open.
     pub layer_edit: Option<LayerEditDraft>,
+    /// Layer whose Attributes window is open.
+    pub layer_attrs: Option<String>,
+    /// Layer whose Membership window is open.
+    pub layer_membership: Option<String>,
     /// Options > Make New Layers Current.
     pub layer_make_current: bool,
     /// Options > Add New Objects to Current Layer.
@@ -2879,6 +2883,8 @@ fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         app.s.current_layer = None;
     }
     layer_edit_dialog(app, ui.ctx());
+    layer_attrs_dialog(app, ui.ctx());
+    layer_membership_dialog(app, ui.ctx());
     egui::Frame::NONE.fill(theme::BG2).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -2934,8 +2940,18 @@ fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     layer_members(app, false);
                 }
                 ui.separator();
-                ui.add_enabled(false, egui::Button::new("Membership...")).on_disabled_hover_text("Relationship Editor is not implemented in this build");
-                ui.add_enabled(false, egui::Button::new("Attributes...")).on_disabled_hover_text("Layer Attribute Editor is not implemented in this build");
+                if menu_item(app, ui, "Membership...") {
+                    let id = app.panels.layer_sel.first().cloned().or_else(|| app.s.current_layer.clone());
+                    if let Some(id) = id {
+                        layer_open_membership(app, &id);
+                    }
+                }
+                if menu_item(app, ui, "Attributes...") {
+                    let id = app.panels.layer_sel.first().cloned().or_else(|| app.s.current_layer.clone());
+                    if let Some(id) = id {
+                        layer_open_attrs(app, &id);
+                    }
+                }
                 ui.separator();
                 if menu_item(app, ui, "Delete Selected Layers") {
                     let lids = app.panels.layer_sel.clone();
@@ -3408,8 +3424,12 @@ fn layer_context_menu(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
         layer_delete(app, std::slice::from_ref(&id));
     }
     ui.separator();
-    ui.add_enabled(false, egui::Button::new("Membership...")).on_disabled_hover_text("Relationship Editor is not implemented in this build");
-    ui.add_enabled(false, egui::Button::new("Attributes...")).on_disabled_hover_text("Layer Attribute Editor is not implemented in this build");
+    if menu_item(app, ui, "Membership...") {
+        layer_open_membership(app, lid);
+    }
+    if menu_item(app, ui, "Attributes...") {
+        layer_open_attrs(app, lid);
+    }
 }
 
 fn layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
@@ -3603,6 +3623,133 @@ fn layer_edit_dialog(app: &mut IncaApp, ctx: &egui::Context) {
         app.panels.layer_edit = None;
     } else {
         app.panels.layer_edit = Some(draft);
+    }
+}
+
+fn layer_open_attrs(app: &mut IncaApp, id: &str) {
+    if app.s.layers.iter().any(|l| l.id == id) {
+        app.panels.layer_attrs = Some(id.to_string());
+    }
+}
+
+fn layer_open_membership(app: &mut IncaApp, id: &str) {
+    if app.s.layers.iter().any(|l| l.id == id) {
+        app.panels.layer_membership = Some(id.to_string());
+    }
+}
+
+fn layer_set_member(app: &mut IncaApp, lid: &str, nid: &str, member: bool) {
+    app.s.checkpoint("layer membership");
+    if let Some(n) = app.s.nodes.get_mut(nid) {
+        n.layer = if member { Some(lid.to_string()) } else { None };
+    }
+    app.s.touch();
+}
+
+/// Maya's layer Attribute Editor: the extra layer attributes not shown in the Edit Layer window.
+fn layer_attrs_dialog(app: &mut IncaApp, ctx: &egui::Context) {
+    let Some(id) = app.panels.layer_attrs.clone() else { return };
+    let Some((name, number)) = app.s.layers.iter().enumerate().find(|(_, l)| l.id == id).map(|(i, l)| (l.name.clone(), i + 1)) else {
+        app.panels.layer_attrs = None;
+        return;
+    };
+    let Some(l) = app.s.layers.iter().find(|l| l.id == id) else { return };
+    let (mut enabled, mut shading, mut texturing, mut anim_playback) = (l.enabled, l.shading, l.texturing, l.anim_playback);
+    let mut lod = l.lod.clone();
+    let mut open = true;
+    let mut changed = false;
+    let center = ctx.content_rect().center();
+    egui::Window::new("Layer Attributes")
+        .id(egui::Id::new("layer_attrs_window"))
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(egui::pos2(center.x - 150.0, center.y - 140.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(RichText::new(&name).strong());
+            ui.add_space(2.0);
+            egui::Grid::new("layer_attrs_grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Enable Overrides");
+                changed |= ui.checkbox(&mut enabled, "").changed();
+                ui.end_row();
+                ui.label("Level of Detail");
+                egui::ComboBox::from_id_salt("layer_attrs_lod")
+                    .selected_text(if lod == "bbox" { "Bounding Box" } else { "Full" })
+                    .show_ui(ui, |ui| {
+                        changed |= ui.selectable_value(&mut lod, "full".into(), "Full").changed();
+                        changed |= ui.selectable_value(&mut lod, "bbox".into(), "Bounding Box").changed();
+                    });
+                ui.end_row();
+                ui.label("Shading");
+                changed |= ui.checkbox(&mut shading, "").changed();
+                ui.end_row();
+                ui.label("Texturing");
+                changed |= ui.checkbox(&mut texturing, "").changed();
+                ui.end_row();
+                ui.label("Playback");
+                changed |= ui.checkbox(&mut anim_playback, "").changed();
+                ui.end_row();
+                ui.label("Number");
+                ui.label(number.to_string());
+                ui.end_row();
+            });
+        });
+    if !open {
+        app.panels.layer_attrs = None;
+    }
+    if changed {
+        layer_update(app, &id, "layer attributes", |l| {
+            l.enabled = enabled;
+            l.shading = shading;
+            l.texturing = texturing;
+            l.anim_playback = anim_playback;
+            l.lod = lod;
+        });
+    }
+}
+
+/// Membership editor: tick the objects that belong to a display layer.
+fn layer_membership_dialog(app: &mut IncaApp, ctx: &egui::Context) {
+    let Some(id) = app.panels.layer_membership.clone() else { return };
+    let Some(name) = app.s.layers.iter().find(|l| l.id == id).map(|l| l.name.clone()) else {
+        app.panels.layer_membership = None;
+        return;
+    };
+    let mut nodes: Vec<(String, String, bool)> = app
+        .s
+        .nodes
+        .values()
+        .map(|n| (n.id.clone(), n.name.clone(), n.layer.as_deref() == Some(id.as_str())))
+        .collect();
+    nodes.sort_by(|a, b| a.1.cmp(&b.1));
+    let total = nodes.len();
+    let mut open = true;
+    let mut toggle: Option<(String, bool)> = None;
+    let center = ctx.content_rect().center();
+    egui::Window::new("Layer Membership")
+        .id(egui::Id::new("layer_membership_window"))
+        .collapsible(false)
+        .resizable(false)
+        .default_pos(egui::pos2(center.x - 150.0, center.y - 180.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(RichText::new(&name).strong());
+            ui.label(RichText::new(format!("{total} objects")).color(theme::TEXT_DIM));
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                ui.set_min_width(240.0);
+                for (nid, nname, member) in &nodes {
+                    let mut m = *member;
+                    if ui.checkbox(&mut m, nname).changed() {
+                        toggle = Some((nid.clone(), m));
+                    }
+                }
+            });
+        });
+    if !open {
+        app.panels.layer_membership = None;
+    }
+    if let Some((nid, member)) = toggle {
+        layer_set_member(app, &id, &nid, member);
     }
 }
 
@@ -5568,6 +5715,21 @@ mod tests {
         assert!(!l.playback);
         assert!(layer_has_color(&l.color));
         assert!(l.shading, "unrelated layer fields must be preserved");
+    }
+
+    #[test]
+    fn layer_membership_adds_and_removes_an_object() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        layer_create(&mut app, false);
+        let lid = app.s.layers[0].id.clone();
+        layer_set_member(&mut app, &lid, &nid, true);
+        assert_eq!(app.s.node(&nid).unwrap().layer.as_deref(), Some(lid.as_str()));
+        layer_set_member(&mut app, &lid, &nid, false);
+        assert!(app.s.node(&nid).unwrap().layer.is_none());
     }
 
     #[test]
