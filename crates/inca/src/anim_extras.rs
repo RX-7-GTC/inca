@@ -18,8 +18,34 @@ pub struct Ghost {
 #[derive(Default)]
 pub struct AnimViz {
     pub ghosts: Vec<Ghost>,
+    /// Layers evaluated up to a ghosted layer, rebuilt when the scene or time changes.
+    pub layer_ghosts: Vec<Ghost>,
     /// world positions per frame, one trail per object
     pub trails: Vec<Vec<DVec3>>,
+    ghost_rev: u64,
+    ghost_time: f64,
+    /// Bumped when the ghost geometry changes, so the viewport texture is redrawn.
+    pub ghost_gen: u64,
+}
+
+/// World-space triangles for the objects at their current evaluated transforms.
+fn capture(app: &IncaApp, objs: &[String], col: [f32; 3], alpha: f32) -> Vec<Ghost> {
+    let mut out = vec![];
+    for o in objs {
+        let wm = app.s.world_matrix(o);
+        let Some(pm) = app.s.node(o).and_then(|n| n.mesh()).map(|m| &m.mesh) else { continue };
+        let mut tris = vec![];
+        for fi in 0..pm.f.len() {
+            for tr in pm.triangulate_face(fi) {
+                for &c in &tr {
+                    let p = wm.transform_point3(pm.v[pm.f[fi][c] as usize]);
+                    tris.push(MeshVertex { pos: [p.x as f32, p.y as f32, p.z as f32], normal: [0.0, 1.0, 0.0], color: col, ..Default::default() });
+                }
+            }
+        }
+        out.push(Ghost { tris, alpha });
+    }
+    out
 }
 
 /// Re-evaluate the scene at `t` (keys, constraints, rigs and the meshes that follow them).
@@ -58,20 +84,7 @@ pub fn ghost(app: &mut IncaApp) {
         goto(app, t);
         let col = if t < t0 { [0.33, 0.47, 1.0] } else { [1.0, 0.47, 0.33] };
         let alpha = 0.18 + 0.1 / (1.0 + (t - t0).abs() as f32 / 10.0);
-        for o in &objs {
-            let wm = app.s.world_matrix(o);
-            let Some(pm) = app.s.node(o).and_then(|n| n.mesh()).map(|m| &m.mesh) else { continue };
-            let mut tris = vec![];
-            for fi in 0..pm.f.len() {
-                for tr in pm.triangulate_face(fi) {
-                    for &c in &tr {
-                        let p = wm.transform_point3(pm.v[pm.f[fi][c] as usize]);
-                        tris.push(MeshVertex { pos: [p.x as f32, p.y as f32, p.z as f32], normal: [0.0, 1.0, 0.0], color: col, ..Default::default() });
-                    }
-                }
-            }
-            app.viz.ghosts.push(Ghost { tris, alpha });
-        }
+        app.viz.ghosts.extend(capture(app, &objs, col, alpha));
     }
     goto(app, t0);
     app.echo("ghosting;");
@@ -80,6 +93,71 @@ pub fn ghost(app: &mut IncaApp) {
 pub fn unghost(app: &mut IncaApp) {
     app.viz.ghosts.clear();
     app.echo("unghostAll;");
+}
+
+/// Rebuild the ghosts for the layers (and BaseAnimation) with their Ghost button on.
+/// Each ghost is the result up to and including that layer at the current frame.
+pub fn layer_ghost_tick(app: &mut IncaApp) {
+    let any = app.s.anim_base_ghost || app.s.anim_layers.iter().any(|l| l.ghost);
+    let t = app.s.time.current;
+    if !any {
+        if !app.viz.layer_ghosts.is_empty() {
+            app.viz.layer_ghosts.clear();
+            app.viz.ghost_gen += 1;
+        }
+        app.viz.ghost_rev = app.s.rev;
+        app.viz.ghost_time = t;
+        return;
+    }
+    if app.viz.ghost_rev == app.s.rev && app.viz.ghost_time.to_bits() == t.to_bits() {
+        return;
+    }
+    let is_mesh = |i: &String| app.s.node(i).is_some_and(|n| n.mesh().is_some());
+    let mut objs: Vec<String> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).filter(is_mesh).collect();
+    if objs.is_empty() {
+        let all = app.s.anim_base_ghost;
+        for l in app.s.anim_layers.iter().filter(|l| l.ghost || all) {
+            for m in &l.members {
+                objs.extend(app.s.subtree(m).into_iter().filter(is_mesh));
+            }
+        }
+    }
+    if objs.is_empty() {
+        for l in app.s.anim_layers.iter().filter(|l| l.ghost) {
+            for c in l.curves.values() {
+                objs.extend(app.s.subtree(&c.node).into_iter().filter(is_mesh));
+            }
+        }
+        if app.s.anim_base_ghost {
+            for c in app.s.anim.curves.values() {
+                objs.extend(app.s.subtree(&c.node).into_iter().filter(is_mesh));
+            }
+        }
+    }
+    objs.sort();
+    objs.dedup();
+    if objs.is_empty() {
+        if !app.viz.layer_ghosts.is_empty() {
+            app.viz.layer_ghosts.clear();
+            app.viz.ghost_gen += 1;
+        }
+    } else {
+        let mut out = vec![];
+        if app.s.anim_base_ghost {
+            app.s.apply_anim_upto(None);
+            out.extend(capture(app, &objs, app.s.anim_base_ghost_color, 0.35));
+        }
+        let layers: Vec<(usize, [f32; 3])> = app.s.anim_layers.iter().enumerate().filter(|(_, l)| l.ghost).map(|(i, l)| (i, l.ghost_color)).collect();
+        for (i, color) in layers {
+            app.s.apply_anim_upto(Some(i));
+            out.extend(capture(app, &objs, color, 0.35));
+        }
+        app.s.set_time(t);
+        app.viz.layer_ghosts = out;
+        app.viz.ghost_gen += 1;
+    }
+    app.viz.ghost_rev = app.s.rev;
+    app.viz.ghost_time = t;
 }
 
 /// Create Motion Trail: the selected objects' pivots over the playback range.
@@ -108,7 +186,7 @@ pub fn motion_trail(app: &mut IncaApp) {
 /// Ghost and trail geometry for a viewport.
 pub fn draws(viz: &AnimViz) -> Vec<DrawCmd> {
     let mut d = vec![];
-    for g in &viz.ghosts {
+    for g in viz.ghosts.iter().chain(viz.layer_ghosts.iter()) {
         d.push(DrawCmd { pass: Pass::MeshBlend, geo: Geo::TransientTris(g.tris.clone()), u: DrawUniform::new(Mat4::IDENTITY).unlit().alpha(g.alpha) });
     }
     let col = [0.55, 0.85, 1.0, 1.0];
@@ -267,6 +345,7 @@ pub fn start(app: &mut IncaApp) {
 
 /// Advance a running playblast (called once per frame, before the viewports draw).
 pub fn tick(app: &mut IncaApp, ctx: &egui::Context) {
+    layer_ghost_tick(app);
     if app.playblast.running.is_none() {
         return;
     }
@@ -479,5 +558,40 @@ mod tests {
         assert_eq!(video_path(PathBuf::from("clip.webm")), PathBuf::from("clip.webm"));
         assert_eq!(video_path(PathBuf::from("clip")), PathBuf::from("clip.webm"));
         assert_eq!(video_path(PathBuf::from("clip.png")), PathBuf::from("clip.png.webm"));
+    }
+
+    #[test]
+    fn layer_ghosts_capture_the_selected_mesh() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), inca_core::scene::SelMode::Replace);
+        app.s.anim_layers.push(inca_core::anim::AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![nid.clone()],
+            ghost: true,
+            ghost_color: inca_core::anim::ghost_red(),
+            curves: Default::default(),
+        });
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!(!app.viz.layer_ghosts.is_empty(), "layer ghost was not built");
+        app.s.anim_layers[0].ghost = false;
+        app.s.anim_base_ghost = true;
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!(!app.viz.layer_ghosts.is_empty(), "BaseAnimation ghost was not built");
+        app.s.anim_base_ghost = false;
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!(app.viz.layer_ghosts.is_empty(), "ghosts stayed on");
     }
 }

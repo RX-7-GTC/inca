@@ -568,6 +568,9 @@ pub struct Scene {
     pub anim_layer_current: Option<Id>,
     /// BaseAnimation refuses new keys while locked.
     pub anim_base_lock: bool,
+    /// Draw BaseAnimation alone as a ghost.
+    pub anim_base_ghost: bool,
+    pub anim_base_ghost_color: [f32; 3],
     /// Mute/lock state of the layers before Solo; restored when Solo is cleared.
     pub anim_solo_saved: Vec<(Id, bool, bool)>,
     /// Static channel values animation layers blend against when BaseAnimation has no curve.
@@ -636,6 +639,8 @@ impl Scene {
             anim_layers: vec![],
             anim_layer_current: None,
             anim_base_lock: false,
+            anim_base_ghost: false,
+            anim_base_ghost_color: crate::anim::ghost_red(),
             anim_solo_saved: vec![],
             anim_static: IndexMap::new(),
             conns: vec![],
@@ -2136,6 +2141,12 @@ impl Scene {
 
     /// Evaluate anim curves at the current time and push values into channels.
     pub fn apply_anim(&mut self) {
+        self.apply_anim_upto(Some(0));
+    }
+
+    /// Evaluate BaseAnimation and the layers from the bottom up to and including `upto`.
+    /// `None` evaluates BaseAnimation alone (used when building layer ghosts).
+    pub fn apply_anim_upto(&mut self, upto: Option<usize>) {
         let t = self.time.current;
         let vals: Vec<(String, String, f64)> = self.anim.curves.values().filter(|c| !c.keys.is_empty() && !c.mute).map(|c| (c.node.clone(), c.attr.clone(), c.eval(t))).collect();
         let mut moved: Vec<Id> = vec![];
@@ -2163,10 +2174,10 @@ impl Scene {
             }
         }
         // Animation layers, bottom-to-top so the upper layers win. Solo silences the rest.
-        if !self.anim_layers.is_empty() {
+        if let Some(upto) = upto {
+            let start = upto.min(self.anim_layers.len());
             let solo = self.anim_layers.iter().any(|l| l.solo);
-            let layers: Vec<AnimLayer> = self
-                .anim_layers
+            let layers: Vec<AnimLayer> = self.anim_layers[start..]
                 .iter()
                 .rev()
                 .filter(|l| !l.mute && l.weight > 1e-6 && (!solo || l.solo))
@@ -2830,6 +2841,8 @@ impl Scene {
             "animLayers": self.anim_layers,
             "animLayerCurrent": self.anim_layer_current,
             "animBaseLock": self.anim_base_lock,
+            "animBaseGhost": self.anim_base_ghost,
+            "animBaseGhostColor": self.anim_base_ghost_color,
             "animSoloSaved": self.anim_solo_saved,
             "animStatic": self.anim_static,
             "conns": self.conns,
@@ -2855,6 +2868,8 @@ impl Scene {
         self.anim_layers.clear();
         self.anim_layer_current = None;
         self.anim_base_lock = false;
+        self.anim_base_ghost = false;
+        self.anim_base_ghost_color = crate::anim::ghost_red();
         self.anim_solo_saved.clear();
         self.anim_static.clear();
         self.conns.clear();
@@ -2923,6 +2938,8 @@ impl Scene {
         self.anim_layers = serde_json::from_value(data.get("animLayers").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         self.anim_layer_current = serde_json::from_value(data.get("animLayerCurrent").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         self.anim_base_lock = data.get("animBaseLock").and_then(|v| v.as_bool()).unwrap_or(false);
+        self.anim_base_ghost = data.get("animBaseGhost").and_then(|v| v.as_bool()).unwrap_or(false);
+        self.anim_base_ghost_color = serde_json::from_value(data.get("animBaseGhostColor").cloned().unwrap_or(Value::Null)).unwrap_or_else(|_| crate::anim::ghost_red());
         self.anim_solo_saved = serde_json::from_value(data.get("animSoloSaved").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         self.anim_static = serde_json::from_value(data.get("animStatic").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         self.conns = serde_json::from_value::<Vec<Conn>>(data["conns"].clone()).unwrap_or_default();
@@ -3448,6 +3465,8 @@ mod tests {
             lock: false,
             override_mode: true,
             members: vec![],
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
             curves,
         });
         s.set_time(5.0);
@@ -3479,6 +3498,8 @@ mod tests {
             lock: false,
             override_mode: false,
             members: vec![],
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -3516,10 +3537,14 @@ mod tests {
             lock: true,
             override_mode: true,
             members: vec![a.clone()],
+            ghost: true,
+            ghost_color: [0.2, 0.4, 0.6],
             curves,
         });
         s.anim_layer_current = Some("al1".into());
         s.anim_base_lock = true;
+        s.anim_base_ghost = true;
+        s.anim_base_ghost_color = [0.6, 0.2, 0.4];
         s.anim_solo_saved = vec![("al1".into(), false, true)];
         s.remember_anim_static(std::slice::from_ref(&a));
         let data = s.serialize();
@@ -3529,11 +3554,51 @@ mod tests {
         assert_eq!(t.anim_layers[0].name, "Layer 1");
         assert_eq!(t.anim_layers[0].members, vec![a.clone()]);
         assert_eq!(t.anim_layer_current.as_deref(), Some("al1"));
+        assert!(t.anim_layers[0].ghost);
+        assert_eq!(t.anim_layers[0].ghost_color, [0.2, 0.4, 0.6]);
+        assert!(t.anim_base_ghost);
+        assert_eq!(t.anim_base_ghost_color, [0.6, 0.2, 0.4]);
         assert!(t.anim_base_lock, "base lock survives the load");
         assert_eq!(t.anim_solo_saved, vec![("al1".into(), false, true)], "solo restore state survives the load");
         assert!((t.anim_static[&Anim::key(&a, "scaleX")] - 1.0).abs() < 1e-9, "static pose survives the load");
         let c = t.anim_layers[0].curves.get(&Anim::key(&a, "translateX")).expect("curve survives");
         assert!((c.eval(0.0) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn animation_can_evaluate_only_the_lower_part_of_the_stack() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_key(&a, "translateX", Some(0.0), Some(0.0));
+        s.set_key(&a, "translateX", Some(10.0), Some(10.0));
+        for (id, v) in [("top", 30.0), ("bottom", 20.0)] {
+            let mut c = AnimCurve::new(&a, "translateX");
+            c.set_key(0.0, v, "linear");
+            c.set_key(10.0, v, "linear");
+            let mut curves = IndexMap::new();
+            curves.insert(Anim::key(&a, "translateX"), c);
+            s.anim_layers.push(AnimLayer {
+                id: id.into(),
+                name: id.into(),
+                weight: 1.0,
+                mute: false,
+                solo: false,
+                lock: false,
+                override_mode: false,
+                members: vec![a.clone()],
+                ghost: false,
+                ghost_color: crate::anim::ghost_red(),
+                curves,
+            });
+        }
+        s.set_time(5.0);
+        assert!((s.get_attr_f(&a, "translateX") - 55.0).abs() < 1e-9, "full stack");
+        s.apply_anim_upto(Some(1));
+        assert!((s.get_attr_f(&a, "translateX") - 25.0).abs() < 1e-9, "base + bottom layer");
+        s.apply_anim_upto(None);
+        assert!((s.get_attr_f(&a, "translateX") - 5.0).abs() < 1e-9, "BaseAnimation only");
+        s.set_time(5.0);
+        assert!((s.get_attr_f(&a, "translateX") - 55.0).abs() < 1e-9, "restored stack");
     }
 
     #[test]
@@ -3549,6 +3614,8 @@ mod tests {
             lock: false,
             override_mode: false,
             members: vec![a.clone()],
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -3590,6 +3657,8 @@ mod tests {
             lock: false,
             override_mode: false,
             members: vec![a.clone()],
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -3637,6 +3706,8 @@ mod tests {
             lock: false,
             override_mode: true,
             members: vec![a.clone()],
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -3673,6 +3744,8 @@ mod tests {
             lock: false,
             override_mode: false,
             members: vec![a.clone()],
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());

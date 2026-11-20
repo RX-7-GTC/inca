@@ -14,6 +14,9 @@ fn constant() -> String {
 fn one() -> f64 {
     1.0
 }
+pub fn ghost_red() -> [f32; 3] {
+    [0.85, 0.10, 0.10]
+}
 
 /// One animation layer above BaseAnimation. Curves are keyed by "nodeId.attr", like `Anim`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -35,6 +38,11 @@ pub struct AnimLayer {
     /// Objects explicitly assigned to the layer.
     #[serde(default)]
     pub members: Vec<String>,
+    /// Draw the stack up to and including this layer as a translucent ghost.
+    #[serde(default)]
+    pub ghost: bool,
+    #[serde(default = "ghost_red")]
+    pub ghost_color: [f32; 3],
     #[serde(default)]
     pub curves: indexmap::IndexMap<String, AnimCurve>,
 }

@@ -4217,6 +4217,38 @@ fn layer_mute_toggle(ui: &mut egui::Ui, muted: bool, solo_muted: bool, selected:
     resp.on_hover_text(tip)
 }
 
+const GHOST_COLORS: [[f32; 3]; 8] = [
+    [0.85, 0.10, 0.10],
+    [0.85, 0.45, 0.10],
+    [0.85, 0.78, 0.15],
+    [0.25, 0.65, 0.25],
+    [0.15, 0.60, 0.65],
+    [0.25, 0.35, 0.85],
+    [0.60, 0.30, 0.80],
+    [0.80, 0.80, 0.80],
+];
+
+fn ghost_swatch(ui: &mut egui::Ui, color: [f32; 3]) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+    ui.painter().rect_filled(rect, 2.0, color32_of(&color));
+    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, Color32::from_gray(0x22)), egui::StrokeKind::Inside);
+    resp.clicked()
+}
+
+/// A coloured dot: the layer's ghost, dimmed when off.
+fn layer_ghost_toggle(ui: &mut egui::Ui, on: bool, color: [f32; 3], selected: bool, tip: &str) -> egui::Response {
+    let (rect, resp) = layer_toggle_shell(ui, selected);
+    let c = rect.center();
+    let dot = if on {
+        color32_of(&color)
+    } else {
+        Color32::from_rgb((color[0].clamp(0.0, 1.0) * 102.0) as u8, (color[1].clamp(0.0, 1.0) * 102.0) as u8, (color[2].clamp(0.0, 1.0) * 102.0) as u8)
+    };
+    ui.painter().circle_filled(c, 4.3, dot);
+    ui.painter().circle_stroke(c, 4.3, egui::Stroke::new(1.0, Color32::from_gray(0x22)));
+    resp.on_hover_text(tip)
+}
+
 // ------------------------------------------------------------ animation layers
 fn anim_layer_unique_name(app: &IncaApp) -> String {
     let mut i = 1;
@@ -4246,6 +4278,8 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
             lock: false,
             override_mode,
             members: vec![],
+            ghost: false,
+            ghost_color: inca_core::anim::ghost_red(),
             curves: Default::default(),
         },
     );
@@ -4521,7 +4555,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             egui::Frame::NONE.fill(if selected { theme::HI } else { Color32::TRANSPARENT }).inner_margin(egui::Margin::symmetric(1, 1)).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
-                    let fixed = 46.0 + 4.0 * 20.0 + 5.0 * 3.0;
+                    let fixed = 46.0 + 5.0 * 20.0 + 6.0 * 3.0;
                     let name_w = (ui.available_width() - fixed).max(60.0);
                     let (name_rect, name_resp) = ui.allocate_exact_size(egui::vec2(name_w, ROW_H), egui::Sense::click());
                     let renaming = app.panels.anim_layer_rename.as_ref().is_some_and(|(id, _)| id == &l.id);
@@ -4605,6 +4639,27 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     if layer_toggle(ui, if l.override_mode { "O" } else { "A" }, selected, "Override (O) / Additive (A)").clicked() {
                         anim_layer_mode(app, &l.id, !l.override_mode);
                     }
+                    let ghost_resp = layer_ghost_toggle(ui, l.ghost, l.ghost_color, selected, "Ghost layer (right-click for color)");
+                    if ghost_resp.clicked() {
+                        anim_layer_update(app, &l.id, "ghost animation layer", |l| l.ghost = !l.ghost);
+                        ui.ctx().request_repaint();
+                    }
+                    ghost_resp.context_menu(|ui| {
+                        ui.label("Ghost color");
+                        let mut picked = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for c in GHOST_COLORS {
+                                if ghost_swatch(ui, c) {
+                                    picked = Some(c);
+                                }
+                            }
+                        });
+                        if let Some(c) = picked {
+                            anim_layer_update(app, &l.id, "animation layer ghost color", |l| l.ghost_color = c);
+                            ui.ctx().request_repaint();
+                            ui.close();
+                        }
+                    });
                 });
             });
         }
@@ -4623,7 +4678,7 @@ fn anim_base_row(app: &mut IncaApp, ui: &mut egui::Ui) {
     egui::Frame::NONE.fill(if selected { theme::HI } else { Color32::TRANSPARENT }).inner_margin(egui::Margin::symmetric(1, 1)).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
-            let fixed = 46.0 + 4.0 * 20.0 + 5.0 * 3.0;
+            let fixed = 46.0 + 5.0 * 20.0 + 6.0 * 3.0;
             let name_w = (ui.available_width() - fixed).max(60.0);
             let (name_rect, name_resp) = ui.allocate_exact_size(egui::vec2(name_w, ROW_H), egui::Sense::click());
             ui.painter().text(
@@ -4647,6 +4702,31 @@ fn anim_base_row(app: &mut IncaApp, ui: &mut egui::Ui) {
                 app.s.touch();
             }
             ui.allocate_exact_size(egui::vec2(20.0, ROW_H), egui::Sense::hover());
+            let ghost_resp = layer_ghost_toggle(ui, app.s.anim_base_ghost, app.s.anim_base_ghost_color, selected, "Ghost BaseAnimation (right-click for color)");
+            if ghost_resp.clicked() {
+                app.s.checkpoint("ghost base animation");
+                app.s.anim_base_ghost = !app.s.anim_base_ghost;
+                app.s.touch();
+                ui.ctx().request_repaint();
+            }
+            ghost_resp.context_menu(|ui| {
+                ui.label("Ghost color");
+                let mut picked = None;
+                ui.horizontal_wrapped(|ui| {
+                    for c in GHOST_COLORS {
+                        if ghost_swatch(ui, c) {
+                            picked = Some(c);
+                        }
+                    }
+                });
+                if let Some(c) = picked {
+                    app.s.checkpoint("base animation ghost color");
+                    app.s.anim_base_ghost_color = c;
+                    app.s.touch();
+                    ui.ctx().request_repaint();
+                    ui.close();
+                }
+            });
         });
     });
 }

@@ -197,6 +197,7 @@ fn vp_render_key(app: &IncaApp, idx: usize, px: [u32; 2], cv: &CamView) -> u64 {
     app.s.sel.hash(&mut h);
     app.s.hilite().hash(&mut h);
     app.s.lead().hash(&mut h);
+    app.viz.ghost_gen.hash(&mut h);
     format!("{:?}", app.vps[idx]).hash(&mut h);
     app.soft.on.hash(&mut h);
     app.soft.radius.to_bits().hash(&mut h);
@@ -273,7 +274,7 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
     let px = [(img_rect.width() * ppp).round().max(1.0) as u32, (img_rect.height() * ppp).round().max(1.0) as u32];
     let cv = viewport::cam_view(&app.s, &app.vps[idx].camera.clone(), [img_rect.width(), img_rect.height()]);
     let render_key = vp_render_key(app, idx, px, &cv);
-    let force_render = !app.viz.ghosts.is_empty() || !app.viz.trails.is_empty();
+    let force_render = !app.viz.ghosts.is_empty() || !app.viz.layer_ghosts.is_empty() || !app.viz.trails.is_empty();
     // ---- render
     if let (Some(rs), Some(gpu)) = (frame.wgpu_render_state(), app.gpu.as_mut()) {
         let tex = {
