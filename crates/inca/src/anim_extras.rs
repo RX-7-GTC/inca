@@ -48,7 +48,7 @@ pub fn ghost(app: &mut IncaApp) {
         }
     } else {
         let keyed: Vec<String> = app.s.sel.clone();
-        let ks = app.s.anim.key_times(&keyed);
+        let ks = app.s.anim_key_times(&keyed);
         let before: Vec<f64> = ks.iter().copied().filter(|t| *t < t0).collect();
         times.extend(before.iter().rev().take(steps));
         times.extend(ks.iter().copied().filter(|t| *t > t0).take(steps));

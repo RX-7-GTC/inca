@@ -11,6 +11,33 @@ fn auto() -> String {
 fn constant() -> String {
     "constant".into()
 }
+fn one() -> f64 {
+    1.0
+}
+
+/// One animation layer above BaseAnimation. Curves are keyed by "nodeId.attr", like `Anim`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AnimLayer {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "one")]
+    pub weight: f64,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub solo: bool,
+    #[serde(default)]
+    pub lock: bool,
+
+    /// true = override, false = additive.
+    #[serde(default)]
+    pub override_mode: bool,
+    /// Objects explicitly assigned to the layer.
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub curves: indexmap::IndexMap<String, AnimCurve>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Key {

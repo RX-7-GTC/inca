@@ -1986,7 +1986,12 @@ fn rotation_without_scale(app: &IncaApp, id: &str) -> DQuat {
     let Some(n) = app.s.node(id) else { return DQuat::IDENTITY };
     let ra = quat_from_euler_deg(n.xf.ra, "xyz");
     let local = n.xf.jo_quat() * ra * quat_from_euler_deg(n.xf.r, &n.xf.ro) * ra.inverse();
-    app.s.parent_world(id).to_scale_rotation_translation().1 * local
+    finite_quat(app.s.parent_world(id).to_scale_rotation_translation().1 * local)
+}
+
+/// A zero-scale matrix has no usable rotation; normalizing it would give NaNs and panic egui.
+fn finite_quat(q: DQuat) -> DQuat {
+    if q.to_array().iter().all(|v| v.is_finite()) { q } else { DQuat::IDENTITY }
 }
 
 fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter, interact: bool) -> bool {
@@ -2035,7 +2040,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                 }
             }
             if comp_local {
-                rot = wm.to_scale_rotation_translation().1;
+                rot = finite_quat(wm.to_scale_rotation_translation().1);
             }
         }
         (c / n.max(1) as f64, rot)
@@ -2046,7 +2051,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         } else if app.space_world(tool) {
             DQuat::IDENTITY
         } else {
-            app.s.world_matrix(lead).to_scale_rotation_translation().1
+            finite_quat(app.s.world_matrix(lead).to_scale_rotation_translation().1)
         };
         (app.s.world_pivot(lead), rot)
     };
@@ -3196,7 +3201,7 @@ fn finish_drag(app: &mut IncaApp, d: GizmoDrag) {
     app.echo(echo);
     if app.s.time.auto_key {
         for (id, _) in &d.objects {
-            let attrs: Vec<String> = inca_core::scene::CHANNELS.iter().filter(|c| app.s.anim.is_keyed(id, c)).map(|c| c.to_string()).collect();
+            let attrs: Vec<String> = inca_core::scene::CHANNELS.iter().filter(|c| app.s.anim_is_keyed(id, c)).map(|c| c.to_string()).collect();
             for a in attrs {
                 app.s.set_key(id, &a, None, None);
             }

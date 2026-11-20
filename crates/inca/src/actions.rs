@@ -741,7 +741,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             if app.win.graph_editor && !app.windows_state.ge_keys.is_empty() {
                 crate::windows::copy_selected_keys(app);
             } else {
-                let ks = app.s.anim.key_times(&app.s.sel);
+                let ks = app.s.anim_key_times(&app.s.sel);
                 if let (Some(a), Some(b)) = (ks.first().copied(), ks.last().copied()) {
                     crate::timeline::copy_keys(app, a, b);
                     app.windows_state.key_clip_kind = crate::windows::KeyClipKind::Timeline;
@@ -1324,7 +1324,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             app.s.set_time(nt);
         }
         "nextKey" | "prevKey" => {
-            let ts = app.s.anim.key_times(&app.s.sel);
+            let ts = app.s.anim_key_times(&app.s.sel);
             let cur = app.s.time.current;
             let t = if id == "nextKey" { ts.iter().copied().find(|&t| t > cur + 1e-6).or(ts.first().copied()) } else { ts.iter().rev().copied().find(|&t| t < cur - 1e-6).or(ts.last().copied()) };
             if let Some(t) = t {

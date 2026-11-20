@@ -1637,7 +1637,7 @@ mod tests {
         let mut curve = inca_core::anim::AnimCurve::new("pCube1", "translateX");
         curve.set_key(1.0, 0.0, "linear");
         curve.set_key(10.0, 1.0, "linear");
-        app.s.anim.curves.insert(ck.clone(), curve);
+        app.s.anim_curves_mut().insert(ck.clone(), curve);
         app.windows_state.ge_keys = vec![(ck.clone(), 0)];
         app.win.graph_editor = true;
         app.windows_state.ge_window_rect = Some(egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)));
@@ -1649,7 +1649,7 @@ mod tests {
         app.s.time.current = 20.0;
         let mut out = ctx.run_ui(raw_with(vec![egui::Event::PointerMoved(egui::pos2(200.0, 200.0)), egui::Event::Paste("Inca keyframes".into())]), |ui| app.hotkeys(ui.ctx()));
         out.textures_delta.clear();
-        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        let times: Vec<f64> = app.s.anim_curves()[&ck].keys.iter().map(|k| k.t).collect();
         assert_eq!(times, vec![1.0, 10.0, 20.0], "Ctrl+V did not paste at the current time");
     }
 
@@ -1661,7 +1661,7 @@ mod tests {
         let mut app = IncaApp::new(&cc);
         app.keymap.clear();
         app.run_mel("test", "polyCube; setKeyframe -at translateX -t 1 -v 0; setKeyframe -at translateX -t 10 -v 1;").expect("scene setup");
-        let ck = app.s.anim.curves.keys().find(|k| k.contains("translateX")).expect("curve").clone();
+        let ck = app.s.anim_curves().keys().find(|k| k.contains("translateX")).expect("curve").clone();
         app.windows_state.ge_keys = vec![(ck, 0)];
         app.win.graph_editor = true;
         let mut frame = eframe::Frame::_new_kittest();
@@ -1686,14 +1686,14 @@ mod tests {
         let mut curve = inca_core::anim::AnimCurve::new("pCube1", "translateX");
         curve.set_key(1.0, 0.0, "linear");
         curve.set_key(10.0, 1.0, "linear");
-        app.s.anim.curves.insert(ck.clone(), curve);
+        app.s.anim_curves_mut().insert(ck.clone(), curve);
         app.windows_state.ge_keys = vec![(ck.clone(), 0)];
         app.win.graph_editor = true;
         app.action("copy");
         assert!(!app.windows_state.ge_clipboard.is_empty(), "application copy did not defer to keys");
         app.s.time.current = 20.0;
         app.action("paste");
-        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        let times: Vec<f64> = app.s.anim_curves()[&ck].keys.iter().map(|k| k.t).collect();
         assert_eq!(times, vec![1.0, 10.0, 20.0], "application paste did not defer to keys");
     }
 
@@ -1732,8 +1732,8 @@ mod tests {
         app.s.time.current = 20.0;
         let bottom = egui::pos2(800.0, 950.0);
         run(&mut app, &mut frame, vec![egui::Event::PointerMoved(bottom), egui::Event::Paste("Inca keyframes".into())]);
-        let ck = app.s.anim.curves.keys().find(|k| k.contains("translateX")).expect("curve").clone();
-        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        let ck = app.s.anim_curves().keys().find(|k| k.contains("translateX")).expect("curve").clone();
+        let times: Vec<f64> = app.s.anim_curves()[&ck].keys.iter().map(|k| k.t).collect();
         assert!(times.contains(&20.0), "Ctrl+V did not paste at the current time: {times:?}");
     }
 
@@ -1750,8 +1750,8 @@ mod tests {
         assert!(!app.key_clip.is_empty(), "timeline copy produced no clip");
         app.s.time.current = 20.0;
         app.action("timelinePaste");
-        let ck = app.s.anim.curves.keys().find(|k| k.contains("translateX")).expect("curve").clone();
-        let times: Vec<f64> = app.s.anim.curves[&ck].keys.iter().map(|k| k.t).collect();
+        let ck = app.s.anim_curves().keys().find(|k| k.contains("translateX")).expect("curve").clone();
+        let times: Vec<f64> = app.s.anim_curves()[&ck].keys.iter().map(|k| k.t).collect();
         assert!(times.contains(&20.0), "timeline paste did not create a key at 20: {times:?}");
     }
 
@@ -1766,7 +1766,7 @@ mod tests {
         let mut curve = inca_core::anim::AnimCurve::new("pCube1", "translateX");
         curve.set_key(1.0, 0.0, "linear");
         curve.set_key(10.0, 1.0, "linear");
-        app.s.anim.curves.insert(ck.clone(), curve);
+        app.s.anim_curves_mut().insert(ck.clone(), curve);
         app.windows_state.ge_keys = vec![(ck, 0)];
         app.win.graph_editor = true;
         app.windows_state.ge_window_rect = Some(egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)));

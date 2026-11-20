@@ -111,12 +111,12 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
         t.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
         t
     } else {
-        app.s.anim.key_times(&app.s.sel)
+        app.s.anim_key_times(&app.s.sel)
     };
     for k in key_times {
         if k >= t0 && k <= t1 {
             let x = x_of(k).round();
-            let breakdown = app.s.anim.curves.values().any(|c| c.keys.iter().any(|key| key.breakdown && (key.t - k).abs() < 1e-6));
+            let breakdown = app.s.anim_curves().values().any(|c| c.keys.iter().any(|key| key.breakdown && (key.t - k).abs() < 1e-6));
             let color = if breakdown { Color32::from_rgb(0x54, 0xc8, 0x60) } else { Color32::from_rgb(0xd7, 0x3b, 0x3e) };
             p.rect_filled(Rect::from_min_size(pos2(x - 1.0, rect.max.y - 22.0), vec2((px_per as f32 * 0.18).max(2.0), 22.0)), 0.0, color);
         }
@@ -211,7 +211,7 @@ pub(crate) fn key_range(app: &IncaApp) -> (f64, f64) {
 fn move_keys(app: &mut IncaApp, lo: f64, hi: f64, d: f64) {
     app.s.checkpoint("move keys");
     let sel = app.s.sel.clone();
-    for c in app.s.anim.curves.values_mut().filter(|c| sel.contains(&c.node)) {
+    for c in app.s.anim_curves_mut().values_mut().filter(|c| sel.contains(&c.node)) {
         let (moving, rest): (Vec<_>, Vec<_>) = c.keys.drain(..).partition(|k| k.t >= lo - 1e-4 && k.t <= hi + 1e-4);
         c.keys = rest.into_iter().filter(|k| !(k.t >= lo + d - 1e-4 && k.t <= hi + d + 1e-4)).collect();
         c.keys.extend(moving.into_iter().map(|mut k| {
@@ -227,10 +227,10 @@ fn move_keys(app: &mut IncaApp, lo: f64, hi: f64, d: f64) {
 fn delete_keys(app: &mut IncaApp, lo: f64, hi: f64) {
     app.s.checkpoint("delete keys");
     let sel = app.s.sel.clone();
-    for c in app.s.anim.curves.values_mut().filter(|c| sel.contains(&c.node)) {
+    for c in app.s.anim_curves_mut().values_mut().filter(|c| sel.contains(&c.node)) {
         c.keys.retain(|k| !(k.t >= lo - 1e-4 && k.t <= hi + 1e-4));
     }
-    app.s.anim.curves.retain(|_, c| !c.keys.is_empty());
+    app.s.anim_curves_mut().retain(|_, c| !c.keys.is_empty());
     app.s.apply_anim();
     app.s.rev += 1;
 }
@@ -265,7 +265,7 @@ pub fn paste_keys(app: &mut IncaApp) {
             if same_nodes && cn != n {
                 continue;
             }
-            if let Some(c) = app.s.anim.curve_mut(n, attr, true) {
+            if let Some(c) = app.s.anim_curve_mut(n, attr, true) {
                 for k in keys {
                     c.keys.retain(|x| (x.t - (k.t + t)).abs() > 1e-4);
                     c.keys.push(inca_core::anim::Key { t: k.t + t, ..k.clone() });
@@ -321,7 +321,7 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             if ui.button(label).clicked() {
                 app.s.checkpoint("tangents");
                 let sel = app.s.sel.clone();
-                for c in app.s.anim.curves.values_mut().filter(|c| sel.contains(&c.node)) {
+                for c in app.s.anim_curves_mut().values_mut().filter(|c| sel.contains(&c.node)) {
                     for k in c.keys.iter_mut().filter(|k| k.t >= lo - 1e-4 && k.t <= hi + 1e-4) {
                         k.it = t.to_string();
                         k.ot = t.to_string();
@@ -350,7 +350,7 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         ui.add_enabled(false, egui::Button::new("Sound Length"));
         if ui.button("Keys of selected").clicked() {
-            let ks = app.s.anim.key_times(&app.s.sel);
+            let ks = app.s.anim_key_times(&app.s.sel);
             if let (Some(a), Some(b)) = (ks.first(), ks.last()) {
                 app.s.time.start = *a;
                 app.s.time.end = b.max(a + 1.0);

@@ -1,7 +1,7 @@
 //! Scene graph: DAG nodes (transform + shape), construction history, attributes, selection,
 //! undo snapshots and the `.inca` JSON format (the same layout the JS app writes).
 
-use crate::anim::{Anim, AnimCurve};
+use crate::anim::{Anim, AnimCurve, AnimLayer};
 use crate::curves::Curve;
 use crate::materials::{Material, Place2D, ShadingData, Texture};
 use crate::math::*;
@@ -562,6 +562,16 @@ pub struct Scene {
     /// Playback state mirrored from the app so `is_visible` can apply layer `P` flags.
     pub playing: bool,
     pub anim: Anim,
+    /// Animation layers above the base animation (top of the list first).
+    pub anim_layers: Vec<AnimLayer>,
+    /// Animation layer receiving new keys; None = BaseAnimation.
+    pub anim_layer_current: Option<Id>,
+    /// BaseAnimation refuses new keys while locked.
+    pub anim_base_lock: bool,
+    /// Mute/lock state of the layers before Solo; restored when Solo is cleared.
+    pub anim_solo_saved: Vec<(Id, bool, bool)>,
+    /// Static channel values animation layers blend against when BaseAnimation has no curve.
+    pub anim_static: IndexMap<String, f64>,
     pub conns: Vec<Conn>,
     pub constraints: Vec<Constraint>,
     /// HumanIK character definitions
@@ -623,6 +633,11 @@ impl Scene {
             add_new_to_current: false,
             playing: false,
             anim: Anim::default(),
+            anim_layers: vec![],
+            anim_layer_current: None,
+            anim_base_lock: false,
+            anim_solo_saved: vec![],
+            anim_static: IndexMap::new(),
             conns: vec![],
             constraints: vec![],
             characters: vec![],
@@ -1247,7 +1262,7 @@ impl Scene {
                     }
                 }
             }
-            self.anim.remove_node(i);
+            self.remove_anim_node(i);
             self.comp.remove(i);
             self.conns.retain(|c| c.src != *i && c.dst != *i);
             self.constraints.retain(|c| c.driven != *i && !c.targets.contains(i));
@@ -1865,9 +1880,29 @@ impl Scene {
             return;
         }
         let t = t.unwrap_or(self.time.current);
-        let v = v.unwrap_or_else(|| self.get_attr_f(id, attr));
+        let mut v = v.unwrap_or_else(|| self.get_attr_f(id, attr));
         let (ti, to) = self.key_tangents.clone();
-        if let Some(c) = self.anim.curve_mut(id, attr, true) {
+        let layer_id = self.anim_layer_current.clone().filter(|lid| self.anim_layers.iter().any(|l| &l.id == lid));
+        if let Some(lid) = &layer_id {
+            // A locked layer rejects new keys instead of silently writing them to the base.
+            if self.anim_layers.iter().any(|l| &l.id == lid && l.lock) {
+                return;
+            }
+        } else if self.anim_base_lock {
+            return;
+        }
+        let key = Anim::key(id, attr);
+        let target: Option<&mut AnimCurve> = if let Some(lid) = &layer_id {
+            // Additive layers store the delta from everything below them, so keying the current
+            // pose does not add the base animation a second time.
+            if attr != "visibility" && self.anim_layers.iter().find(|l| &l.id == lid).is_some_and(|l| !l.override_mode) {
+                v -= self.anim_value_below(&key, t, lid);
+            }
+            self.anim_layers.iter_mut().find(|l| &l.id == lid).map(|l| l.curves.entry(key).or_insert_with(|| AnimCurve::new(id, attr)))
+        } else {
+            self.anim.curve_mut(id, attr, true)
+        };
+        if let Some(c) = target {
             let existed = c.find(t).is_some();
             let i = if breakdown { c.set_breakdown(t, v, &to) } else { c.set_key(t, v, &to) };
             if let Some(k) = c.keys.get_mut(i).filter(|_| !existed) {
@@ -1875,6 +1910,175 @@ impl Scene {
             }
         }
         self.touch();
+    }
+
+    /// Curves shown and edited in the timeline and graph editor: the current animation layer,
+    /// or BaseAnimation when no layer is selected.
+    pub fn anim_curves(&self) -> &IndexMap<String, AnimCurve> {
+        self.anim_layer_current
+            .as_ref()
+            .and_then(|id| self.anim_layers.iter().find(|l| &l.id == id))
+            .map(|l| &l.curves)
+            .unwrap_or(&self.anim.curves)
+    }
+
+    pub fn anim_curves_mut(&mut self) -> &mut IndexMap<String, AnimCurve> {
+        let current = self.anim_layer_current.clone();
+        if let Some(id) = current {
+            if let Some(i) = self.anim_layers.iter().position(|l| l.id == id) {
+                return &mut self.anim_layers[i].curves;
+            }
+        }
+        &mut self.anim.curves
+    }
+
+    pub fn anim_curve(&self, node: &str, attr: &str) -> Option<&AnimCurve> {
+        self.anim_curves().get(&Anim::key(node, attr))
+    }
+
+    /// Snapshot the static channel values layers blend from. Call before the user poses the object.
+    pub fn remember_anim_static(&mut self, ids: &[String]) {
+        for id in ids {
+            let attrs: Vec<String> = {
+                let Some(n) = self.nodes.get(id) else { continue };
+                let mut a: Vec<String> = CHANNELS.iter().map(|c| c.to_string()).collect();
+                a.extend(self.shape_channels(id));
+                if let Some(e) = n.extra.as_object() {
+                    a.extend(e.iter().filter(|(_, v)| v.is_number() || v.is_boolean()).map(|(k, _)| k.clone()));
+                }
+                a.sort();
+                a.dedup();
+                a
+            };
+            for attr in attrs {
+                let key = Anim::key(id, &attr);
+                if !self.anim_static.contains_key(&key) {
+                    let v = self.get_attr_f(id, &attr);
+                    self.anim_static.insert(key, v);
+                }
+            }
+        }
+    }
+
+    fn anim_static_value(&self, key: &str) -> f64 {
+        self.anim_static.get(key).copied().unwrap_or_else(|| {
+            let attr = key.rsplit_once('.').map(|(_, a)| a).unwrap_or("");
+            // scale and visibility rest at 1; the other keyable channels rest at 0
+            if attr.starts_with("scale") || attr == "visibility" { 1.0 } else { 0.0 }
+        })
+    }
+
+    /// Restore the static pose for layered channels whose layer curves are gone.
+    pub fn restore_anim_static(&mut self, keys: &[String]) {
+        for key in keys {
+            self.restore_anim_channel(key);
+        }
+    }
+
+    fn restore_anim_channel(&mut self, key: &str) -> Option<Id> {
+        // an active base curve is already the base; leave it to apply_anim
+        if self.anim.curves.get(key).is_some_and(|c| !c.keys.is_empty() && !c.mute) {
+            return None;
+        }
+        let (node, attr) = key.rsplit_once('.')?;
+        let v = self.anim_static_value(key);
+        if self.nodes.contains_key(node) {
+            self.set_attr_ex(&NodeRef::Dag(node.into()), attr, json!(v), false);
+            Some(node.to_string())
+        } else if let Some(r) = self.history_ref_by_id(node) {
+            self.set_attr(&r, attr, json!(v));
+            None
+        } else {
+            None
+        }
+    }
+
+    /// Value an animation layer sees from BaseAnimation and the layers below it at time `t`.
+    /// Computed from the curves, so repeated evaluation cannot accumulate onto the live channel.
+    fn anim_value_below(&self, key: &str, t: f64, layer_id: &str) -> f64 {
+        let mut v = self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key));
+        let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
+        let solo = self.anim_layers.iter().any(|l| l.solo);
+        // layers are stored top-first, so walk the ones below the current layer bottom-up
+        for l in self.anim_layers[i + 1..].iter().rev() {
+            if l.mute || l.weight <= 1e-6 || (solo && !l.solo) {
+                continue;
+            }
+            let Some(c) = l.curves.get(key) else { continue };
+            if c.keys.is_empty() || c.mute {
+                continue;
+            }
+            let lv = c.eval(t);
+            v = if l.override_mode || c.attr == "visibility" {
+                v + (lv - v) * l.weight
+            } else {
+                v + lv * l.weight
+            };
+        }
+        v
+    }
+
+    pub fn anim_curve_mut(&mut self, node: &str, attr: &str, create: bool) -> Option<&mut AnimCurve> {
+        let k = Anim::key(node, attr);
+        let curves = self.anim_curves_mut();
+        if create && !curves.contains_key(&k) {
+            curves.insert(k.clone(), AnimCurve::new(node, attr));
+        }
+        curves.get_mut(&k)
+    }
+
+    pub fn anim_curves_of(&self, node: &str) -> impl Iterator<Item = &AnimCurve> {
+        let node = node.to_string();
+        self.anim_curves().values().filter(move |c| c.node == node)
+    }
+
+    pub fn anim_is_keyed(&self, node: &str, attr: &str) -> bool {
+        self.anim_curve(node, attr).is_some_and(|c| !c.keys.is_empty())
+    }
+
+    pub fn anim_on_key(&self, node: &str, attr: &str, t: f64) -> bool {
+        self.anim_curve(node, attr).is_some_and(|c| c.find(t).is_some())
+    }
+
+    pub fn anim_key_times(&self, nodes: &[String]) -> Vec<f64> {
+        let mut ts: Vec<f64> = self.anim_curves().values().filter(|c| nodes.is_empty() || nodes.contains(&c.node)).flat_map(|c| c.keys.iter().map(|k| k.t)).collect();
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        ts
+    }
+
+    /// Change a layer's mode, converting its keys so their values keep their meaning:
+    /// additive curves store offsets, override curves store absolute values.
+    pub fn set_anim_layer_override(&mut self, id: &str, override_mode: bool) {
+        let Some(i) = self.anim_layers.iter().position(|l| l.id == id) else { return };
+        if self.anim_layers[i].override_mode == override_mode {
+            return;
+        }
+        let curves: Vec<(String, Vec<f64>)> = self.anim_layers[i]
+            .curves
+            .iter()
+            .filter(|(_, c)| c.attr != "visibility")
+            .map(|(k, c)| (k.clone(), c.keys.iter().map(|k| k.t).collect()))
+            .collect();
+        let lowers: Vec<Vec<f64>> = curves.iter().map(|(key, times)| times.iter().map(|t| self.anim_value_below(key, *t, id)).collect()).collect();
+        let sign = if override_mode { 1.0 } else { -1.0 };
+        for ((key, _), lower) in curves.iter().zip(lowers) {
+            if let Some(c) = self.anim_layers[i].curves.get_mut(key) {
+                for (k, lower) in c.keys.iter_mut().zip(lower) {
+                    k.v += sign * lower;
+                }
+            }
+        }
+        self.anim_layers[i].override_mode = override_mode;
+        self.touch();
+    }
+
+    /// Remove a node's curves from the base animation and every animation layer.
+    pub fn remove_anim_node(&mut self, node: &str) {
+        self.anim.remove_node(node);
+        for l in &mut self.anim_layers {
+            l.curves.retain(|_, c| c.node != node);
+        }
     }
 
     /// Evaluate per-channel expressions. A few passes let expressions that reference other
@@ -1944,6 +2148,56 @@ impl Scene {
                 }
             } else if let Some(r) = self.history_ref_by_id(&n) {
                 self.set_attr(&r, &a, json!(v));
+            }
+        }
+        // Layers blend from the static pose, so muted or zero-weight layers return to it
+        // instead of leaving the value from the previous evaluation.
+        let mut driven: Vec<String> = self.anim_layers.iter().flat_map(|l| l.curves.keys().cloned()).collect();
+        driven.sort();
+        driven.dedup();
+        for key in &driven {
+            if let Some(n) = self.restore_anim_channel(key) {
+                if !moved.contains(&n) {
+                    moved.push(n);
+                }
+            }
+        }
+        // Animation layers, bottom-to-top so the upper layers win. Solo silences the rest.
+        if !self.anim_layers.is_empty() {
+            let solo = self.anim_layers.iter().any(|l| l.solo);
+            let layers: Vec<AnimLayer> = self
+                .anim_layers
+                .iter()
+                .rev()
+                .filter(|l| !l.mute && l.weight > 1e-6 && (!solo || l.solo))
+                .cloned()
+                .collect();
+            for layer in layers {
+                for c in layer.curves.values() {
+                    if c.keys.is_empty() || c.mute {
+                        continue;
+                    }
+                    if !self.nodes.contains_key(&c.node) && self.history_ref_by_id(&c.node).is_none() {
+                        continue;
+                    }
+                    let lv = c.eval(t);
+                    let base = self.anim_value_below(&Anim::key(&c.node, &c.attr), t, &layer.id);
+                    // Boolean channels (visibility) always behave as override, as in Maya.
+                    let v = if layer.override_mode || c.attr == "visibility" {
+                        base + (lv - base) * layer.weight
+                    } else {
+                        base + lv * layer.weight
+                    };
+                    if self.nodes.contains_key(&c.node) {
+                        let r = NodeRef::Dag(c.node.clone());
+                        self.set_attr_ex(&r, &c.attr, json!(v), false);
+                        if !moved.contains(&c.node) {
+                            moved.push(c.node.clone());
+                        }
+                    } else if let Some(r) = self.history_ref_by_id(&c.node) {
+                        self.set_attr(&r, &c.attr, json!(v));
+                    }
+                }
             }
         }
         moved.extend(self.eval_connections());
@@ -2156,6 +2410,10 @@ impl Scene {
             SelMode::Remove => self.sel.retain(|s| !ids.contains(s)),
         }
         self.sel.retain(|s| self.nodes.contains_key(s));
+        if self.anim_layer_current.is_some() {
+            let ids = self.sel.clone();
+            self.remember_anim_static(&ids);
+        }
         self.rev += 1;
     }
     pub fn lead(&self) -> Option<&Id> {
@@ -2569,6 +2827,11 @@ impl Scene {
             "shading": ShadingData { mats: self.mats.values().cloned().collect(), texs: self.texs.values().cloned().collect(), places: self.places.values().cloned().collect(), default_mat_id: Some(self.default_mat.clone()) },
             "layers": self.layers,
             "anim": self.anim.serialize(),
+            "animLayers": self.anim_layers,
+            "animLayerCurrent": self.anim_layer_current,
+            "animBaseLock": self.anim_base_lock,
+            "animSoloSaved": self.anim_solo_saved,
+            "animStatic": self.anim_static,
             "conns": self.conns,
             "constraints": self.constraints,
             "characters": if self.characters.is_empty() { Value::Null } else { serde_json::to_value(&self.characters).unwrap() },
@@ -2589,6 +2852,11 @@ impl Scene {
         self.layers.clear();
         self.current_layer = None;
         self.anim = Anim::default();
+        self.anim_layers.clear();
+        self.anim_layer_current = None;
+        self.anim_base_lock = false;
+        self.anim_solo_saved.clear();
+        self.anim_static.clear();
         self.conns.clear();
         self.constraints.clear();
         self.characters.clear();
@@ -2652,6 +2920,11 @@ impl Scene {
         }
         let anim: Vec<AnimCurve> = serde_json::from_value(data["anim"].clone()).unwrap_or_default();
         self.anim.load(anim);
+        self.anim_layers = serde_json::from_value(data.get("animLayers").cloned().unwrap_or(Value::Null)).unwrap_or_default();
+        self.anim_layer_current = serde_json::from_value(data.get("animLayerCurrent").cloned().unwrap_or(Value::Null)).unwrap_or_default();
+        self.anim_base_lock = data.get("animBaseLock").and_then(|v| v.as_bool()).unwrap_or(false);
+        self.anim_solo_saved = serde_json::from_value(data.get("animSoloSaved").cloned().unwrap_or(Value::Null)).unwrap_or_default();
+        self.anim_static = serde_json::from_value(data.get("animStatic").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         self.conns = serde_json::from_value::<Vec<Conn>>(data["conns"].clone()).unwrap_or_default();
         self.constraints = serde_json::from_value::<Vec<Constraint>>(data["constraints"].clone()).unwrap_or_default();
         if let Ok(t) = serde_json::from_value::<TimeState>(data["time"].clone()) {
@@ -3153,6 +3426,289 @@ mod tests {
         s.set_key(&a, "tx", Some(11.0), Some(10.0));
         s.set_time(11.0);
         assert!((s.get_attr_f(&a, "tx") - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn animation_layers_blend_and_solo() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_key(&a, "translateX", Some(0.0), Some(0.0));
+        s.set_key(&a, "translateX", Some(10.0), Some(10.0));
+        let mut c = AnimCurve::new(&a, "translateX");
+        c.set_key(0.0, 20.0, "linear");
+        c.set_key(10.0, 20.0, "linear");
+        let mut curves = IndexMap::new();
+        curves.insert(Anim::key(&a, "translateX"), c);
+        s.anim_layers.push(AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: true,
+            members: vec![],
+            curves,
+        });
+        s.set_time(5.0);
+        assert!((s.get_attr_f(&a, "translateX") - 20.0).abs() < 1e-9, "override layer wins");
+        s.anim_layers[0].weight = 0.5;
+        s.set_time(5.0);
+        assert!((s.get_attr_f(&a, "translateX") - 12.5).abs() < 1e-9, "weight blends");
+        s.anim_layers[0].mute = true;
+        s.set_time(5.0);
+        assert!((s.get_attr_f(&a, "translateX") - 5.0).abs() < 1e-9, "mute returns to base");
+        s.anim_layers[0].mute = false;
+        s.anim_layers[0].solo = true;
+        s.set_time(5.0);
+        assert!((s.get_attr_f(&a, "translateX") - 12.5).abs() < 1e-9, "solo keeps only that layer");
+    }
+
+    #[test]
+    fn keys_go_into_the_current_animation_layer() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_key(&a, "translateX", Some(0.0), Some(0.0));
+        s.set_key(&a, "translateX", Some(10.0), Some(10.0));
+        s.anim_layers.push(AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![],
+            curves: IndexMap::new(),
+        });
+        s.anim_layer_current = Some("al1".into());
+        s.set_time(3.0);
+        s.set_key(&a, "translateX", Some(3.0), Some(7.0));
+        assert!(s.anim.curves[&Anim::key(&a, "translateX")].find(3.0).is_none(), "key must not go to the base");
+        let c = s.anim_layers[0].curves.get(&Anim::key(&a, "translateX")).expect("layer curve");
+        let base = s.anim.curves[&Anim::key(&a, "translateX")].eval(3.0);
+        assert!((c.eval(3.0) - (7.0 - base)).abs() < 1e-9, "additive key stores the delta");
+        s.set_time(3.0);
+        assert!((s.get_attr_f(&a, "translateX") - 7.0).abs() < 1e-9);
+        assert!(s.anim_key_times(std::slice::from_ref(&a)).contains(&3.0), "timeline sees layer keys");
+        assert!(s.anim_curve(&a, "translateX").is_some_and(|c| c.find(3.0).is_some()));
+        // locked layers reject keys
+        s.anim_layers[0].lock = true;
+        s.set_key(&a, "translateX", Some(4.0), Some(99.0));
+        assert!(s.anim_layers[0].curves[&Anim::key(&a, "translateX")].find(4.0).is_none());
+        assert!(s.anim.curves[&Anim::key(&a, "translateX")].find(4.0).is_none());
+    }
+
+    #[test]
+    fn animation_layers_round_trip_through_scene_json() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut c = AnimCurve::new(&a, "translateX");
+        c.set_key(0.0, 2.0, "linear");
+        let mut curves = IndexMap::new();
+        curves.insert(Anim::key(&a, "translateX"), c);
+        s.anim_layers.push(AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 0.5,
+            mute: true,
+            solo: false,
+            lock: true,
+            override_mode: true,
+            members: vec![a.clone()],
+            curves,
+        });
+        s.anim_layer_current = Some("al1".into());
+        s.anim_base_lock = true;
+        s.anim_solo_saved = vec![("al1".into(), false, true)];
+        s.remember_anim_static(std::slice::from_ref(&a));
+        let data = s.serialize();
+        let mut t = Scene::new();
+        t.load(&data).expect("scene loads");
+        assert_eq!(t.anim_layers.len(), 1);
+        assert_eq!(t.anim_layers[0].name, "Layer 1");
+        assert_eq!(t.anim_layers[0].members, vec![a.clone()]);
+        assert_eq!(t.anim_layer_current.as_deref(), Some("al1"));
+        assert!(t.anim_base_lock, "base lock survives the load");
+        assert_eq!(t.anim_solo_saved, vec![("al1".into(), false, true)], "solo restore state survives the load");
+        assert!((t.anim_static[&Anim::key(&a, "scaleX")] - 1.0).abs() < 1e-9, "static pose survives the load");
+        let c = t.anim_layers[0].curves.get(&Anim::key(&a, "translateX")).expect("curve survives");
+        assert!((c.eval(0.0) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn additive_layer_keys_hold_their_pose_without_compounding() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.anim_layers.push(AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![a.clone()],
+            curves: IndexMap::new(),
+        });
+        s.anim_layer_current = Some("al1".into());
+        // S keys every channel at the rest pose.
+        s.set_time(1.0);
+        for c in CHANNELS {
+            s.set_key(&a, c, None, None);
+        }
+        // Move and key a second rotation pose.
+        s.set_time(20.0);
+        s.set_attr_f(&a, "rotateY", 90.0);
+        s.set_key(&a, "rotateY", None, None);
+        let c = s.anim_layers[0].curves.get(&Anim::key(&a, "rotateY")).expect("layer curve");
+        assert!((c.eval(20.0) - 90.0).abs() < 1e-9, "additive key stored {}", c.eval(20.0));
+        s.set_time(10.0);
+        let mid = s.get_attr_f(&a, "rotateY");
+        assert!(mid > 1.0 && mid < 89.0, "layer does not animate: {mid}");
+        for _ in 0..200 {
+            s.set_time(10.0);
+        }
+        assert!((s.get_attr_f(&a, "rotateY") - mid).abs() < 1e-9, "additive evaluation compounds");
+        s.anim_layers[0].override_mode = true;
+        s.set_time(10.0);
+        assert!((s.get_attr_f(&a, "rotateY") - mid).abs() < 1e-9, "override changes the pose");
+        assert!(s.nodes[&a].visible, "overriding a visibility key hid the object");
+    }
+
+    #[test]
+    fn animation_layer_weight_and_mute_return_to_the_static_pose() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.remember_anim_static(std::slice::from_ref(&a));
+        s.anim_layers.push(AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![a.clone()],
+            curves: IndexMap::new(),
+        });
+        s.anim_layer_current = Some("al1".into());
+        s.set_time(1.0);
+        for c in CHANNELS {
+            s.set_key(&a, c, None, None);
+        }
+        s.set_time(10.0);
+        s.set_attr_f(&a, "rotateY", 80.0);
+        s.set_key(&a, "rotateY", None, None);
+        s.set_time(10.0);
+        assert!((s.get_attr_f(&a, "rotateY") - 80.0).abs() < 1e-9);
+        s.anim_layers[0].weight = 0.5;
+        s.set_time(10.0);
+        assert!((s.get_attr_f(&a, "rotateY") - 40.0).abs() < 1e-9, "weight does not blend the pose");
+        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9, "weight changed the scale");
+        s.anim_layers[0].weight = 0.0;
+        s.set_time(10.0);
+        assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9, "weight 0 did not return to the static pose");
+        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
+        s.anim_layers[0].weight = 1.0;
+        s.anim_layers[0].mute = true;
+        s.set_time(10.0);
+        assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9, "mute did not return to the static pose");
+        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
+        let keys: Vec<String> = s.anim_layers[0].curves.keys().cloned().collect();
+        s.anim_layers.clear();
+        s.restore_anim_static(&keys);
+        s.set_time(10.0);
+        assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9, "deleting the layer left the old pose");
+        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn override_layer_weight_does_not_scale_unkeyed_channels() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.remember_anim_static(std::slice::from_ref(&a));
+        s.anim_layers.push(AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: true,
+            members: vec![a.clone()],
+            curves: IndexMap::new(),
+        });
+        s.anim_layer_current = Some("al1".into());
+        s.set_time(1.0);
+        for c in CHANNELS {
+            s.set_key(&a, c, None, None);
+        }
+        s.set_time(10.0);
+        s.set_attr_f(&a, "rotateY", 80.0);
+        s.set_key(&a, "rotateY", None, None);
+        s.set_time(10.0);
+        s.anim_layers[0].weight = 0.5;
+        s.set_time(10.0);
+        assert!((s.get_attr_f(&a, "rotateY") - 40.0).abs() < 1e-9);
+        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9, "override weight scaled the object");
+        s.anim_layers[0].weight = 0.0;
+        s.set_time(10.0);
+        assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9);
+        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn changing_animation_layer_mode_converts_its_keys() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_attr_f(&a, "translateX", 5.0);
+        s.remember_anim_static(std::slice::from_ref(&a));
+        s.anim_layers.push(AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![a.clone()],
+            curves: IndexMap::new(),
+        });
+        s.anim_layer_current = Some("al1".into());
+        s.set_time(1.0);
+        for c in CHANNELS {
+            s.set_key(&a, c, None, None);
+        }
+        s.set_time(10.0);
+        s.set_attr_f(&a, "translateX", 8.0);
+        s.set_key(&a, "translateX", None, None);
+        let key = Anim::key(&a, "translateX");
+        let value_at = |s: &Scene, t: f64| s.anim_layers[0].curves[&key].keys[s.anim_layers[0].curves[&key].find(t).unwrap()].v;
+        assert!((value_at(&s, 10.0) - 3.0).abs() < 1e-9, "additive key stores the offset");
+        s.set_time(10.0);
+        assert!((s.get_attr_f(&a, "translateX") - 8.0).abs() < 1e-9);
+        s.set_anim_layer_override("al1", true);
+        s.set_time(10.0);
+        assert!((value_at(&s, 10.0) - 8.0).abs() < 1e-9, "override key is absolute");
+        assert!((s.get_attr_f(&a, "translateX") - 8.0).abs() < 1e-9, "mode change moved the object");
+        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9, "mode change collapsed the scale");
+        s.set_anim_layer_override("al1", false);
+        s.set_time(10.0);
+        assert!((value_at(&s, 10.0) - 3.0).abs() < 1e-9, "additive key is an offset again");
+        assert!((s.get_attr_f(&a, "translateX") - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn base_animation_lock_rejects_new_keys() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.anim_base_lock = true;
+        s.set_key(&a, "translateX", Some(1.0), Some(5.0));
+        assert!(!s.anim_is_keyed(&a, "translateX"), "locked BaseAnimation received a key");
+        s.anim_base_lock = false;
+        s.set_key(&a, "translateX", Some(1.0), Some(5.0));
+        assert!(s.anim_is_keyed(&a, "translateX"));
     }
 
     #[test]

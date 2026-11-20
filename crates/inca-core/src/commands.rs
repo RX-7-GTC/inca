@@ -1109,7 +1109,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             }
             if a.has(&["c", "channels"]) {
                 for id in targets(s, &a) {
-                    s.anim.remove_node(&id);
+                    s.remove_anim_node(&id);
                 }
                 return Ok(Val::None);
             }
@@ -1238,16 +1238,16 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let t = a.s(&["t", "time"]).and_then(|x| x.split(':').next().and_then(|v| v.parse::<f64>().ok()));
             let mut n = 0;
             for id in targets(s, &a) {
-                let keys: Vec<String> = s.anim.curves.iter().filter(|(_, c)| c.node == id && (attrs.is_empty() || attrs.contains(&c.attr))).map(|(k, _)| k.clone()).collect();
+                let keys: Vec<String> = s.anim_curves().iter().filter(|(_, c)| c.node == id && (attrs.is_empty() || attrs.contains(&c.attr))).map(|(k, _)| k.clone()).collect();
                 for k in keys {
                     match t {
                         Some(t) => {
-                            if s.anim.curves.get_mut(&k).unwrap().remove_at(t) {
+                            if s.anim_curves_mut().get_mut(&k).unwrap().remove_at(t) {
                                 n += 1;
                             }
                         }
                         None => {
-                            n += s.anim.curves.shift_remove(&k).map(|c| c.keys.len()).unwrap_or(0);
+                            n += s.anim_curves_mut().shift_remove(&k).map(|c| c.keys.len()).unwrap_or(0);
                         }
                     }
                 }
@@ -1258,7 +1258,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "keyframe" => {
             let attrs: Vec<String> = a.flags.iter().filter(|(f, _)| f == "at" || f == "attribute").filter_map(|(_, v)| v.first().map(|x| alias(&x.str()).to_string())).collect();
             let ts = targets(s, &a);
-            let curves: Vec<crate::anim::AnimCurve> = s.anim.curves.values().filter(|c| ts.contains(&c.node) && (attrs.is_empty() || attrs.contains(&c.attr))).cloned().collect();
+            let curves: Vec<crate::anim::AnimCurve> = s.anim_curves().values().filter(|c| ts.contains(&c.node) && (attrs.is_empty() || attrs.contains(&c.attr))).cloned().collect();
             if a.has(&["kc", "keyframeCount"]) {
                 return Ok(Val::Int(curves.iter().map(|c| c.keys.len()).sum::<usize>() as i64));
             }
