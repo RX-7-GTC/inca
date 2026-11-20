@@ -38,6 +38,9 @@ pub struct AnimLayer {
     /// Objects explicitly assigned to the layer.
     #[serde(default)]
     pub members: Vec<String>,
+    /// Attributes assigned to the layer, keyed "node.attr".
+    #[serde(default)]
+    pub attrs: Vec<String>,
     /// Draw the stack up to and including this layer as a translucent ghost.
     #[serde(default)]
     pub ghost: bool,
@@ -45,6 +48,18 @@ pub struct AnimLayer {
     pub ghost_color: [f32; 3],
     #[serde(default)]
     pub curves: indexmap::IndexMap<String, AnimCurve>,
+}
+
+impl AnimLayer {
+    /// Whether this layer owns `node.attr`. Old scenes without an attribute list keep
+    /// their object-level membership until the loader migrates them.
+    pub fn has_attr(&self, node: &str, attr: &str) -> bool {
+        let key = Anim::key(node, attr);
+        if self.attrs.is_empty() && !self.members.is_empty() {
+            return self.members.iter().any(|m| m == node);
+        }
+        self.attrs.iter().any(|a| a == &key)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

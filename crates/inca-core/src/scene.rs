@@ -1873,28 +1873,71 @@ impl Scene {
         }
     }
 
+    /// Individual keyable attributes of a node, used for animation-layer membership.
+    pub fn keyable_attrs(&self, id: &str) -> Vec<String> {
+        let Some(n) = self.nodes.get(id) else { return vec![] };
+        let mut list: Vec<String> = CHANNELS.iter().map(|c| c.to_string()).collect();
+        if let Some(e) = n.extra.as_object() {
+            list.extend(e.iter().filter(|(_, v)| v.is_number() || v.is_boolean()).map(|(k, _)| k.clone()));
+        }
+        list.extend(self.shape_channels(id));
+        list.sort();
+        list.dedup();
+        list.retain(|c| n.is_keyable(alias(c)));
+        list
+    }
+
+    /// Scenes saved before per-attribute membership only listed member objects: assign all
+    /// their keyable attributes, then keep every existing layer curve.
+    pub fn migrate_anim_layer_attrs(&mut self) {
+        for i in 0..self.anim_layers.len() {
+            if self.anim_layers[i].attrs.is_empty() {
+                let mut attrs = vec![];
+                for m in self.anim_layers[i].members.clone() {
+                    attrs.extend(self.keyable_attrs(&m).into_iter().map(|a| Anim::key(&m, &a)));
+                }
+                self.anim_layers[i].attrs = attrs;
+            }
+            for k in self.anim_layers[i].curves.keys().cloned().collect::<Vec<_>>() {
+                if !self.anim_layers[i].attrs.contains(&k) {
+                    self.anim_layers[i].attrs.push(k);
+                }
+            }
+            let nodes: Vec<String> = self.anim_layers[i].attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
+            for n in &nodes {
+                if !self.anim_layers[i].members.contains(n) {
+                    self.anim_layers[i].members.push(n.clone());
+                }
+            }
+            self.anim_layers[i].members.retain(|m| nodes.contains(m));
+        }
+    }
+
     // ------------------------------------------------------------ animation
-    pub fn set_key(&mut self, id: &str, attr: &str, t: Option<f64>, v: Option<f64>) {
+    pub fn set_key(&mut self, id: &str, attr: &str, t: Option<f64>, v: Option<f64>) -> bool {
         self.set_key_ex(id, attr, t, v, false)
     }
 
-    /// Set a key; `breakdown` marks it as a breakdown key.
-    pub fn set_key_ex(&mut self, id: &str, attr: &str, t: Option<f64>, v: Option<f64>, breakdown: bool) {
+    /// Set a key; `breakdown` marks it as a breakdown key. Returns false when the layer
+    /// doesn't own the attribute (or is locked).
+    pub fn set_key_ex(&mut self, id: &str, attr: &str, t: Option<f64>, v: Option<f64>, breakdown: bool) -> bool {
         let attr = alias(attr);
         if self.nodes.get(id).is_some_and(|n| !n.is_keyable(attr)) {
-            return;
+            return false;
         }
         let t = t.unwrap_or(self.time.current);
         let mut v = v.unwrap_or_else(|| self.get_attr_f(id, attr));
         let (ti, to) = self.key_tangents.clone();
         let layer_id = self.anim_layer_current.clone().filter(|lid| self.anim_layers.iter().any(|l| &l.id == lid));
         if let Some(lid) = &layer_id {
-            // A locked layer rejects new keys instead of silently writing them to the base.
-            if self.anim_layers.iter().any(|l| &l.id == lid && l.lock) {
-                return;
+            // A locked layer rejects new keys; a layer only receives keys for attributes
+            // explicitly assigned to it.
+            let Some(l) = self.anim_layers.iter().find(|l| &l.id == lid) else { return false };
+            if l.lock || !l.has_attr(id, attr) {
+                return false;
             }
         } else if self.anim_base_lock {
-            return;
+            return false;
         }
         let key = Anim::key(id, attr);
         let target: Option<&mut AnimCurve> = if let Some(lid) = &layer_id {
@@ -1907,14 +1950,14 @@ impl Scene {
         } else {
             self.anim.curve_mut(id, attr, true)
         };
-        if let Some(c) = target {
-            let existed = c.find(t).is_some();
-            let i = if breakdown { c.set_breakdown(t, v, &to) } else { c.set_key(t, v, &to) };
-            if let Some(k) = c.keys.get_mut(i).filter(|_| !existed) {
-                k.it = ti;
-            }
+        let Some(c) = target else { return false };
+        let existed = c.find(t).is_some();
+        let i = if breakdown { c.set_breakdown(t, v, &to) } else { c.set_key(t, v, &to) };
+        if let Some(k) = c.keys.get_mut(i).filter(|_| !existed) {
+            k.it = ti;
         }
         self.touch();
+        true
     }
 
     /// Curves shown and edited in the timeline and graph editor: the current animation layer,
@@ -2937,6 +2980,7 @@ impl Scene {
         self.anim.load(anim);
         self.anim_layers = serde_json::from_value(data.get("animLayers").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         self.anim_layer_current = serde_json::from_value(data.get("animLayerCurrent").cloned().unwrap_or(Value::Null)).unwrap_or_default();
+        self.migrate_anim_layer_attrs();
         self.anim_base_lock = data.get("animBaseLock").and_then(|v| v.as_bool()).unwrap_or(false);
         self.anim_base_ghost = data.get("animBaseGhost").and_then(|v| v.as_bool()).unwrap_or(false);
         self.anim_base_ghost_color = serde_json::from_value(data.get("animBaseGhostColor").cloned().unwrap_or(Value::Null)).unwrap_or_else(|_| crate::anim::ghost_red());
@@ -3465,6 +3509,7 @@ mod tests {
             lock: false,
             override_mode: true,
             members: vec![],
+            attrs: vec![],
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves,
@@ -3497,7 +3542,8 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
-            members: vec![],
+            members: vec![a.clone()],
+            attrs: vec![Anim::key(&a, "translateX")],
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3537,6 +3583,7 @@ mod tests {
             lock: true,
             override_mode: true,
             members: vec![a.clone()],
+            attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             ghost: true,
             ghost_color: [0.2, 0.4, 0.6],
             curves,
@@ -3556,6 +3603,7 @@ mod tests {
         assert_eq!(t.anim_layer_current.as_deref(), Some("al1"));
         assert!(t.anim_layers[0].ghost);
         assert_eq!(t.anim_layers[0].ghost_color, [0.2, 0.4, 0.6]);
+        assert!(t.anim_layers[0].attrs.contains(&Anim::key(&a, "translateX")));
         assert!(t.anim_base_ghost);
         assert_eq!(t.anim_base_ghost_color, [0.6, 0.2, 0.4]);
         assert!(t.anim_base_lock, "base lock survives the load");
@@ -3586,6 +3634,7 @@ mod tests {
                 lock: false,
                 override_mode: false,
                 members: vec![a.clone()],
+                attrs: vec![],
                 ghost: false,
                 ghost_color: crate::anim::ghost_red(),
                 curves,
@@ -3614,6 +3663,7 @@ mod tests {
             lock: false,
             override_mode: false,
             members: vec![a.clone()],
+            attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3657,6 +3707,7 @@ mod tests {
             lock: false,
             override_mode: false,
             members: vec![a.clone()],
+            attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3706,6 +3757,7 @@ mod tests {
             lock: false,
             override_mode: true,
             members: vec![a.clone()],
+            attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3744,6 +3796,7 @@ mod tests {
             lock: false,
             override_mode: false,
             members: vec![a.clone()],
+            attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3782,6 +3835,68 @@ mod tests {
         s.anim_base_lock = false;
         s.set_key(&a, "translateX", Some(1.0), Some(5.0));
         assert!(s.anim_is_keyed(&a, "translateX"));
+    }
+
+    #[test]
+    fn layer_keys_require_attribute_membership() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.anim_layers.push(AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![a.clone()],
+            attrs: vec![Anim::key(&a, "translateX")],
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
+            curves: IndexMap::new(),
+        });
+        s.anim_layer_current = Some("al1".into());
+        assert!(s.set_key(&a, "translateX", Some(1.0), Some(5.0)));
+        assert!(!s.set_key(&a, "translateY", Some(1.0), Some(5.0)));
+        assert!(s.anim_layers[0].curves.contains_key(&Anim::key(&a, "translateX")));
+        assert!(!s.anim_layers[0].curves.contains_key(&Anim::key(&a, "translateY")));
+        assert!(!s.anim.curves.contains_key(&Anim::key(&a, "translateY")), "rejected key leaked to BaseAnimation");
+        // an empty layer owns no attributes
+        s.anim_layers[0].attrs.clear();
+        s.anim_layers[0].members.clear();
+        assert!(!s.set_key(&a, "translateX", Some(2.0), Some(6.0)));
+    }
+
+    #[test]
+    fn old_object_membership_migrates_to_attributes() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut c = AnimCurve::new(&a, "translateX");
+        c.set_key(0.0, 1.0, "linear");
+        let mut curves = IndexMap::new();
+        curves.insert(Anim::key(&a, "translateX"), c);
+        s.anim_layers.push(AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![a.clone()],
+            attrs: vec![],
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
+            curves,
+        });
+        let data = s.serialize();
+        let mut t = Scene::new();
+        t.load(&data).expect("scene loads");
+        let l = &t.anim_layers[0];
+        assert!(l.attrs.contains(&Anim::key(&a, "translateX")), "curve attribute was lost");
+        assert!(l.attrs.contains(&Anim::key(&a, "rotateY")), "keyable attribute was not added");
+        assert!(l.attrs.contains(&Anim::key(&a, "smoothLevel")), "shape attribute was not added");
+        assert!(l.members.contains(&a));
     }
 
     #[test]

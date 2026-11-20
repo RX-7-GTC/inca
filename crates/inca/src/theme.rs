@@ -13,9 +13,7 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(0x8f, 0x8f, 0x8f);
 pub const HI: Color32 = Color32::from_rgb(0x52, 0x85, 0xa6);
 pub const BTN: Color32 = Color32::from_rgb(0x5d, 0x5d, 0x5d);
 pub const BTN_HOVER: Color32 = Color32::from_rgb(0x6f, 0x6f, 0x6f);
-pub const KEYED: Color32 = Color32::from_rgb(0xdd, 0x72, 0x7a);
 pub const KEY: Color32 = Color32::from_rgb(0xcd, 0x5c, 0x5c);
-pub const LOCKED: Color32 = Color32::from_rgb(0x5c, 0x68, 0x74);
 pub const DRIVEN: Color32 = Color32::from_rgb(0xe6, 0xc5, 0x4a);
 pub const ACCENT: Color32 = Color32::from_rgb(0x48, 0xaa, 0xb5);
 

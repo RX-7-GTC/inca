@@ -577,6 +577,7 @@ mod tests {
             lock: false,
             override_mode: false,
             members: vec![nid.clone()],
+            attrs: vec![],
             ghost: true,
             ghost_color: inca_core::anim::ghost_red(),
             curves: Default::default(),

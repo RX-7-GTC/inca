@@ -156,26 +156,39 @@ fn cb_locked(app: &IncaApp, first: &NodeRef, attr: &str) -> bool {
     }
 }
 
-fn cb_fill(app: &IncaApp, first: &NodeRef, attr: &str) -> Color32 {
+/// Color of the narrow state bar at the left of a value field. Layer membership wins over
+/// the keyed colours, as in Maya 2020.
+fn cb_state_color(app: &IncaApp, first: &NodeRef, attr: &str) -> Option<Color32> {
     let id = app.s.ref_id(first);
+    if cb_locked(app, first, attr) {
+        return Some(Color32::from_gray(0x78));
+    }
+    if app.s.anim_layer_current.as_ref().is_some_and(|lid| app.s.anim_layers.iter().find(|l| &l.id == lid).is_some_and(|l| l.has_attr(&id, attr))) {
+        return Some(Color32::from_rgb(0x6a, 0xd6, 0xcf));
+    }
     let keyed = app.s.anim_is_keyed(&id, attr);
     let muted = app.s.anim_curve(&id, attr).is_some_and(|c| c.mute);
     let on_key = app.s.anim_on_key(&id, attr, app.s.time.current);
     let driven = app.s.conns.iter().any(|c| c.dst == id && c.dst_attr == attr);
     let expressed = app.s.node(&id).is_some_and(|n| n.expressions.contains_key(attr));
-    if cb_locked(app, first, attr) {
-        theme::LOCKED
-    } else if muted {
-        Color32::from_gray(0x4c)
-    } else if driven || expressed {
-        theme::DRIVEN.gamma_multiply(0.6)
+    if muted {
+        Some(Color32::from_rgb(0x8a, 0x5a, 0x3a))
+    } else if expressed {
+        Some(Color32::from_rgb(0x9a, 0x5a, 0xc6))
+    } else if driven {
+        Some(theme::DRIVEN)
     } else if on_key {
-        theme::KEY
+        Some(theme::KEY)
     } else if keyed {
-        theme::KEYED.gamma_multiply(0.7)
+        Some(Color32::from_rgb(0xb0, 0x5a, 0x66))
     } else {
-        theme::FIELD
+        None
     }
+}
+
+fn cb_paint_state_bar(ui: &egui::Ui, rect: Rect, color: Color32) {
+    let bar = Rect::from_min_max(egui::pos2(rect.left() + 1.0, rect.top() + 1.0), egui::pos2(rect.left() + 9.0, rect.bottom() - 1.0));
+    ui.painter().rect_filled(bar, 0.0, color);
 }
 
 /// Commit the active field editor if its text changed, then close it. Used when the user clicks
@@ -335,7 +348,7 @@ fn cb_numeric_cell(
         let text = cb_text(kind, x, decimals);
         let (rrect, r) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::click_and_drag());
         let painter = ui.painter();
-        painter.rect_filled(rrect, 2.0, if field_selected { theme::HI } else { cb_fill(app, first, attr) });
+        painter.rect_filled(rrect, 2.0, if field_selected { theme::HI } else { theme::FIELD });
         painter.text(
             rrect.right_center() - egui::vec2(5.0, 0.0),
             egui::Align2::RIGHT_CENTER,
@@ -409,6 +422,9 @@ fn cb_numeric_cell(
         }
         r.on_hover_cursor(egui::CursorIcon::Text)
     };
+    if let Some(c) = cb_state_color(app, first, attr) {
+        cb_paint_state_bar(ui, r.rect, c);
+    }
     rows.push(CbRow { key, pick: me, label: label_rect, field: Some(r.rect), numeric: true, locked });
     r
 }
@@ -1445,9 +1461,6 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
     let Some(first) = targets.first() else { return };
     let Some(cur) = app.s.get_attr(first, attr) else { return };
     let id = app.s.ref_id(first);
-    let keyed = app.s.anim_is_keyed(&id, attr);
-    let on_key = app.s.anim_on_key(&id, attr, app.s.time.current);
-    let driven = app.s.conns.iter().any(|c| c.dst == id && c.dst_attr == attr);
     let locked = match first {
         NodeRef::Dag(i) => app.s.node(i).is_some_and(|n| n.is_locked(attr)),
         _ => false,
@@ -1513,22 +1526,13 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                 ui.memory_mut(|m| m.surrender_focus(fid));
             }
         }
-        let fill = if field_selected {
-            theme::HI
-        } else if locked {
-            theme::LOCKED
-        } else if driven {
-            theme::DRIVEN.gamma_multiply(0.6)
-        } else if on_key {
-            theme::KEY
-        } else if keyed {
-            theme::KEYED.gamma_multiply(0.7)
-        } else {
-            theme::FIELD
-        };
+        let fill = if field_selected { theme::HI } else { theme::FIELD };
         let w = if attr == "rotateOrder" { 70.0 } else { ui.available_width() };
         let frame = egui::Frame::NONE.fill(fill).show(ui, |ui| {
             ui.set_width(w);
+            if selectable && matches!(kind, ChanKind::Bool | ChanKind::Enum(_)) {
+                ui.add_space(9.0);
+            }
             ui.add_enabled_ui(!locked, |ui| match kind {
                 ChanKind::Bool => {
                     let mut b = cur.as_bool().unwrap_or(cur.as_f64().unwrap_or(0.0) != 0.0);
@@ -1547,7 +1551,8 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                 ChanKind::Enum(opts) => {
                     let mut i = cur.as_f64().map(|x| x as usize).or_else(|| cur.as_str().and_then(|s| opts.iter().position(|o| *o == s))).unwrap_or(0);
                     let before = i;
-                    let r = egui::ComboBox::from_id_salt(("enum", attr, id.clone())).width(w - 8.0).selected_text(opts.get(i).copied().unwrap_or("?")).show_index(ui, &mut i, opts.len(), |k| opts[k].to_string());
+                    let cw = if selectable { (w - 18.0).max(24.0) } else { w - 8.0 };
+                    let r = egui::ComboBox::from_id_salt(("enum", attr, id.clone())).width(cw).selected_text(opts.get(i).copied().unwrap_or("?")).show_index(ui, &mut i, opts.len(), |k| opts[k].to_string());
                     if r.clicked() {
                         cb_clear_names(app);
                     }
@@ -1662,6 +1667,11 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                     numeric,
                     locked,
                 });
+            }
+        }
+        if selectable && !matches!(kind, ChanKind::Float | ChanKind::Int) {
+            if let Some(c) = cb_state_color(app, first, attr) {
+                cb_paint_state_bar(ui, frame.response.rect, c);
             }
         }
         let channel_menu = app.right_tab == RightTab::ChannelBox;
@@ -2083,10 +2093,18 @@ fn channels_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     }
     ui.separator();
-    if menu_item(app, ui, "Add to Selected Layers") {
+    ui.add_enabled_ui(app.s.anim_layer_current.is_some() && !app.panels.cb_pick.is_empty(), |ui| {
+        if menu_item(app, ui, "Add To Selected Layers") {
+            anim_layer_attrs_from_picks(app, true);
+        }
+        if menu_item(app, ui, "Remove From Selected Layers") {
+            anim_layer_attrs_from_picks(app, false);
+        }
+    });
+    if menu_item(app, ui, "Add to Selected Display Layers") {
         layer_members(app, true);
     }
-    if menu_item(app, ui, "Remove From Selected Layers") {
+    if menu_item(app, ui, "Remove From Selected Display Layers") {
         layer_members(app, false);
     }
 }
@@ -2589,13 +2607,17 @@ pub(crate) fn key_selected_channels(app: &mut IncaApp) -> bool {
                 if app.s.node(id).is_some_and(|n| !n.is_keyable(&p.attr)) {
                     continue;
                 }
-                app.s.set_key(id, &p.attr, None, None);
-                n += 1;
+                if app.s.set_key(id, &p.attr, None, None) {
+                    n += 1;
+                }
             }
         }
     }
     app.s.apply_anim();
     app.s.touch();
+    if n == 0 && app.s.anim_layer_current.is_some() {
+        app.warn("No keys were set: the layer is locked or the attributes are not on it.");
+    }
     app.help = format!("Keyed {n} selected channel(s)");
     n > 0
 }
@@ -4278,6 +4300,7 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
             lock: false,
             override_mode,
             members: vec![],
+            attrs: vec![],
             ghost: false,
             ghost_color: inca_core::anim::ghost_red(),
             curves: Default::default(),
@@ -4292,10 +4315,12 @@ fn anim_layer_new_from_selected(app: &mut IncaApp, override_mode: bool) {
         return;
     }
     let sel = app.s.sel.clone();
+    let attrs: Vec<String> = sel.iter().flat_map(|n| app.s.keyable_attrs(n).into_iter().map(|a| inca_core::anim::Anim::key(n, &a))).collect();
     anim_layer_new(app, override_mode);
     if let Some(id) = app.s.anim_layer_current.clone() {
         if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
             l.members = sel;
+            l.attrs = attrs;
         }
         app.s.touch();
     }
@@ -4307,20 +4332,90 @@ fn anim_layer_add_remove_selected(app: &mut IncaApp, id: &str, add: bool) {
         return;
     }
     let sel = app.s.sel.clone();
+    let attrs: Vec<String> = sel.iter().flat_map(|n| app.s.keyable_attrs(n).into_iter().map(|a| inca_core::anim::Anim::key(n, &a))).collect();
     app.s.checkpoint(if add { "add objects to animation layer" } else { "remove objects from animation layer" });
     if add {
         app.s.remember_anim_static(&sel);
     }
+    let mut removed_curves = vec![];
     if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
         if add {
-            for n in sel {
-                if !l.members.contains(&n) {
-                    l.members.push(n);
+            for n in &sel {
+                if !l.members.contains(n) {
+                    l.members.push(n.clone());
+                }
+            }
+            for k in attrs {
+                if !l.attrs.contains(&k) {
+                    l.attrs.push(k);
                 }
             }
         } else {
+            let owned = |k: &String| sel.iter().any(|n| k.rsplit_once('.').is_some_and(|(node, _)| node == n));
+            removed_curves.extend(l.curves.keys().filter(|k| owned(k)).cloned());
+            l.attrs.retain(|k| !owned(k));
+            l.curves.retain(|k, _| !owned(k));
             l.members.retain(|m| !sel.contains(m));
         }
+    }
+    if !removed_curves.is_empty() {
+        app.s.restore_anim_static(&removed_curves);
+        app.s.set_time(app.s.time.current);
+    }
+    app.s.touch();
+}
+
+/// Add or remove the Channel Box's picked attributes on the current animation layer.
+fn anim_layer_attrs_from_picks(app: &mut IncaApp, add: bool) {
+    let Some(id) = app.s.anim_layer_current.clone() else { return };
+    let picks = app.panels.cb_pick.clone();
+    if picks.is_empty() {
+        return;
+    }
+    let mut keys = vec![];
+    for p in picks {
+        let attr = inca_core::scene::alias(&p.attr).to_string();
+        for t in &p.targets {
+            if let NodeRef::Dag(nid) = t {
+                if app.s.node(nid).is_some_and(|n| !n.is_keyable(&attr)) {
+                    continue;
+                }
+                keys.push(inca_core::anim::Anim::key(nid, &attr));
+            }
+        }
+    }
+    if keys.is_empty() {
+        return;
+    }
+    app.s.checkpoint(if add { "add attributes to animation layer" } else { "remove attributes from animation layer" });
+    if add {
+        let ids: Vec<String> = keys.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
+        app.s.remember_anim_static(&ids);
+    }
+    let mut removed_curves = vec![];
+    if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
+        if add {
+            for k in keys {
+                if !l.attrs.contains(&k) {
+                    l.attrs.push(k.clone());
+                }
+                if let Some((node, _)) = k.rsplit_once('.') {
+                    if !l.members.iter().any(|m| m == node) {
+                        l.members.push(node.to_string());
+                    }
+                }
+            }
+        } else {
+            removed_curves.extend(l.curves.keys().filter(|k| keys.contains(k)).cloned());
+            l.attrs.retain(|k| !keys.contains(k));
+            l.curves.retain(|k, _| !keys.contains(k));
+            let keep: Vec<String> = l.attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
+            l.members.retain(|m| keep.contains(m));
+        }
+    }
+    if !removed_curves.is_empty() {
+        app.s.restore_anim_static(&removed_curves);
+        app.s.set_time(app.s.time.current);
     }
     app.s.touch();
 }
@@ -6660,10 +6755,16 @@ mod tests {
         assert!(app.s.anim_layers[0].members.is_empty());
         anim_layer_add_remove_selected(&mut app, &lid, true);
         assert_eq!(app.s.anim_layers[0].members, vec![nid.clone()]);
+        for attr in ["translateX", "rotateY", "scaleX", "visibility", "smoothLevel"] {
+            let key = inca_core::anim::Anim::key(&nid, attr);
+            assert!(app.s.anim_layers[0].attrs.contains(&key), "{attr} was not assigned");
+        }
         anim_layer_add_remove_selected(&mut app, &lid, false);
         assert!(app.s.anim_layers[0].members.is_empty());
+        assert!(app.s.anim_layers[0].attrs.is_empty());
         anim_layer_new_from_selected(&mut app, false);
         assert!(app.s.anim_layers[0].members.contains(&nid), "from-selected assigns the object");
+        assert!(app.s.anim_layers[0].attrs.contains(&inca_core::anim::Anim::key(&nid, "translateX")));
     }
 
     #[test]
@@ -6674,7 +6775,7 @@ mod tests {
         let mut app = IncaApp::new(&cc);
         let nid = app.s.create_mesh("polyCube", &Params::new(), None);
         app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
-        anim_layer_new(&mut app, false);
+        anim_layer_new_from_selected(&mut app, false);
         let lid = app.s.anim_layer_current.clone().expect("current layer");
         // S keys every channel at the rest pose, then a second rotation pose.
         app.s.set_time(1.0);
@@ -6703,6 +6804,45 @@ mod tests {
         anim_layer_update(&mut app, &lid, "layer mute", |l| l.mute = true);
         assert!((app.s.get_attr_f(&nid, "rotateY")).abs() < 1e-9, "mute did not return to the static pose");
         assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn animation_layer_attribute_membership_gates_keys() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new(&mut app, false);
+        assert!(!app.s.set_key(&nid, "translateX", Some(1.0), Some(5.0)), "empty layer received a key");
+        app.panels.cb_pick = vec![CbPick { targets: vec![NodeRef::Dag(nid.clone())], attr: "translateX".into(), int: false, min: None, max: None }];
+        anim_layer_attrs_from_picks(&mut app, true);
+        assert!(app.s.anim_layers[0].attrs.contains(&inca_core::anim::Anim::key(&nid, "translateX")));
+        assert!(app.s.set_key(&nid, "translateX", Some(1.0), Some(5.0)));
+        assert!(!app.s.set_key(&nid, "translateY", Some(1.0), Some(5.0)), "unassigned attribute was keyed");
+    }
+
+    #[test]
+    fn removing_an_attribute_deletes_its_curve_and_restores_static() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        app.s.set_time(1.0);
+        app.s.set_attr_f(&nid, "translateX", 3.0);
+        assert!(app.s.set_key(&nid, "translateX", None, None));
+        let key = inca_core::anim::Anim::key(&nid, "translateX");
+        assert!(app.s.anim_layers[0].curves.contains_key(&key));
+        app.panels.cb_pick = vec![CbPick { targets: vec![NodeRef::Dag(nid.clone())], attr: "translateX".into(), int: false, min: None, max: None }];
+        anim_layer_attrs_from_picks(&mut app, false);
+        assert!(!app.s.anim_layers[0].attrs.contains(&key));
+        assert!(!app.s.anim_layers[0].curves.contains_key(&key), "curve survived attribute removal");
+        app.s.set_time(1.0);
+        assert!(app.s.get_attr_f(&nid, "translateX").abs() < 1e-9, "attribute removal left the old pose");
     }
 
     #[test]

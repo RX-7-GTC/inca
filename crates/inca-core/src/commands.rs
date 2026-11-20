@@ -1200,36 +1200,31 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let bd = a.flags.iter().any(|(f, _)| f == "bd" || f == "breakdown");
             let attrs: Vec<String> = a.flags.iter().filter(|(f, _)| f == "at" || f == "attribute").filter_map(|(_, v)| v.first().map(|x| x.str())).collect();
             let mut n = 0;
+            let mut attempted = false;
             for tgt in a.strings() {
                 if let Some((obj, attr)) = tgt.split_once('.') {
                     if let Some(id) = s.find(obj) {
-                        s.set_key_ex(&id, attr, t, v, bd);
-                        n += 1;
+                        attempted = true;
+                        if s.set_key_ex(&id, attr, t, v, bd) {
+                            n += 1;
+                        }
                     }
                 }
             }
             if n == 0 {
                 let ts: Vec<Id> = if a.strings().is_empty() { s.sel.clone() } else { a.strings().iter().filter_map(|x| s.find(x)).collect() };
                 for id in ts {
-                    let mut list: Vec<String> = if attrs.is_empty() {
-                        CHANNELS.iter().map(|c| c.to_string()).collect()
-                    } else {
-                        attrs.clone()
-                    };
-                    if attrs.is_empty() {
-                        if let Some(n) = s.node(&id).and_then(|n| n.extra.as_object()) {
-                            list.extend(n.keys().filter(|k| n.get(*k).is_some_and(|v| v.is_number() || v.is_boolean())).cloned());
-                        }
-                        list.extend(s.shape_channels(&id));
-                        list.sort();
-                        list.dedup();
-                    }
-                    let list: Vec<String> = list.into_iter().filter(|c| s.nodes.get(&id).is_none_or(|n| n.is_keyable(alias(c)))).collect();
+                    attempted = true;
+                    let list = if attrs.is_empty() { s.keyable_attrs(&id) } else { attrs.clone() };
                     for at in list {
-                        s.set_key_ex(&id, &at, t, v, bd);
-                        n += 1;
+                        if s.set_key_ex(&id, &at, t, v, bd) {
+                            n += 1;
+                        }
                     }
                 }
+            }
+            if n == 0 && attempted && s.anim_layer_current.is_some() {
+                s.warn("No keys were set: the layer is locked or the attributes are not on it.");
             }
             Ok(Val::Int(n))
         }
@@ -3232,6 +3227,33 @@ mod tests {
         assert!((s.get_attr_f(&id, "tx") - 9.0).abs() < 1e-9);
         let r = mel(&mut s, "keyframe -q -tc -at tx pCube1;").unwrap();
         assert_eq!(r.list().len(), 2);
+    }
+
+    #[test]
+    fn set_keyframe_obeys_layer_attribute_membership() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n pCube1; select -r pCube1;").unwrap();
+        let a = s.find("pCube1").unwrap();
+        s.anim_layers.push(crate::anim::AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![a.clone()],
+            attrs: vec![crate::anim::Anim::key(&a, "translateX")],
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
+            curves: Default::default(),
+        });
+        s.anim_layer_current = Some("al1".into());
+        assert_eq!(mel(&mut s, "setKeyframe -at translateX;").unwrap().num(), 1.0);
+        assert_eq!(mel(&mut s, "setKeyframe -at translateY;").unwrap().num(), 0.0);
+        assert!(s.anim_layers[0].curves.contains_key(&crate::anim::Anim::key(&a, "translateX")));
+        assert!(!s.anim_layers[0].curves.contains_key(&crate::anim::Anim::key(&a, "translateY")));
+        assert!(!s.anim.curves.contains_key(&crate::anim::Anim::key(&a, "translateY")));
     }
 
     #[test]
