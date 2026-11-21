@@ -98,8 +98,16 @@ fn cb_adjust_speed(app: &IncaApp) -> f64 {
 
 /// Rotation is in degrees, so the same drag distance needs a much larger step than
 /// translation to feel like the other channels. Dragging left turns positive.
+/// Z points toward the default camera, so invert it to keep a left drag moving left.
 fn cb_attr_multiplier(attr: &str) -> f64 {
-    if inca_core::scene::alias(attr).starts_with("rotate") { -50.0 } else { 1.0 }
+    let attr = inca_core::scene::alias(attr);
+    if attr.starts_with("rotate") {
+        -50.0
+    } else if attr == "translateZ" {
+        -1.0
+    } else {
+        1.0
+    }
 }
 
 fn cb_shown(filter: [bool; 4], attr: &str) -> bool {
@@ -7412,6 +7420,8 @@ mod tests {
         assert_eq!(cb_attr_multiplier("rotateX"), -50.0);
         assert_eq!(cb_attr_multiplier("rx"), -50.0);
         assert_eq!(cb_attr_multiplier("translateX"), 1.0);
+        assert_eq!(cb_attr_multiplier("translateZ"), -1.0);
+        assert_eq!(cb_attr_multiplier("tz"), -1.0);
         assert_eq!(cb_attr_multiplier("scaleY"), 1.0);
     }
 
