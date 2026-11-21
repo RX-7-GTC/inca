@@ -310,6 +310,7 @@ fn cb_numeric_cell(
     decimals: Option<usize>,
     rows: &mut Vec<CbRow>,
     label_rect: Rect,
+    left_align: bool,
 ) -> egui::Response {
     let Some(first) = targets.first() else {
         return ui.allocate_response(egui::vec2(width, 18.0), egui::Sense::hover());
@@ -330,7 +331,11 @@ fn cb_numeric_cell(
         let mut text = app.panels.cb_edit_text.clone();
         let r = ui.add_sized(
             [width, 18.0],
-            egui::TextEdit::singleline(&mut text).id(edit_id).horizontal_align(egui::Align::RIGHT).margin(egui::Margin::symmetric(4, 2)),
+            egui::TextEdit::singleline(&mut text).id(edit_id).horizontal_align(if left_align { egui::Align::LEFT } else { egui::Align::RIGHT }).margin(if left_align {
+                egui::Margin { left: 11, right: 4, top: 2, bottom: 2 }
+            } else {
+                egui::Margin::symmetric(4, 2)
+            }),
         );
         app.panels.cb_edit_text = text;
         let still_editing = app.panels.cb_editing.as_ref() == Some(&key);
@@ -355,13 +360,13 @@ fn cb_numeric_cell(
         let (rrect, r) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::click_and_drag());
         let painter = ui.painter();
         painter.rect_filled(rrect, 2.0, if field_selected { theme::HI } else { theme::FIELD });
-        painter.text(
-            rrect.right_center() - egui::vec2(5.0, 0.0),
-            egui::Align2::RIGHT_CENTER,
-            text,
-            egui::FontId::proportional(12.0),
-            if locked { theme::TEXT_DIM } else { theme::TEXT },
-        );
+        let (text_pos, text_align) = if left_align {
+            // clear the layer/key state bar on the left edge
+            (rrect.left_center() + egui::vec2(11.0, 0.0), egui::Align2::LEFT_CENTER)
+        } else {
+            (rrect.right_center() - egui::vec2(5.0, 0.0), egui::Align2::RIGHT_CENTER)
+        };
+        painter.text(text_pos, text_align, text, egui::FontId::proportional(12.0), if locked { theme::TEXT_DIM } else { theme::TEXT });
         let border = if field_selected { Color32::from_rgb(0x9a, 0xc8, 0xe0) } else { theme::LINE };
         painter.rect_stroke(rrect, 2.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
         if r.hovered() && !locked {
@@ -1457,7 +1462,7 @@ fn channel_vec_row(app: &mut IncaApp, ui: &mut egui::Ui, rows: &mut Vec<CbRow>, 
         let w = ((ui.available_width() - gap * 2.0) / 3.0).max(24.0);
         for (i, attr) in attrs.iter().enumerate() {
             let w = if i == 2 { ui.available_width().max(24.0) } else { w };
-            cb_numeric_cell(app, ui, w, targets, attr, ChanKind::Float, None, None, decimals, rows, lr);
+            cb_numeric_cell(app, ui, w, targets, attr, ChanKind::Float, None, None, decimals, rows, lr, false);
         }
     });
 }
@@ -1592,7 +1597,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                     let x = cur.as_f64().unwrap_or(0.0);
                     if selectable {
                         let rows = rows.as_deref_mut().expect("selectable channel rows");
-                        cb_numeric_cell(app, ui, w - 4.0, targets, attr, kind, min, max, decimals, rows, rect)
+                        cb_numeric_cell(app, ui, w - 4.0, targets, attr, kind, min, max, decimals, rows, rect, true)
                     } else {
                         let mut x = x;
                         // typed expressions: "2*3", or relative "+=2" "-=1" "*=2" "/=2" applied to each selected object's own value
