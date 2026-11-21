@@ -2171,6 +2171,122 @@ impl Scene {
         v
     }
 
+    /// Evaluated value at the output of `layer_id`, ignoring anything above it.
+    fn anim_value_through(&self, key: &str, t: f64, layer_id: &str) -> f64 {
+        let mut v = self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key));
+        let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
+        let solo = self.anim_layers.iter().any(|l| l.solo);
+        for l in self.anim_layers[i..].iter().rev() {
+            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+                continue;
+            }
+            let Some(c) = l.curves.get(key) else { continue };
+            if c.keys.is_empty() || c.mute {
+                continue;
+            }
+            let lv = c.eval(t);
+            let w = self.anim_layer_effective_weight(l);
+            v = if l.override_mode || c.attr == "visibility" {
+                v + (lv - v) * w
+            } else {
+                v + lv * w
+            };
+        }
+        v
+    }
+
+    /// Value below a layer with some layers ignored. Used when baking a merge.
+    fn anim_value_below_skip(&self, key: &str, t: f64, layer_id: &str, skip: &HashSet<String>) -> f64 {
+        let mut v = self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key));
+        let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
+        let solo = self.anim_layers.iter().any(|l| l.solo);
+        for l in self.anim_layers[i + 1..].iter().rev() {
+            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+                continue;
+            }
+            let Some(c) = l.curves.get(key) else { continue };
+            if c.keys.is_empty() || c.mute {
+                continue;
+            }
+            let lv = c.eval(t);
+            let w = self.anim_layer_effective_weight(l);
+            v = if l.override_mode || c.attr == "visibility" {
+                v + (lv - v) * w
+            } else {
+                v + lv * w
+            };
+        }
+        v
+    }
+
+    /// Evaluated value with some layers ignored. Used when flattening.
+    fn anim_value_without(&self, key: &str, t: f64, skip: &HashSet<String>) -> f64 {
+        let mut v = self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key));
+        let solo = self.anim_layers.iter().any(|l| l.solo);
+        for l in self.anim_layers.iter().rev() {
+            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+                continue;
+            }
+            let Some(c) = l.curves.get(key) else { continue };
+            if c.keys.is_empty() || c.mute {
+                continue;
+            }
+            let lv = c.eval(t);
+            let w = self.anim_layer_effective_weight(l);
+            v = if l.override_mode || c.attr == "visibility" {
+                v + (lv - v) * w
+            } else {
+                v + lv * w
+            };
+        }
+        v
+    }
+
+    fn anim_curve_times(&self, key: &str) -> Vec<f64> {
+        let mut ts: Vec<f64> = self
+            .anim
+            .curves
+            .get(key)
+            .into_iter()
+            .chain(self.anim_layers.iter().filter_map(|l| l.curves.get(key)))
+            .flat_map(|c| c.keys.iter().map(|k| k.t))
+            .collect();
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        if let (Some(lo), Some(hi)) = (ts.first().copied(), ts.last().copied()) {
+            // Bake on frames (like Maya's merge) so between-key shapes survive. Very long
+            // ranges are capped instead of generating a key for every frame.
+            // shortcut: 2000 samples per curve, raise if long clips need more fidelity.
+            let step = ((hi - lo) / 2000.0).max(1.0);
+            let mut t = if step <= 1.0 { lo.ceil() } else { lo + step };
+            while t < hi {
+                ts.push(t);
+                t += step;
+            }
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        }
+        ts
+    }
+
+    fn anim_layer_subtree_ids(&self, id: &str) -> Vec<String> {
+        let mut out = vec![];
+        let mut stack = vec![id.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(x) = stack.pop() {
+            if !seen.insert(x.clone()) {
+                continue;
+            }
+            out.push(x.clone());
+            for l in &self.anim_layers {
+                if l.parent.as_deref() == Some(x.as_str()) {
+                    stack.push(l.id.clone());
+                }
+            }
+        }
+        out
+    }
+
     pub fn anim_curve_mut(&mut self, node: &str, attr: &str, create: bool) -> Option<&mut AnimCurve> {
         let k = Anim::key(node, attr);
         let curves = self.anim_curves_mut();
@@ -2224,6 +2340,214 @@ impl Scene {
         }
         self.anim_layers[i].override_mode = override_mode;
         self.touch();
+    }
+
+    /// Merge `sources` (and their child layers) into `target`, baking the result onto the
+    /// target's curves. Only the part of the stack up to the target is preserved, so layers
+    /// above the target keep the same input. Returns false for soloed stacks, a muted target
+    /// parent, zero target weight, or a target inside a source subtree.
+    pub fn merge_anim_layers(&mut self, target: &str, sources: &[String]) -> bool {
+        let Some(target_i) = self.anim_layers.iter().position(|l| l.id == target) else { return false };
+        if sources.is_empty() || sources.iter().any(|s| s == target) || self.anim_layers.iter().any(|l| l.solo) {
+            return false;
+        }
+        let target_layer = self.anim_layers[target_i].clone();
+        if self.anim_layer_parent_muted(&target_layer) {
+            return false;
+        }
+        let mut merged = HashSet::new();
+        for s in sources {
+            for id in self.anim_layer_subtree_ids(s) {
+                merged.insert(id);
+            }
+        }
+        if merged.contains(target) {
+            return false;
+        }
+        let weight = self.anim_layer_effective_weight(&target_layer);
+        if weight <= 1e-6 {
+            return false;
+        }
+        let result_override = target_layer.override_mode
+            || self.anim_layers.iter().filter(|l| merged.contains(&l.id)).any(|l| l.override_mode);
+        // A merge-down removes the block directly above the target; the next surviving layer
+        // above must see the same input, so bake the output through the top of that block.
+        // Layers above a topmost target instead keep seeing the target's own output.
+        let above: Vec<usize> = self.anim_layers.iter().enumerate().filter(|(_, l)| merged.contains(&l.id) && l.id != target).map(|(i, _)| i).filter(|i| *i < target_i).collect();
+        let absorb = if let Some(top) = above.iter().min().copied() {
+            if (top..target_i).any(|i| !merged.contains(&self.anim_layers[i].id)) {
+                return false; // unselected layer inside the removed block cannot be compensated
+            }
+            Some(self.anim_layers[top].id.clone())
+        } else {
+            None
+        };
+        // Only bake attributes the sources actually animate. Muted curves and zero-weight
+        // layers contribute nothing, so leave the target's own curves untouched for them.
+        let mut keys = HashSet::new();
+        for l in self.anim_layers.iter().filter(|l| merged.contains(&l.id)) {
+            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 {
+                continue;
+            }
+            for (k, c) in &l.curves {
+                if !c.keys.is_empty() && !c.mute {
+                    keys.insert(k.clone());
+                }
+            }
+        }
+        let mut baked = vec![];
+        for key in keys {
+            let times = self.anim_curve_times(&key);
+            if times.is_empty() {
+                continue;
+            }
+            let attr = key.rsplit_once('.').map(|(_, a)| a).unwrap_or("");
+            let samples: Vec<(f64, f64)> = times
+                .into_iter()
+                .filter_map(|t| {
+                    let want = self.anim_value_through(&key, t, absorb.as_deref().unwrap_or(target));
+                    let base = self.anim_value_below_skip(&key, t, target, &merged);
+                    let stored = if result_override || attr == "visibility" { base + (want - base) / weight } else { (want - base) / weight };
+                    stored.is_finite().then_some((t, stored))
+                })
+                .collect();
+            if !samples.is_empty() {
+                baked.push((key, samples));
+            }
+        }
+        self.checkpoint("merge animation layers");
+        if !baked.is_empty() {
+            let t = &mut self.anim_layers[target_i];
+            t.override_mode = result_override;
+            t.mute = false;
+            for (key, samples) in &baked {
+                let (node, attr) = key.rsplit_once('.').unwrap();
+                let c = t.curves.entry(key.clone()).or_insert_with(|| AnimCurve::new(node, attr));
+                c.keys.clear();
+                c.mute = false;
+                for (time, value) in samples {
+                    c.set_key(*time, *value, "auto");
+                }
+                if !t.attrs.contains(key) {
+                    t.attrs.push(key.clone());
+                }
+            }
+            t.attrs.sort();
+            t.attrs.dedup();
+            let nodes: HashSet<String> = t.attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
+            t.members.retain(|m| nodes.contains(m));
+            for n in nodes {
+                if !t.members.contains(&n) {
+                    t.members.push(n);
+                }
+            }
+        }
+        self.anim_layers.retain(|l| !merged.contains(&l.id));
+        self.normalize_anim_layer_hierarchy();
+        self.anim_layer_current = Some(target.to_string());
+        self.apply_anim();
+        self.touch();
+        true
+    }
+
+    /// Bake every layer into BaseAnimation and remove the layer stack. The evaluated animation
+    /// is unchanged; muted layers contribute nothing and are discarded.
+    pub fn flatten_anim_layers(&mut self) -> bool {
+        if self.anim_layers.is_empty() {
+            return false;
+        }
+        let mut keys = HashSet::new();
+        for l in &self.anim_layers {
+            for (k, c) in &l.curves {
+                if !c.keys.is_empty() {
+                    keys.insert(k.clone());
+                }
+            }
+        }
+        let empty = HashSet::new();
+        let mut baked = vec![];
+        for key in keys {
+            let times = self.anim_curve_times(&key);
+            if times.is_empty() {
+                continue;
+            }
+            let samples: Vec<(f64, f64)> = times.into_iter().map(|t| (t, self.anim_value_without(&key, t, &empty))).collect();
+            baked.push((key, samples));
+        }
+        self.checkpoint("flatten animation layers");
+        for (key, samples) in baked {
+            let Some((node, attr)) = key.rsplit_once('.') else { continue };
+            if let Some(c) = self.anim.curve_mut(node, attr, true) {
+                c.keys.clear();
+                c.mute = false;
+                for (time, value) in samples {
+                    c.set_key(time, value, "auto");
+                }
+            }
+        }
+        self.anim_layers.clear();
+        self.anim_layer_current = None;
+        self.anim_solo_saved.clear();
+        self.apply_anim();
+        self.touch();
+        true
+    }
+
+    /// Move the curves of `nodes` from `source` into a new sibling layer placed directly above
+    /// it, so the evaluated result is preserved. Returns the new layer id.
+    pub fn extract_anim_layer_objects(&mut self, source: &str, nodes: &[String], name: &str) -> Option<String> {
+        let source_i = self.anim_layers.iter().position(|l| l.id == source)?;
+        let node_set: HashSet<&str> = nodes.iter().map(|s| s.as_str()).collect();
+        let keys: Vec<String> = self.anim_layers[source_i].curves.iter().filter(|(_, c)| node_set.contains(c.node.as_str())).map(|(k, _)| k.clone()).collect();
+        if keys.is_empty() {
+            return None;
+        }
+        self.checkpoint("extract animation layer objects");
+        let id = self.new_id("al");
+        let src = self.anim_layers[source_i].clone();
+        let mut curves = IndexMap::new();
+        for key in &keys {
+            if let Some(c) = src.curves.get(key) {
+                curves.insert(key.clone(), c.clone());
+            }
+        }
+        let mut attrs = keys.clone();
+        attrs.sort();
+        attrs.dedup();
+        let mut members: Vec<String> = attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
+        members.sort();
+        members.dedup();
+        {
+            let s = &mut self.anim_layers[source_i];
+            for key in &keys {
+                s.curves.shift_remove(key);
+            }
+            s.attrs.retain(|a| !keys.contains(a));
+            let remaining: HashSet<String> = s.attrs.iter().chain(s.curves.keys()).filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
+            s.members.retain(|m| remaining.contains(m));
+        }
+        self.anim_layers.insert(
+            source_i,
+            AnimLayer {
+                id: id.clone(),
+                name: name.to_string(),
+                weight: src.weight,
+                mute: src.mute,
+                solo: src.solo,
+                lock: false,
+                override_mode: src.override_mode,
+                members,
+                attrs,
+                parent: src.parent.clone(),
+                ghost: src.ghost,
+                ghost_color: src.ghost_color,
+                curves,
+            },
+        );
+        self.anim_layer_current = Some(id.clone());
+        self.apply_anim();
+        self.touch();
+        Some(id)
     }
 
     /// Remove a node's curves from the base animation and every animation layer.
@@ -3673,6 +3997,130 @@ mod tests {
         s.set_key(&a, "translateX", Some(4.0), Some(99.0));
         assert!(s.anim_layers[0].curves[&Anim::key(&a, "translateX")].find(4.0).is_none());
         assert!(s.anim.curves[&Anim::key(&a, "translateX")].find(4.0).is_none());
+    }
+
+    fn anim_test_layer(s: &Scene, id: &str, node: &str, attr: &str, override_mode: bool, pts: &[(f64, f64)]) -> AnimLayer {
+        let mut c = AnimCurve::new(node, attr);
+        for (t, v) in pts {
+            c.set_key(*t, *v, "linear");
+        }
+        let mut curves = IndexMap::new();
+        let key = Anim::key(node, attr);
+        curves.insert(key.clone(), c);
+        AnimLayer {
+            id: id.into(),
+            name: id.into(),
+            weight: 1.0,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode,
+            members: vec![node.into()],
+            attrs: vec![key],
+            parent: None,
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
+            curves,
+        }
+    }
+
+    fn baked_values(s: &mut Scene, node: &str, attr: &str, times: &[f64]) -> Vec<f64> {
+        times
+            .iter()
+            .map(|t| {
+                s.set_time(*t);
+                s.get_attr_f(node, attr)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_layer_down_preserves_animation() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_key(&a, "translateX", Some(0.0), Some(0.0));
+        s.set_key(&a, "translateX", Some(10.0), Some(10.0));
+        s.anim_layers = vec![
+            anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 2.0), (10.0, -1.0)]),
+            anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 3.0), (10.0, 8.0)]),
+        ];
+        let times = [0.0, 5.0, 10.0];
+        let before = baked_values(&mut s, &a, "translateX", &times);
+        assert!(s.merge_anim_layers("al2", &["al1".into()]), "merge failed");
+        assert_eq!(s.anim_layers.len(), 1);
+        assert_eq!(s.anim_layer_current.as_deref(), Some("al2"));
+        let after = baked_values(&mut s, &a, "translateX", &times);
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert!((b - a).abs() < 1e-9, "merge changed the animation: {before:?} vs {after:?}");
+        }
+    }
+
+    #[test]
+    fn merge_with_override_source_uses_override_result() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_key(&a, "translateX", Some(0.0), Some(0.0));
+        s.set_key(&a, "translateX", Some(10.0), Some(10.0));
+        s.anim_layers = vec![
+            anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 2.0), (10.0, -1.0)]),
+            anim_test_layer(&s, "al2", &a, "translateX", true, &[(0.0, 3.0), (10.0, 8.0)]),
+        ];
+        let times = [0.0, 4.0, 10.0];
+        let before = baked_values(&mut s, &a, "translateX", &times);
+        assert!(s.merge_anim_layers("al1", &["al2".into()]));
+        assert!(s.anim_layers[0].override_mode, "an override source must make the result override");
+        let after = baked_values(&mut s, &a, "translateX", &times);
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert!((b - a).abs() < 1e-9, "merge changed the animation: {before:?} vs {after:?}");
+        }
+    }
+
+    #[test]
+    fn flatten_layers_writes_base_animation() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_key(&a, "translateX", Some(0.0), Some(0.0));
+        s.set_key(&a, "translateX", Some(10.0), Some(10.0));
+        s.anim_layers = vec![
+            anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 20.0), (10.0, 30.0)]),
+            anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 2.0), (10.0, -3.0)]),
+        ];
+        let times = [0.0, 6.0, 10.0];
+        let before = baked_values(&mut s, &a, "translateX", &times);
+        assert!(s.flatten_anim_layers());
+        assert!(s.anim_layers.is_empty());
+        assert!(s.anim_layer_current.is_none());
+        let after = baked_values(&mut s, &a, "translateX", &times);
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert!((b - a).abs() < 1e-9, "flatten changed the animation: {before:?} vs {after:?}");
+        }
+        assert!(s.anim.curves.contains_key(&Anim::key(&a, "translateX")));
+    }
+
+    #[test]
+    fn extract_selected_objects_splits_a_layer() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let b = s.create_mesh("polyCube", &Params::new(), None);
+        s.set_key(&a, "translateX", Some(0.0), Some(0.0));
+        s.set_key(&b, "translateX", Some(0.0), Some(0.0));
+        let mut layer = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 4.0)]);
+        let mut bc = AnimCurve::new(&b, "translateX");
+        bc.set_key(0.0, 9.0, "linear");
+        layer.curves.insert(Anim::key(&b, "translateX"), bc);
+        layer.attrs.push(Anim::key(&b, "translateX"));
+        layer.members.push(b.clone());
+        s.anim_layers = vec![layer];
+        let new_id = s.extract_anim_layer_objects("al1", &[a.clone()], "Layer 1_extract").expect("extract");
+        assert_eq!(s.anim_layers.len(), 2);
+        assert_eq!(s.anim_layers[0].id, new_id);
+        assert_eq!(s.anim_layers[0].name, "Layer 1_extract");
+        assert_eq!(s.anim_layers[0].curves.len(), 1);
+        assert!(s.anim_layers[0].curves.contains_key(&Anim::key(&a, "translateX")));
+        assert_eq!(s.anim_layers[1].curves.len(), 1);
+        assert!(s.anim_layers[1].curves.contains_key(&Anim::key(&b, "translateX")));
+        assert_eq!(s.anim_layers[1].members, vec![b]);
+        assert_eq!(s.anim_layer_current.as_deref(), Some(new_id.as_str()));
     }
 
     #[test]

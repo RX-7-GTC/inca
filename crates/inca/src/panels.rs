@@ -551,6 +551,8 @@ pub struct PanelState {
     pub anim_layer_rename_new: bool,
     /// Hide the BaseAnimation row in the animation layer editor.
     pub anim_hide_base: bool,
+    /// Selected animation layers. The current layer is always one of them.
+    pub anim_layer_sel: Vec<String>,
     /// Collapsed animation-layer parents.
     pub anim_layer_collapsed: std::collections::HashSet<String>,
     /// Layer being middle-dragged for parenting.
@@ -4359,6 +4361,34 @@ fn anim_layer_order(layers: &[inca_core::anim::AnimLayer], collapsed: &std::coll
     out
 }
 
+/// Click handling for animation-layer rows: plain selects one, Ctrl toggles, Shift selects a
+/// range in visible stack order. The clicked layer becomes current (the keying target).
+fn anim_layer_pick(app: &mut IncaApp, id: &str, order: &[String], mods: egui::Modifiers) {
+    if mods.shift {
+        let anchor = app.s.anim_layer_current.as_deref().and_then(|a| order.iter().position(|x| x == a));
+        let target = order.iter().position(|x| x == id);
+        if let (Some(a), Some(t)) = (anchor, target) {
+            app.panels.anim_layer_sel = order[a.min(t)..=a.max(t)].to_vec();
+        } else {
+            app.panels.anim_layer_sel = vec![id.to_string()];
+        }
+        app.s.anim_layer_current = Some(id.to_string());
+    } else if mods.ctrl || mods.command {
+        if let Some(i) = app.panels.anim_layer_sel.iter().position(|x| x == id) {
+            app.panels.anim_layer_sel.remove(i);
+            if app.s.anim_layer_current.as_deref() == Some(id) {
+                app.s.anim_layer_current = app.panels.anim_layer_sel.first().cloned();
+            }
+        } else {
+            app.panels.anim_layer_sel.push(id.to_string());
+            app.s.anim_layer_current = Some(id.to_string());
+        }
+    } else {
+        app.panels.anim_layer_sel = vec![id.to_string()];
+        app.s.anim_layer_current = Some(id.to_string());
+    }
+}
+
 fn anim_layer_set_parent(app: &mut IncaApp, id: &str, parent: Option<String>) {
     if parent.as_deref() == Some(id) {
         return;
@@ -4429,7 +4459,8 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
             curves: Default::default(),
         },
     );
-    app.s.anim_layer_current = Some(id);
+    app.s.anim_layer_current = Some(id.clone());
+    app.panels.anim_layer_sel = vec![id];
     app.s.touch();
 }
 
@@ -4568,13 +4599,100 @@ fn anim_layer_delete(app: &mut IncaApp, id: &str) {
         }
     }
     app.panels.anim_layer_collapsed.remove(id);
+    app.panels.anim_layer_sel.retain(|x| x != id);
     if app.s.anim_layer_current.as_deref() == Some(id) {
-        app.s.anim_layer_current = None;
+        app.s.anim_layer_current = app.panels.anim_layer_sel.first().cloned();
     }
     let orphan: Vec<String> = keys.into_iter().filter(|k| !app.s.anim_layers.iter().any(|l| l.curves.contains_key(k))).collect();
     app.s.restore_anim_static(&orphan);
     app.s.set_time(app.s.time.current);
     app.s.touch();
+}
+
+fn anim_layer_merge_selected(app: &mut IncaApp) {
+    let selected = app.panels.anim_layer_sel.clone();
+    if selected.len() < 2 {
+        app.help = "Select two or more animation layers to merge".into();
+        return;
+    }
+    let target = selected
+        .iter()
+        .filter_map(|id| app.s.anim_layers.iter().position(|l| &l.id == id).map(|i| (i, id.clone())))
+        .min_by_key(|(i, _)| *i)
+        .map(|(_, id)| id);
+    let Some(target) = target else {
+        app.help = "Select two or more animation layers to merge".into();
+        return;
+    };
+    let sources: Vec<String> = selected.into_iter().filter(|id| *id != target).collect();
+    if app.s.merge_anim_layers(&target, &sources) {
+        app.panels.anim_layer_sel = vec![target];
+        app.s.set_time(app.s.time.current);
+        app.s.touch();
+        app.help = "Merged the selected animation layers into the top selected layer".into();
+    } else {
+        app.help = "Cannot merge: turn off Solo; the target must not be inside a selected layer, muted by its parent, or at zero weight".into();
+    }
+}
+
+fn anim_layer_merge_down(app: &mut IncaApp, id: &str) {
+    let layers = app.s.anim_layers.clone();
+    let subtree = anim_layer_subtree(&layers, id);
+    let last = subtree.iter().filter_map(|x| layers.iter().position(|l| &l.id == x)).max();
+    let target = last.and_then(|i| layers.get(i + 1)).map(|l| l.id.clone());
+    let Some(target) = target else {
+        app.help = "No animation layer below this one".into();
+        return;
+    };
+    if app.s.merge_anim_layers(&target, &[id.to_string()]) {
+        app.panels.anim_layer_sel = vec![target];
+        app.s.set_time(app.s.time.current);
+        app.s.touch();
+        app.help = "Merged the current animation layer down".into();
+    } else {
+        app.help = "Cannot merge: turn off Solo; the layer must not be muted by its parent or at zero weight".into();
+    }
+}
+
+fn anim_layer_extract_selected(app: &mut IncaApp, id: &str) {
+    if app.s.sel.is_empty() {
+        app.help = "Select objects to extract from the current animation layer".into();
+        return;
+    }
+    let Some(source) = app.s.anim_layers.iter().find(|l| l.id == id).map(|l| l.name.clone()) else { return };
+    let base = format!("{source}_extract");
+    let mut name = base.clone();
+    let mut i = 1;
+    while app.s.anim_layers.iter().any(|l| l.name == name) {
+        name = format!("{base}_{i}");
+        i += 1;
+    }
+    let sel = app.s.sel.clone();
+    if let Some(new_id) = app.s.extract_anim_layer_objects(id, &sel, &name) {
+        app.panels.anim_layer_sel = vec![new_id];
+        app.s.set_time(app.s.time.current);
+        app.s.touch();
+        app.help = format!("Extracted the selected objects to {name}");
+    } else {
+        app.help = "No animation for the selected objects on this layer".into();
+    }
+}
+
+fn anim_layer_flatten(app: &mut IncaApp) {
+    if !app.s.flatten_anim_layers() {
+        app.help = "There are no animation layers to flatten".into();
+        return;
+    }
+    app.panels.anim_layer_sel.clear();
+    app.panels.anim_layer_collapsed.clear();
+    app.panels.anim_layer_rename = None;
+    app.panels.layer_color_popup = None;
+    app.panels.anim_layer_drag = None;
+    app.panels.anim_layer_drag_target = None;
+    app.panels.anim_layer_drag_base = false;
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+    app.help = "Flattened the animation layers into BaseAnimation".into();
 }
 
 fn anim_layer_move(app: &mut IncaApp, id: &str, up: bool) {
@@ -4737,6 +4855,14 @@ fn anim_layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
 fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::icons;
     use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
+    // Keep the selection valid and make external changes to the current layer (new, merge,
+    // extract, delete, scene load) show up as a one-layer selection.
+    app.panels.anim_layer_sel.retain(|id| app.s.anim_layers.iter().any(|l| &l.id == id));
+    match app.s.anim_layer_current.clone() {
+        Some(id) if !app.panels.anim_layer_sel.contains(&id) => app.panels.anim_layer_sel = vec![id],
+        None => app.panels.anim_layer_sel.clear(),
+        _ => {}
+    }
     // Maya: menus on their own row, the four layer buttons on the row below.
     panel_bar(app, ui, MenuSource::LayerEditor, &["Layers", "Options", "Show", "Help"], true, |app, ui, title| match title {
             "Layers" => {
@@ -4781,6 +4907,40 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         anim_layer_delete(app, &id);
                     }
                 }
+                ui.separator();
+                let current = app.s.anim_layer_current.clone();
+                let can_merge = app.panels.anim_layer_sel.len() >= 2;
+                let can_down = current.as_deref().is_some_and(|id| {
+                    let layers = &app.s.anim_layers;
+                    let last = anim_layer_subtree(layers, id).iter().filter_map(|x| layers.iter().position(|l| &l.id == x)).max();
+                    last.is_some_and(|i| i + 1 < layers.len())
+                });
+                let can_extract = current.is_some() && !app.s.sel.is_empty();
+                ui.add_enabled_ui(can_merge, |ui| {
+                    if menu_item(app, ui, "Merge Layers") {
+                        anim_layer_merge_selected(app);
+                    }
+                });
+                ui.add_enabled_ui(can_down, |ui| {
+                    if menu_item(app, ui, "Merge Layer Down") {
+                        if let Some(id) = current.as_deref() {
+                            anim_layer_merge_down(app, id);
+                        }
+                    }
+                });
+                ui.add_enabled_ui(can_extract, |ui| {
+                    if menu_item(app, ui, "Extract Selected Objects") {
+                        if let Some(id) = current.as_deref() {
+                            anim_layer_extract_selected(app, id);
+                        }
+                    }
+                });
+                ui.separator();
+                ui.add_enabled_ui(!app.s.anim_layers.is_empty(), |ui| {
+                    if menu_item(app, ui, "Flatten Layers to BaseAnimation") {
+                        anim_layer_flatten(app);
+                    }
+                });
             }
             "Options" => {
                 if let Some(id) = app.s.anim_layer_current.clone() {
@@ -4808,7 +4968,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             "Help" => {
                 if menu_item(app, ui, "Animation Layer Editor Help") {
-                    app.help = "Select a layer to receive new keys. Weight blends the layer, the barred circle mutes, S solos, the padlock locks, O/A switches override/additive. Keys on additive layers are stored as deltas.".into();
+                    app.help = "Select a layer to receive new keys. Weight blends the layer, the barred circle mutes, S solos, the padlock locks, O/A switches override/additive. Keys on additive layers are stored as deltas. Merge Layers bakes the stack into the top layer; Flatten bakes it into BaseAnimation.".into();
                 }
             }
             _ => {}
@@ -4854,7 +5014,8 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 ui.set_min_width(ui.available_width());
                 let order = anim_layer_order(&layers, &app.panels.anim_layer_collapsed);
                 for (l, depth) in &order {
-            let selected = current.as_deref() == Some(l.id.as_str());
+            let is_current = current.as_deref() == Some(l.id.as_str());
+            let selected = app.panels.anim_layer_sel.contains(&l.id);
             let solo_muted = solo_active && !anim_layer_soloed_ui(&layers, l);
             let parent_muted = !anim_layer_soloed_ui(&layers, l) && anim_layer_parent_muted_ui(&layers, l);
             let has_children = layers.iter().any(|c| c.parent.as_deref() == Some(l.id.as_str()));
@@ -4910,7 +5071,9 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                                     app.panels.anim_layer_collapsed.insert(l.id.clone());
                                 }
                             } else {
-                                app.s.anim_layer_current = Some(l.id.clone());
+                                let ids: Vec<String> = order.iter().map(|(x, _)| x.id.clone()).collect();
+                                let mods = ui.input(|i| i.modifiers);
+                                anim_layer_pick(app, &l.id, &ids, mods);
                             }
                         }
                         if name_resp.double_clicked() && !arrow_hit {
@@ -5026,6 +5189,10 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     });
                 });
+                if is_current {
+                    let r = row.response.rect;
+                    ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(r.left(), r.top()), egui::pos2(r.left() + 2.0, r.bottom())), 0.0, theme::ACCENT);
+                }
                 if app.panels.anim_layer_drag.is_some() {
                     if ui.ctx().pointer_hover_pos().is_some_and(|p| row.response.rect.contains(p)) {
                         app.panels.anim_layer_drag_target = Some(l.id.clone());
@@ -5077,6 +5244,7 @@ fn anim_base_row(app: &mut IncaApp, ui: &mut egui::Ui) {
             );
             if name_resp.clicked() {
                 app.s.anim_layer_current = None;
+                app.panels.anim_layer_sel.clear();
             }
             // keep the Lock in the same column as the layer rows; BaseAnimation has no
             // weight, mute, solo or mode
@@ -7225,6 +7393,114 @@ mod tests {
             }
         }
         assert!(app.s.anim_solo_saved.is_empty());
+    }
+
+    #[test]
+    fn animation_layer_rows_support_multi_selection() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        for _ in 0..3 {
+            anim_layer_new(&mut app, false);
+        }
+        let ids: Vec<String> = app.s.anim_layers.iter().map(|l| l.id.clone()).collect();
+        let order: Vec<String> = anim_layer_order(&app.s.anim_layers, &Default::default()).iter().map(|(l, _)| l.id.clone()).collect();
+        anim_layer_pick(&mut app, &ids[0], &order, egui::Modifiers::default());
+        assert_eq!(app.panels.anim_layer_sel, vec![ids[0].clone()]);
+        assert_eq!(app.s.anim_layer_current.as_deref(), Some(ids[0].as_str()));
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+        anim_layer_pick(&mut app, &ids[1], &order, ctrl);
+        assert_eq!(app.panels.anim_layer_sel, vec![ids[0].clone(), ids[1].clone()]);
+        assert_eq!(app.s.anim_layer_current.as_deref(), Some(ids[1].as_str()));
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        anim_layer_pick(&mut app, &ids[2], &order, shift);
+        assert_eq!(app.panels.anim_layer_sel, vec![ids[1].clone(), ids[2].clone()]);
+        assert_eq!(app.s.anim_layer_current.as_deref(), Some(ids[2].as_str()));
+        anim_layer_pick(&mut app, &ids[2], &order, ctrl);
+        assert_eq!(app.panels.anim_layer_sel, vec![ids[1].clone()]);
+        assert_eq!(app.s.anim_layer_current.as_deref(), Some(ids[1].as_str()));
+        anim_layer_pick(&mut app, &ids[1], &order, ctrl);
+        assert!(app.panels.anim_layer_sel.is_empty());
+        assert!(app.s.anim_layer_current.is_none());
+    }
+
+    #[test]
+    fn merging_layers_keeps_the_top_layer() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let lower = app.s.anim_layer_current.clone().expect("lower layer");
+        app.s.set_time(0.0);
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(2.0)));
+        assert!(app.s.set_key(&nid, "translateX", Some(10.0), Some(2.0)));
+        anim_layer_new_from_selected(&mut app, false);
+        let upper = app.s.anim_layer_current.clone().expect("upper layer");
+        assert_eq!(app.s.anim_layers[0].id, upper);
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(5.0)));
+        assert!(app.s.set_key(&nid, "translateX", Some(10.0), Some(5.0)));
+        app.panels.anim_layer_sel = vec![lower, upper.clone()];
+        anim_layer_merge_selected(&mut app);
+        assert_eq!(app.s.anim_layers.len(), 1, "merge did not remove the source layer");
+        assert_eq!(app.s.anim_layer_current.as_deref(), Some(upper.as_str()));
+        app.s.set_time(5.0);
+        let v = app.s.get_attr_f(&nid, "translateX");
+        assert!((v - 5.0).abs() < 1e-9, "merged pose is {v}, curves: {:?}", app.s.anim_layers[0].curves.values().map(|c| c.keys.iter().map(|k| (k.t, k.v)).collect::<Vec<_>>()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn merging_layer_down_uses_the_layer_below() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let lower = app.s.anim_layer_current.clone().expect("lower layer");
+        app.s.set_time(0.0);
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(2.0)));
+        assert!(app.s.set_key(&nid, "translateX", Some(10.0), Some(2.0)));
+        anim_layer_new_from_selected(&mut app, false);
+        let upper = app.s.anim_layer_current.clone().expect("upper layer");
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(5.0)));
+        assert!(app.s.set_key(&nid, "translateX", Some(10.0), Some(5.0)));
+        anim_layer_merge_down(&mut app, &upper);
+        assert_eq!(app.s.anim_layers.len(), 1, "merge down did not remove the upper layer");
+        assert_eq!(app.s.anim_layer_current.as_deref(), Some(lower.as_str()));
+        app.s.set_time(5.0);
+        let v = app.s.get_attr_f(&nid, "translateX");
+        assert!((v - 5.0).abs() < 1e-9, "merge down changed the pose to {v}");
+    }
+
+    #[test]
+    fn extracting_objects_moves_their_curves_to_a_new_layer() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let a = app.s.create_mesh("polyCube", &Params::new(), None);
+        let b = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(&[a.clone(), b.clone()], SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let source = app.s.anim_layer_current.clone().expect("source layer");
+        app.s.set_time(1.0);
+        assert!(app.s.set_key(&a, "translateX", Some(1.0), Some(4.0)));
+        assert!(app.s.set_key(&b, "translateX", Some(1.0), Some(9.0)));
+        app.s.select(std::slice::from_ref(&a), SelMode::Replace);
+        anim_layer_extract_selected(&mut app, &source);
+        assert_eq!(app.s.anim_layers.len(), 2, "extract did not create a layer");
+        let new = app.s.anim_layer_current.clone().expect("extracted layer");
+        let src = app.s.anim_layers.iter().find(|l| l.id == source).expect("source survives");
+        let ext = app.s.anim_layers.iter().find(|l| l.id == new).expect("extracted layer");
+        assert!(ext.name.ends_with("_extract"));
+        assert!(ext.curves.contains_key(&inca_core::anim::Anim::key(&a, "translateX")));
+        assert!(!src.curves.contains_key(&inca_core::anim::Anim::key(&a, "translateX")));
+        assert!(src.curves.contains_key(&inca_core::anim::Anim::key(&b, "translateX")));
     }
 
     #[test]
