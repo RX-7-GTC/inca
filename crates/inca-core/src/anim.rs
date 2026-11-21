@@ -25,6 +25,9 @@ pub struct AnimLayer {
     pub name: String,
     #[serde(default = "one")]
     pub weight: f64,
+    /// Animated layer weight. Empty keys means the static `weight` is used.
+    #[serde(default)]
+    pub weight_curve: AnimCurve,
     #[serde(default)]
     pub mute: bool,
     #[serde(default)]
@@ -54,6 +57,14 @@ pub struct AnimLayer {
 }
 
 impl AnimLayer {
+    pub fn weight_at(&self, t: f64) -> f64 {
+        if self.weight_curve.keys.is_empty() {
+            self.weight
+        } else {
+            self.weight_curve.eval(t)
+        }
+    }
+
     /// Whether this layer owns `node.attr`. Old scenes without an attribute list keep
     /// their object-level membership until the loader migrates them.
     pub fn has_attr(&self, node: &str, attr: &str) -> bool {
@@ -95,6 +106,12 @@ pub struct AnimCurve {
     /// Muted animation curves are not evaluated during playback.
     #[serde(default)]
     pub mute: bool,
+}
+
+impl Default for AnimCurve {
+    fn default() -> Self {
+        Self::new("", "weight")
+    }
 }
 
 impl AnimCurve {

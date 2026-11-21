@@ -1912,15 +1912,19 @@ impl Scene {
     }
 
     /// Children's weight is multiplied by every ancestor's weight.
-    pub fn anim_layer_effective_weight(&self, l: &AnimLayer) -> f64 {
-        let mut w = l.weight;
+    pub fn anim_layer_effective_weight_at(&self, l: &AnimLayer, t: f64) -> f64 {
+        let mut w = l.weight_at(t);
         let mut p = self.anim_layer_parent(l);
         for _ in 0..self.anim_layers.len() {
             let Some(pl) = p else { break };
-            w *= pl.weight;
+            w *= pl.weight_at(t);
             p = self.anim_layer_parent(pl);
         }
         w
+    }
+
+    pub fn anim_layer_effective_weight(&self, l: &AnimLayer) -> f64 {
+        self.anim_layer_effective_weight_at(l, self.time.current)
     }
 
     /// A child of a muted parent cannot be keyed.
@@ -2153,7 +2157,7 @@ impl Scene {
         let solo = self.anim_layers.iter().any(|l| l.solo);
         // layers are stored top-first, so walk the ones below the current layer bottom-up
         for l in self.anim_layers[i + 1..].iter().rev() {
-            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight_at(l, t) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
             let Some(c) = l.curves.get(key) else { continue };
@@ -2161,7 +2165,7 @@ impl Scene {
                 continue;
             }
             let lv = c.eval(t);
-            let w = self.anim_layer_effective_weight(l);
+            let w = self.anim_layer_effective_weight_at(l, t);
             v = if l.override_mode || c.attr == "visibility" {
                 v + (lv - v) * w
             } else {
@@ -2177,7 +2181,7 @@ impl Scene {
         let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
         let solo = self.anim_layers.iter().any(|l| l.solo);
         for l in self.anim_layers[i..].iter().rev() {
-            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight_at(l, t) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
             let Some(c) = l.curves.get(key) else { continue };
@@ -2185,7 +2189,7 @@ impl Scene {
                 continue;
             }
             let lv = c.eval(t);
-            let w = self.anim_layer_effective_weight(l);
+            let w = self.anim_layer_effective_weight_at(l, t);
             v = if l.override_mode || c.attr == "visibility" {
                 v + (lv - v) * w
             } else {
@@ -2201,7 +2205,7 @@ impl Scene {
         let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
         let solo = self.anim_layers.iter().any(|l| l.solo);
         for l in self.anim_layers[i + 1..].iter().rev() {
-            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight_at(l, t) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
             let Some(c) = l.curves.get(key) else { continue };
@@ -2209,7 +2213,7 @@ impl Scene {
                 continue;
             }
             let lv = c.eval(t);
-            let w = self.anim_layer_effective_weight(l);
+            let w = self.anim_layer_effective_weight_at(l, t);
             v = if l.override_mode || c.attr == "visibility" {
                 v + (lv - v) * w
             } else {
@@ -2224,7 +2228,7 @@ impl Scene {
         let mut v = self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key));
         let solo = self.anim_layers.iter().any(|l| l.solo);
         for l in self.anim_layers.iter().rev() {
-            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight_at(l, t) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
             let Some(c) = l.curves.get(key) else { continue };
@@ -2232,7 +2236,7 @@ impl Scene {
                 continue;
             }
             let lv = c.eval(t);
-            let w = self.anim_layer_effective_weight(l);
+            let w = self.anim_layer_effective_weight_at(l, t);
             v = if l.override_mode || c.attr == "visibility" {
                 v + (lv - v) * w
             } else {
@@ -2364,10 +2368,6 @@ impl Scene {
         if merged.contains(target) {
             return false;
         }
-        let weight = self.anim_layer_effective_weight(&target_layer);
-        if weight <= 1e-6 {
-            return false;
-        }
         let result_override = target_layer.override_mode
             || self.anim_layers.iter().filter(|l| merged.contains(&l.id)).any(|l| l.override_mode);
         // A merge-down removes the block directly above the target; the next surviving layer
@@ -2386,7 +2386,7 @@ impl Scene {
         // layers contribute nothing, so leave the target's own curves untouched for them.
         let mut keys = HashSet::new();
         for l in self.anim_layers.iter().filter(|l| merged.contains(&l.id)) {
-            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 {
+            if self.anim_layer_effective_mute(l) {
                 continue;
             }
             for (k, c) in &l.curves {
@@ -2396,6 +2396,7 @@ impl Scene {
             }
         }
         let mut baked = vec![];
+        let mut weight_zero = false;
         for key in keys {
             let times = self.anim_curve_times(&key);
             if times.is_empty() {
@@ -2404,16 +2405,24 @@ impl Scene {
             let attr = key.rsplit_once('.').map(|(_, a)| a).unwrap_or("");
             let samples: Vec<(f64, f64)> = times
                 .into_iter()
-                .filter_map(|t| {
-                    let want = self.anim_value_through(&key, t, absorb.as_deref().unwrap_or(target));
-                    let base = self.anim_value_below_skip(&key, t, target, &merged);
+                .filter_map(|time| {
+                    let weight = self.anim_layer_effective_weight_at(&target_layer, time);
+                    if weight <= 1e-6 {
+                        weight_zero = true;
+                        return None;
+                    }
+                    let want = self.anim_value_through(&key, time, absorb.as_deref().unwrap_or(target));
+                    let base = self.anim_value_below_skip(&key, time, target, &merged);
                     let stored = if result_override || attr == "visibility" { base + (want - base) / weight } else { (want - base) / weight };
-                    stored.is_finite().then_some((t, stored))
+                    stored.is_finite().then_some((time, stored))
                 })
                 .collect();
             if !samples.is_empty() {
                 baked.push((key, samples));
             }
+        }
+        if weight_zero {
+            return false;
         }
         self.checkpoint("merge animation layers");
         if !baked.is_empty() {
@@ -2532,6 +2541,7 @@ impl Scene {
                 id: id.clone(),
                 name: name.to_string(),
                 weight: src.weight,
+                weight_curve: src.weight_curve.clone(),
                 mute: src.mute,
                 solo: src.solo,
                 lock: false,
@@ -2652,7 +2662,7 @@ impl Scene {
             let layers: Vec<AnimLayer> = self.anim_layers[start..]
                 .iter()
                 .rev()
-                .filter(|l| !self.anim_layer_effective_mute(l) && self.anim_layer_effective_weight(l) > 1e-6 && (!solo || self.anim_layer_soloed(l)))
+                .filter(|l| !self.anim_layer_effective_mute(l) && self.anim_layer_effective_weight_at(l, t) > 1e-6 && (!solo || self.anim_layer_soloed(l)))
                 .cloned()
                 .collect();
             for layer in layers {
@@ -2665,7 +2675,7 @@ impl Scene {
                     }
                     let lv = c.eval(t);
                     let base = self.anim_value_below(&Anim::key(&c.node, &c.attr), t, &layer.id);
-                    let w = self.anim_layer_effective_weight(&layer);
+                    let w = self.anim_layer_effective_weight_at(&layer, t);
                     // Boolean channels (visibility) always behave as override, as in Maya.
                     let v = if layer.override_mode || c.attr == "visibility" {
                         base + (lv - base) * w
@@ -3935,6 +3945,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -3970,6 +3981,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4011,6 +4023,7 @@ mod tests {
             id: id.into(),
             name: id.into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4076,6 +4089,22 @@ mod tests {
     }
 
     #[test]
+    fn keyed_layer_weight_blends_over_time() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut layer = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 10.0)]);
+        layer.weight_curve.set_key(0.0, 0.0, "linear");
+        layer.weight_curve.set_key(10.0, 1.0, "linear");
+        s.anim_layers = vec![layer];
+        for (t, want) in [(0.0, 0.0), (5.0, 5.0), (10.0, 10.0)] {
+            s.set_time(t);
+            assert!((s.get_attr_f(&a, "translateX") - want).abs() < 1e-9, "time {t}");
+        }
+        let layer = &s.anim_layers[0];
+        assert!((s.anim_layer_effective_weight_at(layer, 5.0) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn flatten_layers_writes_base_animation() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
@@ -4135,6 +4164,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 0.5,
+            weight_curve: Default::default(),
             mute: true,
             solo: false,
             lock: true,
@@ -4187,6 +4217,7 @@ mod tests {
                 id: id.into(),
                 name: id.into(),
                 weight: 1.0,
+                weight_curve: Default::default(),
                 mute: false,
                 solo: false,
                 lock: false,
@@ -4217,6 +4248,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4262,6 +4294,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4313,6 +4346,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4353,6 +4387,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4414,6 +4449,7 @@ mod tests {
             id: "parent".into(),
             name: "Parent".into(),
             weight: 0.5,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4429,6 +4465,7 @@ mod tests {
             id: "child".into(),
             name: "Child".into(),
             weight: 0.5,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4465,6 +4502,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4500,6 +4538,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,

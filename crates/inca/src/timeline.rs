@@ -98,7 +98,7 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
         t += minor;
     }
     // keys of the selection (or only the picked Channel Box channels when sync is on)
-    let key_times: Vec<f64> = if app.panels.cb_sync_timeline && !app.panels.cb_sel.is_empty() {
+    let mut key_times: Vec<f64> = if app.panels.cb_sync_timeline && !app.panels.cb_sel.is_empty() {
         let mut t: Vec<f64> = app
             .s
             .anim
@@ -113,13 +113,11 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
     } else {
         app.s.anim_key_times(&app.s.sel)
     };
-    for k in key_times {
-        if k >= t0 && k <= t1 {
-            let x = x_of(k).round();
-            let breakdown = app.s.anim_curves().values().any(|c| c.keys.iter().any(|key| key.breakdown && (key.t - k).abs() < 1e-6));
-            let color = if breakdown { Color32::from_rgb(0x54, 0xc8, 0x60) } else { Color32::from_rgb(0xd7, 0x3b, 0x3e) };
-            p.rect_filled(Rect::from_min_size(pos2(x - 1.0, rect.max.y - 22.0), vec2((px_per as f32 * 0.18).max(2.0), 22.0)), 0.0, color);
-        }
+    // The current layer's animated weight is keyed in the bottom Weight row; show its keys too.
+    if let Some(l) = app.s.anim_layer_current.as_ref().and_then(|id| app.s.anim_layers.iter().find(|l| &l.id == id)) {
+        key_times.extend(l.weight_curve.keys.iter().map(|k| k.t));
+        key_times.sort_by(|a, b| a.total_cmp(b));
+        key_times.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
     }
     // current time: grey frame band, white line, label box
     let cx = x_of(app.s.time.current);
@@ -132,6 +130,15 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
     let lx = (cx + 2.0).min(rect.max.x - tw);
     p.rect_filled(Rect::from_min_size(pos2(lx, rect.min.y + 1.0), vec2(tw, 13.0)), 0.0, Color32::from_gray(0xd9));
     p.text(pos2(lx + 3.0, rect.min.y + 1.5), egui::Align2::LEFT_TOP, lab, font, Color32::from_gray(0x11));
+    // Draw key ticks last so a key on the current frame stays visible under the playhead.
+    for k in key_times {
+        if k >= t0 && k <= t1 {
+            let x = x_of(k).round();
+            let breakdown = app.s.anim_curves().values().any(|c| c.keys.iter().any(|key| key.breakdown && (key.t - k).abs() < 1e-6));
+            let color = if breakdown { Color32::from_rgb(0x54, 0xc8, 0x60) } else { Color32::from_rgb(0xd7, 0x3b, 0x3e) };
+            p.rect_filled(Rect::from_min_size(pos2(x - 1.0, rect.max.y - 22.0), vec2((px_per as f32 * 0.18).max(2.0), 22.0)), 0.0, color);
+        }
+    }
 
     // ---- interaction
     let (mods, ptr) = ui.input(|i| (i.modifiers, i.pointer.clone()));

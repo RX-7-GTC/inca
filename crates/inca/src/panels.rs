@@ -4467,6 +4467,7 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
             id: id.clone(),
             name,
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
@@ -4756,6 +4757,30 @@ fn anim_layer_update(app: &mut IncaApp, id: &str, label: &str, f: impl FnOnce(&m
         f(l);
     }
     app.s.set_time(app.s.time.current);
+    app.s.touch();
+}
+
+/// Set the layer weight. Once the weight has keys, editing it at the current frame
+/// updates/creates a key instead of changing the static value.
+fn anim_layer_set_weight(app: &mut IncaApp, id: &str, w: f64) {
+    if app.s.anim_layers.iter().find(|l| l.id == id).is_some_and(|l| !l.weight_curve.keys.is_empty()) {
+        anim_layer_key_weight(app, id, Some(w));
+    } else {
+        anim_layer_update(app, id, "animation layer weight", |l| l.weight = w);
+    }
+}
+
+/// Key the layer weight at the current frame. `value` also sets the weight before keying.
+fn anim_layer_key_weight(app: &mut IncaApp, id: &str, value: Option<f64>) {
+    let t = app.s.time.current;
+    let Some(l) = app.s.anim_layers.iter().find(|l| l.id == id) else { return };
+    let w = value.unwrap_or_else(|| l.weight_at(t));
+    app.s.checkpoint("key animation layer weight");
+    if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
+        l.weight = w;
+        l.weight_curve.set_key(t, w, "auto");
+    }
+    app.s.set_time(t);
     app.s.touch();
 }
 
@@ -5171,9 +5196,9 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             }
                         });
                     }
-                    let mut w = l.weight;
+                    let mut w = l.weight_at(app.s.time.current);
                     if ui.add_sized([46.0, ROW_H], egui::DragValue::new(&mut w).speed(0.01).range(0.0..=1.0).max_decimals(2)).changed() {
-                        anim_layer_update(app, &l.id, "animation layer weight", |l| l.weight = w);
+                        anim_layer_set_weight(app, &l.id, w);
                     }
                     if layer_mute_toggle(ui, l.mute || parent_muted, solo_muted || parent_muted, selected, "Mute").clicked() {
                         anim_layer_mute(app, &l.id);
@@ -5228,25 +5253,42 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         });
     });
-    // Maya's bottom weight slider edits the current layer.
+    // Maya's bottom weight row: Weight label, value field, slider, K key button.
     ui.horizontal(|ui| {
         ui.label("Weight");
         let current = app.s.anim_layer_current.clone();
-        let mut w = current.as_ref().and_then(|id| app.s.anim_layers.iter().find(|l| &l.id == id)).map(|l| l.weight).unwrap_or(1.0);
+        let mut w = current
+            .as_ref()
+            .and_then(|id| app.s.anim_layers.iter().find(|l| &l.id == id))
+            .map(|l| l.weight_at(app.s.time.current))
+            .unwrap_or(1.0);
         let enabled = current.is_some();
         let avail = ui.available_width();
-        let r = ui
-            .add_enabled_ui(enabled, |ui| {
-                ui.spacing_mut().slider_width = (avail - 48.0).max(40.0);
-                ui.add(egui::Slider::new(&mut w, 0.0..=1.0).show_value(true).max_decimals(2).custom_formatter(|v, _| format!("{v:.2}")))
-            })
-            .inner;
-        if r.changed() {
-            if let Some(id) = current {
-                anim_layer_update(app, &id, "animation layer weight", |l| l.weight = w);
+        let field_w = 58.0;
+        let key_w = 22.0;
+        let slider_w = (avail - field_w - key_w - 12.0).max(40.0);
+        let mut changed = false;
+        let mut key_now = false;
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            changed |= ui
+                .add_sized([field_w, 18.0], egui::DragValue::new(&mut w).speed(0.01).range(0.0..=1.0).fixed_decimals(3))
+                .on_hover_text("Weight of the current animation layer")
+                .changed();
+            ui.spacing_mut().slider_width = slider_w;
+            changed |= ui.add(egui::Slider::new(&mut w, 0.0..=1.0).show_value(false)).changed();
+            key_now = ui.small_button("K").on_hover_text("Key the current weight at this frame").clicked();
+        });
+        if changed {
+            if let Some(id) = current.clone() {
+                anim_layer_set_weight(app, &id, w);
             }
         }
-        r.on_hover_text("Weight of the current animation layer");
+        if key_now {
+            if let Some(id) = current.clone() {
+                anim_layer_key_weight(app, &id, None);
+            }
+        }
     });
     if app.panels.anim_layer_drag.is_some() && !ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle)) {
         let drag = app.panels.anim_layer_drag.take().unwrap();
@@ -7433,6 +7475,32 @@ mod tests {
             }
         }
         assert!(app.s.anim_solo_saved.is_empty());
+    }
+
+    #[test]
+    fn weight_keys_are_set_on_the_current_layer() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        app.s.set_time(1.0);
+        anim_layer_key_weight(&mut app, &lid, Some(0.25));
+        app.s.set_time(10.0);
+        anim_layer_key_weight(&mut app, &lid, Some(1.0));
+        let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("layer");
+        assert_eq!(layer.weight_curve.keys.len(), 2);
+        assert!((layer.weight_at(1.0) - 0.25).abs() < 1e-9);
+        assert!((layer.weight_at(10.0) - 1.0).abs() < 1e-9);
+        let mid = layer.weight_at(5.0);
+        app.s.set_time(5.0);
+        anim_layer_key_weight(&mut app, &lid, None);
+        let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("layer");
+        assert_eq!(layer.weight_curve.keys.len(), 3);
+        assert!((layer.weight_at(5.0) - mid).abs() < 1e-9, "K changed the weight");
     }
 
     #[test]

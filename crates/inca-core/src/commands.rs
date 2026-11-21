@@ -3238,6 +3238,7 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight: 1.0,
+            weight_curve: Default::default(),
             mute: false,
             solo: false,
             lock: false,
