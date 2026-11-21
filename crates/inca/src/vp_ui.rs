@@ -340,7 +340,7 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
 }
 
 fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
-    use crate::menus::{activated, menu_check, menu_item, menu_radio, menu_selectable, panel_bar, MenuSource};
+    use crate::menus::{menu_check, menu_item, menu_item_ext, menu_radio, menu_selectable, menu_submenu, panel_bar, MenuSource};
     ui.spacing_mut().button_padding = vec2(4.0, 0.0);
     let cam = app.vps[idx].camera.clone();
     let titles = ["View", "Shading", "Lighting", "Show", "Renderer", "Panels"];
@@ -349,18 +349,15 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         if menu_item(app, ui, "Select Camera") {
             select_camera(app, idx);
         }
-        let r = ui.add_enabled(app.can_undo_view(idx), egui::Button::new("Undo View Change").shortcut_text("Alt+Z"));
-        if activated(app, ui, &r) {
+        if menu_item_ext(app, ui, app.can_undo_view(idx), "Undo View Change", "Alt+Z") {
             app.active_vp = idx;
             app.undo_view(idx);
         }
-        let r = ui.add_enabled(app.can_redo_view(idx), egui::Button::new("Redo View Change").shortcut_text("Alt+Y"));
-        if activated(app, ui, &r) {
+        if menu_item_ext(app, ui, app.can_redo_view(idx), "Redo View Change", "Alt+Y") {
             app.active_vp = idx;
             app.redo_view(idx);
         }
-        let r = ui.add(egui::Button::new("Default View").shortcut_text("Alt+Home"));
-        if activated(app, ui, &r) {
+        if menu_item_ext(app, ui, true, "Default View", "Alt+Home") {
             app.active_vp = idx;
             app.push_view_change(idx);
             viewport::default_view(&mut app.s, &cam);
@@ -374,18 +371,16 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
                 viewport::look_at(&mut app.s, &cam, b.center());
             }
         }
-        let r = ui.add(egui::Button::new("Frame All").shortcut_text("A"));
-        if activated(app, ui, &r) {
+        if menu_item_ext(app, ui, true, "Frame All", "A") {
             app.active_vp = idx;
             app.action("frameAll");
         }
-        let r = ui.add(egui::Button::new("Frame Selection").shortcut_text("F"));
-        if activated(app, ui, &r) {
+        if menu_item_ext(app, ui, true, "Frame Selection", "F") {
             app.active_vp = idx;
             app.action("frameSelected");
         }
         ui.separator();
-        ui.menu_button("Camera Settings", |ui| {
+        menu_submenu(ui, "Camera Settings", |ui| {
             if menu_check(app, ui, app.vps[idx].res_gate, "Resolution Gate") {
                 app.vps[idx].res_gate = !app.vps[idx].res_gate;
                 app.vps[idx].film_gate = false;
@@ -403,7 +398,7 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
             app.action("attributeEditor");
         }
         ui.separator();
-        ui.menu_button("Predefined Bookmarks", |ui| {
+        menu_submenu(ui, "Predefined Bookmarks", |ui| {
             for (l, t, r) in BOOKMARKS {
                 if menu_item(app, ui, l) {
                     let ortho = viewport::camera_id(&app.s, &cam).and_then(|id| app.s.node(&id)).is_some_and(|n| matches!(&n.shape, Shape::Camera(c) if c.ortho));
@@ -475,11 +470,11 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
             app.vps[idx].shadows = !app.vps[idx].shadows;
         }
         if app.vps[idx].shadows && app.vps[idx].lights != LightMode::All {
-            ui.label(egui::RichText::new("Shadows need \"Use All Lights\" (7)").color(theme::TEXT_DIM));
+            crate::menus::menu_note(ui, "Shadows need \"Use All Lights\" (7)");
         }
         }
         "Show" => {
-        ui.menu_button("Isolate Select", |ui| {
+        menu_submenu(ui, "Isolate Select", |ui| {
             if menu_check(app, ui, app.vps[idx].isolate.is_some(), "View Selected") {
                 app.active_vp = idx;
                 app.action("isolateSelect");
@@ -545,7 +540,7 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
         }
         "Renderer" => {
         let _ = menu_radio(app, ui, true, "Viewport 2.0 (Inca wgpu)");
-        if menu_item(app, ui, "   Inca Path Tracer (Render View)") {
+        if menu_item(app, ui, "Inca Path Tracer (Render View)") {
             app.action("renderView");
         }
         }
@@ -554,7 +549,7 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
             Shape::Camera(c) => Some((n.name.clone(), c.ortho)),
             _ => None,
         }).collect();
-        ui.menu_button("Perspective", |ui| {
+        menu_submenu(ui, "Perspective", |ui| {
             for (c, _) in cams.iter().filter(|c| !c.1) {
                 if menu_check(app, ui, app.vps[idx].camera == *c, c) {
                     app.push_view_change(idx);
@@ -571,7 +566,7 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
                 }
             }
         });
-        ui.menu_button("Orthographic", |ui| {
+        menu_submenu(ui, "Orthographic", |ui| {
             for (c, _) in cams.iter().filter(|c| c.1) {
                 if menu_check(app, ui, app.vps[idx].camera == *c, c) {
                     app.push_view_change(idx);
@@ -589,14 +584,14 @@ fn panel_menus(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize) {
             }
         }
         ui.separator();
-        ui.menu_button("Panel", |ui| {
+        menu_submenu(ui, "Panel", |ui| {
             for (l, a) in [("Outliner", "outlinerWindow"), ("Graph Editor", "graphEditor"), ("Dope Sheet", "dopeSheet"), ("Hypershade", "hypershade"), ("Hypergraph Hierarchy", "hypergraph"), ("Render View", "renderView")] {
                 if menu_item(app, ui, l) {
                     app.action(a);
                 }
             }
         });
-        ui.menu_button("Layouts", |ui| {
+        menu_submenu(ui, "Layouts", |ui| {
             for (l, lay) in [("Single Pane", Layout::Single), ("Two Panes Side by Side", Layout::TwoSide), ("Two Panes Stacked", Layout::TwoStack), ("Three Panes Split Left", Layout::Three), ("Four Panes", Layout::Four)] {
                 if menu_check(app, ui, app.layout == lay, l) {
                     app.active_vp = idx;

@@ -6,6 +6,14 @@ use egui::{vec2, Color32, Rect, Response, Sense, TextureHandle, Ui};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Exact icon for an action id, if one exists (no fallback).
+pub fn action_icon(id: &str) -> Option<&'static str> {
+    if let Some((_, i)) = CMD_ICONS.iter().find(|(c, _)| *c == id) {
+        return Some(i);
+    }
+    ICONS.iter().find(|(n, _)| *n == id).map(|(n, _)| *n)
+}
+
 /// Icon name for an action id: the JS command's icon, an icon of the same name, or `help`.
 pub fn for_action(id: &str) -> &'static str {
     if let Some((_, i)) = CMD_ICONS.iter().find(|(c, _)| *c == id) {

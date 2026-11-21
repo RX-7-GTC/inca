@@ -68,82 +68,46 @@ pub fn restore_all(app: &mut IncaApp) {
 
 /// Windows > Workspaces and the menu bar selector share this list.
 pub fn menu(app: &mut IncaApp, ui: &mut egui::Ui) {
-    crate::menus::menu_hover(ui);
     for w in WORKSPACES {
-        let resp = ui.selectable_label(app.workspace == w.name, w.name);
-        crate::menus::highlight_under_press(ui, &resp);
-        if resp.clicked() || crate::menus::released_here(ui, &resp) {
+        if crate::menus::menu_selectable(app, ui, app.workspace == w.name, w.name) {
             apply(app, w.name);
-            app.open_menu = None;
             ui.close();
         }
     }
     ui.separator();
-    let reset = ui.button("Reset Current Workspace");
-    crate::menus::highlight_under_press(ui, &reset);
-    if reset.clicked() || crate::menus::released_here(ui, &reset) {
+    if crate::menus::menu_item(app, ui, "Reset Current Workspace") {
         let n = app.workspace.clone();
         apply(app, &n);
-        app.open_menu = None;
         ui.close();
     }
 }
 
 /// Display > UI Elements.
 pub fn elements_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
-    crate::menus::menu_hover(ui);
     for (k, l) in ELEMENTS {
-        let mut on = app.shown(k);
-        let resp = ui.checkbox(&mut on, *l);
-        crate::menus::highlight_under_press(ui, &resp);
-        if resp.clicked() {
-            app.set_shown(k, on);
-            app.open_menu = None;
-            ui.close();
-        } else if crate::menus::released_here(ui, &resp) {
-            // a release from a press-drag does not toggle egui's checkbox state
+        let on = app.shown(k);
+        if crate::menus::menu_check(app, ui, on, l) {
             app.set_shown(k, !on);
-            app.open_menu = None;
             ui.close();
         }
     }
-    let mut on = app.show_right;
-    let resp = ui.checkbox(&mut on, "Channel Box / Attribute Editor");
-    crate::menus::highlight_under_press(ui, &resp);
-    if resp.clicked() {
-        app.show_right = on;
-        app.open_menu = None;
-        ui.close();
-    } else if crate::menus::released_here(ui, &resp) {
+    let on = app.show_right;
+    if crate::menus::menu_check(app, ui, on, "Channel Box / Attribute Editor") {
         app.show_right = !on;
-        app.open_menu = None;
         ui.close();
     }
-    let mut on = app.show_outliner;
-    let resp = ui.checkbox(&mut on, "Outliner");
-    crate::menus::highlight_under_press(ui, &resp);
-    if resp.clicked() {
-        app.show_outliner = on;
-        app.open_menu = None;
-        ui.close();
-    } else if crate::menus::released_here(ui, &resp) {
+    let on = app.show_outliner;
+    if crate::menus::menu_check(app, ui, on, "Outliner") {
         app.show_outliner = !on;
-        app.open_menu = None;
         ui.close();
     }
     ui.separator();
-    let hide = ui.add(egui::Button::new("Hide UI Elements").shortcut_text("Ctrl+Space"));
-    crate::menus::highlight_under_press(ui, &hide);
-    if hide.clicked() || crate::menus::released_here(ui, &hide) {
+    if crate::menus::menu_item_ext(app, ui, true, "Hide UI Elements", "Ctrl+Space") {
         toggle_all(app);
-        app.open_menu = None;
         ui.close();
     }
-    let restore = ui.button("Restore UI Elements");
-    crate::menus::highlight_under_press(ui, &restore);
-    if restore.clicked() || crate::menus::released_here(ui, &restore) {
+    if crate::menus::menu_item(app, ui, "Restore UI Elements") {
         restore_all(app);
-        app.open_menu = None;
         ui.close();
     }
 }

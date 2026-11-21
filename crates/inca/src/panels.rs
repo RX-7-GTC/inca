@@ -625,7 +625,7 @@ impl Default for OutlinerOpts {
 // ------------------------------------------------------------------ outliner
 
 pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
-    use crate::menus::{activated, menu_check, menu_item, panel_bar, MenuSource};
+    use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
     panel_bar(app, ui, MenuSource::Outliner, &["Edit", "Display", "Show", "Help"], false, |app, ui, title| match title {
         "Edit" => {
             for (l, a) in [("Rename", "renameSel"), ("Select Hierarchy", "selectHierarchy")] {
@@ -636,12 +636,10 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
                 outliner_cmd(app, ui, l, a);
             }
             ui.separator();
-            let r = ui.button("Expand All");
-            if activated(app, ui, &r) {
+            if menu_item(app, ui, "Expand All") {
                 app.panels.expanded = app.s.all_dag(true).into_iter().collect();
             }
-            let r = ui.button("Collapse All");
-            if activated(app, ui, &r) {
+            if menu_item(app, ui, "Collapse All") {
                 app.panels.expanded.clear();
             }
         }
@@ -758,8 +756,7 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
 }
 
 fn outliner_cmd(app: &mut IncaApp, ui: &mut egui::Ui, label: &str, action: &str) {
-    let r = ui.button(label);
-    if crate::menus::activated(app, ui, &r) {
+    if crate::menus::menu_item(app, ui, label) {
         app.action(action);
     }
 }
@@ -2116,7 +2113,7 @@ fn channels_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
 }
 
 fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
-    use crate::menus::{menu_check, menu_item, menu_radio, panel_bar, MenuSource};
+    use crate::menus::{menu_check, menu_item, menu_radio, menu_submenu, panel_bar, MenuSource};
     panel_bar(app, ui, MenuSource::ChannelBox, &["Channels", "Edit", "Object", "Show"], false, |app, ui, title| match title {
         "Channels" => channels_menu(app, ui),
         "Edit" => {
@@ -2189,8 +2186,8 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             if menu_item(app, ui, "Delete History") {
                 app.action("deleteHistory");
             }
-            ui.menu_button("Settings", |ui| {
-                ui.menu_button("Attribute Adjustment Speed", |ui| {
+            menu_submenu(ui, "Settings", |ui| {
+                menu_submenu(ui, "Attribute Adjustment Speed", |ui| {
                     for (value, label) in [(1u8, "Slow"), (0u8, "Medium"), (2u8, "Fast")] {
                         if menu_check(app, ui, app.panels.cb_speed == value, label) {
                             app.panels.cb_speed = value;
@@ -2217,7 +2214,7 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
                     app.panels.cb_manips = None;
                     cb_arm(app);
                 }
-                ui.menu_button("Change Precision", |ui| {
+                menu_submenu(ui, "Change Precision", |ui| {
                     if menu_check(app, ui, app.panels.cb_precision.is_none(), "Default") {
                         app.panels.cb_precision = None;
                     }
@@ -2239,7 +2236,7 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
                     cb_arm(app);
                 }
             });
-            ui.menu_button("Channel Names", |ui| {
+            menu_submenu(ui, "Channel Names", |ui| {
                 for (value, label) in [(0u8, "Nice"), (1u8, "Long"), (2u8, "Short")] {
                     if menu_check(app, ui, app.panels.cb_names == value, label) {
                         app.panels.cb_names = value;
@@ -2258,7 +2255,7 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
         "Show" => {
-            ui.menu_button("Attributes", |ui| {
+            menu_submenu(ui, "Attributes", |ui| {
                 let mut f = cb_filter(app);
                 for (i, name) in ["Translate", "Rotate", "Scale", "Visibility"].iter().enumerate() {
                     if menu_check(app, ui, f[i], name) {
@@ -2287,7 +2284,7 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             let entries = app.panels.cb_custom_entries.clone();
             if !entries.is_empty() {
-                ui.menu_button("Custom Entries", |ui| {
+                menu_submenu(ui, "Custom Entries", |ui| {
                     if menu_check(app, ui, app.panels.cb_custom_active.is_none(), "Off") {
                         app.panels.cb_custom_active = None;
                     }
@@ -2297,7 +2294,7 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
-                ui.menu_button("Delete Entry...", |ui| {
+                menu_submenu(ui, "Delete Entry...", |ui| {
                     for (i, (name, _)) in entries.iter().enumerate() {
                         if menu_item(app, ui, name) {
                             app.panels.cb_custom_entries.remove(i);
@@ -2308,7 +2305,7 @@ fn channel_box_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
                 });
             }
             ui.separator();
-            ui.menu_button("Show Assets", |ui| {
+            menu_submenu(ui, "Show Assets", |ui| {
                 if menu_check(app, ui, app.panels.cb_asset_mode == 0, "All Attributes") {
                     app.panels.cb_asset_mode = 0;
                 }
@@ -3017,7 +3014,7 @@ fn show_selected_channel_types(app: &mut IncaApp) {
 
 fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::icons;
-    use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
+    use crate::menus::{menu_check, menu_item, menu_submenu, panel_bar, MenuSource};
     app.panels.layer_sel.retain(|id| app.s.layers.iter().any(|l| &l.id == id));
     if app.panels.layer_rename.as_ref().is_some_and(|(id, _)| !app.s.layers.iter().any(|l| &l.id == id)) {
         app.panels.layer_rename = None;
@@ -3105,9 +3102,9 @@ fn layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     layer_delete_unused(app);
                 }
                 ui.separator();
-                ui.menu_button("Set All Layers", |ui| layer_set_entries(app, ui, LayerScope::All));
-                ui.menu_button("Set Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::Selected));
-                ui.menu_button("Set Only Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::OnlySelected));
+                menu_submenu(ui, "Set All Layers", |ui| layer_set_entries(app, ui, LayerScope::All));
+                menu_submenu(ui, "Set Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::Selected));
+                menu_submenu(ui, "Set Only Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::OnlySelected));
                 ui.separator();
                 if menu_item(app, ui, "Sort Layers Alphabetically") {
                     layer_sort(app, true);
@@ -4801,7 +4798,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         anim_layer_lock(app, &id);
                     }
                 } else {
-                    ui.add_enabled(false, egui::Button::new("No layer selected"));
+                    crate::menus::menu_disabled(ui, "No layer selected");
                 }
             }
             "Show" => {
@@ -6020,7 +6017,7 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
         "Attributes" => {
-            ui.add_enabled(false, egui::Button::new("Add Attribute..."));
+            crate::menus::menu_disabled(ui, "Add Attribute...");
         }
         "Display" => {
             let mut mode = app.panels.ae_names;

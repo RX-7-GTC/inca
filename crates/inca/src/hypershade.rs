@@ -1928,7 +1928,7 @@ fn menu_row(app: &mut IncaApp, ui: &mut egui::Ui, enabled: bool, label: &str) ->
     if enabled {
         crate::menus::menu_item(app, ui, label)
     } else {
-        ui.add_enabled(false, egui::Button::new(label));
+        crate::menus::menu_disabled(ui, label);
         false
     }
 }
@@ -2049,7 +2049,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             }
             "Create" => {
-                ui.menu_button("Material", |ui| {
+                crate::menus::menu_submenu(ui, "Material", |ui| {
                     for t in MAT_TYPES {
                         if crate::menus::menu_item(app, ui, t.label) {
                             let _ = app.run_mel("create material", &format!("shadingNode -asShader {};", t.ty));
@@ -2060,7 +2060,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
-                ui.menu_button("Texture", |ui| {
+                crate::menus::menu_submenu(ui, "Texture", |ui| {
                     for t in TEX_TYPES {
                         if crate::menus::menu_item(app, ui, t.label) {
                             let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {};", t.ty));
@@ -2071,12 +2071,12 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
-                ui.menu_button("Utility", |ui| {
+                crate::menus::menu_submenu(ui, "Utility", |ui| {
                     if crate::menus::menu_item(app, ui, "Place 2D Texture") {
                         create_place_node(app, None);
                     }
                 });
-                ui.menu_button("Lights", |ui| {
+                crate::menus::menu_submenu(ui, "Lights", |ui| {
                     for (ty, label) in LIGHT_TYPES {
                         if crate::menus::menu_item(app, ui, label) {
                             create_light_node(app, ty);

@@ -242,14 +242,95 @@ pub(crate) fn menu_hover(ui: &mut egui::Ui) {
     v.hovered.weak_bg_fill = crate::theme::HI;
 }
 
+/// Checkbox column used only in menus that contain checkable rows.
+const MENU_PREFIX: &str = "            ";
+const MENU_BAND_W: f32 = 24.0;
+
+#[derive(Clone, Copy)]
+struct MenuCheck {
+    rect: egui::Rect,
+    on: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MenuIcon {
+    rect: egui::Rect,
+    name: &'static str,
+}
+
+#[derive(Clone, Default)]
+struct MenuChecks {
+    checks: Vec<MenuCheck>,
+    icons: Vec<MenuIcon>,
+}
+
+fn menu_checks_id(ui: &egui::Ui) -> egui::Id {
+    ui.id().with("menu_checks")
+}
+
+fn menu_label(label: &str) -> String {
+    format!("{MENU_PREFIX}{label}")
+}
+
+fn menu_begin(ui: &mut egui::Ui) {
+    ui.data_mut(|d| d.insert_temp(menu_checks_id(ui), MenuChecks::default()));
+}
+
+fn menu_row_band(ui: &egui::Ui, rect: egui::Rect) {
+    let band = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top() - 1.0), egui::pos2(rect.left() + MENU_BAND_W, rect.bottom() + 1.0));
+    ui.painter().rect_filled(band, 0.0, crate::theme::BG_DARK);
+}
+
+fn menu_record_check(ui: &mut egui::Ui, rect: egui::Rect, on: bool) {
+    if ui.data(|d| d.get_temp::<MenuChecks>(menu_checks_id(ui)).is_some()) {
+        ui.data_mut(|d| d.get_temp_mut_or_default::<MenuChecks>(menu_checks_id(ui)).checks.push(MenuCheck { rect, on }));
+    } else {
+        paint_menu_check(ui, rect, on);
+    }
+}
+
+fn menu_record_icon(ui: &mut egui::Ui, rect: egui::Rect, name: &'static str) {
+    if ui.data(|d| d.get_temp::<MenuChecks>(menu_checks_id(ui)).is_some()) {
+        ui.data_mut(|d| d.get_temp_mut_or_default::<MenuChecks>(menu_checks_id(ui)).icons.push(MenuIcon { rect, name }));
+    } else {
+        paint_menu_icon(ui, rect, name);
+    }
+}
+
+fn menu_end(ui: &mut egui::Ui) {
+    let items = ui.data_mut(|d| d.remove_temp::<MenuChecks>(menu_checks_id(ui)).unwrap_or_default());
+    let rect = ui.min_rect();
+    let band = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.top()), egui::pos2(rect.left() + MENU_BAND_W, rect.bottom()));
+    ui.painter().rect_filled(band, 0.0, crate::theme::BG_DARK);
+    for i in items.icons {
+        paint_menu_icon(ui, i.rect, i.name);
+    }
+    for c in items.checks {
+        paint_menu_check(ui, c.rect, c.on);
+    }
+}
+
+fn paint_menu_check(ui: &egui::Ui, rect: egui::Rect, on: bool) {
+    // Center the box on the same axis as the tool icons, and make it big enough to read at
+    // the menu font size.
+    let box_rect = egui::Rect::from_center_size(egui::pos2(rect.left() + 12.0, rect.center().y), egui::vec2(12.0, 12.0));
+    let edge = ui.visuals().widgets.inactive.fg_stroke.color;
+    ui.painter().rect_stroke(box_rect, 1.0, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+    if on {
+        let color = ui.visuals().text_color();
+        ui.painter().line_segment([egui::pos2(box_rect.left() + 2.5, rect.center().y), egui::pos2(box_rect.left() + 5.0, rect.center().y + 2.5)], egui::Stroke::new(1.4, color));
+        ui.painter().line_segment([egui::pos2(box_rect.left() + 5.0, rect.center().y + 2.5), egui::pos2(box_rect.right() - 2.0, rect.center().y - 2.5)], egui::Stroke::new(1.4, color));
+    }
+}
+
+fn paint_menu_icon(ui: &egui::Ui, rect: egui::Rect, name: &str) {
+    let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.left() + 12.0, rect.center().y), egui::vec2(16.0, 16.0));
+    crate::icons::paint(ui, icon_rect, name, egui::Color32::WHITE);
+}
+
 pub fn submenu_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    // One extra pixel of right padding moves only the arrow; the row label shifts by the same
-    // negligible amount. Atom spacers are unsuitable here because egui inserts item spacing
-    // between separate atoms.
-    let old = ui.style().spacing.button_padding;
-    ui.style_mut().spacing.button_padding.x += 2.0;
-    let button = ui.add(egui::Button::new(label).right_text(egui::menu::SubMenuButton::RIGHT_ARROW));
-    ui.style_mut().spacing.button_padding = old;
+    let button = ui.add(egui::Button::new(menu_label(label)).right_text(egui::menu::SubMenuButton::RIGHT_ARROW));
+    menu_row_band(ui, button.rect);
     button
 }
 
@@ -265,10 +346,7 @@ fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
         match it {
             A(id) => {
                 let checked = toggle_state(app, id);
-                let mut text = label(id);
-                if let Some(c) = checked {
-                    text = format!("{} {text}", if c { "✔" } else { "  " });
-                }
+                let text = menu_label(&label(id));
                 let has_box = crate::options::has_box(id);
                 let keys = crate::hotkey_editor::chords_for(app, id).first().cloned().unwrap_or_default();
                 let b = if has_box {
@@ -282,6 +360,12 @@ fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                     // the option box opens the command's options dialog
                     let mut opened = false;
                     let main = ui.add(b);
+                    menu_row_band(ui, main.rect);
+                    if let Some(on) = checked {
+                        menu_record_check(ui, main.rect, on);
+                    } else if let Some(icon) = crate::icons::action_icon(id) {
+                        menu_record_icon(ui, main.rect, icon);
+                    }
                     highlight_under_press(ui, &main);
                     let opt_rect = egui::Rect::from_center_size(egui::pos2(main.rect.right() - 8.0, main.rect.center().y), egui::vec2(16.0, 16.0));
                     let opt = ui.interact(opt_rect, main.id.with("option_box"), egui::Sense::click()).on_hover_text("Options");
@@ -309,6 +393,12 @@ fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                     }
                 } else {
                     let r = ui.add(b);
+                    menu_row_band(ui, r.rect);
+                    if let Some(on) = checked {
+                        menu_record_check(ui, r.rect, on);
+                    } else if let Some(icon) = crate::icons::action_icon(id) {
+                        menu_record_icon(ui, r.rect, icon);
+                    }
                     highlight_under_press(ui, &r);
                     if r.clicked() || released_here(ui, &r) {
                         menu_pick(app, ui, id);
@@ -323,10 +413,12 @@ fn items(app: &mut IncaApp, ui: &mut egui::Ui, list: &[M]) {
                 }
             }
             Sep => {
-                ui.separator();
+                let s = ui.separator();
+                menu_row_band(ui, s.rect);
             }
             Todo(l) => {
-                ui.add_enabled(false, egui::Button::new(format!("{l} (planned)")));
+                let r = ui.add_enabled(false, egui::Button::new(format!("{MENU_PREFIX}{l} (planned)")));
+                menu_row_band(ui, r.rect);
             }
             Dyn(l) => {
                 let button = submenu_button(ui, l);
@@ -345,10 +437,11 @@ fn dyn_menu(app: &mut IncaApp, ui: &mut egui::Ui, label: &str) {
             let files = label == "Recent Files";
             let list = if files { app.recent.clone() } else { app.recent_projects.clone() };
             if list.is_empty() {
-                ui.add_enabled(false, egui::Button::new("(none)"));
+                menu_disabled(ui, "(none)");
             }
             for r in list {
-                let resp = ui.button(&r);
+                let resp = ui.button(menu_label(&r));
+                menu_row_band(ui, resp.rect);
                 highlight_under_press(ui, &resp);
                 if resp.clicked() || released_here(ui, &resp) {
                     if files {
@@ -364,7 +457,8 @@ fn dyn_menu(app: &mut IncaApp, ui: &mut egui::Ui, label: &str) {
         "Assign Existing Material" => {
             let mats: Vec<(String, String)> = app.s.mats.values().map(|m| (m.id.clone(), m.name.clone())).collect();
             for (_, name) in mats {
-                let resp = ui.button(&name);
+                let resp = ui.button(menu_label(&name));
+                menu_row_band(ui, resp.rect);
                 highlight_under_press(ui, &resp);
                 if resp.clicked() || released_here(ui, &resp) {
                     let _ = app.run_mel("assign material", &format!("hyperShade -assign {name};"));
@@ -427,7 +521,10 @@ fn submenu_show<R>(ui: &Ui, button_response: &Response, content: impl FnOnce(&mu
             if button_response.clicked() || button_response.is_pointer_button_down_on() {
                 ui.ctx().move_to_top(ui.layer_id());
             }
-            content(ui)
+            menu_begin(ui);
+            let out = content(ui);
+            menu_end(ui);
+            out
         });
 
     if let Some(popup_response) = &popup_response {
@@ -702,7 +799,9 @@ fn show_menu_popup_ui(
     let popup = if suppress_close { popup.open(true) } else { popup.open_bool(&mut open) };
     let shown = popup.show(|ui| {
         menu_hover(ui);
+        menu_begin(ui);
         body(app, ui);
+        menu_end(ui);
     });
     if !open {
         app.open_menu = None;
@@ -735,28 +834,70 @@ pub fn activated(app: &mut IncaApp, ui: &egui::Ui, r: &egui::Response) -> bool {
 /// A plain menu row.
 pub fn menu_item(app: &mut IncaApp, ui: &mut egui::Ui, label: &str) -> bool {
     menu_hover(ui);
-    let r = ui.button(label);
+    let r = ui.button(menu_label(label));
+    menu_row_band(ui, r.rect);
     activated(app, ui, &r)
+}
+
+/// A plain menu row with an optional shortcut, drawn dim when `enabled` is false.
+pub fn menu_item_ext(app: &mut IncaApp, ui: &mut egui::Ui, enabled: bool, label: &str, shortcut: &str) -> bool {
+    menu_hover(ui);
+    let b = egui::Button::new(menu_label(label)).shortcut_text(shortcut);
+    let r = ui.add_enabled(enabled, b);
+    menu_row_band(ui, r.rect);
+    activated(app, ui, &r)
+}
+
+/// A submenu row. Uses the custom popup so the submenu gets the same checkbox band.
+pub fn menu_submenu<R>(ui: &mut egui::Ui, label: &str, content: impl FnOnce(&mut egui::Ui) -> R) -> bool {
+    menu_hover(ui);
+    let button = submenu_button(ui, label);
+    let opened = submenu_show(ui, &button, content).is_some();
+    if opened {
+        button.highlight();
+    }
+    opened
+}
+
+/// A disabled menu row. Its label still starts after the checkbox band.
+pub fn menu_disabled(ui: &mut egui::Ui, label: &str) {
+    let r = ui.add_enabled(false, egui::Button::new(menu_label(label)));
+    menu_row_band(ui, r.rect);
+}
+
+/// A dim explanatory row inside a menu, aligned with the other rows.
+pub fn menu_note(ui: &mut egui::Ui, label: &str) {
+    let r = ui.label(egui::RichText::new(menu_label(label)).color(crate::theme::TEXT_DIM));
+    menu_row_band(ui, r.rect);
 }
 
 /// A checkable menu row; like the JS menus it closes the popup when toggled.
 pub fn menu_check(app: &mut IncaApp, ui: &mut egui::Ui, on: bool, label: &str) -> bool {
     menu_hover(ui);
-    let r = ui.add(egui::Button::new(format!("{} {label}", if on { "✔" } else { "  " })));
+    let r = ui.add(egui::Button::new(menu_label(label)));
+    menu_row_band(ui, r.rect);
+    menu_record_check(ui, r.rect, on);
     activated(app, ui, &r)
 }
 
 /// A radio-style menu row; closes the popup when picked. Uses the same check mark as the
 /// checkable rows because the default egui fonts have no U+25CF (a missing-glyph box is shown).
 pub fn menu_radio(app: &mut IncaApp, ui: &mut egui::Ui, on: bool, label: &str) -> bool {
-    let r = ui.add(egui::Button::new(format!("{} {label}", if on { "✔" } else { "  " })));
+    menu_hover(ui);
+    let r = ui.add(egui::Button::new(menu_label(label)));
+    menu_row_band(ui, r.rect);
+    menu_record_check(ui, r.rect, on);
     activated(app, ui, &r)
 }
 
 /// A highlighted menu row for the current choice; closes the popup when picked.
 pub fn menu_selectable(app: &mut IncaApp, ui: &mut egui::Ui, on: bool, label: &str) -> bool {
     menu_hover(ui);
-    let r = ui.selectable_label(on, label);
+    let r = ui.selectable_label(on, menu_label(label));
+    menu_row_band(ui, r.rect);
+    if on {
+        menu_record_check(ui, r.rect, true);
+    }
     activated(app, ui, &r)
 }
 
