@@ -5019,7 +5019,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     let layers = app.s.anim_layers.clone();
     let current = app.s.anim_layer_current.clone();
     let solo_active = layers.iter().any(|l| l.solo);
-    let well_h = (ui.available_height() - 4.0).max(ROW_H);
+    let well_h = (ui.available_height() - 26.0).max(ROW_H);
     if app.panels.anim_layer_drag.is_some() {
         app.panels.anim_layer_drag_target = None;
         app.panels.anim_layer_drag_base = false;
@@ -5227,6 +5227,26 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             anim_base_row(app, ui);
         }
         });
+    });
+    // Maya's bottom weight slider edits the current layer.
+    ui.horizontal(|ui| {
+        ui.label("Weight");
+        let current = app.s.anim_layer_current.clone();
+        let mut w = current.as_ref().and_then(|id| app.s.anim_layers.iter().find(|l| &l.id == id)).map(|l| l.weight).unwrap_or(1.0);
+        let enabled = current.is_some();
+        let avail = ui.available_width();
+        let r = ui
+            .add_enabled_ui(enabled, |ui| {
+                ui.spacing_mut().slider_width = (avail - 48.0).max(40.0);
+                ui.add(egui::Slider::new(&mut w, 0.0..=1.0).show_value(true).max_decimals(2).custom_formatter(|v, _| format!("{v:.2}")))
+            })
+            .inner;
+        if r.changed() {
+            if let Some(id) = current {
+                anim_layer_update(app, &id, "animation layer weight", |l| l.weight = w);
+            }
+        }
+        r.on_hover_text("Weight of the current animation layer");
     });
     if app.panels.anim_layer_drag.is_some() && !ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle)) {
         let drag = app.panels.anim_layer_drag.take().unwrap();
