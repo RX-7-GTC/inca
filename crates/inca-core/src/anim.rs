@@ -41,6 +41,9 @@ pub struct AnimLayer {
     /// Attributes assigned to the layer, keyed "node.attr".
     #[serde(default)]
     pub attrs: Vec<String>,
+    /// Parent layer in the stack; None = top level.
+    #[serde(default)]
+    pub parent: Option<String>,
     /// Draw the stack up to and including this layer as a translucent ghost.
     #[serde(default)]
     pub ghost: bool,

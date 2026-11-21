@@ -1887,6 +1887,110 @@ impl Scene {
         list
     }
 
+    fn anim_layer_parent(&self, l: &AnimLayer) -> Option<&AnimLayer> {
+        l.parent.as_deref().and_then(|id| self.anim_layers.iter().find(|p| p.id == id))
+    }
+
+    /// Children inherit their ancestors' mutes.
+    pub fn anim_layer_effective_mute(&self, l: &AnimLayer) -> bool {
+        if l.mute {
+            return true;
+        }
+        // A soloed child stays active even though Solo muted its ancestors.
+        if self.anim_layers.iter().any(|x| x.solo) && self.anim_layer_soloed(l) {
+            return false;
+        }
+        let mut p = self.anim_layer_parent(l);
+        for _ in 0..self.anim_layers.len() {
+            let Some(pl) = p else { break };
+            if pl.mute {
+                return true;
+            }
+            p = self.anim_layer_parent(pl);
+        }
+        false
+    }
+
+    /// Children's weight is multiplied by every ancestor's weight.
+    pub fn anim_layer_effective_weight(&self, l: &AnimLayer) -> f64 {
+        let mut w = l.weight;
+        let mut p = self.anim_layer_parent(l);
+        for _ in 0..self.anim_layers.len() {
+            let Some(pl) = p else { break };
+            w *= pl.weight;
+            p = self.anim_layer_parent(pl);
+        }
+        w
+    }
+
+    /// A child of a muted parent cannot be keyed.
+    pub fn anim_layer_parent_muted(&self, l: &AnimLayer) -> bool {
+        let mut p = self.anim_layer_parent(l);
+        for _ in 0..self.anim_layers.len() {
+            let Some(pl) = p else { break };
+            if pl.mute {
+                return true;
+            }
+            p = self.anim_layer_parent(pl);
+        }
+        false
+    }
+
+    /// A soloed parent keeps its descendants active.
+    pub fn anim_layer_soloed(&self, l: &AnimLayer) -> bool {
+        if l.solo {
+            return true;
+        }
+        let mut p = self.anim_layer_parent(l);
+        for _ in 0..self.anim_layers.len() {
+            let Some(pl) = p else { break };
+            if pl.solo {
+                return true;
+            }
+            p = self.anim_layer_parent(pl);
+        }
+        false
+    }
+
+    /// Repair parent ids and rewrite the flat list as a valid tree preorder.
+    pub fn normalize_anim_layer_hierarchy(&mut self) {
+        let ids: std::collections::HashSet<String> = self.anim_layers.iter().map(|l| l.id.clone()).collect();
+        for l in &mut self.anim_layers {
+            if l.parent.as_ref().is_some_and(|p| p == &l.id || !ids.contains(p)) {
+                l.parent = None;
+            }
+        }
+        for i in 0..self.anim_layers.len() {
+            let mut seen = std::collections::HashSet::new();
+            let mut p = self.anim_layers[i].parent.clone();
+            while let Some(id) = p {
+                if !seen.insert(id.clone()) {
+                    self.anim_layers[i].parent = None;
+                    break;
+                }
+                p = self.anim_layers.iter().find(|l| l.id == id).and_then(|l| l.parent.clone());
+            }
+        }
+        fn add(layers: &[AnimLayer], parent: Option<&str>, out: &mut Vec<AnimLayer>, seen: &mut std::collections::HashSet<String>) {
+            for l in layers.iter().filter(|l| l.parent.as_deref() == parent) {
+                if !seen.insert(l.id.clone()) {
+                    continue;
+                }
+                out.push(l.clone());
+                add(layers, Some(&l.id), out, seen);
+            }
+        }
+        let mut out = vec![];
+        let mut seen = std::collections::HashSet::new();
+        add(&self.anim_layers, None, &mut out, &mut seen);
+        for l in &self.anim_layers {
+            if seen.insert(l.id.clone()) {
+                out.push(l.clone());
+            }
+        }
+        self.anim_layers = out;
+    }
+
     /// Scenes saved before per-attribute membership only listed member objects: assign all
     /// their keyable attributes, then keep every existing layer curve.
     pub fn migrate_anim_layer_attrs(&mut self) {
@@ -1933,7 +2037,7 @@ impl Scene {
             // A locked layer rejects new keys; a layer only receives keys for attributes
             // explicitly assigned to it.
             let Some(l) = self.anim_layers.iter().find(|l| &l.id == lid) else { return false };
-            if l.lock || !l.has_attr(id, attr) {
+            if l.lock || (!self.anim_layer_soloed(l) && self.anim_layer_parent_muted(l)) || !l.has_attr(id, attr) {
                 return false;
             }
         } else if self.anim_base_lock {
@@ -2049,7 +2153,7 @@ impl Scene {
         let solo = self.anim_layers.iter().any(|l| l.solo);
         // layers are stored top-first, so walk the ones below the current layer bottom-up
         for l in self.anim_layers[i + 1..].iter().rev() {
-            if l.mute || l.weight <= 1e-6 || (solo && !l.solo) {
+            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight(l) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
             let Some(c) = l.curves.get(key) else { continue };
@@ -2057,10 +2161,11 @@ impl Scene {
                 continue;
             }
             let lv = c.eval(t);
+            let w = self.anim_layer_effective_weight(l);
             v = if l.override_mode || c.attr == "visibility" {
-                v + (lv - v) * l.weight
+                v + (lv - v) * w
             } else {
-                v + lv * l.weight
+                v + lv * w
             };
         }
         v
@@ -2223,7 +2328,7 @@ impl Scene {
             let layers: Vec<AnimLayer> = self.anim_layers[start..]
                 .iter()
                 .rev()
-                .filter(|l| !l.mute && l.weight > 1e-6 && (!solo || l.solo))
+                .filter(|l| !self.anim_layer_effective_mute(l) && self.anim_layer_effective_weight(l) > 1e-6 && (!solo || self.anim_layer_soloed(l)))
                 .cloned()
                 .collect();
             for layer in layers {
@@ -2236,11 +2341,12 @@ impl Scene {
                     }
                     let lv = c.eval(t);
                     let base = self.anim_value_below(&Anim::key(&c.node, &c.attr), t, &layer.id);
+                    let w = self.anim_layer_effective_weight(&layer);
                     // Boolean channels (visibility) always behave as override, as in Maya.
                     let v = if layer.override_mode || c.attr == "visibility" {
-                        base + (lv - base) * layer.weight
+                        base + (lv - base) * w
                     } else {
-                        base + lv * layer.weight
+                        base + lv * w
                     };
                     if self.nodes.contains_key(&c.node) {
                         let r = NodeRef::Dag(c.node.clone());
@@ -2981,6 +3087,7 @@ impl Scene {
         self.anim_layers = serde_json::from_value(data.get("animLayers").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         self.anim_layer_current = serde_json::from_value(data.get("animLayerCurrent").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         self.migrate_anim_layer_attrs();
+        self.normalize_anim_layer_hierarchy();
         self.anim_base_lock = data.get("animBaseLock").and_then(|v| v.as_bool()).unwrap_or(false);
         self.anim_base_ghost = data.get("animBaseGhost").and_then(|v| v.as_bool()).unwrap_or(false);
         self.anim_base_ghost_color = serde_json::from_value(data.get("animBaseGhostColor").cloned().unwrap_or(Value::Null)).unwrap_or_else(|_| crate::anim::ghost_red());
@@ -3510,6 +3617,7 @@ mod tests {
             override_mode: true,
             members: vec![],
             attrs: vec![],
+            parent: None,
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves,
@@ -3544,6 +3652,7 @@ mod tests {
             override_mode: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
+            parent: None,
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3584,6 +3693,7 @@ mod tests {
             override_mode: true,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
+            parent: None,
             ghost: true,
             ghost_color: [0.2, 0.4, 0.6],
             curves,
@@ -3635,6 +3745,7 @@ mod tests {
                 override_mode: false,
                 members: vec![a.clone()],
                 attrs: vec![],
+                parent: None,
                 ghost: false,
                 ghost_color: crate::anim::ghost_red(),
                 curves,
@@ -3664,6 +3775,7 @@ mod tests {
             override_mode: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
+            parent: None,
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3708,6 +3820,7 @@ mod tests {
             override_mode: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
+            parent: None,
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3758,6 +3871,7 @@ mod tests {
             override_mode: true,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
+            parent: None,
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3797,6 +3911,7 @@ mod tests {
             override_mode: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
+            parent: None,
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3838,6 +3953,63 @@ mod tests {
     }
 
     #[test]
+    fn parent_layer_mute_and_weight_are_inherited() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.remember_anim_static(std::slice::from_ref(&a));
+        let mut c = AnimCurve::new(&a, "translateX");
+        c.set_key(0.0, 10.0, "linear");
+        c.set_key(10.0, 10.0, "linear");
+        let mut curves = IndexMap::new();
+        curves.insert(Anim::key(&a, "translateX"), c);
+        s.anim_layers.push(AnimLayer {
+            id: "parent".into(),
+            name: "Parent".into(),
+            weight: 0.5,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![],
+            attrs: vec![],
+            parent: None,
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
+            curves: IndexMap::new(),
+        });
+        s.anim_layers.push(AnimLayer {
+            id: "child".into(),
+            name: "Child".into(),
+            weight: 0.5,
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            members: vec![a.clone()],
+            attrs: vec![Anim::key(&a, "translateX")],
+            parent: Some("parent".into()),
+            ghost: false,
+            ghost_color: crate::anim::ghost_red(),
+            curves,
+        });
+        s.anim_layer_current = Some("child".into());
+        s.set_time(5.0);
+        assert!((s.get_attr_f(&a, "translateX") - 2.5).abs() < 1e-9, "weights multiply");
+        if let Some(p) = s.anim_layers.iter_mut().find(|l| l.id == "parent") {
+            p.mute = true;
+        }
+        s.set_time(5.0);
+        assert!(s.get_attr_f(&a, "translateX").abs() < 1e-9, "parent mute did not mute the child");
+        assert!(!s.set_key(&a, "translateX", Some(6.0), Some(9.0)), "muted child received a key");
+        if let Some(p) = s.anim_layers.iter_mut().find(|l| l.id == "parent") {
+            p.mute = false;
+            p.weight = 1.0;
+        }
+        s.set_time(5.0);
+        assert!((s.get_attr_f(&a, "translateX") - 5.0).abs() < 1e-9, "parent weight did not update");
+    }
+
+    #[test]
     fn layer_keys_require_attribute_membership() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
@@ -3851,6 +4023,7 @@ mod tests {
             override_mode: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
+            parent: None,
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
@@ -3885,6 +4058,7 @@ mod tests {
             override_mode: false,
             members: vec![a.clone()],
             attrs: vec![],
+            parent: None,
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves,

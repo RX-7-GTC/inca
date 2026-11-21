@@ -551,6 +551,12 @@ pub struct PanelState {
     pub anim_layer_rename_new: bool,
     /// Hide the BaseAnimation row in the animation layer editor.
     pub anim_hide_base: bool,
+    /// Collapsed animation-layer parents.
+    pub anim_layer_collapsed: std::collections::HashSet<String>,
+    /// Layer being middle-dragged for parenting.
+    pub anim_layer_drag: Option<String>,
+    pub anim_layer_drag_target: Option<String>,
+    pub anim_layer_drag_base: bool,
     /// Layer whose colour palette popup is open.
     pub layer_color_popup: Option<String>,
     /// Custom RGB chosen in the layer colour popup (0..1 per channel).
@@ -4272,6 +4278,125 @@ fn layer_ghost_toggle(ui: &mut egui::Ui, on: bool, color: [f32; 3], selected: bo
 }
 
 // ------------------------------------------------------------ animation layers
+fn anim_layer_children<'a>(layers: &'a [inca_core::anim::AnimLayer], parent: Option<&str>) -> Vec<&'a inca_core::anim::AnimLayer> {
+    layers.iter().filter(|l| l.parent.as_deref() == parent).collect()
+}
+
+fn anim_layer_subtree(layers: &[inca_core::anim::AnimLayer], id: &str) -> Vec<String> {
+    fn add(layers: &[inca_core::anim::AnimLayer], id: &str, out: &mut Vec<String>) {
+        out.push(id.to_string());
+        for c in anim_layer_children(layers, Some(id)) {
+            add(layers, &c.id, out);
+        }
+    }
+    let mut out = vec![];
+    add(layers, id, &mut out);
+    out
+}
+
+fn anim_layer_is_descendant(layers: &[inca_core::anim::AnimLayer], id: &str, ancestor: &str) -> bool {
+    let mut p = layers.iter().find(|l| l.id == id).and_then(|l| l.parent.clone());
+    for _ in 0..layers.len() {
+        let Some(pid) = p else { return false };
+        if pid == ancestor {
+            return true;
+        }
+        p = layers.iter().find(|l| l.id == pid).and_then(|l| l.parent.clone());
+    }
+    false
+}
+
+fn anim_layer_soloed_ui(layers: &[inca_core::anim::AnimLayer], l: &inca_core::anim::AnimLayer) -> bool {
+    if l.solo {
+        return true;
+    }
+    let mut p = l.parent.as_deref().and_then(|id| layers.iter().find(|x| x.id == id));
+    for _ in 0..layers.len() {
+        let Some(pl) = p else { return false };
+        if pl.solo {
+            return true;
+        }
+        p = pl.parent.as_deref().and_then(|id| layers.iter().find(|x| x.id == id));
+    }
+    false
+}
+
+fn anim_layer_parent_muted_ui(layers: &[inca_core::anim::AnimLayer], l: &inca_core::anim::AnimLayer) -> bool {
+    let mut p = l.parent.as_deref().and_then(|id| layers.iter().find(|x| x.id == id));
+    for _ in 0..layers.len() {
+        let Some(pl) = p else { return false };
+        if pl.mute {
+            return true;
+        }
+        p = pl.parent.as_deref().and_then(|id| layers.iter().find(|x| x.id == id));
+    }
+    false
+}
+
+fn anim_layer_order(layers: &[inca_core::anim::AnimLayer], collapsed: &std::collections::HashSet<String>) -> Vec<(inca_core::anim::AnimLayer, usize)> {
+    fn add(layers: &[inca_core::anim::AnimLayer], parent: Option<&str>, depth: usize, collapsed: &std::collections::HashSet<String>, out: &mut Vec<(inca_core::anim::AnimLayer, usize)>, seen: &mut std::collections::HashSet<String>) {
+        for l in anim_layer_children(layers, parent) {
+            if !seen.insert(l.id.clone()) {
+                continue;
+            }
+            out.push((l.clone(), depth));
+            if !collapsed.contains(&l.id) {
+                add(layers, Some(&l.id), depth + 1, collapsed, out, seen);
+            }
+        }
+    }
+    let mut out = vec![];
+    let mut seen = std::collections::HashSet::new();
+    add(layers, None, 0, collapsed, &mut out, &mut seen);
+    for l in layers {
+        if seen.contains(&l.id) {
+            continue;
+        }
+        if l.parent.as_deref().is_some_and(|p| layers.iter().any(|x| x.id == p)) {
+            continue; // hidden under a collapsed parent
+        }
+        if seen.insert(l.id.clone()) {
+            out.push((l.clone(), 0));
+        }
+    }
+    out
+}
+
+fn anim_layer_set_parent(app: &mut IncaApp, id: &str, parent: Option<String>) {
+    if parent.as_deref() == Some(id) {
+        return;
+    }
+    if let Some(p) = &parent {
+        if !app.s.anim_layers.iter().any(|l| &l.id == p) || anim_layer_is_descendant(&app.s.anim_layers, p, id) {
+            return;
+        }
+    }
+    app.s.checkpoint(if parent.is_some() { "parent animation layer" } else { "unparent animation layer" });
+    let block_ids: std::collections::HashSet<String> = anim_layer_subtree(&app.s.anim_layers, id).into_iter().collect();
+    let mut block: Vec<inca_core::anim::AnimLayer> = app.s.anim_layers.iter().filter(|l| block_ids.contains(&l.id)).cloned().collect();
+    app.s.anim_layers.retain(|l| !block_ids.contains(&l.id));
+    if let Some(root) = block.iter_mut().find(|l| l.id == id) {
+        root.parent = parent.clone();
+    }
+    let idx = if let Some(p) = parent.as_deref() {
+        let last = anim_layer_subtree(&app.s.anim_layers, p).last().and_then(|pid| app.s.anim_layers.iter().position(|l| &l.id == pid));
+        last.map(|i| i + 1).unwrap_or(0)
+    } else {
+        0
+    };
+    let idx = idx.min(app.s.anim_layers.len());
+    app.s.anim_layers.splice(idx..idx, block);
+    app.s.normalize_anim_layer_hierarchy();
+    if !app.s.anim_solo_saved.is_empty() && app.s.anim_layers.iter().any(|l| l.solo) {
+        anim_layer_apply_solo(app);
+    }
+    if let Some(p) = parent {
+        app.panels.anim_layer_collapsed.remove(&p);
+    }
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+}
+
 fn anim_layer_unique_name(app: &IncaApp) -> String {
     let mut i = 1;
     loop {
@@ -4301,6 +4426,7 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
             override_mode,
             members: vec![],
             attrs: vec![],
+            parent: None,
             ghost: false,
             ghost_color: inca_core::anim::ghost_red(),
             curves: Default::default(),
@@ -4427,11 +4553,24 @@ fn anim_layer_select_objects(app: &mut IncaApp, id: &str) {
 
 fn anim_layer_delete(app: &mut IncaApp, id: &str) {
     app.s.checkpoint("delete animation layer");
-    if app.s.anim_layers.iter().any(|l| l.id == id && l.solo) {
-        anim_layer_unsolo(app);
-    }
+    let parent = app.s.anim_layers.iter().find(|l| l.id == id).and_then(|l| l.parent.clone());
+    let children: Vec<String> = anim_layer_children(&app.s.anim_layers, Some(id)).iter().map(|l| l.id.clone()).collect();
     let keys: Vec<String> = app.s.anim_layers.iter().filter(|l| l.id == id).flat_map(|l| l.curves.keys().cloned()).collect();
     app.s.anim_layers.retain(|l| l.id != id);
+    for c in children {
+        if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == c) {
+            l.parent = parent.clone();
+        }
+    }
+    app.s.normalize_anim_layer_hierarchy();
+    if !app.s.anim_solo_saved.is_empty() {
+        if app.s.anim_layers.iter().any(|l| l.solo) {
+            anim_layer_apply_solo(app);
+        } else {
+            anim_layer_unsolo(app);
+        }
+    }
+    app.panels.anim_layer_collapsed.remove(id);
     if app.s.anim_layer_current.as_deref() == Some(id) {
         app.s.anim_layer_current = None;
     }
@@ -4442,17 +4581,36 @@ fn anim_layer_delete(app: &mut IncaApp, id: &str) {
 }
 
 fn anim_layer_move(app: &mut IncaApp, id: &str, up: bool) {
-    let Some(i) = app.s.anim_layers.iter().position(|l| l.id == id) else { return };
-    let j = if up {
-        i.checked_sub(1)
-    } else if i + 1 < app.s.anim_layers.len() {
-        Some(i + 1)
+    let layers = app.s.anim_layers.clone();
+    let Some(l) = layers.iter().find(|l| l.id == id) else { return };
+    let parent = l.parent.clone();
+    let siblings: Vec<String> = layers.iter().filter(|x| x.parent == parent).map(|x| x.id.clone()).collect();
+    let Some(pos) = siblings.iter().position(|x| x == id) else { return };
+    let target = if up {
+        pos.checked_sub(1)
+    } else if pos + 1 < siblings.len() {
+        Some(pos + 1)
     } else {
         None
     };
-    let Some(j) = j else { return };
+    let Some(target) = target else { return };
+    let moving = anim_layer_subtree(&layers, id);
+    let target_block = anim_layer_subtree(&layers, &siblings[target]);
     app.s.checkpoint("reorder animation layers");
-    app.s.anim_layers.swap(i, j);
+    let moving_set: std::collections::HashSet<String> = moving.into_iter().collect();
+    let block: Vec<inca_core::anim::AnimLayer> = app.s.anim_layers.iter().filter(|l| moving_set.contains(&l.id)).cloned().collect();
+    app.s.anim_layers.retain(|l| !moving_set.contains(&l.id));
+    let target_set: std::collections::HashSet<String> = target_block.into_iter().collect();
+    let first = app.s.anim_layers.iter().position(|l| target_set.contains(&l.id));
+    let last = app.s.anim_layers.iter().rposition(|l| target_set.contains(&l.id));
+    let idx = match (up, first, last) {
+        (true, Some(i), _) => i,
+        (false, _, Some(i)) => i + 1,
+        _ => 0,
+    };
+    let idx = idx.min(app.s.anim_layers.len());
+    app.s.anim_layers.splice(idx..idx, block);
+    app.s.normalize_anim_layer_hierarchy();
     app.s.set_time(app.s.time.current);
     app.s.touch();
 }
@@ -4484,6 +4642,57 @@ fn anim_layer_mode(app: &mut IncaApp, id: &str, override_mode: bool) {
     app.s.touch();
 }
 
+fn anim_solo_snapshot(app: &IncaApp) -> Vec<(String, bool, bool)> {
+    app.s.anim_layers.iter().map(|l| (l.id.clone(), l.mute, l.lock)).collect()
+}
+
+/// Recompute the mute/lock state of every layer while one or more layers are soloed.
+fn anim_layer_apply_solo(app: &mut IncaApp) {
+    let soloed: std::collections::HashSet<String> = app.s.anim_layers.iter().filter(|l| l.solo).map(|l| l.id.clone()).collect();
+    if soloed.is_empty() {
+        anim_layer_unsolo(app);
+        return;
+    }
+    let mut group = std::collections::HashSet::new();
+    for id in &soloed {
+        group.extend(anim_layer_subtree(&app.s.anim_layers, id));
+    }
+    let saved = app.s.anim_solo_saved.clone();
+    for l in &mut app.s.anim_layers {
+        if group.contains(&l.id) {
+            if soloed.contains(&l.id) {
+                l.mute = false;
+                l.lock = false;
+            } else if let Some((_, mute, lock)) = saved.iter().find(|(sid, _, _)| sid == &l.id) {
+                l.mute = *mute;
+                l.lock = *lock;
+            }
+        } else {
+            l.mute = true;
+            l.lock = true;
+        }
+    }
+}
+
+fn anim_layer_exclusive_solo(app: &mut IncaApp, id: &str) {
+    if !app.s.anim_layers.iter().any(|l| l.id == id) {
+        return;
+    }
+    app.s.checkpoint("exclusive solo animation layer");
+    if app.s.anim_solo_saved.is_empty() {
+        app.s.anim_solo_saved = anim_solo_snapshot(app);
+    }
+    for l in &mut app.s.anim_layers {
+        l.solo = false;
+    }
+    if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
+        l.solo = true;
+    }
+    anim_layer_apply_solo(app);
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+}
+
 fn anim_layer_unsolo(app: &mut IncaApp) {
     let saved = std::mem::take(&mut app.s.anim_solo_saved);
     for l in &mut app.s.anim_layers {
@@ -4497,23 +4706,17 @@ fn anim_layer_unsolo(app: &mut IncaApp) {
 
 fn anim_layer_solo(app: &mut IncaApp, id: &str) {
     let Some(on) = app.s.anim_layers.iter().find(|l| l.id == id).map(|l| !l.solo) else { return };
-    app.s.checkpoint("solo animation layer");
-    if !app.s.anim_solo_saved.is_empty() {
-        anim_layer_unsolo(app);
+    app.s.checkpoint(if on { "solo animation layer" } else { "unsolo animation layer" });
+    if on && app.s.anim_solo_saved.is_empty() {
+        app.s.anim_solo_saved = anim_solo_snapshot(app);
     }
-    if on {
-        app.s.anim_solo_saved = app.s.anim_layers.iter().map(|l| (l.id.clone(), l.mute, l.lock)).collect();
-        for l in &mut app.s.anim_layers {
-            if l.id == id {
-                l.solo = true;
-                l.mute = false;
-                l.lock = false;
-            } else {
-                l.solo = false;
-                l.mute = true;
-                l.lock = true;
-            }
-        }
+    if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
+        l.solo = on;
+    }
+    if app.s.anim_layers.iter().any(|l| l.solo) {
+        anim_layer_apply_solo(app);
+    } else {
+        anim_layer_unsolo(app);
     }
     app.s.set_time(app.s.time.current);
     app.s.touch();
@@ -4591,6 +4794,9 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     if menu_check(app, ui, solo, "Solo Current Layer") {
                         anim_layer_solo(app, &id);
                     }
+                    if menu_item(app, ui, "Exclusive Solo Current Layer") {
+                        anim_layer_exclusive_solo(app, &id);
+                    }
                     if menu_check(app, ui, lock, "Lock Current Layer") {
                         anim_layer_lock(app, &id);
                     }
@@ -4637,22 +4843,31 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     let current = app.s.anim_layer_current.clone();
     let solo_active = layers.iter().any(|l| l.solo);
     let well_h = (ui.available_height() - 4.0).max(ROW_H);
-    egui::Frame::NONE
+    if app.panels.anim_layer_drag.is_some() {
+        app.panels.anim_layer_drag_target = None;
+        app.panels.anim_layer_drag_base = false;
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
+    let well = egui::Frame::NONE
         .fill(theme::BG_DARK)
         .inner_margin(egui::Margin::same(2))
         .show(ui, |ui| {
             ui.set_min_height(well_h);
             egui::ScrollArea::vertical().id_salt("anim_layers").max_height(well_h).auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                for l in &layers {
+                let order = anim_layer_order(&layers, &app.panels.anim_layer_collapsed);
+                for (l, depth) in &order {
             let selected = current.as_deref() == Some(l.id.as_str());
-            let solo_muted = solo_active && !l.solo;
+            let solo_muted = solo_active && !anim_layer_soloed_ui(&layers, l);
+            let parent_muted = !anim_layer_soloed_ui(&layers, l) && anim_layer_parent_muted_ui(&layers, l);
+            let has_children = layers.iter().any(|c| c.parent.as_deref() == Some(l.id.as_str()));
+            let collapsed = app.panels.anim_layer_collapsed.contains(&l.id);
             egui::Frame::NONE.fill(if selected { theme::HI } else { Color32::TRANSPARENT }).inner_margin(egui::Margin::symmetric(1, 1)).show(ui, |ui| {
-                ui.horizontal(|ui| {
+                let row = ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     let fixed = 46.0 + 5.0 * 20.0 + 6.0 * 3.0;
                     let name_w = (ui.available_width() - fixed).max(60.0);
-                    let (name_rect, name_resp) = ui.allocate_exact_size(egui::vec2(name_w, ROW_H), egui::Sense::click());
+                    let (name_rect, name_resp) = ui.allocate_exact_size(egui::vec2(name_w, ROW_H), egui::Sense::click_and_drag());
                     let renaming = app.panels.anim_layer_rename.as_ref().is_some_and(|(id, _)| id == &l.id);
                     if renaming {
                         let mut edit = app.panels.anim_layer_rename.take().unwrap();
@@ -4670,19 +4885,46 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             app.panels.anim_layer_rename = Some(edit);
                         }
                     } else {
+                        let indent = *depth as f32 * 12.0;
+                        let arrow_w = if has_children { 12.0 } else { 0.0 };
+                        let tri_x = name_rect.min.x + 4.0 + indent;
+                        if has_children {
+                            let cy = name_rect.center().y;
+                            let pts = if collapsed {
+                                vec![egui::pos2(tri_x, cy - 3.0), egui::pos2(tri_x + 6.0, cy), egui::pos2(tri_x, cy + 3.0)]
+                            } else {
+                                vec![egui::pos2(tri_x, cy - 3.0), egui::pos2(tri_x + 6.0, cy - 3.0), egui::pos2(tri_x + 3.0, cy + 3.0)]
+                            };
+                            ui.painter().add(egui::Shape::convex_polygon(pts, if selected { Color32::WHITE } else { theme::TEXT }, egui::Stroke::NONE));
+                        }
+                        let arrow_hit = has_children && name_resp.interact_pointer_pos().is_some_and(|p| p.x < tri_x + 12.0);
                         ui.painter().text(
-                            egui::pos2(name_rect.min.x + 4.0, name_rect.center().y),
+                            egui::pos2(tri_x + arrow_w, name_rect.center().y),
                             egui::Align2::LEFT_CENTER,
                             &l.name,
                             egui::FontId::proportional(12.0),
-                            if l.mute || solo_muted { theme::TEXT_DIM } else if selected { Color32::WHITE } else { theme::TEXT },
+                            if l.mute || solo_muted || parent_muted { theme::TEXT_DIM } else if selected { Color32::WHITE } else { theme::TEXT },
                         );
                         if name_resp.clicked() {
-                            app.s.anim_layer_current = Some(l.id.clone());
+                            if arrow_hit {
+                                if collapsed {
+                                    app.panels.anim_layer_collapsed.remove(&l.id);
+                                } else {
+                                    app.panels.anim_layer_collapsed.insert(l.id.clone());
+                                }
+                            } else {
+                                app.s.anim_layer_current = Some(l.id.clone());
+                            }
                         }
-                        if name_resp.double_clicked() {
+                        if name_resp.double_clicked() && !arrow_hit {
                             app.panels.anim_layer_rename = Some((l.id.clone(), l.name.clone()));
                             app.panels.anim_layer_rename_new = true;
+                        }
+                        if name_resp.drag_started_by(egui::PointerButton::Middle) {
+                            app.panels.anim_layer_drag = Some(l.id.clone());
+                            app.panels.anim_layer_drag_target = None;
+                            app.panels.anim_layer_drag_base = false;
+                            app.help = "Drop on a layer to parent it, or on BaseAnimation/empty space to unparent".into();
                         }
                         name_resp.context_menu(|ui| {
                             if ui.button("Add Selected Objects").clicked() {
@@ -4695,6 +4937,37 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             }
                             if ui.button("Select Objects").clicked() {
                                 anim_layer_select_objects(app, &l.id);
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.menu_button("Parent", |ui| {
+                                for p in layers.iter().filter(|p| p.id != l.id && !anim_layer_is_descendant(&layers, &p.id, &l.id)) {
+                                    if ui.button(&p.name).clicked() {
+                                        anim_layer_set_parent(app, &l.id, Some(p.id.clone()));
+                                        ui.close();
+                                    }
+                                }
+                                if l.parent.is_some() {
+                                    ui.separator();
+                                    if ui.button("Unparent").clicked() {
+                                        anim_layer_set_parent(app, &l.id, None);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                            if has_children {
+                                let label = if collapsed { "Expand Children" } else { "Collapse Children" };
+                                if ui.button(label).clicked() {
+                                    if collapsed {
+                                        app.panels.anim_layer_collapsed.remove(&l.id);
+                                    } else {
+                                        app.panels.anim_layer_collapsed.insert(l.id.clone());
+                                    }
+                                    ui.close();
+                                }
+                            }
+                            if ui.button("Exclusive Solo").clicked() {
+                                anim_layer_exclusive_solo(app, &l.id);
                                 ui.close();
                             }
                             ui.separator();
@@ -4722,7 +4995,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     if ui.add_sized([46.0, ROW_H], egui::DragValue::new(&mut w).speed(0.01).range(0.0..=1.0).max_decimals(2)).changed() {
                         anim_layer_update(app, &l.id, "animation layer weight", |l| l.weight = w);
                     }
-                    if layer_mute_toggle(ui, l.mute, solo_muted, selected, "Mute").clicked() {
+                    if layer_mute_toggle(ui, l.mute || parent_muted, solo_muted || parent_muted, selected, "Mute").clicked() {
                         anim_layer_mute(app, &l.id);
                     }
                     if layer_toggle(ui, if l.solo { "S" } else { " " }, selected, "Solo").clicked() {
@@ -4756,6 +5029,14 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     });
                 });
+                if app.panels.anim_layer_drag.is_some() {
+                    if ui.ctx().pointer_hover_pos().is_some_and(|p| row.response.rect.contains(p)) {
+                        app.panels.anim_layer_drag_target = Some(l.id.clone());
+                        if app.panels.anim_layer_drag.as_deref() != Some(l.id.as_str()) {
+                            ui.painter().rect_stroke(row.response.rect.expand(1.0), 2.0, egui::Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+                        }
+                    }
+                }
             });
         }
         if !app.panels.anim_hide_base {
@@ -4763,6 +5044,20 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         });
     });
+    if app.panels.anim_layer_drag.is_some() && !ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle)) {
+        let drag = app.panels.anim_layer_drag.take().unwrap();
+        let target = app.panels.anim_layer_drag_target.take();
+        let base = std::mem::take(&mut app.panels.anim_layer_drag_base);
+        let in_well = ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| well.response.rect.contains(p));
+        if base || (target.is_none() && in_well) {
+            anim_layer_set_parent(app, &drag, None);
+        } else if let Some(t) = target {
+            if t != drag {
+                anim_layer_set_parent(app, &drag, Some(t));
+            }
+        }
+        app.help = "Right-click a layer or middle-drag it onto another layer to parent it".into();
+    }
     if app.panels.anim_layer_rename.as_ref().is_some_and(|(id, _)| !app.s.anim_layers.iter().any(|l| &l.id == id)) {
         app.panels.anim_layer_rename = None;
     }
@@ -4771,7 +5066,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
 fn anim_base_row(app: &mut IncaApp, ui: &mut egui::Ui) {
     let selected = app.s.anim_layer_current.is_none();
     egui::Frame::NONE.fill(if selected { theme::HI } else { Color32::TRANSPARENT }).inner_margin(egui::Margin::symmetric(1, 1)).show(ui, |ui| {
-        ui.horizontal(|ui| {
+        let row = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
             let fixed = 46.0 + 5.0 * 20.0 + 6.0 * 3.0;
             let name_w = (ui.available_width() - fixed).max(60.0);
@@ -4823,6 +5118,12 @@ fn anim_base_row(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             });
         });
+        if app.panels.anim_layer_drag.is_some() {
+            if ui.ctx().pointer_hover_pos().is_some_and(|p| row.response.rect.contains(p)) {
+                app.panels.anim_layer_drag_base = true;
+                ui.painter().rect_stroke(row.response.rect.expand(1.0), 2.0, egui::Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+            }
+        }
     });
 }
 
@@ -6898,14 +7199,23 @@ mod tests {
             }
         }
         assert_eq!(app.s.anim_solo_saved.len(), 3);
-        // switching solo restores the previous mute/lock states, then applies the new solo
+        // Solo is additive: a second solo layer joins the first.
         let other = ids[0].clone();
         anim_layer_solo(&mut app, &other);
+        for l in &app.s.anim_layers {
+            if l.id == other || l.id == solo_id {
+                assert!(l.solo && !l.mute && !l.lock, "{} is not active", l.name);
+            } else {
+                assert!(l.mute && l.lock, "{} is not muted", l.name);
+            }
+        }
+        // Exclusive Solo clears the other solo.
+        anim_layer_exclusive_solo(&mut app, &other);
         for l in &app.s.anim_layers {
             if l.id == other {
                 assert!(l.solo && !l.mute && !l.lock);
             } else {
-                assert!(l.mute && l.lock);
+                assert!(!l.solo && l.mute && l.lock);
             }
         }
         anim_layer_solo(&mut app, &other);
@@ -6917,6 +7227,62 @@ mod tests {
                 assert!(!l.mute && !l.lock, "unsolo did not restore {}", l.name);
             }
         }
+        assert!(app.s.anim_solo_saved.is_empty());
+    }
+
+    #[test]
+    fn parenting_reorders_and_collapses_the_layer_stack() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        for _ in 0..3 {
+            anim_layer_new(&mut app, false);
+        }
+        let ids: Vec<String> = app.s.anim_layers.iter().map(|l| l.id.clone()).collect();
+        let (c, b, a) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        anim_layer_set_parent(&mut app, &c, Some(a.clone()));
+        let order = anim_layer_order(&app.s.anim_layers, &app.panels.anim_layer_collapsed);
+        assert_eq!(order.iter().map(|(l, d)| (l.id.clone(), *d)).collect::<Vec<_>>(), vec![(b.clone(), 0), (a.clone(), 0), (c.clone(), 1)]);
+        app.panels.anim_layer_collapsed.insert(a.clone());
+        let order = anim_layer_order(&app.s.anim_layers, &app.panels.anim_layer_collapsed);
+        assert_eq!(order.len(), 2, "collapsed child still rendered");
+        app.panels.anim_layer_collapsed.remove(&a);
+        anim_layer_set_parent(&mut app, &c, None);
+        assert_eq!(anim_layer_order(&app.s.anim_layers, &app.panels.anim_layer_collapsed).iter().map(|(l, _)| l.id.clone()).collect::<Vec<_>>(), vec![c.clone(), b, a.clone()]);
+        anim_layer_set_parent(&mut app, &c, Some(a.clone()));
+        anim_layer_set_parent(&mut app, &a, Some(c.clone()));
+        assert_eq!(app.s.anim_layers.iter().find(|l| l.id == a).and_then(|l| l.parent.clone()), None, "cycle created");
+    }
+
+    #[test]
+    fn solo_parent_keeps_children_active() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        for _ in 0..3 {
+            anim_layer_new(&mut app, false);
+        }
+        let ids: Vec<String> = app.s.anim_layers.iter().map(|l| l.id.clone()).collect();
+        let (child, other, parent) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+        anim_layer_set_parent(&mut app, &child, Some(parent.clone()));
+        anim_layer_solo(&mut app, &parent);
+        let layers = app.s.anim_layers.clone();
+        let l = layers.iter().find(|l| l.id == parent).unwrap();
+        let c = layers.iter().find(|l| l.id == child).unwrap();
+        let o = layers.iter().find(|l| l.id == other).unwrap();
+        assert!(l.solo);
+        assert!(!c.solo && !c.mute && !c.lock);
+        assert!(o.mute && o.lock);
+        assert!(anim_layer_soloed_ui(&layers, c));
+        anim_layer_solo(&mut app, &parent);
+        anim_layer_solo(&mut app, &child);
+        let layers = app.s.anim_layers.clone();
+        let c = layers.iter().find(|l| l.id == child).unwrap();
+        assert!(c.solo && anim_layer_soloed_ui(&layers, c));
+        assert!(!app.s.anim_layer_effective_mute(c), "solo child silenced by its muted parent");
+        anim_layer_solo(&mut app, &child);
         assert!(app.s.anim_solo_saved.is_empty());
     }
 

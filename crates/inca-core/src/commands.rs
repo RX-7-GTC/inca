@@ -3244,6 +3244,7 @@ mod tests {
             override_mode: false,
             members: vec![a.clone()],
             attrs: vec![crate::anim::Anim::key(&a, "translateX")],
+            parent: None,
             ghost: false,
             ghost_color: crate::anim::ghost_red(),
             curves: Default::default(),
