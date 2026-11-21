@@ -96,6 +96,12 @@ fn cb_adjust_speed(app: &IncaApp) -> f64 {
     [0.01, 0.005, 0.05][app.panels.cb_speed.min(2) as usize]
 }
 
+/// Rotation is in degrees, so the same drag distance needs a much larger step than
+/// translation to feel like the other channels. Dragging left turns positive.
+fn cb_attr_multiplier(attr: &str) -> f64 {
+    if inca_core::scene::alias(attr).starts_with("rotate") { -50.0 } else { 1.0 }
+}
+
 fn cb_shown(filter: [bool; 4], attr: &str) -> bool {
     if attr.starts_with("translate") {
         filter[0]
@@ -1361,7 +1367,8 @@ pub fn virtual_slider(app: &mut IncaApp, resp: &egui::Response) -> bool {
         };
         let d = mapped * speed * if m.ctrl || m.command { 0.1 } else if m.shift { 10.0 } else { 1.0 };
         for (r, a, start, int, lo, hi) in &list {
-            let mut x = start + d;
+            let step = if *int { 1.0 } else { cb_attr_multiplier(a) };
+            let mut x = start + d * step;
             if let Some(lo) = lo {
                 x = x.max(*lo);
             }
@@ -7393,6 +7400,14 @@ mod tests {
             }
         }
         assert!(app.s.anim_solo_saved.is_empty());
+    }
+
+    #[test]
+    fn rotation_virtual_slider_step_is_larger() {
+        assert_eq!(cb_attr_multiplier("rotateX"), -50.0);
+        assert_eq!(cb_attr_multiplier("rx"), -50.0);
+        assert_eq!(cb_attr_multiplier("translateX"), 1.0);
+        assert_eq!(cb_attr_multiplier("scaleY"), 1.0);
     }
 
     #[test]
