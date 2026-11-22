@@ -4943,6 +4943,127 @@ fn anim_layer_solo(app: &mut IncaApp, id: &str) {
     app.s.touch();
 }
 
+fn anim_layer_duplicate(app: &mut IncaApp, no_animation: bool) {
+    let selected: Vec<String> = if !app.panels.anim_layer_sel.is_empty() {
+        app.panels.anim_layer_sel.clone()
+    } else if let Some(id) = app.s.anim_layer_current.clone() {
+        vec![id]
+    } else {
+        return;
+    };
+    let layers = app.s.anim_layers.clone();
+    let mut id_map = std::collections::HashMap::new();
+    let mut clones = vec![];
+    for id in &selected {
+        let Some(orig) = layers.iter().find(|l| &l.id == id) else { continue };
+        let mut name = format!("{} copy", orig.name);
+        let mut n = 2;
+        while app.s.anim_layers.iter().any(|l| l.name == name) || clones.iter().any(|c: &inca_core::anim::AnimLayer| c.name == name) {
+            name = format!("{} copy {}", orig.name, n);
+            n += 1;
+        }
+        let new_id = app.s.new_id("al");
+        id_map.insert(orig.id.clone(), new_id.clone());
+        let mut clone = orig.clone();
+        clone.id = new_id;
+        clone.name = name;
+        if no_animation {
+            clone.curves.clear();
+        }
+        clones.push(clone);
+    }
+    if clones.is_empty() {
+        return;
+    }
+    app.s.checkpoint("duplicate animation layers");
+    for c in &mut clones {
+        if let Some(p) = c.parent.as_ref() {
+            if let Some(np) = id_map.get(p) {
+                c.parent = Some(np.clone());
+            }
+        }
+    }
+    // Insert each copy directly above its original, bottom-most first so indices stay valid.
+    let mut inserted = vec![];
+    let mut originals: Vec<(usize, String)> = selected.iter().filter_map(|id| layers.iter().position(|l| &l.id == id).map(|i| (i, id.clone()))).collect();
+    originals.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, id) in originals {
+        let Some(clone) = clones.iter().find(|c| id_map.get(&id) == Some(&c.id)) else { continue };
+        let Some(pos) = app.s.anim_layers.iter().position(|l| l.id == id) else { continue };
+        inserted.push(clone.id.clone());
+        app.s.anim_layers.insert(pos, clone.clone());
+    }
+    inserted.sort_by_key(|id| app.s.anim_layers.iter().position(|l| &l.id == id).unwrap_or(usize::MAX));
+    if let Some(cur) = app.s.anim_layer_current.as_ref().and_then(|c| id_map.get(c)) {
+        app.s.anim_layer_current = Some(cur.clone());
+    } else {
+        app.s.anim_layer_current = inserted.first().cloned();
+    }
+    app.panels.anim_layer_sel = inserted;
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+}
+
+fn anim_layer_select_all(app: &mut IncaApp) {
+    app.panels.anim_layer_sel = app.s.anim_layers.iter().map(|l| l.id.clone()).collect();
+    if let Some(cur) = &app.s.anim_layer_current {
+        if !app.panels.anim_layer_sel.contains(cur) {
+            app.s.anim_layer_current = app.panels.anim_layer_sel.first().cloned();
+        }
+    }
+}
+
+fn anim_layer_select_branch(app: &mut IncaApp) {
+    let roots: Vec<String> = if !app.panels.anim_layer_sel.is_empty() {
+        app.panels.anim_layer_sel.clone()
+    } else if let Some(id) = app.s.anim_layer_current.clone() {
+        vec![id]
+    } else {
+        return;
+    };
+    let mut out = vec![];
+    for id in roots {
+        for branch_id in anim_layer_subtree(&app.s.anim_layers, &id) {
+            if !out.contains(&branch_id) {
+                out.push(branch_id);
+            }
+        }
+    }
+    out.sort_by_key(|id| app.s.anim_layers.iter().position(|l| &l.id == id).unwrap_or(usize::MAX));
+    app.panels.anim_layer_sel = out;
+    if app.s.anim_layer_current.is_none() {
+        app.s.anim_layer_current = app.panels.anim_layer_sel.first().cloned();
+    }
+}
+
+fn anim_layer_delete_empty(app: &mut IncaApp) {
+    let ids: Vec<String> = app.s.anim_layers.iter().filter(|l| l.attrs.is_empty() && l.curves.is_empty()).map(|l| l.id.clone()).collect();
+    if ids.is_empty() {
+        app.help = "There are no empty animation layers".into();
+        return;
+    }
+    app.s.checkpoint("delete empty animation layers");
+    for id in &ids {
+        let parent = app.s.anim_layers.iter().find(|l| &l.id == id).and_then(|l| l.parent.clone());
+        let children: Vec<String> = app.s.anim_layers.iter().filter(|l| l.parent.as_deref() == Some(id)).map(|l| l.id.clone()).collect();
+        app.s.anim_layers.retain(|l| &l.id != id);
+        for c in children {
+            if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == c) {
+                l.parent = parent.clone();
+            }
+        }
+        app.panels.anim_layer_collapsed.remove(id);
+        app.panels.anim_layer_sel.retain(|x| x != id);
+    }
+    app.s.normalize_anim_layer_hierarchy();
+    if app.s.anim_layer_current.as_ref().is_some_and(|id| ids.contains(id)) {
+        app.s.anim_layer_current = app.panels.anim_layer_sel.first().cloned();
+    }
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+    app.help = format!("Deleted {} empty layer(s)", ids.len());
+}
+
 fn anim_layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
     let want = new.trim();
     if want.is_empty() {
@@ -4988,6 +5109,15 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                 });
                 ui.separator();
+                ui.add_enabled_ui(!app.panels.anim_layer_sel.is_empty() || app.s.anim_layer_current.is_some(), |ui| {
+                    if menu_item(app, ui, "Duplicate Layer") {
+                        anim_layer_duplicate(app, false);
+                    }
+                    if menu_item(app, ui, "Duplicate Layer (No Animation)") {
+                        anim_layer_duplicate(app, true);
+                    }
+                });
+                ui.separator();
                 ui.add_enabled_ui(app.s.anim_layer_current.is_some() && !app.s.sel.is_empty(), |ui| {
                     if menu_item(app, ui, "Add Selected Objects") {
                         if let Some(id) = app.s.anim_layer_current.clone() {
@@ -5012,6 +5142,16 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     if let Some(id) = app.s.anim_layer_current.clone() {
                         anim_layer_delete(app, &id);
                     }
+                }
+                if menu_item(app, ui, "Delete Empty Layers") {
+                    anim_layer_delete_empty(app);
+                }
+                ui.separator();
+                if menu_item(app, ui, "Select All") {
+                    anim_layer_select_all(app);
+                }
+                if menu_item(app, ui, "Select Branch") {
+                    anim_layer_select_branch(app);
                 }
                 ui.separator();
                 let current = app.s.anim_layer_current.clone();
@@ -7575,6 +7715,51 @@ mod tests {
             }
         }
         assert!(app.s.anim_solo_saved.is_empty());
+    }
+
+    #[test]
+    fn duplicate_layers_copy_animation_or_leave_it_empty() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let source = app.s.anim_layer_current.clone().expect("layer");
+        app.s.set_time(0.0);
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(4.0)));
+        anim_layer_duplicate(&mut app, false);
+        assert_eq!(app.s.anim_layers.len(), 2);
+        let copy = app.s.anim_layer_current.clone().expect("copy");
+        let copy_layer = app.s.anim_layers.iter().find(|l| l.id == copy).expect("copy layer");
+        assert!(copy_layer.curves.contains_key(&inca_core::anim::Anim::key(&nid, "translateX")));
+        assert_ne!(copy, source);
+        anim_layer_duplicate(&mut app, true);
+        assert_eq!(app.s.anim_layers.len(), 3);
+        let empty = app.s.anim_layer_current.clone().expect("empty copy");
+        assert!(app.s.anim_layers.iter().find(|l| l.id == empty).is_some_and(|l| l.curves.is_empty()));
+    }
+
+    #[test]
+    fn selecting_branches_and_deleting_empty_layers() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        for _ in 0..3 {
+            anim_layer_new(&mut app, false);
+        }
+        let ids: Vec<String> = app.s.anim_layers.iter().map(|l| l.id.clone()).collect();
+        anim_layer_set_parent(&mut app, &ids[1], Some(ids[0].clone()));
+        app.s.anim_layer_current = Some(ids[0].clone());
+        app.panels.anim_layer_sel = vec![ids[0].clone()];
+        anim_layer_select_branch(&mut app);
+        assert_eq!(app.panels.anim_layer_sel, vec![ids[0].clone(), ids[1].clone()]);
+        anim_layer_select_all(&mut app);
+        assert_eq!(app.panels.anim_layer_sel.len(), 3);
+        anim_layer_delete_empty(&mut app);
+        assert!(app.s.anim_layers.is_empty());
     }
 
     #[test]
