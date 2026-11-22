@@ -4497,6 +4497,7 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
             override_mode,
             passthrough: true,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![],
             attrs: vec![],
             parent: None,
@@ -4846,6 +4847,13 @@ fn anim_layer_set_passthrough(app: &mut IncaApp, id: &str, passthrough: bool) {
 fn anim_layer_set_rotation_accumulation(app: &mut IncaApp, id: &str, by_layer: bool) {
     app.s.checkpoint("animation layer rotation accumulation");
     app.s.set_anim_layer_rotation_by_layer(id, by_layer);
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+}
+
+fn anim_layer_set_scale_accumulation(app: &mut IncaApp, id: &str, additive: bool) {
+    app.s.checkpoint("animation layer scale accumulation");
+    app.s.set_anim_layer_scale_additive(id, additive);
     app.s.set_time(app.s.time.current);
     app.s.touch();
 }
@@ -5250,6 +5258,16 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                                 }
                                 if menu_check(app, ui, l.rotation_by_layer, "By Layer") {
                                     anim_layer_set_rotation_accumulation(app, &l.id, true);
+                                    ui.close();
+                                }
+                            });
+                            menu_submenu(ui, "Scale Accumulation", |ui| {
+                                if menu_check(app, ui, !l.scale_additive, "Multiply") {
+                                    anim_layer_set_scale_accumulation(app, &l.id, false);
+                                    ui.close();
+                                }
+                                if menu_check(app, ui, l.scale_additive, "Additive") {
+                                    anim_layer_set_scale_accumulation(app, &l.id, true);
                                     ui.close();
                                 }
                             });

@@ -2050,10 +2050,22 @@ impl Scene {
         let key = Anim::key(id, attr);
         let target: Option<&mut AnimCurve> = if let Some(lid) = &layer_id {
             // Additive layers store the delta from everything below them, so keying the current
-            // pose does not add the base animation a second time. Scale is multiplicative, so
-            // its additive keys stay absolute (a rest-pose scale of 1 stores 1, not 0).
-            if attr != "visibility" && !attr.starts_with("scale") && self.anim_layers.iter().find(|l| &l.id == lid).is_some_and(|l| !l.override_mode) {
-                v -= self.anim_value_below(&key, t, lid);
+            // pose does not add the base animation a second time. Multiply-accumulated scale
+            // stores the ratio to the layers below; Additive scale stores a delta.
+            if let Some(l) = self.anim_layers.iter().find(|l| &l.id == lid) {
+                if !l.override_mode && attr != "visibility" {
+                    let below = self.anim_value_below(&key, t, lid);
+                    if attr.starts_with("scale") {
+                        if l.scale_additive {
+                            v -= below;
+                        } else if below.abs() > 1e-12 {
+                            // Multiply accumulation keys store the layer's scale ratio.
+                            v /= below;
+                        }
+                    } else {
+                        v -= below;
+                    }
+                }
             }
             self.anim_layers.iter_mut().find(|l| &l.id == lid).map(|l| l.curves.entry(key).or_insert_with(|| AnimCurve::new(id, attr)))
         } else {
@@ -2138,9 +2150,13 @@ impl Scene {
             let base = if l.override_mode && !l.passthrough { raw } else { v };
             base + (lv - base) * w
         } else if attr.starts_with("scale") {
-            // Maya's default additive scale accumulation is Multiply: scale^weight.
-            let factor = if lv < 0.0 { -(-lv).powf(w) } else { lv.powf(w) };
-            v * factor
+            if l.scale_additive {
+                v + lv * w
+            } else {
+                // Maya's default additive scale accumulation is Multiply: scale^weight.
+                let factor = if lv < 0.0 { -(-lv).powf(w) } else { lv.powf(w) };
+                v * factor
+            }
         } else {
             v + lv * w
         }
@@ -2403,6 +2419,13 @@ impl Scene {
         }
     }
 
+    pub fn set_anim_layer_scale_additive(&mut self, id: &str, additive: bool) {
+        if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == id) {
+            l.scale_additive = additive;
+            self.touch();
+        }
+    }
+
     /// Merge `sources` (and their child layers) into `target`, baking the result onto the
     /// target's curves. Only the part of the stack up to the target is preserved, so layers
     /// above the target keep the same input. Returns false for soloed stacks, a muted target
@@ -2488,6 +2511,8 @@ impl Scene {
                     } else if attr == "visibility" {
                         // Booleans are evaluated with the override formula even on Additive layers.
                         base + (want - base) / weight
+                    } else if attr.starts_with("scale") && target_layer.scale_additive {
+                        (want - base) / weight
                     } else if attr.starts_with("scale") {
                         if base.abs() <= 1e-12 {
                             if want.abs() <= 1e-12 {
@@ -2715,6 +2740,7 @@ impl Scene {
                 override_mode: src.override_mode,
                 passthrough: src.passthrough,
                 rotation_by_layer: src.rotation_by_layer,
+                scale_additive: src.scale_additive,
                 members,
                 attrs,
                 parent: src.parent.clone(),
@@ -4135,6 +4161,7 @@ mod tests {
             override_mode: true,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![],
             attrs: vec![],
             parent: None,
@@ -4173,6 +4200,7 @@ mod tests {
             override_mode: false,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: None,
@@ -4217,6 +4245,7 @@ mod tests {
             override_mode,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![node.into()],
             attrs: vec![key],
             parent: None,
@@ -4382,6 +4411,7 @@ mod tests {
             override_mode: true,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4437,6 +4467,7 @@ mod tests {
                 override_mode: false,
                 passthrough: false,
                 rotation_by_layer: false,
+                scale_additive: false,
                 members: vec![a.clone()],
                 attrs: vec![],
                 parent: None,
@@ -4470,6 +4501,7 @@ mod tests {
             override_mode: false,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4518,6 +4550,7 @@ mod tests {
             override_mode: false,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4572,6 +4605,7 @@ mod tests {
             override_mode: true,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4720,6 +4754,73 @@ mod tests {
     }
 
     #[test]
+    fn additive_scale_keys_store_the_ratio_to_the_layers_below() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut lower = anim_test_layer(&s, "al2", &a, "scaleY", false, &[(0.0, 0.0)]);
+        lower.attrs = vec![Anim::key(&a, "scaleY")];
+        lower.curves.clear();
+        let mut upper = lower.clone();
+        upper.id = "al1".into();
+        upper.name = "al1".into();
+        s.anim_layers = vec![upper, lower];
+        s.set_time(0.0);
+        s.anim_layer_current = Some("al2".into());
+        s.set_attr_f(&a, "scaleY", 2.0);
+        assert!(s.set_key(&a, "scaleY", Some(0.0), None));
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "scaleY") - 2.0).abs() < 1e-9);
+        s.anim_layer_current = Some("al1".into());
+        s.set_attr_f(&a, "scaleY", 3.0);
+        assert!(s.set_key(&a, "scaleY", Some(0.0), None));
+        let c = &s.anim_layers[0].curves[&Anim::key(&a, "scaleY")];
+        assert!((c.keys[0].v - 1.5).abs() < 1e-9, "top additive scale should store the ratio 3/2, got {}", c.keys[0].v);
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "scaleY") - 3.0).abs() < 1e-9, "result should match Maya's 3");
+    }
+
+    #[test]
+    fn additive_scale_accumulation_adds_and_keys_deltas() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut layer = anim_test_layer(&s, "al1", &a, "scaleX", false, &[(0.0, 0.0)]);
+        layer.scale_additive = true;
+        layer.attrs = vec![Anim::key(&a, "scaleX")];
+        layer.curves.clear();
+        s.anim_layers = vec![layer];
+        s.anim_layer_current = Some("al1".into());
+        s.set_time(0.0);
+        s.set_attr_f(&a, "scaleX", 2.0);
+        assert!(s.set_key(&a, "scaleX", Some(0.0), None));
+        let c = &s.anim_layers[0].curves[&Anim::key(&a, "scaleX")];
+        assert!((c.keys[0].v - 1.0).abs() < 1e-9, "additive scale should key the delta, got {}", c.keys[0].v);
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "scaleX") - 2.0).abs() < 1e-9);
+        s.anim_layers[0].weight = 0.5;
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "scaleX") - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merging_additive_scale_preserves_the_pose() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut target = anim_test_layer(&s, "al1", &a, "scaleX", false, &[(0.0, 0.0)]);
+        target.scale_additive = true;
+        target.weight = 0.5;
+        let mut source = anim_test_layer(&s, "al2", &a, "scaleX", false, &[(0.0, 0.5)]);
+        source.scale_additive = true;
+        s.anim_layers = vec![target, source];
+        s.set_time(0.0);
+        let before = s.get_attr_f(&a, "scaleX");
+        assert!((before - 1.5).abs() < 1e-9);
+        assert!(s.merge_anim_layers("al1", &["al2".into()]));
+        assert!((s.anim_layers[0].weight - 0.5).abs() < 1e-9, "merge changed the target weight");
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "scaleX") - before).abs() < 1e-9);
+    }
+
+    #[test]
     fn additive_scale_multiplies_and_keeps_absolute_keys() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
@@ -4772,6 +4873,7 @@ mod tests {
             override_mode: false,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4836,6 +4938,7 @@ mod tests {
             override_mode: false,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![],
             attrs: vec![],
             parent: None,
@@ -4854,6 +4957,7 @@ mod tests {
             override_mode: false,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: Some("parent".into()),
@@ -4893,6 +4997,7 @@ mod tests {
             override_mode: false,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: None,
@@ -4931,6 +5036,7 @@ mod tests {
             override_mode: false,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![],
             parent: None,

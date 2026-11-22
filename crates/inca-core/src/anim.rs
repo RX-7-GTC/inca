@@ -49,6 +49,9 @@ pub struct AnimLayer {
     /// Combine rotations per Euler component (false) or as a quaternion per layer (true).
     #[serde(default)]
     pub rotation_by_layer: bool,
+    /// Additive scale uses Additive accumulation instead of the default Multiply.
+    #[serde(default)]
+    pub scale_additive: bool,
     /// Objects explicitly assigned to the layer.
     #[serde(default)]
     pub members: Vec<String>,
