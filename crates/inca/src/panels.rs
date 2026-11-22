@@ -572,6 +572,8 @@ pub struct PanelState {
     pub anim_hide_base: bool,
     /// Selected animation layers. The current layer is always one of them.
     pub anim_layer_sel: Vec<String>,
+    /// A weight edit is one undo step from press to release.
+    anim_layer_weight_edit: bool,
     /// Collapsed animation-layer parents.
     pub anim_layer_collapsed: std::collections::HashSet<String>,
     /// Layer being middle-dragged for parenting.
@@ -4762,13 +4764,22 @@ fn anim_layer_update(app: &mut IncaApp, id: &str, label: &str, f: impl FnOnce(&m
 }
 
 /// Set the layer weight. Once the weight has keys, editing it at the current frame
-/// updates/creates a key instead of changing the static value.
+/// updates/creates a key instead of changing the static value. A whole drag is one undo step,
+/// not one per pixel.
 fn anim_layer_set_weight(app: &mut IncaApp, id: &str, w: f64) {
-    if app.s.anim_layers.iter().find(|l| l.id == id).is_some_and(|l| !l.weight_curve.keys.is_empty()) {
-        anim_layer_key_weight(app, id, Some(w));
-    } else {
-        anim_layer_update(app, id, "animation layer weight", |l| l.weight = w);
+    if !app.panels.anim_layer_weight_edit {
+        app.s.checkpoint("animation layer weight");
+        app.panels.anim_layer_weight_edit = true;
     }
+    let t = app.s.time.current;
+    if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
+        l.weight = w;
+        if !l.weight_curve.keys.is_empty() {
+            l.weight_curve.set_key(t, w, "auto");
+        }
+    }
+    app.s.set_time(t);
+    app.s.touch();
 }
 
 /// Key the layer weight at the current frame. `value` also sets the weight before keying.
@@ -5332,6 +5343,9 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
         app.help = "Right-click a layer or middle-drag it onto another layer to parent it".into();
+    }
+    if app.panels.anim_layer_weight_edit && !ui.input(|i| i.pointer.primary_down()) {
+        app.panels.anim_layer_weight_edit = false;
     }
     if app.panels.anim_layer_rename.as_ref().is_some_and(|(id, _)| !app.s.anim_layers.iter().any(|l| &l.id == id)) {
         app.panels.anim_layer_rename = None;
@@ -7504,6 +7518,25 @@ mod tests {
             }
         }
         assert!(app.s.anim_solo_saved.is_empty());
+    }
+
+    #[test]
+    fn weight_slider_drag_is_one_undo_step() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        anim_layer_new(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        app.panels.anim_layer_weight_edit = false;
+        let before = app.s.undo_stack.len();
+        anim_layer_set_weight(&mut app, &lid, 0.6);
+        anim_layer_set_weight(&mut app, &lid, 0.4);
+        anim_layer_set_weight(&mut app, &lid, 0.2);
+        assert_eq!(app.s.undo_stack.len(), before + 1, "weight drag added more than one undo step");
+        app.panels.anim_layer_weight_edit = false;
+        anim_layer_set_weight(&mut app, &lid, 0.1);
+        assert_eq!(app.s.undo_stack.len(), before + 2, "a new drag did not add an undo step");
     }
 
     #[test]
