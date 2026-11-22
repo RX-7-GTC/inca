@@ -1,7 +1,7 @@
 //! Scene graph: DAG nodes (transform + shape), construction history, attributes, selection,
 //! undo snapshots and the `.inca` JSON format (the same layout the JS app writes).
 
-use crate::anim::{Anim, AnimCurve, AnimLayer};
+use crate::anim::{Anim, AnimCurve, AnimLayer, MergeLayerMode, MergeLayerOptions};
 use crate::curves::Curve;
 use crate::materials::{Material, Place2D, ShadingData, Texture};
 use crate::math::*;
@@ -2451,6 +2451,10 @@ impl Scene {
     /// above the target keep the same input. Returns false for soloed stacks, a muted target
     /// parent, zero target weight, or a target inside a source subtree.
     pub fn merge_anim_layers(&mut self, target: &str, sources: &[String]) -> bool {
+        self.merge_anim_layers_with(target, sources, MergeLayerOptions::default())
+    }
+
+    pub fn merge_anim_layers_with(&mut self, target: &str, sources: &[String], opts: MergeLayerOptions) -> bool {
         let Some(target_i) = self.anim_layers.iter().position(|l| l.id == target) else { return false };
         if sources.is_empty() || sources.iter().any(|s| s == target) || self.anim_layers.iter().any(|l| l.solo) {
             return false;
@@ -2461,15 +2465,22 @@ impl Scene {
         }
         let mut merged = HashSet::new();
         for s in sources {
-            for id in self.anim_layer_subtree_ids(s) {
-                merged.insert(id);
+            if opts.include_children {
+                for id in self.anim_layer_subtree_ids(s) {
+                    merged.insert(id);
+                }
+            } else {
+                merged.insert(s.clone());
             }
         }
         if merged.contains(target) {
             return false;
         }
-        let mut result_override = target_layer.override_mode
-            || self.anim_layers.iter().filter(|l| merged.contains(&l.id)).any(|l| l.override_mode);
+        let mut result_override = match opts.result_mode {
+            MergeLayerMode::Automatic => target_layer.override_mode || self.anim_layers.iter().filter(|l| merged.contains(&l.id)).any(|l| l.override_mode),
+            MergeLayerMode::Additive => false,
+            MergeLayerMode::Override => true,
+        };
         // A merge-down removes the block directly above the target; the next surviving layer
         // above must see the same input, so bake the output through the top of that block.
         // Layers above a topmost target instead keep seeing the target's own output.
@@ -2636,7 +2647,21 @@ impl Scene {
                 }
             }
         }
-        self.anim_layers.retain(|l| !merged.contains(&l.id));
+        // Maya keeps an emptied source layer when Delete Baked Layers is off, and keeps a
+        // merged parent with unselected children so the hierarchy is not orphaned.
+        let keep_empty: HashSet<String> = merged
+            .iter()
+            .filter(|id| !opts.delete_layers || (!opts.include_children && self.anim_layers.iter().any(|l| l.parent.as_deref() == Some(id.as_str()))))
+            .cloned()
+            .collect();
+        for id in &keep_empty {
+            if let Some(l) = self.anim_layers.iter_mut().find(|l| &l.id == id) {
+                l.curves.clear();
+                l.attrs.clear();
+                l.members.clear();
+            }
+        }
+        self.anim_layers.retain(|l| !merged.contains(&l.id) || keep_empty.contains(&l.id));
         self.normalize_anim_layer_hierarchy();
         self.anim_layer_current = Some(target.to_string());
         self.apply_anim();
@@ -4324,6 +4349,45 @@ mod tests {
         for (b, a) in before.iter().zip(after.iter()) {
             assert!((b - a).abs() < 1e-9, "merge changed the animation: {before:?} vs {after:?}");
         }
+    }
+
+    #[test]
+    fn merge_options_can_exclude_children_and_keep_empty_sources() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let target = anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 1.0)]);
+        let source = anim_test_layer(&s, "al2", &a, "translateY", false, &[(0.0, 2.0)]);
+        let mut child = anim_test_layer(&s, "al3", &a, "translateZ", false, &[(0.0, 3.0)]);
+        child.parent = Some("al2".into());
+        s.anim_layers = vec![target, source, child];
+        let opts = MergeLayerOptions { include_children: false, ..Default::default() };
+        assert!(s.merge_anim_layers_with("al1", &["al2".into()], opts));
+        assert_eq!(s.anim_layers.len(), 3, "the emptied parent must stay for its child");
+        let kept = s.anim_layers.iter().find(|l| l.id == "al2").expect("kept parent");
+        assert!(kept.curves.is_empty() && kept.attrs.is_empty());
+        assert!(s.anim_layers.iter().find(|l| l.id == "al3").expect("child").curves.contains_key(&Anim::key(&a, "translateZ")));
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "translateY") - 2.0).abs() < 1e-9, "source animation was not merged");
+        assert!((s.get_attr_f(&a, "translateZ") - 3.0).abs() < 1e-9, "unselected child animation was merged");
+    }
+
+    #[test]
+    fn merge_options_force_result_mode_and_keep_sources() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.anim_layers = vec![
+            anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 1.0)]),
+            anim_test_layer(&s, "al2", &a, "translateX", true, &[(0.0, 5.0)]),
+        ];
+        let opts = MergeLayerOptions { result_mode: MergeLayerMode::Additive, delete_layers: false, ..Default::default() };
+        s.set_time(0.0);
+        let before = s.get_attr_f(&a, "translateX");
+        assert!(s.merge_anim_layers_with("al1", &["al2".into()], opts));
+        assert!(!s.anim_layers[0].override_mode, "Additive must override Automatic");
+        assert_eq!(s.anim_layers.len(), 2);
+        assert!(s.anim_layers.iter().find(|l| l.id == "al2").expect("kept source").curves.is_empty());
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "translateX") - before).abs() < 1e-9);
     }
 
     #[test]

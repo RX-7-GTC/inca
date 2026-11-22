@@ -273,11 +273,11 @@ pub(crate) fn place_window<R>(
             } else {
                 fix = Some(centered_window_pos(ctx, rect.size()));
             }
+        } else {
+            // No remembered rect: open centered instead of at egui's top-left default.
+            fix = Some(centered_window_pos(ctx, egui::vec2(480.0, 360.0)));
         }
     }
-    // A legacy egui position has no size. Center it once on first open instead of placing its
-    // top-left at the old, possibly off-screen, position.
-    let stale_pos = first && last.is_none() && persisted.is_some();
     if app.windows_state.window_recenter.remove(&id) {
         let size = last.map_or(egui::vec2(480.0, 360.0), |r| r.size());
         fix = Some(centered_window_pos(ctx, size));
@@ -287,7 +287,9 @@ pub(crate) fn place_window<R>(
         if let Some(r) = &resp {
             let rect = r.response.rect;
             app.windows_state.window_last_rect.insert(key, rect);
-            if first && (stale_pos || !window_reachable(ctx, rect)) {
+            // A new window is centered with an estimated size first; recenter it once its
+            // real size is known so large editors are not off-center.
+            if first && (last.is_none() || !window_reachable(ctx, rect)) {
                 app.windows_state.window_recenter.insert(id);
                 ctx.request_repaint();
             }
@@ -1889,6 +1891,42 @@ mod tests {
         out.textures_delta.clear();
         let rect = ctx.memory(|m| m.area_rect(id)).expect("reopened window");
         assert!(window_reachable(&ctx, rect), "window is still off screen: {rect:?}");
+    }
+
+    #[test]
+    fn new_placed_windows_open_centered() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = egui::Id::new("centered_window_test");
+        let mut open = true;
+        let mut run = |app: &mut IncaApp, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+            raw.time = Some(t);
+            let is_open = open;
+            app.windows_state.window_seen_now.clear();
+            let mut out = ctx.run_ui(raw, |ui| {
+                let ctx = ui.ctx().clone();
+                let _ = place_window(app, &ctx, id, is_open, |_app, fix| {
+                    let mut window = egui::Window::new("Center Test").id(id).open(&mut open).constrain(false);
+                    if let Some(p) = fix {
+                        window = window.fixed_pos(p);
+                    }
+                    window.show(&ctx, |ui| {
+                        ui.label("x");
+                    })
+                });
+            });
+            out.textures_delta.clear();
+            std::mem::swap(&mut app.windows_state.window_seen, &mut app.windows_state.window_seen_now);
+        };
+        run(&mut app, 0.0);
+        run(&mut app, 0.1);
+        let rect = ctx.memory(|m| m.area_rect(id)).expect("window shown");
+        let center = ctx.content_rect().center();
+        assert!((rect.center() - center).length() < 2.0, "window is not centered: {rect:?} vs {center:?}");
     }
 
     #[test]

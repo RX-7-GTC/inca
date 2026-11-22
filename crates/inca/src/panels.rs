@@ -579,6 +579,10 @@ pub struct PanelState {
     pub layer_default_rotation_by_layer: bool,
     pub layer_default_scale_additive: bool,
     pub create_layer_options_open: bool,
+    /// Merge Layers option box: target direction and core merge options.
+    pub merge_to_bottom: bool,
+    pub merge_options: inca_core::anim::MergeLayerOptions,
+    pub merge_options_open: bool,
     /// Collapsed animation-layer parents.
     pub anim_layer_collapsed: std::collections::HashSet<String>,
     /// Layer being middle-dragged for parenting.
@@ -4667,21 +4671,26 @@ fn anim_layer_merge_selected(app: &mut IncaApp) {
         app.help = "Select two or more animation layers to merge".into();
         return;
     }
-    let target = selected
+    let found: Vec<(usize, String)> = selected
         .iter()
         .filter_map(|id| app.s.anim_layers.iter().position(|l| &l.id == id).map(|i| (i, id.clone())))
-        .min_by_key(|(i, _)| *i)
-        .map(|(_, id)| id);
+        .collect();
+    let target = if app.panels.merge_to_bottom {
+        found.iter().max_by_key(|(i, _)| *i)
+    } else {
+        found.iter().min_by_key(|(i, _)| *i)
+    }
+    .map(|(_, id)| id.clone());
     let Some(target) = target else {
         app.help = "Select two or more animation layers to merge".into();
         return;
     };
     let sources: Vec<String> = selected.into_iter().filter(|id| *id != target).collect();
-    if app.s.merge_anim_layers(&target, &sources) {
+    if app.s.merge_anim_layers_with(&target, &sources, app.panels.merge_options) {
         app.panels.anim_layer_sel = vec![target];
         app.s.set_time(app.s.time.current);
         app.s.touch();
-        app.help = "Merged the selected animation layers into the top selected layer".into();
+        app.help = format!("Merged the selected animation layers into the {} selected layer", if app.panels.merge_to_bottom { "bottom" } else { "top" });
     } else {
         app.help = "Cannot merge: turn off Solo; the target must not be inside a selected layer, muted by its parent, or at zero weight".into();
     }
@@ -5089,14 +5098,16 @@ fn anim_layer_create_options(app: &mut IncaApp, ctx: &egui::Context) {
         return;
     }
     let mut open = true;
+    let is_open = open;
     let mut passthrough = app.panels.layer_default_passthrough.unwrap_or(true);
     let mut rotation_by_layer = app.panels.layer_default_rotation_by_layer;
     let mut scale_additive = app.panels.layer_default_scale_additive;
-    egui::Window::new("Create Layer Options")
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("CreateLayerOptions"), is_open, |_app, fix| {
+        let mut window = egui::Window::new("Create Layer Options").open(&mut open).collapsible(false).resizable(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
             ui.checkbox(&mut passthrough, "Passthrough (Override Only)");
             ui.separator();
             ui.label("Rotation Accumulation");
@@ -5112,11 +5123,64 @@ fn anim_layer_create_options(app: &mut IncaApp, ctx: &egui::Context) {
                 rotation_by_layer = false;
                 scale_additive = false;
             }
-        });
+        })
+    });
     app.panels.layer_default_passthrough = Some(passthrough);
     app.panels.layer_default_rotation_by_layer = rotation_by_layer;
     app.panels.layer_default_scale_additive = scale_additive;
     app.panels.create_layer_options_open = open;
+}
+
+fn anim_layer_merge_options(app: &mut IncaApp, ctx: &egui::Context) {
+    if !app.panels.merge_options_open {
+        return;
+    }
+    let mut open = true;
+    let is_open = open;
+    let mut to_bottom = app.panels.merge_to_bottom;
+    let mut opts = app.panels.merge_options;
+    let count = app.panels.anim_layer_sel.len();
+    let mut merge = false;
+    let mut close = false;
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("MergeLayerOptions"), is_open, |_app, fix| {
+        let mut window = egui::Window::new("Merge Layer Options").open(&mut open).collapsible(false).resizable(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+            ui.label("Merge To");
+            ui.radio_value(&mut to_bottom, false, "Top Selected Layer");
+            ui.radio_value(&mut to_bottom, true, "Bottom Selected Layer");
+            ui.separator();
+            ui.label("Layers Hierarchy");
+            ui.radio_value(&mut opts.include_children, false, "Selected");
+            ui.radio_value(&mut opts.include_children, true, "Include Children");
+            ui.separator();
+            ui.label("Result Layer Mode");
+            ui.radio_value(&mut opts.result_mode, inca_core::anim::MergeLayerMode::Automatic, "Automatic");
+            ui.radio_value(&mut opts.result_mode, inca_core::anim::MergeLayerMode::Additive, "Additive");
+            ui.radio_value(&mut opts.result_mode, inca_core::anim::MergeLayerMode::Override, "Override");
+            ui.separator();
+            ui.checkbox(&mut opts.delete_layers, "Delete Baked (Merged) Layers");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(count >= 2, |ui| {
+                    if ui.button("Merge").clicked() {
+                        merge = true;
+                    }
+                });
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        })
+    });
+    app.panels.merge_to_bottom = to_bottom;
+    app.panels.merge_options = opts;
+    app.panels.merge_options_open = open && !close;
+    if merge {
+        anim_layer_merge_selected(app);
+    }
 }
 
 fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
@@ -5124,6 +5188,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::menus::{menu_check, menu_item, menu_submenu, panel_bar, MenuSource};
     let ctx = ui.ctx().clone();
     anim_layer_create_options(app, &ctx);
+    anim_layer_merge_options(app, &ctx);
     // Keep the selection valid and make external changes to the current layer (new, merge,
     // extract, delete, scene load) show up as a one-layer selection.
     app.panels.anim_layer_sel.retain(|id| app.s.anim_layers.iter().any(|l| &l.id == id));
@@ -5212,6 +5277,9 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         anim_layer_merge_selected(app);
                     }
                 });
+                if menu_item(app, ui, "Merge Layers Options...") {
+                    app.panels.merge_options_open = true;
+                }
                 ui.add_enabled_ui(can_down, |ui| {
                     if menu_item(app, ui, "Merge Layer Down") {
                         if let Some(id) = current.as_deref() {
@@ -7955,6 +8023,31 @@ mod tests {
         app.s.set_time(5.0);
         let v = app.s.get_attr_f(&nid, "translateX");
         assert!((v - 5.0).abs() < 1e-9, "merged pose is {v}, curves: {:?}", app.s.anim_layers[0].curves.values().map(|c| c.keys.iter().map(|k| (k.t, k.v)).collect::<Vec<_>>()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn merge_options_choose_the_bottom_selected_layer() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let lower = app.s.anim_layer_current.clone().expect("lower layer");
+        app.s.set_time(0.0);
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(2.0)));
+        anim_layer_new_from_selected(&mut app, false);
+        let upper = app.s.anim_layer_current.clone().expect("upper layer");
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(5.0)));
+        app.panels.merge_to_bottom = true;
+        app.panels.anim_layer_sel = vec![lower.clone(), upper];
+        anim_layer_merge_selected(&mut app);
+        assert_eq!(app.s.anim_layers.len(), 1, "merge did not remove the source layer");
+        assert_eq!(app.s.anim_layer_current.as_deref(), Some(lower.as_str()));
+        app.s.set_time(0.0);
+        let v = app.s.get_attr_f(&nid, "translateX");
+        assert!((v - 5.0).abs() < 1e-9, "merged pose is {v}");
     }
 
     #[test]

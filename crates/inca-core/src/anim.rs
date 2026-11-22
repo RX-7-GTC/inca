@@ -90,6 +90,29 @@ impl AnimLayer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MergeLayerMode {
+    #[default]
+    Automatic,
+    Additive,
+    Override,
+}
+
+/// Options shared by Merge Layers and its option box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeLayerOptions {
+    /// Merge child layers of a selected layer even when they are not selected.
+    pub include_children: bool,
+    pub result_mode: MergeLayerMode,
+    pub delete_layers: bool,
+}
+
+impl Default for MergeLayerOptions {
+    fn default() -> Self {
+        Self { include_children: true, result_mode: MergeLayerMode::Automatic, delete_layers: true }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Key {
     pub t: f64,
