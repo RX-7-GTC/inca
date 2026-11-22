@@ -3243,6 +3243,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: vec![crate::anim::Anim::key(&a, "translateX")],
             parent: None,

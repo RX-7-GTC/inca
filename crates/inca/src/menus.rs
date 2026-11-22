@@ -809,6 +809,18 @@ fn show_menu_popup_ui(
     shown.map(|r| r.response.rect)
 }
 
+/// A right-click menu with the same checkbox band as the menu bars.
+pub fn show_context_menu(app: &mut IncaApp, response: &egui::Response, body: impl FnOnce(&mut IncaApp, &mut egui::Ui)) {
+    egui::Popup::context_menu(response)
+        .layout(egui::Layout::top_down_justified(egui::Align::Min))
+        .show(|ui| {
+            menu_hover(ui);
+            menu_begin(ui);
+            body(app, ui);
+            menu_end(ui);
+        });
+}
+
 /// True when a row was clicked, or when the button was released over it. The JS menus run rows
 /// on `mouseup`, so holding the button after opening a menu and releasing over a row runs it.
 /// Closes the open menu, as every JS menu row does.

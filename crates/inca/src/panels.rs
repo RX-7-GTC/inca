@@ -4472,6 +4472,7 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
             solo: false,
             lock: false,
             override_mode,
+            passthrough: true,
             members: vec![],
             attrs: vec![],
             parent: None,
@@ -4795,11 +4796,23 @@ fn anim_layer_lock(app: &mut IncaApp, id: &str) {
     anim_layer_update(app, id, "lock animation layer", |l| l.lock = !l.lock);
 }
 
-fn anim_layer_mode(app: &mut IncaApp, id: &str, override_mode: bool) {
+fn anim_layer_set_override(app: &mut IncaApp, id: &str, override_mode: bool) {
     app.s.checkpoint("animation layer mode");
     app.s.set_anim_layer_override(id, override_mode);
     app.s.set_time(app.s.time.current);
     app.s.touch();
+}
+
+fn anim_layer_set_passthrough(app: &mut IncaApp, id: &str, passthrough: bool) {
+    app.s.checkpoint("animation layer passthrough");
+    app.s.set_anim_layer_passthrough(id, passthrough);
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+}
+
+fn anim_layer_cycle_mode(app: &mut IncaApp, id: &str) {
+    let Some(override_mode) = app.s.anim_layers.iter().find(|l| l.id == id).map(|l| l.override_mode) else { return };
+    anim_layer_set_override(app, id, !override_mode);
 }
 
 fn anim_solo_snapshot(app: &IncaApp) -> Vec<(String, bool, bool)> {
@@ -4899,7 +4912,7 @@ fn anim_layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
 
 fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::icons;
-    use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
+    use crate::menus::{menu_check, menu_item, menu_submenu, panel_bar, MenuSource};
     // Keep the selection valid and make external changes to the current layer (new, merge,
     // extract, delete, scene load) show up as a one-layer selection.
     app.panels.anim_layer_sel.retain(|id| app.s.anim_layers.iter().any(|l| &l.id == id));
@@ -5013,7 +5026,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
             "Help" => {
                 if menu_item(app, ui, "Animation Layer Editor Help") {
-                    app.help = "Select a layer to receive new keys. Weight blends the layer, the barred circle mutes, S solos, the padlock locks, O/A switches override/additive. Keys on additive layers are stored as deltas. Merge Layers bakes the stack into the top layer; Flatten bakes it into BaseAnimation.".into();
+                    app.help = "Select a layer to receive new keys. Weight blends the layer, the barred circle mutes, S solos, the padlock locks, A/O toggles additive/override. Right-click a layer for Layer Mode and the independent Passthrough toggle. Keys on additive layers are stored as deltas. Merge Layers bakes the stack into the top layer; Flatten bakes it into BaseAnimation.".into();
                 }
             }
             _ => {}
@@ -5131,30 +5144,30 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             app.panels.anim_layer_drag_base = false;
                             app.help = "Drop on a layer to parent it, or on BaseAnimation/empty space to unparent".into();
                         }
-                        name_resp.context_menu(|ui| {
-                            if ui.button("Add Selected Objects").clicked() {
+                        crate::menus::show_context_menu(app, &name_resp, |app, ui| {
+                            if menu_item(app, ui, "Add Selected Objects") {
                                 anim_layer_add_remove_selected(app, &l.id, true);
                                 ui.close();
                             }
-                            if ui.button("Remove Selected Objects").clicked() {
+                            if menu_item(app, ui, "Remove Selected Objects") {
                                 anim_layer_add_remove_selected(app, &l.id, false);
                                 ui.close();
                             }
-                            if ui.button("Select Objects").clicked() {
+                            if menu_item(app, ui, "Select Objects") {
                                 anim_layer_select_objects(app, &l.id);
                                 ui.close();
                             }
                             ui.separator();
-                            ui.menu_button("Parent", |ui| {
+                            menu_submenu(ui, "Parent", |ui| {
                                 for p in layers.iter().filter(|p| p.id != l.id && !anim_layer_is_descendant(&layers, &p.id, &l.id)) {
-                                    if ui.button(&p.name).clicked() {
+                                    if menu_item(app, ui, &p.name) {
                                         anim_layer_set_parent(app, &l.id, Some(p.id.clone()));
                                         ui.close();
                                     }
                                 }
                                 if l.parent.is_some() {
                                     ui.separator();
-                                    if ui.button("Unparent").clicked() {
+                                    if menu_item(app, ui, "Unparent") {
                                         anim_layer_set_parent(app, &l.id, None);
                                         ui.close();
                                     }
@@ -5162,7 +5175,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             });
                             if has_children {
                                 let label = if collapsed { "Expand Children" } else { "Collapse Children" };
-                                if ui.button(label).clicked() {
+                                if menu_item(app, ui, label) {
                                     if collapsed {
                                         app.panels.anim_layer_collapsed.remove(&l.id);
                                     } else {
@@ -5171,26 +5184,41 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                                     ui.close();
                                 }
                             }
-                            if ui.button("Exclusive Solo").clicked() {
+                            if menu_item(app, ui, "Exclusive Solo") {
                                 anim_layer_exclusive_solo(app, &l.id);
                                 ui.close();
                             }
+                            menu_submenu(ui, "Layer Mode", |ui| {
+                                if menu_check(app, ui, !l.override_mode, "Additive") {
+                                    anim_layer_set_override(app, &l.id, false);
+                                    ui.close();
+                                }
+                                if menu_check(app, ui, l.override_mode, "Override") {
+                                    anim_layer_set_override(app, &l.id, true);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if menu_check(app, ui, l.passthrough, "Passthrough") {
+                                    anim_layer_set_passthrough(app, &l.id, !l.passthrough);
+                                    ui.close();
+                                }
+                            });
                             ui.separator();
-                            if ui.button("Rename").clicked() {
+                            if menu_item(app, ui, "Rename") {
                                 app.panels.anim_layer_rename = Some((l.id.clone(), l.name.clone()));
                                 app.panels.anim_layer_rename_new = true;
                                 ui.close();
                             }
-                            if ui.button("Delete").clicked() {
+                            if menu_item(app, ui, "Delete") {
                                 anim_layer_delete(app, &l.id);
                                 ui.close();
                             }
                             ui.separator();
-                            if ui.button("Move Up").clicked() {
+                            if menu_item(app, ui, "Move Up") {
                                 anim_layer_move(app, &l.id, true);
                                 ui.close();
                             }
-                            if ui.button("Move Down").clicked() {
+                            if menu_item(app, ui, "Move Down") {
                                 anim_layer_move(app, &l.id, false);
                                 ui.close();
                             }
@@ -5209,8 +5237,9 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     if layer_lock_toggle(ui, l.lock, selected, "Lock").clicked() {
                         anim_layer_lock(app, &l.id);
                     }
-                    if layer_toggle(ui, if l.override_mode { "O" } else { "A" }, selected, "Override (O) / Additive (A)").clicked() {
-                        anim_layer_mode(app, &l.id, !l.override_mode);
+                    let mode = if l.override_mode { "O" } else { "A" };
+                    if layer_toggle(ui, mode, selected, "Layer mode: Additive / Override (right-click for Passthrough)").clicked() {
+                        anim_layer_cycle_mode(app, &l.id);
                     }
                     let ghost_resp = layer_ghost_toggle(ui, l.ghost, l.ghost_color, selected, "Ghost layer (right-click for color)");
                     if ghost_resp.clicked() {
@@ -7316,7 +7345,7 @@ mod tests {
     }
 
     #[test]
-    fn additive_layer_keys_and_mode_toggle_keep_the_object() {
+    fn changing_mode_reinterprets_layer_keys_like_maya() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
         let cc = eframe::CreationContext::_new_kittest(ctx);
@@ -7336,12 +7365,12 @@ mod tests {
         app.s.set_time(10.0);
         let mid = app.s.get_attr_f(&nid, "rotateY");
         assert!(mid > 1.0 && mid < 89.0, "layer key does not animate: {mid}");
-        anim_layer_mode(&mut app, &lid, true);
-        assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9, "switching to override collapsed the scale");
-        anim_layer_mode(&mut app, &lid, false);
+        anim_layer_set_override(&mut app, &lid, true);
+        assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9, "the rest-pose scale key is absolute and must stay 1");
+        anim_layer_set_override(&mut app, &lid, false);
         assert!(app.s.nodes[&nid].visible, "mode toggle hid the object");
-        assert!((app.s.get_attr_f(&nid, "rotateY") - mid).abs() < 1e-9, "mode toggle changed the pose");
-        assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9, "mode toggle changed the scale");
+        assert!((app.s.get_attr_f(&nid, "rotateY") - mid).abs() < 1e-9, "switching back did not restore the additive result");
+        assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9, "switching back did not restore the scale");
         anim_layer_update(&mut app, &lid, "layer weight", |l| l.weight = 0.5);
         assert!((app.s.get_attr_f(&nid, "rotateY") - mid / 2.0).abs() < 1e-9, "weight does not blend the pose");
         assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9, "weight changed the scale");
@@ -7475,6 +7504,25 @@ mod tests {
             }
         }
         assert!(app.s.anim_solo_saved.is_empty());
+    }
+
+    #[test]
+    fn layer_mode_cycles_additive_override_and_passthrough_is_independent() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        anim_layer_new(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        assert!(!app.s.anim_layers[0].override_mode && app.s.anim_layers[0].passthrough, "new layers are Additive with Passthrough on");
+        anim_layer_cycle_mode(&mut app, &lid);
+        assert!(app.s.anim_layers[0].override_mode && app.s.anim_layers[0].passthrough, "Override keeps Passthrough on");
+        anim_layer_set_passthrough(&mut app, &lid, false);
+        assert!(app.s.anim_layers[0].override_mode && !app.s.anim_layers[0].passthrough);
+        anim_layer_cycle_mode(&mut app, &lid);
+        assert!(!app.s.anim_layers[0].override_mode && !app.s.anim_layers[0].passthrough, "cycle must not touch Passthrough");
+        anim_layer_set_passthrough(&mut app, &lid, true);
+        assert!(app.s.anim_layers[0].passthrough);
     }
 
     #[test]

@@ -18,6 +18,10 @@ pub fn ghost_red() -> [f32; 3] {
     [0.85, 0.10, 0.10]
 }
 
+fn passthrough_default() -> bool {
+    true
+}
+
 /// One animation layer above BaseAnimation. Curves are keyed by "nodeId.attr", like `Anim`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AnimLayer {
@@ -38,6 +42,10 @@ pub struct AnimLayer {
     /// true = override, false = additive.
     #[serde(default)]
     pub override_mode: bool,
+    /// Override layer with variable opacity: blend with the layers below instead of the raw
+    /// base animation. On by default, independently of Additive/Override.
+    #[serde(default = "passthrough_default")]
+    pub passthrough: bool,
     /// Objects explicitly assigned to the layer.
     #[serde(default)]
     pub members: Vec<String>,

@@ -577,6 +577,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![nid.clone()],
             attrs: vec![],
             parent: None,

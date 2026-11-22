@@ -2050,8 +2050,9 @@ impl Scene {
         let key = Anim::key(id, attr);
         let target: Option<&mut AnimCurve> = if let Some(lid) = &layer_id {
             // Additive layers store the delta from everything below them, so keying the current
-            // pose does not add the base animation a second time.
-            if attr != "visibility" && self.anim_layers.iter().find(|l| &l.id == lid).is_some_and(|l| !l.override_mode) {
+            // pose does not add the base animation a second time. Scale is multiplicative, so
+            // its additive keys stay absolute (a rest-pose scale of 1 stores 1, not 0).
+            if attr != "visibility" && !attr.starts_with("scale") && self.anim_layers.iter().find(|l| &l.id == lid).is_some_and(|l| !l.override_mode) {
                 v -= self.anim_value_below(&key, t, lid);
             }
             self.anim_layers.iter_mut().find(|l| &l.id == lid).map(|l| l.curves.entry(key).or_insert_with(|| AnimCurve::new(id, attr)))
@@ -2124,6 +2125,27 @@ impl Scene {
         })
     }
 
+    /// BaseAnimation value, ignoring every layer.
+    fn anim_base_value(&self, key: &str, t: f64) -> f64 {
+        self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key))
+    }
+
+    /// Apply one layer's curve to the running value. An opaque Override layer blends with the
+    /// raw base animation; Override-Passthrough blends with the layers below.
+    fn anim_layer_blend(&self, l: &AnimLayer, attr: &str, v: f64, raw: f64, lv: f64, t: f64) -> f64 {
+        let w = self.anim_layer_effective_weight_at(l, t);
+        if l.override_mode || attr == "visibility" {
+            let base = if l.override_mode && !l.passthrough { raw } else { v };
+            base + (lv - base) * w
+        } else if attr.starts_with("scale") {
+            // Maya's default additive scale accumulation is Multiply: scale^weight.
+            let factor = if lv < 0.0 { -(-lv).powf(w) } else { lv.powf(w) };
+            v * factor
+        } else {
+            v + lv * w
+        }
+    }
+
     /// Restore the static pose for layered channels whose layer curves are gone.
     pub fn restore_anim_static(&mut self, keys: &[String]) {
         for key in keys {
@@ -2152,96 +2174,76 @@ impl Scene {
     /// Value an animation layer sees from BaseAnimation and the layers below it at time `t`.
     /// Computed from the curves, so repeated evaluation cannot accumulate onto the live channel.
     fn anim_value_below(&self, key: &str, t: f64, layer_id: &str) -> f64 {
-        let mut v = self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key));
+        let raw = self.anim_base_value(key, t);
+        let mut v = raw;
         let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
         let solo = self.anim_layers.iter().any(|l| l.solo);
         // layers are stored top-first, so walk the ones below the current layer bottom-up
         for l in self.anim_layers[i + 1..].iter().rev() {
-            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight_at(l, t) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+            if self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
             let Some(c) = l.curves.get(key) else { continue };
             if c.keys.is_empty() || c.mute {
                 continue;
             }
-            let lv = c.eval(t);
-            let w = self.anim_layer_effective_weight_at(l, t);
-            v = if l.override_mode || c.attr == "visibility" {
-                v + (lv - v) * w
-            } else {
-                v + lv * w
-            };
+            v = self.anim_layer_blend(l, &c.attr, v, raw, c.eval(t), t);
         }
         v
     }
 
     /// Evaluated value at the output of `layer_id`, ignoring anything above it.
     fn anim_value_through(&self, key: &str, t: f64, layer_id: &str) -> f64 {
-        let mut v = self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key));
+        let raw = self.anim_base_value(key, t);
+        let mut v = raw;
         let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
         let solo = self.anim_layers.iter().any(|l| l.solo);
         for l in self.anim_layers[i..].iter().rev() {
-            if self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight_at(l, t) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+            if self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
             let Some(c) = l.curves.get(key) else { continue };
             if c.keys.is_empty() || c.mute {
                 continue;
             }
-            let lv = c.eval(t);
-            let w = self.anim_layer_effective_weight_at(l, t);
-            v = if l.override_mode || c.attr == "visibility" {
-                v + (lv - v) * w
-            } else {
-                v + lv * w
-            };
+            v = self.anim_layer_blend(l, &c.attr, v, raw, c.eval(t), t);
         }
         v
     }
 
     /// Value below a layer with some layers ignored. Used when baking a merge.
     fn anim_value_below_skip(&self, key: &str, t: f64, layer_id: &str, skip: &HashSet<String>) -> f64 {
-        let mut v = self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key));
+        let raw = self.anim_base_value(key, t);
+        let mut v = raw;
         let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
         let solo = self.anim_layers.iter().any(|l| l.solo);
         for l in self.anim_layers[i + 1..].iter().rev() {
-            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight_at(l, t) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
             let Some(c) = l.curves.get(key) else { continue };
             if c.keys.is_empty() || c.mute {
                 continue;
             }
-            let lv = c.eval(t);
-            let w = self.anim_layer_effective_weight_at(l, t);
-            v = if l.override_mode || c.attr == "visibility" {
-                v + (lv - v) * w
-            } else {
-                v + lv * w
-            };
+            v = self.anim_layer_blend(l, &c.attr, v, raw, c.eval(t), t);
         }
         v
     }
 
     /// Evaluated value with some layers ignored. Used when flattening.
     fn anim_value_without(&self, key: &str, t: f64, skip: &HashSet<String>) -> f64 {
-        let mut v = self.anim.curves.get(key).filter(|c| !c.keys.is_empty() && !c.mute).map(|c| c.eval(t)).unwrap_or_else(|| self.anim_static_value(key));
+        let raw = self.anim_base_value(key, t);
+        let mut v = raw;
         let solo = self.anim_layers.iter().any(|l| l.solo);
         for l in self.anim_layers.iter().rev() {
-            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || self.anim_layer_effective_weight_at(l, t) <= 1e-6 || (solo && !self.anim_layer_soloed(l)) {
+            if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
             let Some(c) = l.curves.get(key) else { continue };
             if c.keys.is_empty() || c.mute {
                 continue;
             }
-            let lv = c.eval(t);
-            let w = self.anim_layer_effective_weight_at(l, t);
-            v = if l.override_mode || c.attr == "visibility" {
-                v + (lv - v) * w
-            } else {
-                v + lv * w
-            };
+            v = self.anim_layer_blend(l, &c.attr, v, raw, c.eval(t), t);
         }
         v
     }
@@ -2320,30 +2322,21 @@ impl Scene {
         ts
     }
 
-    /// Change a layer's mode, converting its keys so their values keep their meaning:
-    /// additive curves store offsets, override curves store absolute values.
+    /// Change Additive/Override. Maya reinterprets the existing curves: additive offsets
+    /// become absolute override values (or the other way round), so set the mode before
+    /// adding keys. Passthrough is an independent toggle and is not changed here.
     pub fn set_anim_layer_override(&mut self, id: &str, override_mode: bool) {
-        let Some(i) = self.anim_layers.iter().position(|l| l.id == id) else { return };
-        if self.anim_layers[i].override_mode == override_mode {
-            return;
+        if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == id) {
+            l.override_mode = override_mode;
+            self.touch();
         }
-        let curves: Vec<(String, Vec<f64>)> = self.anim_layers[i]
-            .curves
-            .iter()
-            .filter(|(_, c)| c.attr != "visibility")
-            .map(|(k, c)| (k.clone(), c.keys.iter().map(|k| k.t).collect()))
-            .collect();
-        let lowers: Vec<Vec<f64>> = curves.iter().map(|(key, times)| times.iter().map(|t| self.anim_value_below(key, *t, id)).collect()).collect();
-        let sign = if override_mode { 1.0 } else { -1.0 };
-        for ((key, _), lower) in curves.iter().zip(lowers) {
-            if let Some(c) = self.anim_layers[i].curves.get_mut(key) {
-                for (k, lower) in c.keys.iter_mut().zip(lower) {
-                    k.v += sign * lower;
-                }
-            }
+    }
+
+    pub fn set_anim_layer_passthrough(&mut self, id: &str, passthrough: bool) {
+        if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == id) {
+            l.passthrough = passthrough;
+            self.touch();
         }
-        self.anim_layers[i].override_mode = override_mode;
-        self.touch();
     }
 
     /// Merge `sources` (and their child layers) into `target`, baking the result onto the
@@ -2396,7 +2389,7 @@ impl Scene {
             }
         }
         let mut baked = vec![];
-        let mut weight_zero = false;
+        let mut cannot_bake = false;
         for key in keys {
             let times = self.anim_curve_times(&key);
             if times.is_empty() {
@@ -2408,12 +2401,29 @@ impl Scene {
                 .filter_map(|time| {
                     let weight = self.anim_layer_effective_weight_at(&target_layer, time);
                     if weight <= 1e-6 {
-                        weight_zero = true;
+                        cannot_bake = true;
                         return None;
                     }
                     let want = self.anim_value_through(&key, time, absorb.as_deref().unwrap_or(target));
                     let base = self.anim_value_below_skip(&key, time, target, &merged);
-                    let stored = if result_override || attr == "visibility" { base + (want - base) / weight } else { (want - base) / weight };
+                    let raw = self.anim_base_value(&key, time);
+                    let stored = if result_override {
+                        raw + (want - raw) / weight
+                    } else if attr.starts_with("scale") {
+                        if base.abs() <= 1e-12 {
+                            if want.abs() <= 1e-12 {
+                                1.0
+                            } else {
+                                cannot_bake = true;
+                                return None;
+                            }
+                        } else {
+                            let ratio = want / base;
+                            if ratio < 0.0 { -(-ratio).powf(1.0 / weight) } else { ratio.powf(1.0 / weight) }
+                        }
+                    } else {
+                        (want - base) / weight
+                    };
                     stored.is_finite().then_some((time, stored))
                 })
                 .collect();
@@ -2421,13 +2431,14 @@ impl Scene {
                 baked.push((key, samples));
             }
         }
-        if weight_zero {
+        if cannot_bake {
             return false;
         }
         self.checkpoint("merge animation layers");
         if !baked.is_empty() {
             let t = &mut self.anim_layers[target_i];
             t.override_mode = result_override;
+            t.passthrough = false;
             t.mute = false;
             for (key, samples) in &baked {
                 let (node, attr) = key.rsplit_once('.').unwrap();
@@ -2546,6 +2557,7 @@ impl Scene {
                 solo: src.solo,
                 lock: false,
                 override_mode: src.override_mode,
+                passthrough: src.passthrough,
                 members,
                 attrs,
                 parent: src.parent.clone(),
@@ -2662,7 +2674,7 @@ impl Scene {
             let layers: Vec<AnimLayer> = self.anim_layers[start..]
                 .iter()
                 .rev()
-                .filter(|l| !self.anim_layer_effective_mute(l) && self.anim_layer_effective_weight_at(l, t) > 1e-6 && (!solo || self.anim_layer_soloed(l)))
+                .filter(|l| !self.anim_layer_effective_mute(l) && (!solo || self.anim_layer_soloed(l)))
                 .cloned()
                 .collect();
             for layer in layers {
@@ -2674,14 +2686,10 @@ impl Scene {
                         continue;
                     }
                     let lv = c.eval(t);
-                    let base = self.anim_value_below(&Anim::key(&c.node, &c.attr), t, &layer.id);
-                    let w = self.anim_layer_effective_weight_at(&layer, t);
+                    let key = Anim::key(&c.node, &c.attr);
+                    let base = self.anim_value_below(&key, t, &layer.id);
                     // Boolean channels (visibility) always behave as override, as in Maya.
-                    let v = if layer.override_mode || c.attr == "visibility" {
-                        base + (lv - base) * w
-                    } else {
-                        base + lv * w
-                    };
+                    let v = self.anim_layer_blend(&layer, &c.attr, base, self.anim_base_value(&key, t), lv, t);
                     if self.nodes.contains_key(&c.node) {
                         let r = NodeRef::Dag(c.node.clone());
                         self.set_attr_ex(&r, &c.attr, json!(v), false);
@@ -3950,6 +3958,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: true,
+            passthrough: false,
             members: vec![],
             attrs: vec![],
             parent: None,
@@ -3986,6 +3995,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: None,
@@ -4028,6 +4038,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode,
+            passthrough: false,
             members: vec![node.into()],
             attrs: vec![key],
             parent: None,
@@ -4086,6 +4097,28 @@ mod tests {
         for (b, a) in before.iter().zip(after.iter()) {
             assert!((b - a).abs() < 1e-9, "merge changed the animation: {before:?} vs {after:?}");
         }
+    }
+
+    #[test]
+    fn override_passthrough_blends_with_layers_below() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let lower = anim_test_layer(&s, "al2", &a, "translateX", true, &[(0.0, 10.0)]);
+        let mut upper = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 30.0)]);
+        upper.weight = 0.5;
+        s.anim_layers = vec![upper, lower];
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "translateX") - 15.0).abs() < 1e-9, "opaque override should ignore the layer below");
+        s.anim_layers[0].passthrough = true;
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "translateX") - 20.0).abs() < 1e-9, "passthrough should blend with the layer below");
+        s.anim_layers[0].weight = 0.0;
+        s.anim_layers[0].passthrough = false;
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "translateX")).abs() < 1e-9, "opaque override at weight 0 must still block lower layers");
+        s.anim_layers[0].passthrough = true;
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "translateX") - 10.0).abs() < 1e-9, "passthrough at weight 0 exposes the layer below");
     }
 
     #[test]
@@ -4169,6 +4202,7 @@ mod tests {
             solo: false,
             lock: true,
             override_mode: true,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4222,6 +4256,7 @@ mod tests {
                 solo: false,
                 lock: false,
                 override_mode: false,
+                passthrough: false,
                 members: vec![a.clone()],
                 attrs: vec![],
                 parent: None,
@@ -4253,6 +4288,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4299,6 +4335,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4351,6 +4388,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: true,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4378,7 +4416,43 @@ mod tests {
     }
 
     #[test]
-    fn changing_animation_layer_mode_converts_its_keys() {
+    fn additive_scale_multiplies_and_keeps_absolute_keys() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let layer = anim_test_layer(&s, "al1", &a, "scaleX", false, &[(0.0, 3.0)]);
+        s.anim_layers = vec![layer];
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "scaleX") - 3.0).abs() < 1e-9, "additive scale should multiply the base");
+        s.anim_layers[0].weight = 0.5;
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "scaleX") - 3.0_f64.sqrt()).abs() < 1e-9, "weight should be a scale exponent");
+        s.anim_layers[0].weight = 1.0;
+        s.set_anim_layer_override("al1", true);
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "scaleX") - 3.0).abs() < 1e-9, "absolute scale key should survive the mode switch");
+    }
+
+    #[test]
+    fn override_reads_the_additive_offset_after_a_mode_switch() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let lower = anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 10.0)]);
+        let upper = anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 0.0)]);
+        s.anim_layers = vec![upper, lower];
+        s.anim_layer_current = Some("al1".into());
+        s.set_time(0.0);
+        s.set_attr_f(&a, "translateX", 30.0);
+        assert!(s.set_key(&a, "translateX", Some(0.0), None));
+        assert!((s.get_attr_f(&a, "translateX") - 30.0).abs() < 1e-9);
+        // The additive key stored 20 (30 - the 10 from the layer below). Switch the upper
+        // layer to Override without converting: 20 becomes its absolute value, as in Maya.
+        s.set_anim_layer_override("al1", true);
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "translateX") - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn changing_animation_layer_mode_reinterprets_its_keys() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
         s.set_attr_f(&a, "translateX", 5.0);
@@ -4392,6 +4466,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4414,13 +4489,13 @@ mod tests {
         assert!((s.get_attr_f(&a, "translateX") - 8.0).abs() < 1e-9);
         s.set_anim_layer_override("al1", true);
         s.set_time(10.0);
-        assert!((value_at(&s, 10.0) - 8.0).abs() < 1e-9, "override key is absolute");
-        assert!((s.get_attr_f(&a, "translateX") - 8.0).abs() < 1e-9, "mode change moved the object");
-        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9, "mode change collapsed the scale");
+        assert!((value_at(&s, 10.0) - 3.0).abs() < 1e-9, "Maya reinterprets, it does not convert");
+        assert!((s.get_attr_f(&a, "translateX") - 3.0).abs() < 1e-9, "override should reinterpret the stored offset");
+        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9, "the rest-pose scale key is already absolute");
         s.set_anim_layer_override("al1", false);
         s.set_time(10.0);
-        assert!((value_at(&s, 10.0) - 3.0).abs() < 1e-9, "additive key is an offset again");
         assert!((s.get_attr_f(&a, "translateX") - 8.0).abs() < 1e-9);
+        assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -4454,6 +4529,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![],
             attrs: vec![],
             parent: None,
@@ -4470,6 +4546,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: Some("parent".into()),
@@ -4507,6 +4584,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: None,
@@ -4543,6 +4621,7 @@ mod tests {
             solo: false,
             lock: false,
             override_mode: false,
+            passthrough: false,
             members: vec![a.clone()],
             attrs: vec![],
             parent: None,
