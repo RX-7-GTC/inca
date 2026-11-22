@@ -814,7 +814,7 @@ pub(crate) fn delete_selected_keys(app: &mut IncaApp) {
     for (ck, mut indices) in by_curve {
         indices.sort_unstable();
         indices.dedup();
-        if let Some(c) = app.s.anim_curves_mut().get_mut(&ck) {
+        if let Some(c) = app.s.graph_curve_mut(&ck) {
             for &i in indices.iter().rev() {
                 if i < c.keys.len() {
                     c.keys.remove(i);
@@ -835,7 +835,7 @@ pub(crate) fn copy_selected_keys(app: &mut IncaApp) {
     let selected = app.windows_state.ge_keys.clone();
     let mut clip = Vec::new();
     for (ck, ki) in selected {
-        if let Some(key) = app.s.anim_curves().get(&ck).and_then(|c| c.keys.get(ki)) {
+        if let Some(key) = app.s.graph_curve(&ck).and_then(|c| c.keys.get(ki)) {
             clip.push((ck, key.t, key.clone()));
         }
     }
@@ -857,7 +857,7 @@ pub(crate) fn paste_keys(app: &mut IncaApp) {
     if clip.is_empty() {
         return;
     }
-    let valid: Vec<(String, f64, inca_core::anim::Key)> = clip.into_iter().filter(|(ck, _, _)| app.s.anim_curves().contains_key(ck)).collect();
+    let valid: Vec<(String, f64, inca_core::anim::Key)> = clip.into_iter().filter(|(ck, _, _)| app.s.graph_curve(ck).is_some()).collect();
     if valid.is_empty() {
         return;
     }
@@ -867,7 +867,7 @@ pub(crate) fn paste_keys(app: &mut IncaApp) {
     let mut pasted: Vec<(String, f64)> = Vec::new();
     for (ck, t, key) in &valid {
         let new_t = *t + offset;
-        if let Some(c) = app.s.anim_curves_mut().get_mut(ck) {
+        if let Some(c) = app.s.graph_curve_mut(ck) {
             let mut k = key.clone();
             k.t = new_t;
             if let Some(i) = c.find(new_t) {
@@ -881,7 +881,7 @@ pub(crate) fn paste_keys(app: &mut IncaApp) {
     }
     let mut selected = Vec::new();
     for (ck, t) in &pasted {
-        if let Some(c) = app.s.anim_curves().get(ck) {
+        if let Some(c) = app.s.graph_curve(ck) {
             if let Some(i) = c.find(*t) {
                 selected.push((ck.clone(), i));
             }
@@ -943,7 +943,8 @@ fn ge_toggle(app: &mut IncaApp, ck: &str, ki: usize) {
 fn nearest_graph_key(app: &IncaApp, shown: &[String], tf: &egui_plot::PlotTransform, pp: egui::Pos2) -> Option<(String, usize)> {
     let mut best: Option<(f32, String, usize)> = None;
     for k in shown {
-        for (i, key) in app.s.anim_curves()[k].keys.iter().enumerate() {
+        let Some(c) = app.s.graph_curve(k) else { continue };
+        for (i, key) in c.keys.iter().enumerate() {
             let sp = tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v));
             let d = sp.distance(pp);
             if d < 10.0 && best.as_ref().is_none_or(|b| d < b.0) {
@@ -960,7 +961,7 @@ fn graph_tangent_handles(app: &IncaApp, tf: &egui_plot::PlotTransform, selected:
         return None;
     }
     let (ck, ki) = &selected[0];
-    let c = app.s.anim_curves().get(ck)?;
+    let c = app.s.graph_curve(ck)?;
     let key = c.keys.get(*ki)?;
     let kp = tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v));
     let left = tf.value_from_position(kp - egui::vec2(36.0, 0.0));
@@ -989,7 +990,7 @@ pub(crate) fn finish_graph_scale(app: &mut IncaApp) {
     let keys = app.windows_state.ge_drag_keys.clone();
     let affected: std::collections::HashSet<String> = keys.iter().map(|(ck, _, _, _)| ck.clone()).collect();
     for ck in &affected {
-        if let Some(c) = app.s.anim_curves_mut().get_mut(ck) {
+        if let Some(c) = app.s.graph_curve_mut(ck) {
             c.sort();
         }
     }
@@ -998,7 +999,7 @@ pub(crate) fn finish_graph_scale(app: &mut IncaApp) {
         for (ck, _, t0, v0) in &keys {
             let nt = pt + (t0 - pt) * sx;
             let nv = pv + (v0 - pv) * sy;
-            if let Some(c) = app.s.anim_curves().get(ck) {
+            if let Some(c) = app.s.graph_curve(ck) {
                 // Match time and value: keys can share a time after collapsing onto the pivot.
                 if let Some(i) = c.keys.iter().position(|k| (k.t - nt).abs() < 1e-4 && (k.v - nv).abs() < 1e-4) {
                     selected.push((ck.clone(), i));
@@ -1033,6 +1034,20 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     if app.panels.cb_sync_graph && !app.panels.cb_sel.is_empty() {
         curves.retain(|(_, _, attr)| app.panels.cb_sel.contains(attr));
     }
+    // A keyed layer weight is a curve too: show it while its layer is current or selected.
+    let mut weight_ids = app.panels.anim_layer_sel.clone();
+    if let Some(id) = &app.s.anim_layer_current {
+        if !weight_ids.contains(id) {
+            weight_ids.push(id.clone());
+        }
+    }
+    for id in &weight_ids {
+        if let Some(l) = app.s.anim_layers.iter().find(|l| &l.id == id) {
+            if !l.weight_curve.keys.is_empty() {
+                curves.push((Scene::layer_weight_curve_key(&l.id), l.name.clone(), "weight".into()));
+            }
+        }
+    }
     let status = app.windows_state.ge_status.clone();
     ui.horizontal(|ui| {
         if let Some(status) = &status {
@@ -1048,7 +1063,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         if let Some((ck, ki)) = app.windows_state.ge_keys.first().cloned() {
             if selected_count > 1 {
                 ui.label(format!("{selected_count} keys selected"));
-            } else if let Some(c) = app.s.anim_curves().get(&ck).cloned() {
+            } else if let Some(c) = app.s.graph_curve(&ck).cloned() {
                 if let Some(k) = c.keys.get(ki).cloned() {
                     ui.label(format!("Key  t={}  v={}", inca_core::math::fmt_num(k.t), inca_core::math::fmt_num(k.v)));
                     let mut tan = k.ot.clone();
@@ -1059,7 +1074,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     });
                     if tan != k.ot {
                         app.s.checkpoint("key tangents");
-                        let key = &mut app.s.anim_curves_mut().get_mut(&ck).unwrap().keys[ki];
+                        let key = &mut app.s.graph_curve_mut(&ck).unwrap().keys[ki];
                         key.it = tan.clone();
                         key.ot = tan;
                         app.s.touch();
@@ -1077,7 +1092,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         ui.selectable_value(&mut post, t.to_string(), *t);
                     }
                 });
-                let c = app.s.anim_curves_mut().get_mut(&ck).unwrap();
+                let c = app.s.graph_curve_mut(&ck).unwrap();
                 if pre != c.pre || post != c.post {
                     c.pre = pre;
                     c.post = post;
@@ -1119,7 +1134,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         // raw values like 217.13609496869865 at the axis limits. Pad the visible range.
         let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
         for k in &shown {
-            if let Some(c) = app.s.anim_curves().get(k) {
+            if let Some(c) = app.s.graph_curve(k) {
                 for key in &c.keys {
                     ymin = ymin.min(key.v);
                     ymax = ymax.max(key.v);
@@ -1136,7 +1151,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let (y0, y1) = (ymin - pad, ymax + pad);
         let (mut kx0, mut kx1) = (f64::INFINITY, f64::NEG_INFINITY);
         for k in &shown {
-            if let Some(c) = app.s.anim_curves().get(k) {
+            if let Some(c) = app.s.graph_curve(k) {
                 if let Some(first) = c.keys.first() {
                     kx0 = kx0.min(first.t);
                 }
@@ -1158,7 +1173,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         if !selected_keys.is_empty() {
             let (mut t0k, mut t1k, mut v0k, mut v1k) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
             for (ck, ki) in &selected_keys {
-                if let Some(k) = app.s.anim_curves().get(ck).and_then(|c| c.keys.get(*ki)) {
+                if let Some(k) = app.s.graph_curve(ck).and_then(|c| c.keys.get(*ki)) {
                     t0k = t0k.min(k.t);
                     t1k = t1k.max(k.t);
                     v0k = v0k.min(k.v);
@@ -1233,7 +1248,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 }
             }
             for (i, k) in shown.iter().enumerate() {
-                let c = &app.s.anim_curves()[k];
+                let Some(c) = app.s.graph_curve(k) else { continue };
                 let col = match c.attr.chars().last() {
                     Some('X') => colors[0],
                     Some('Y') => colors[1],
@@ -1267,7 +1282,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let r = resp.response;
         let tf = resp.transform;
         app.windows_state.ge_first_key_screen = shown.iter().find_map(|k| {
-            app.s.anim_curves().get(k).and_then(|c| c.keys.first()).map(|key| tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v)))
+            app.s.graph_curve(k).and_then(|c| c.keys.first()).map(|key| tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v)))
         });
         let alt = ui.input(|i| i.modifiers.alt);
         let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command);
@@ -1300,7 +1315,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         let keys = app.windows_state.ge_keys.clone();
                         app.windows_state.ge_drag_keys = keys
                             .into_iter()
-                            .filter_map(|(k, i)| app.s.anim_curves().get(&k).and_then(|c| c.keys.get(i)).map(|key| (k, i, key.t, key.v)))
+                            .filter_map(|(k, i)| app.s.graph_curve(&k).and_then(|c| c.keys.get(i)).map(|key| (k, i, key.t, key.v)))
                             .collect();
                         app.windows_state.ge_drag = false;
                         app.windows_state.ge_box = None;
@@ -1347,7 +1362,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             let keys = app.windows_state.ge_keys.clone();
                             app.windows_state.ge_drag_keys = keys
                                 .into_iter()
-                                .filter_map(|(k, i)| app.s.anim_curves().get(&k).and_then(|c| c.keys.get(i)).map(|key| (k, i, key.t, key.v)))
+                                .filter_map(|(k, i)| app.s.graph_curve(&k).and_then(|c| c.keys.get(i)).map(|key| (k, i, key.t, key.v)))
                                 .collect();
                             app.windows_state.ge_box = None;
                             app.windows_state.ge_tan_drag = None;
@@ -1377,7 +1392,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             if let Some(side) = app.windows_state.ge_tan_drag {
                 if let Some(p) = pointer {
                     if let Some((ck, ki)) = app.windows_state.ge_keys.first().cloned() {
-                        if let Some(c) = app.s.anim_curves_mut().get_mut(&ck) {
+                        if let Some(c) = app.s.graph_curve_mut(&ck) {
                             if let Some(key) = c.keys.get_mut(ki) {
                                 let dx = if side < 0 { key.t - p.x } else { p.x - key.t };
                                 if dx.abs() > 1e-6 {
@@ -1403,7 +1418,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     let mut dt_min = f64::NEG_INFINITY;
                     let mut dt_max = f64::INFINITY;
                     for (ck, ki, t0k, _) in &app.windows_state.ge_drag_keys {
-                        if let Some(c) = app.s.anim_curves().get(ck) {
+                        if let Some(c) = app.s.graph_curve(ck) {
                             let selected: std::collections::HashSet<usize> = app.windows_state.ge_drag_keys.iter().filter(|(k, _, _, _)| k == ck).map(|(_, i, _, _)| *i).collect();
                             if let Some(prev) = (0..*ki).rev().find(|i| !selected.contains(i)) {
                                 dt_min = dt_min.max(c.keys[prev].t - *t0k + 1.0);
@@ -1416,7 +1431,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     let dt = if dt_min <= dt_max { raw_dt.clamp(dt_min, dt_max) } else { 0.0 };
                     let keys = app.windows_state.ge_drag_keys.clone();
                     for (ck, ki, t0k, v0k) in keys {
-                        if let Some(c) = app.s.anim_curves_mut().get_mut(&ck) {
+                        if let Some(c) = app.s.graph_curve_mut(&ck) {
                             if let Some(key) = c.keys.get_mut(ki) {
                                 key.t = t0k + dt;
                                 key.v = v0k + dv;
@@ -1465,7 +1480,7 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             let nt = pt + (t0 - pt) * sx;
                             let nv = pv + (v0 - pv) * sy;
                             targets.push((ck.clone(), nt, nv));
-                            if let Some(c) = app.s.anim_curves_mut().get_mut(ck) {
+                            if let Some(c) = app.s.graph_curve_mut(ck) {
                                 if let Some(key) = c.keys.get_mut(*ki) {
                                     key.t = nt;
                                     key.v = nv;
@@ -1474,13 +1489,13 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                         let affected: std::collections::HashSet<String> = targets.iter().map(|(ck, _, _)| ck.clone()).collect();
                         for ck in &affected {
-                            if let Some(c) = app.s.anim_curves_mut().get_mut(ck) {
+                            if let Some(c) = app.s.graph_curve_mut(ck) {
                                 c.sort();
                             }
                         }
                         let mut remapped = Vec::with_capacity(original.len());
                         for ((ck, _, t0, v0), (_, nt, nv)) in original.iter().zip(targets.iter()) {
-                            if let Some(c) = app.s.anim_curves().get(ck) {
+                            if let Some(c) = app.s.graph_curve(ck) {
                                 if let Some(i) = c.keys.iter().position(|k| k.t == *nt && k.v == *nv) {
                                     remapped.push((ck.clone(), i, *t0, *v0));
                                 }
@@ -1537,7 +1552,8 @@ fn graph_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             app.windows_state.ge_keys.clear();
                         }
                         for k in &shown {
-                            for (i, key) in app.s.anim_curves()[k].keys.iter().enumerate() {
+                            let Some(c) = app.s.graph_curve(k) else { continue };
+                            for (i, key) in c.keys.iter().enumerate() {
                                 let sp = tf.position_from_point(&egui_plot::PlotPoint::new(key.t, key.v));
                                 if rect.contains(sp) && !ge_selected(app, k, i) {
                                     app.windows_state.ge_keys.push((k.clone(), i));
@@ -1826,7 +1842,7 @@ mod tests {
         app.s.anim_curves_mut().insert(ck.clone(), c);
         app.windows_state.ge_keys = vec![(ck.clone(), 0)];
         delete_selected_keys(&mut app);
-        let c = app.s.anim_curves().get(&ck).expect("curve with a remaining key should stay");
+        let c = app.s.graph_curve(&ck).expect("curve with a remaining key should stay");
         assert_eq!(c.keys.len(), 1);
         assert_eq!(c.keys[0].t, 10.0);
         app.windows_state.ge_keys = vec![(ck.clone(), 0)];
@@ -2065,7 +2081,7 @@ mod tests {
         app.s.anim_curves_mut().insert(ck.clone(), c);
         app.windows_state.ge_keys = vec![(ck.clone(), 1), (ck.clone(), 3)];
         delete_selected_keys(&mut app);
-        let c = app.s.anim_curves().get(&ck).expect("curve should remain");
+        let c = app.s.graph_curve(&ck).expect("curve should remain");
         assert_eq!(c.keys.iter().map(|k| k.t).collect::<Vec<_>>(), vec![1.0, 10.0]);
     }
 

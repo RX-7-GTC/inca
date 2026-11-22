@@ -2101,6 +2101,26 @@ impl Scene {
         &mut self.anim.curves
     }
 
+    /// Synthetic Graph Editor key for an animation layer's weight curve.
+    pub fn layer_weight_curve_key(id: &str) -> String {
+        format!("/animLayerWeight/{id}")
+    }
+
+    /// A Graph Editor curve: a curve on the displayed node/layer, or a layer weight curve.
+    pub fn graph_curve(&self, key: &str) -> Option<&AnimCurve> {
+        if let Some(id) = key.strip_prefix("/animLayerWeight/") {
+            return self.anim_layers.iter().find(|l| l.id == id).filter(|l| !l.weight_curve.keys.is_empty()).map(|l| &l.weight_curve);
+        }
+        self.anim_curves().get(key)
+    }
+
+    pub fn graph_curve_mut(&mut self, key: &str) -> Option<&mut AnimCurve> {
+        if let Some(id) = key.strip_prefix("/animLayerWeight/") {
+            return self.anim_layers.iter_mut().find(|l| l.id == id).map(|l| &mut l.weight_curve);
+        }
+        self.anim_curves_mut().get_mut(key)
+    }
+
     pub fn anim_curve(&self, node: &str, attr: &str) -> Option<&AnimCurve> {
         self.anim_curves().get(&Anim::key(node, attr))
     }
@@ -4342,6 +4362,23 @@ mod tests {
         }
         let layer = &s.anim_layers[0];
         assert!((s.anim_layer_effective_weight_at(layer, 5.0) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn graph_editor_reads_and_edits_layer_weight_curves() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut layer = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 10.0)]);
+        layer.weight_curve.set_key(0.0, 0.0, "linear");
+        layer.weight_curve.set_key(10.0, 1.0, "linear");
+        s.anim_layers = vec![layer];
+        s.anim_layer_current = Some("al1".into());
+        let key = Scene::layer_weight_curve_key("al1");
+        assert_eq!(s.graph_curve(&key).expect("weight curve").keys.len(), 2);
+        assert!(s.graph_curve(&Anim::key(&a, "translateX")).is_some(), "normal curves still resolve");
+        s.graph_curve_mut(&key).unwrap().keys[0].v = 0.5;
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "translateX") - 5.0).abs() < 1e-9, "edited weight keys affect the pose");
     }
 
     #[test]
