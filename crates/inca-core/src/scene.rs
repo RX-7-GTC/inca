@@ -2446,22 +2446,14 @@ impl Scene {
             .filter(|l| (l.id == target || merged.contains(&l.id)) && l.rotation_by_layer)
             .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
             .collect();
-        // A slerp cannot reliably encode the inverse of a partial weight (it would need an
-        // arc longer than 180 degrees), so bake by-layer rotations into a weight-1 layer.
-        let normalize_weights = !by_layer_nodes.is_empty();
-        if normalize_weights {
+        let result_passthrough = !by_layer_nodes.is_empty();
+        if result_passthrough {
             result_override = true;
-            let mut probe = target_layer.clone();
-            probe.weight = 1.0;
-            probe.weight_curve = Default::default();
-            if (self.anim_layer_effective_weight_at(&probe, self.time.current) - 1.0).abs() > 1e-6 {
-                return false;
-            }
         }
         // Only bake attributes the sources actually animate. Muted curves and zero-weight
         // layers contribute nothing, so leave the target's own curves untouched for them.
         let mut keys = HashSet::new();
-        for l in self.anim_layers.iter().filter(|l| merged.contains(&l.id) || (normalize_weights && l.id == target)) {
+        for l in self.anim_layers.iter().filter(|l| merged.contains(&l.id)) {
             if self.anim_layer_effective_mute(l) {
                 continue;
             }
@@ -2482,7 +2474,7 @@ impl Scene {
             let samples: Vec<(f64, f64)> = times
                 .into_iter()
                 .filter_map(|time| {
-                    let weight = if normalize_weights { 1.0 } else { self.anim_layer_effective_weight_at(&target_layer, time) };
+                    let weight = self.anim_layer_effective_weight_at(&target_layer, time);
                     if weight <= 1e-6 {
                         cannot_bake = true;
                         return None;
@@ -2491,7 +2483,8 @@ impl Scene {
                     let base = self.anim_value_below_skip(&key, time, target, &merged);
                     let raw = self.anim_base_value(&key, time);
                     let stored = if result_override {
-                        raw + (want - raw) / weight
+                        let b = if result_passthrough { base } else { raw };
+                        b + (want - b) / weight
                     } else if attr == "visibility" {
                         // Booleans are evaluated with the override formula even on Additive layers.
                         base + (want - base) / weight
@@ -2520,7 +2513,9 @@ impl Scene {
         if !by_layer_nodes.is_empty() {
             let boundary = absorb.as_deref().unwrap_or(target);
             let Some(boundary_i) = active.iter().position(|l| l.id == boundary) else { return false };
+            let Some(target_i_active) = active.iter().position(|l| l.id == target) else { return false };
             let want_layers = &active[..=boundary_i];
+            let below: Vec<AnimLayer> = active[..target_i_active].iter().filter(|l| !merged.contains(&l.id)).cloned().collect();
             for node in &by_layer_nodes {
                 let Some(ro) = self.nodes.get(node).map(|n| n.xf.ro.clone()) else { continue };
                 let mut times = vec![];
@@ -2535,8 +2530,23 @@ impl Scene {
                 let mut prev = [0.0; 3];
                 let mut samples: Vec<(f64, [f64; 3])> = vec![];
                 for time in times {
-                    let want = self.anim_rotation_with_layers(node, time, want_layers);
-                    let q_stored = quat_from_euler_deg(want, &ro);
+                    let weight = self.anim_layer_effective_weight_at(&target_layer, time);
+                    if weight <= 1e-6 {
+                        cannot_bake = true;
+                        break;
+                    }
+                    let want_q = quat_from_euler_deg(self.anim_rotation_with_layers(node, time, want_layers), &ro);
+                    let below_q = quat_from_euler_deg(self.anim_rotation_with_layers(node, time, &below), &ro);
+                    let mut rel = below_q.inverse() * want_q;
+                    if rel.w < 0.0 {
+                        rel = -rel;
+                    }
+                    let (axis, angle) = rel.to_axis_angle();
+                    if angle / weight > std::f64::consts::PI + 1e-6 {
+                        cannot_bake = true;
+                        break;
+                    }
+                    let q_stored = below_q * DQuat::from_axis_angle(axis, angle / weight);
                     let e = euler_deg_from_quat_near(q_stored, &ro, prev);
                     prev = e;
                     samples.push((time, e));
@@ -2556,12 +2566,8 @@ impl Scene {
         if !baked.is_empty() {
             let t = &mut self.anim_layers[target_i];
             t.override_mode = result_override;
-            t.passthrough = false;
+            t.passthrough = result_passthrough;
             t.rotation_by_layer |= !by_layer_nodes.is_empty();
-            if normalize_weights {
-                t.weight = 1.0;
-                t.weight_curve = Default::default();
-            }
             t.mute = false;
             for (key, samples) in &baked {
                 let (node, attr) = key.rsplit_once('.').unwrap();
@@ -4651,6 +4657,28 @@ mod tests {
     }
 
     #[test]
+    fn by_layer_merge_preserves_the_target_weight() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut target = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
+        target.weight = 0.5;
+        target.rotation_by_layer = true;
+        let mut source = anim_test_layer(&s, "al2", &a, "rotateY", true, &[(0.0, 90.0)]);
+        source.rotation_by_layer = true;
+        s.anim_layers = vec![target, source];
+        s.set_time(0.0);
+        let before = [s.get_attr_f(&a, "rotateX"), s.get_attr_f(&a, "rotateY"), s.get_attr_f(&a, "rotateZ")];
+        assert!(s.merge_anim_layers("al1", &["al2".into()]));
+        assert_eq!(s.anim_layers.len(), 1);
+        assert!((s.anim_layers[0].weight - 0.5).abs() < 1e-9, "merge changed the weight");
+        s.set_time(0.0);
+        for (attr, want) in ["rotateX", "rotateY", "rotateZ"].iter().zip(before) {
+            let got = s.get_attr_f(&a, attr);
+            assert!((got - want).abs() < 1e-9, "{attr} changed after merge: {want} -> {got}");
+        }
+    }
+
+    #[test]
     fn merging_by_layer_rotations_keeps_visibility_on() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
@@ -4671,7 +4699,8 @@ mod tests {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
         let mut target = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
-        target.weight = 0.5;
+        target.weight = 1.0;
+        target.weight_curve.set_key(0.0, 1.0, "linear");
         target.passthrough = true;
         target.rotation_by_layer = true;
         let mut source = anim_test_layer(&s, "al2", &a, "rotateY", true, &[(0.0, 90.0)]);
@@ -4681,6 +4710,8 @@ mod tests {
         let before = [s.get_attr_f(&a, "rotateX"), s.get_attr_f(&a, "rotateY"), s.get_attr_f(&a, "rotateZ")];
         assert!(s.merge_anim_layers("al1", &["al2".into()]));
         assert_eq!(s.anim_layers.len(), 1);
+        assert!((s.anim_layers[0].weight - 1.0).abs() < 1e-9);
+        assert_eq!(s.anim_layers[0].weight_curve.keys.len(), 1, "merge cleared the weight curve");
         s.set_time(0.0);
         for (attr, want) in ["rotateX", "rotateY", "rotateZ"].iter().zip(before) {
             let got = s.get_attr_f(&a, attr);
