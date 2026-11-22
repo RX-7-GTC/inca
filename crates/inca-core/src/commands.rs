@@ -1226,6 +1226,10 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             if n == 0 && attempted && s.anim_layer_current.is_some() {
                 s.warn("No keys were set: the layer is locked or the attributes are not on it.");
             }
+            if n > 0 {
+                // Layered values (scale especially) can differ from the raw pose just keyed.
+                s.apply_anim();
+            }
             Ok(Val::Int(n))
         }
         "cutKey" => {
@@ -3245,6 +3249,7 @@ mod tests {
             override_mode: false,
             passthrough: false,
             rotation_by_layer: false,
+            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![crate::anim::Anim::key(&a, "translateX")],
             parent: None,
