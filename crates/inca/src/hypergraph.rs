@@ -1657,8 +1657,8 @@ pub fn connection_editor(app: &mut IncaApp, ctx: &egui::Context) {
             if down.clicked() {
                 nav = Some((true, None));
             }
-            up.context_menu(|ui| nav_menu(app, ui, false, &mut nav));
-            down.context_menu(|ui| nav_menu(app, ui, true, &mut nav));
+            crate::menus::show_plain_context_menu(&up, |ui| nav_menu(app, ui, false, &mut nav));
+            crate::menus::show_plain_context_menu(&down, |ui| nav_menu(app, ui, true, &mut nav));
         });
         ui.separator();
         let (l, r) = (app.hg.ce_left.clone(), app.hg.ce_right.clone());

@@ -205,7 +205,7 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
         }
         ui.data_mut(|d| d.remove::<DragState>(state_id));
     }
-    resp.context_menu(|ui| time_menu(app, ui));
+    crate::menus::show_plain_context_menu(&resp, |ui| time_menu(app, ui));
 }
 
 pub(crate) fn key_range(app: &IncaApp) -> (f64, f64) {
@@ -306,7 +306,7 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         app.action("timelineCopy");
         ui.close();
     }
-    ui.menu_button("Paste", |ui| {
+    crate::menus::show_plain_submenu(ui, "Paste", |ui| {
         if ui.add_enabled(!app.key_clip.is_empty(), egui::Button::new("Paste")).clicked() {
             app.action("timelinePaste");
             ui.close();
@@ -321,7 +321,7 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         act(app, ui, l, a);
     }
     ui.separator();
-    ui.menu_button("Tangents", |ui| {
+    crate::menus::show_plain_submenu(ui, "Tangents", |ui| {
         for t in inca_core::anim::TANGENTS.iter().filter(|t| **t != "fixed") {
             let mut label = t.to_string();
             label[..1].make_ascii_uppercase();
@@ -341,7 +341,7 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     });
     ui.separator();
-    ui.menu_button("Playback Looping", |ui| {
+    crate::menus::show_plain_submenu(ui, "Playback Looping", |ui| {
         for (l, v) in [("Once", "once"), ("Oscillate", "oscillate"), ("Continuous", "continuous")] {
             if ui.radio(app.s.time.r#loop == v, l).clicked() {
                 app.s.time.r#loop = v.into();
@@ -349,7 +349,7 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
     });
-    ui.menu_button("Set Range To", |ui| {
+    crate::menus::show_plain_submenu(ui, "Set Range To", |ui| {
         if ui.add_enabled(app.range_sel.is_some(), egui::Button::new("Selected")).clicked() {
             app.s.time.start = lo;
             app.s.time.end = hi.max(lo + 1.0);

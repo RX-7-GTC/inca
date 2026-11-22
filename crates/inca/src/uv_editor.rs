@@ -816,7 +816,7 @@ fn interact(app: &mut IncaApp, ui: &egui::Ui, rect: Rect, resp: &egui::Response,
             None => {}
         }
     }
-    resp.context_menu(|ui| {
+    crate::menus::show_plain_context_menu(&resp, |ui| {
         for (l, k) in [("Select All UVs", "all"), ("Select Shell", "shell"), ("Clear Selection", "clear")] {
             if ui.button(l).clicked() {
                 match k {

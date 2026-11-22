@@ -821,6 +821,38 @@ pub fn show_context_menu(app: &mut IncaApp, response: &egui::Response, body: imp
         });
 }
 
+/// A right-click menu for arbitrary content: the content is indented past the checkbox band,
+/// which stays continuous down the whole popup.
+pub fn show_plain_context_menu(response: &egui::Response, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Popup::context_menu(response).show(|ui| {
+        menu_hover(ui);
+        menu_begin(ui);
+        ui.horizontal(|ui| {
+            ui.add_space(MENU_BAND_W + 4.0);
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| body(ui));
+        });
+        menu_end(ui);
+    });
+}
+
+/// A submenu for arbitrary content, indented past the same checkbox band.
+pub fn show_plain_submenu(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
+    let button = ui.add(egui::Button::new(label).right_text(egui::menu::SubMenuButton::RIGHT_ARROW));
+    let opened = submenu_show(ui, &button, |ui| {
+        menu_hover(ui);
+        menu_begin(ui);
+        ui.horizontal(|ui| {
+            ui.add_space(MENU_BAND_W + 4.0);
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| body(ui));
+        });
+        menu_end(ui);
+    })
+    .is_some();
+    if opened {
+        button.highlight();
+    }
+}
+
 /// True when a row was clicked, or when the button was released over it. The JS menus run rows
 /// on `mouseup`, so holding the button after opening a menu and releasing over a row runs it.
 /// Closes the open menu, as every JS menu row does.

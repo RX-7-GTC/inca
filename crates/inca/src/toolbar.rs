@@ -431,7 +431,7 @@ pub fn shelf(app: &mut IncaApp, ui: &mut egui::Ui) {
                             _ => {}
                         }
                     }
-                    r.context_menu(|ui| {
+                    crate::menus::show_plain_context_menu(&r, |ui| {
                         if ui.button("Delete").clicked() {
                             remove = Some(i);
                             ui.close();

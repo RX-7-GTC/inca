@@ -1054,7 +1054,7 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
             }
         }
     }
-    resp.context_menu(|ui| {
+    crate::menus::show_plain_context_menu(&resp, |ui| {
         if !app.s.sel.iter().any(|s| s == id) {
             app.select_names(&[id.to_string()], SelMode::Replace);
         }
@@ -1711,7 +1711,7 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
             cb_arm(app);
         }
         if channel_menu {
-            lresp.context_menu(|ui| {
+            crate::menus::show_plain_context_menu(&lresp, |ui| {
                 ui.label(RichText::new("Channels").strong().color(theme::TEXT_DIM));
                 ui.separator();
                 channels_menu(app, ui);
@@ -3532,6 +3532,7 @@ fn layer_set_entries(app: &mut IncaApp, ui: &mut egui::Ui, scope: LayerScope) {
     let item = |app: &mut IncaApp, ui: &mut egui::Ui, label: &str, set: fn(&mut inca_core::scene::Layer), inverse: fn(&mut inca_core::scene::Layer)| {
         if menu_item(app, ui, label) {
             layer_apply(app, scope, label, set, inverse);
+            ui.close();
         }
     };
     item(app, ui, "Visible", |l| l.visible = true, |l| l.visible = false);
@@ -3558,45 +3559,54 @@ fn layer_set_entries(app: &mut IncaApp, ui: &mut egui::Ui, scope: LayerScope) {
 }
 
 fn layer_context_menu(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
-    use crate::menus::menu_item;
+    use crate::menus::{menu_item, menu_submenu};
     let id = lid.to_string();
     if menu_item(app, ui, "Add Selected Objects") {
         layer_members_to(app, std::slice::from_ref(&id), true);
+        ui.close();
     }
     if menu_item(app, ui, "Remove Selected Objects") {
         layer_members_to(app, std::slice::from_ref(&id), false);
+        ui.close();
     }
     if menu_item(app, ui, "Select Objects") {
         let ids: Vec<String> = app.s.nodes.values().filter(|n| n.layer.as_deref() == Some(lid)).map(|n| n.id.clone()).collect();
         app.select_names(&ids, SelMode::Replace);
         app.help = format!("Selected {} object(s) in the layer", ids.len());
+        ui.close();
     }
     if menu_item(app, ui, "Edit Layer...") {
         layer_open_edit(app, lid);
+        ui.close();
     }
     if menu_item(app, ui, "Rename...") {
         if let Some(l) = app.s.layers.iter().find(|l| l.id == lid) {
             app.panels.layer_rename = Some((lid.to_string(), l.name.clone()));
             app.panels.layer_rename_new = true;
         }
+        ui.close();
     }
     ui.separator();
-    ui.menu_button("Set All Layers", |ui| layer_set_entries(app, ui, LayerScope::All));
-    ui.menu_button("Set Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::Selected));
-    ui.menu_button("Set Only Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::OnlySelected));
+    menu_submenu(ui, "Set All Layers", |ui| layer_set_entries(app, ui, LayerScope::All));
+    menu_submenu(ui, "Set Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::Selected));
+    menu_submenu(ui, "Set Only Selected Layers", |ui| layer_set_entries(app, ui, LayerScope::OnlySelected));
     ui.separator();
     if menu_item(app, ui, "Empty the Layer") {
         layer_empty(app, lid);
+        ui.close();
     }
     if menu_item(app, ui, "Delete Layer") {
         layer_delete(app, std::slice::from_ref(&id));
+        ui.close();
     }
     ui.separator();
     if menu_item(app, ui, "Membership...") {
         layer_open_membership(app, lid);
+        ui.close();
     }
     if menu_item(app, ui, "Attributes...") {
         layer_open_attributes(app, lid);
+        ui.close();
     }
 }
 
@@ -5257,7 +5267,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         anim_layer_update(app, &l.id, "ghost animation layer", |l| l.ghost = !l.ghost);
                         ui.ctx().request_repaint();
                     }
-                    ghost_resp.context_menu(|ui| {
+                    crate::menus::show_plain_context_menu(&ghost_resp, |ui| {
                         ui.label("Ghost color");
                         let mut picked = None;
                         ui.horizontal_wrapped(|ui| {
@@ -5389,7 +5399,7 @@ fn anim_base_row(app: &mut IncaApp, ui: &mut egui::Ui) {
                 app.s.touch();
                 ui.ctx().request_repaint();
             }
-            ghost_resp.context_menu(|ui| {
+            crate::menus::show_plain_context_menu(&ghost_resp, |ui| {
                 ui.label("Ghost color");
                 let mut picked = None;
                 ui.horizontal_wrapped(|ui| {
@@ -5634,7 +5644,7 @@ fn layer_row(app: &mut IncaApp, ui: &mut egui::Ui, l: &inca_core::scene::Layer) 
                 app.panels.layer_anchor = Some(l.id.clone());
                 app.s.current_layer = Some(l.id.clone());
             }
-            name.context_menu(|ui| layer_context_menu(app, ui, &l.id));
+            crate::menus::show_context_menu(app, &name, |app, ui| layer_context_menu(app, ui, &l.id));
         });
     });
 }

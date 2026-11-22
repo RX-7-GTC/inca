@@ -2312,7 +2312,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
                                 close = Some(i);
                             }
                         }
-                        resp.context_menu(|ui| {
+                        crate::menus::show_plain_context_menu(&resp, |ui| {
                             if ui.button("Rename Tab...").clicked() {
                                 rename = Some(i);
                                 ui.close();
@@ -2414,7 +2414,7 @@ pub fn window(app: &mut IncaApp, ui: &mut egui::Ui) {
             };
             let restore_resp = crate::icons::button_ex(ui, "undo", &tip, false, 20.0, 16.0, closed_count > 0);
             let mut restore_all = false;
-            restore_resp.context_menu(|ui| {
+            crate::menus::show_plain_context_menu(&restore_resp, |ui| {
                 if ui.button("Restore All Closed Tabs").clicked() {
                     restore_all = true;
                     ui.close();
