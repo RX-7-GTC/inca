@@ -578,6 +578,7 @@ mod tests {
             lock: false,
             override_mode: false,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![nid.clone()],
             attrs: vec![],
             parent: None,

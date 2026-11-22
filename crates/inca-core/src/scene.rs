@@ -2339,6 +2339,13 @@ impl Scene {
         }
     }
 
+    pub fn set_anim_layer_rotation_by_layer(&mut self, id: &str, by_layer: bool) {
+        if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == id) {
+            l.rotation_by_layer = by_layer;
+            self.touch();
+        }
+    }
+
     /// Merge `sources` (and their child layers) into `target`, baking the result onto the
     /// target's curves. Only the part of the stack up to the target is preserved, so layers
     /// above the target keep the same input. Returns false for soloed stacks, a muted target
@@ -2558,6 +2565,7 @@ impl Scene {
                 lock: false,
                 override_mode: src.override_mode,
                 passthrough: src.passthrough,
+                rotation_by_layer: src.rotation_by_layer,
                 members,
                 attrs,
                 parent: src.parent.clone(),
@@ -2677,7 +2685,12 @@ impl Scene {
                 .filter(|l| !self.anim_layer_effective_mute(l) && (!solo || self.anim_layer_soloed(l)))
                 .cloned()
                 .collect();
-            for layer in layers {
+            let by_layer_nodes: HashSet<String> = layers
+                .iter()
+                .filter(|l| l.rotation_by_layer)
+                .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
+                .collect();
+            for layer in &layers {
                 for c in layer.curves.values() {
                     if c.keys.is_empty() || c.mute {
                         continue;
@@ -2685,11 +2698,14 @@ impl Scene {
                     if !self.nodes.contains_key(&c.node) && self.history_ref_by_id(&c.node).is_none() {
                         continue;
                     }
+                    if c.attr.starts_with("rotate") && by_layer_nodes.contains(&c.node) {
+                        continue;
+                    }
                     let lv = c.eval(t);
                     let key = Anim::key(&c.node, &c.attr);
                     let base = self.anim_value_below(&key, t, &layer.id);
                     // Boolean channels (visibility) always behave as override, as in Maya.
-                    let v = self.anim_layer_blend(&layer, &c.attr, base, self.anim_base_value(&key, t), lv, t);
+                    let v = self.anim_layer_blend(layer, &c.attr, base, self.anim_base_value(&key, t), lv, t);
                     if self.nodes.contains_key(&c.node) {
                         let r = NodeRef::Dag(c.node.clone());
                         self.set_attr_ex(&r, &c.attr, json!(v), false);
@@ -2699,6 +2715,66 @@ impl Scene {
                     } else if let Some(r) = self.history_ref_by_id(&c.node) {
                         self.set_attr(&r, &c.attr, json!(v));
                     }
+                }
+            }
+            for node in &by_layer_nodes {
+                let Some(ro) = self.nodes.get(node).map(|n| n.xf.ro.clone()) else { continue };
+                let base_rot = [
+                    self.anim_base_value(&Anim::key(node, "rotateX"), t),
+                    self.anim_base_value(&Anim::key(node, "rotateY"), t),
+                    self.anim_base_value(&Anim::key(node, "rotateZ"), t),
+                ];
+                let mut cur = base_rot;
+                for layer in &layers {
+                    let weight = self.anim_layer_effective_weight_at(layer, t);
+                    if weight <= 1e-6 {
+                        continue;
+                    }
+                    let mut vals = [0.0, 0.0, 0.0];
+                    let mut any = false;
+                    for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
+                        let c = layer.curves.get(&Anim::key(node, attr));
+                        if let Some(c) = c.filter(|c| !c.keys.is_empty() && !c.mute) {
+                            vals[i] = c.eval(t);
+                            any = true;
+                        } else if layer.override_mode {
+                            vals[i] = cur[i];
+                        }
+                    }
+                    if !any {
+                        continue;
+                    }
+                    if layer.rotation_by_layer {
+                        let q_layer = quat_from_euler_deg(vals, &ro);
+                        let q_cur = quat_from_euler_deg(cur, &ro);
+                        let q_out = if layer.override_mode {
+                            let q_from = if layer.passthrough { q_cur } else { quat_from_euler_deg(base_rot, &ro) };
+                            q_from.slerp(q_layer, weight)
+                        } else {
+                            q_cur * DQuat::IDENTITY.slerp(quat_from_euler_deg(vals, &ro), weight)
+                        };
+                        cur = euler_deg_from_quat_near(q_out, &ro, cur);
+                    } else {
+                        for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
+                            if layer.curves.get(&Anim::key(node, attr)).is_none_or(|c| c.keys.is_empty() || c.mute) {
+                                continue;
+                            }
+                            let lv = vals[i];
+                            if layer.override_mode {
+                                let base = if layer.passthrough { cur[i] } else { base_rot[i] };
+                                cur[i] = base + (lv - base) * weight;
+                            } else {
+                                cur[i] += lv * weight;
+                            }
+                        }
+                    }
+                }
+                for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
+                    let r = NodeRef::Dag(node.clone());
+                    self.set_attr_ex(&r, attr, json!(cur[i]), false);
+                }
+                if !moved.contains(node) {
+                    moved.push(node.clone());
                 }
             }
         }
@@ -3959,6 +4035,7 @@ mod tests {
             lock: false,
             override_mode: true,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![],
             attrs: vec![],
             parent: None,
@@ -3996,6 +4073,7 @@ mod tests {
             lock: false,
             override_mode: false,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: None,
@@ -4039,6 +4117,7 @@ mod tests {
             lock: false,
             override_mode,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![node.into()],
             attrs: vec![key],
             parent: None,
@@ -4203,6 +4282,7 @@ mod tests {
             lock: true,
             override_mode: true,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4257,6 +4337,7 @@ mod tests {
                 lock: false,
                 override_mode: false,
                 passthrough: false,
+                rotation_by_layer: false,
                 members: vec![a.clone()],
                 attrs: vec![],
                 parent: None,
@@ -4289,6 +4370,7 @@ mod tests {
             lock: false,
             override_mode: false,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4336,6 +4418,7 @@ mod tests {
             lock: false,
             override_mode: false,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4389,6 +4472,7 @@ mod tests {
             lock: false,
             override_mode: true,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4413,6 +4497,29 @@ mod tests {
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9);
         assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn by_layer_rotation_uses_a_quaternion_slerp() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut layer = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
+        let mut cy = AnimCurve::new(&a, "rotateY");
+        cy.set_key(0.0, 90.0, "linear");
+        layer.curves.insert(Anim::key(&a, "rotateY"), cy);
+        layer.attrs.push(Anim::key(&a, "rotateY"));
+        layer.weight = 0.5;
+        s.anim_layers = vec![layer];
+        s.set_time(0.0);
+        assert!((s.get_attr_f(&a, "rotateX") - 45.0).abs() < 1e-9);
+        assert!((s.get_attr_f(&a, "rotateY") - 45.0).abs() < 1e-9);
+        s.anim_layers[0].rotation_by_layer = true;
+        s.set_time(0.0);
+        let q = quat_from_euler_deg([90.0, 90.0, 0.0], "xyz");
+        let want = euler_deg_from_quat_near(DQuat::IDENTITY.slerp(q, 0.5), "xyz", [0.0, 0.0, 0.0]);
+        assert!((s.get_attr_f(&a, "rotateX") - want[0]).abs() < 1e-9, "by-layer X");
+        assert!((s.get_attr_f(&a, "rotateY") - want[1]).abs() < 1e-9, "by-layer Y");
+        assert!((s.get_attr_f(&a, "rotateZ") - want[2]).abs() < 1e-9, "by-layer Z");
     }
 
     #[test]
@@ -4467,6 +4574,7 @@ mod tests {
             lock: false,
             override_mode: false,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
@@ -4530,6 +4638,7 @@ mod tests {
             lock: false,
             override_mode: false,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![],
             attrs: vec![],
             parent: None,
@@ -4547,6 +4656,7 @@ mod tests {
             lock: false,
             override_mode: false,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: Some("parent".into()),
@@ -4585,6 +4695,7 @@ mod tests {
             lock: false,
             override_mode: false,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: None,
@@ -4622,6 +4733,7 @@ mod tests {
             lock: false,
             override_mode: false,
             passthrough: false,
+            rotation_by_layer: false,
             members: vec![a.clone()],
             attrs: vec![],
             parent: None,
