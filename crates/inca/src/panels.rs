@@ -574,6 +574,11 @@ pub struct PanelState {
     pub anim_layer_sel: Vec<String>,
     /// A weight edit is one undo step from press to release.
     anim_layer_weight_edit: bool,
+    /// Defaults used by Create Layer / Create Layer from Selected.
+    pub layer_default_passthrough: Option<bool>,
+    pub layer_default_rotation_by_layer: bool,
+    pub layer_default_scale_additive: bool,
+    pub create_layer_options_open: bool,
     /// Collapsed animation-layer parents.
     pub anim_layer_collapsed: std::collections::HashSet<String>,
     /// Layer being middle-dragged for parenting.
@@ -4495,9 +4500,9 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
             solo: false,
             lock: false,
             override_mode,
-            passthrough: true,
-            rotation_by_layer: false,
-            scale_additive: false,
+            passthrough: if override_mode { app.panels.layer_default_passthrough.unwrap_or(true) } else { true },
+            rotation_by_layer: app.panels.layer_default_rotation_by_layer,
+            scale_additive: app.panels.layer_default_scale_additive,
             members: vec![],
             attrs: vec![],
             parent: None,
@@ -5079,9 +5084,46 @@ fn anim_layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
     app.s.touch();
 }
 
+fn anim_layer_create_options(app: &mut IncaApp, ctx: &egui::Context) {
+    if !app.panels.create_layer_options_open {
+        return;
+    }
+    let mut open = true;
+    let mut passthrough = app.panels.layer_default_passthrough.unwrap_or(true);
+    let mut rotation_by_layer = app.panels.layer_default_rotation_by_layer;
+    let mut scale_additive = app.panels.layer_default_scale_additive;
+    egui::Window::new("Create Layer Options")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.checkbox(&mut passthrough, "Passthrough (Override Only)");
+            ui.separator();
+            ui.label("Rotation Accumulation");
+            ui.radio_value(&mut rotation_by_layer, false, "By Component");
+            ui.radio_value(&mut rotation_by_layer, true, "By Layer");
+            ui.separator();
+            ui.label("Scale Accumulation");
+            ui.radio_value(&mut scale_additive, false, "Multiply");
+            ui.radio_value(&mut scale_additive, true, "Additive");
+            ui.separator();
+            if ui.button("Reset Defaults").clicked() {
+                passthrough = true;
+                rotation_by_layer = false;
+                scale_additive = false;
+            }
+        });
+    app.panels.layer_default_passthrough = Some(passthrough);
+    app.panels.layer_default_rotation_by_layer = rotation_by_layer;
+    app.panels.layer_default_scale_additive = scale_additive;
+    app.panels.create_layer_options_open = open;
+}
+
 fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::icons;
     use crate::menus::{menu_check, menu_item, menu_submenu, panel_bar, MenuSource};
+    let ctx = ui.ctx().clone();
+    anim_layer_create_options(app, &ctx);
     // Keep the selection valid and make external changes to the current layer (new, merge,
     // extract, delete, scene load) show up as a one-layer selection.
     app.panels.anim_layer_sel.retain(|id| app.s.anim_layers.iter().any(|l| &l.id == id));
@@ -5109,6 +5151,9 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                 });
                 ui.separator();
+                if menu_item(app, ui, "Create Layer Options...") {
+                    app.panels.create_layer_options_open = true;
+                }
                 ui.add_enabled_ui(!app.panels.anim_layer_sel.is_empty() || app.s.anim_layer_current.is_some(), |ui| {
                     if menu_item(app, ui, "Duplicate Layer") {
                         anim_layer_duplicate(app, false);
@@ -7715,6 +7760,25 @@ mod tests {
             }
         }
         assert!(app.s.anim_solo_saved.is_empty());
+    }
+
+    #[test]
+    fn create_layer_options_apply_to_new_layers() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        app.panels.layer_default_passthrough = Some(false);
+        app.panels.layer_default_rotation_by_layer = true;
+        app.panels.layer_default_scale_additive = true;
+        anim_layer_new(&mut app, true);
+        let l = &app.s.anim_layers[0];
+        assert!(l.override_mode && !l.passthrough);
+        assert!(l.rotation_by_layer && l.scale_additive);
+        anim_layer_new(&mut app, false);
+        let l = &app.s.anim_layers[0];
+        assert!(!l.override_mode && l.passthrough);
+        assert!(l.rotation_by_layer && l.scale_additive);
     }
 
     #[test]
