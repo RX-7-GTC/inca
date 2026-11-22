@@ -2146,6 +2146,63 @@ impl Scene {
         }
     }
 
+    /// Final rotation for a node from BaseAnimation and the given bottom-up layer stack.
+    /// Layers using By Layer rotation are combined as quaternions.
+    fn anim_rotation_with_layers(&self, node: &str, t: f64, layers: &[AnimLayer]) -> [f64; 3] {
+        let Some(ro) = self.nodes.get(node).map(|n| n.xf.ro.clone()) else { return [0.0; 3] };
+        let base_rot = [
+            self.anim_base_value(&Anim::key(node, "rotateX"), t),
+            self.anim_base_value(&Anim::key(node, "rotateY"), t),
+            self.anim_base_value(&Anim::key(node, "rotateZ"), t),
+        ];
+        let mut cur = base_rot;
+        for layer in layers {
+            let weight = self.anim_layer_effective_weight_at(layer, t);
+            if weight <= 1e-6 {
+                continue;
+            }
+            let mut vals = [0.0, 0.0, 0.0];
+            let mut any = false;
+            for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
+                let c = layer.curves.get(&Anim::key(node, attr));
+                if let Some(c) = c.filter(|c| !c.keys.is_empty() && !c.mute) {
+                    vals[i] = c.eval(t);
+                    any = true;
+                } else if layer.override_mode {
+                    vals[i] = cur[i];
+                }
+            }
+            if !any {
+                continue;
+            }
+            if layer.rotation_by_layer {
+                let q_layer = quat_from_euler_deg(vals, &ro);
+                let q_cur = quat_from_euler_deg(cur, &ro);
+                let q_out = if layer.override_mode {
+                    let q_from = if layer.passthrough { q_cur } else { quat_from_euler_deg(base_rot, &ro) };
+                    q_from.slerp(q_layer, weight)
+                } else {
+                    q_cur * DQuat::IDENTITY.slerp(quat_from_euler_deg(vals, &ro), weight)
+                };
+                cur = euler_deg_from_quat_near(q_out, &ro, cur);
+            } else {
+                for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
+                    if layer.curves.get(&Anim::key(node, attr)).is_none_or(|c| c.keys.is_empty() || c.mute) {
+                        continue;
+                    }
+                    let lv = vals[i];
+                    if layer.override_mode {
+                        let base = if layer.passthrough { cur[i] } else { base_rot[i] };
+                        cur[i] = base + (lv - base) * weight;
+                    } else {
+                        cur[i] += lv * weight;
+                    }
+                }
+            }
+        }
+        cur
+    }
+
     /// Restore the static pose for layered channels whose layer curves are gone.
     pub fn restore_anim_static(&mut self, keys: &[String]) {
         for key in keys {
@@ -2368,7 +2425,7 @@ impl Scene {
         if merged.contains(target) {
             return false;
         }
-        let result_override = target_layer.override_mode
+        let mut result_override = target_layer.override_mode
             || self.anim_layers.iter().filter(|l| merged.contains(&l.id)).any(|l| l.override_mode);
         // A merge-down removes the block directly above the target; the next surviving layer
         // above must see the same input, so bake the output through the top of that block.
@@ -2382,15 +2439,34 @@ impl Scene {
         } else {
             None
         };
+        let solo = self.anim_layers.iter().any(|l| l.solo);
+        let active: Vec<AnimLayer> = self.anim_layers.iter().rev().filter(|l| !self.anim_layer_effective_mute(l) && (!solo || self.anim_layer_soloed(l))).cloned().collect();
+        let by_layer_nodes: HashSet<String> = active
+            .iter()
+            .filter(|l| (l.id == target || merged.contains(&l.id)) && l.rotation_by_layer)
+            .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
+            .collect();
+        // A slerp cannot reliably encode the inverse of a partial weight (it would need an
+        // arc longer than 180 degrees), so bake by-layer rotations into a weight-1 layer.
+        let normalize_weights = !by_layer_nodes.is_empty();
+        if normalize_weights {
+            result_override = true;
+            let mut probe = target_layer.clone();
+            probe.weight = 1.0;
+            probe.weight_curve = Default::default();
+            if (self.anim_layer_effective_weight_at(&probe, self.time.current) - 1.0).abs() > 1e-6 {
+                return false;
+            }
+        }
         // Only bake attributes the sources actually animate. Muted curves and zero-weight
         // layers contribute nothing, so leave the target's own curves untouched for them.
         let mut keys = HashSet::new();
-        for l in self.anim_layers.iter().filter(|l| merged.contains(&l.id)) {
+        for l in self.anim_layers.iter().filter(|l| merged.contains(&l.id) || (normalize_weights && l.id == target)) {
             if self.anim_layer_effective_mute(l) {
                 continue;
             }
             for (k, c) in &l.curves {
-                if !c.keys.is_empty() && !c.mute {
+                if !c.keys.is_empty() && !c.mute && !(c.attr.starts_with("rotate") && by_layer_nodes.contains(&c.node)) {
                     keys.insert(k.clone());
                 }
             }
@@ -2406,7 +2482,7 @@ impl Scene {
             let samples: Vec<(f64, f64)> = times
                 .into_iter()
                 .filter_map(|time| {
-                    let weight = self.anim_layer_effective_weight_at(&target_layer, time);
+                    let weight = if normalize_weights { 1.0 } else { self.anim_layer_effective_weight_at(&target_layer, time) };
                     if weight <= 1e-6 {
                         cannot_bake = true;
                         return None;
@@ -2416,6 +2492,9 @@ impl Scene {
                     let raw = self.anim_base_value(&key, time);
                     let stored = if result_override {
                         raw + (want - raw) / weight
+                    } else if attr == "visibility" {
+                        // Booleans are evaluated with the override formula even on Additive layers.
+                        base + (want - base) / weight
                     } else if attr.starts_with("scale") {
                         if base.abs() <= 1e-12 {
                             if want.abs() <= 1e-12 {
@@ -2438,6 +2517,38 @@ impl Scene {
                 baked.push((key, samples));
             }
         }
+        if !by_layer_nodes.is_empty() {
+            let boundary = absorb.as_deref().unwrap_or(target);
+            let Some(boundary_i) = active.iter().position(|l| l.id == boundary) else { return false };
+            let want_layers = &active[..=boundary_i];
+            for node in &by_layer_nodes {
+                let Some(ro) = self.nodes.get(node).map(|n| n.xf.ro.clone()) else { continue };
+                let mut times = vec![];
+                for attr in ["rotateX", "rotateY", "rotateZ"] {
+                    times.extend(self.anim_curve_times(&Anim::key(node, attr)));
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                times.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+                if times.is_empty() {
+                    continue;
+                }
+                let mut prev = [0.0; 3];
+                let mut samples: Vec<(f64, [f64; 3])> = vec![];
+                for time in times {
+                    let want = self.anim_rotation_with_layers(node, time, want_layers);
+                    let q_stored = quat_from_euler_deg(want, &ro);
+                    let e = euler_deg_from_quat_near(q_stored, &ro, prev);
+                    prev = e;
+                    samples.push((time, e));
+                }
+                if samples.is_empty() {
+                    continue;
+                }
+                for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
+                    baked.push((Anim::key(node, attr), samples.iter().map(|(t, v)| (*t, v[i])).collect()));
+                }
+            }
+        }
         if cannot_bake {
             return false;
         }
@@ -2446,6 +2557,11 @@ impl Scene {
             let t = &mut self.anim_layers[target_i];
             t.override_mode = result_override;
             t.passthrough = false;
+            t.rotation_by_layer |= !by_layer_nodes.is_empty();
+            if normalize_weights {
+                t.weight = 1.0;
+                t.weight_curve = Default::default();
+            }
             t.mute = false;
             for (key, samples) in &baked {
                 let (node, attr) = key.rsplit_once('.').unwrap();
@@ -2483,6 +2599,13 @@ impl Scene {
         if self.anim_layers.is_empty() {
             return false;
         }
+        let solo = self.anim_layers.iter().any(|l| l.solo);
+        let active: Vec<AnimLayer> = self.anim_layers.iter().rev().filter(|l| !self.anim_layer_effective_mute(l) && (!solo || self.anim_layer_soloed(l))).cloned().collect();
+        let by_layer_nodes: HashSet<String> = active
+            .iter()
+            .filter(|l| l.rotation_by_layer)
+            .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
+            .collect();
         let mut keys = HashSet::new();
         for l in &self.anim_layers {
             for (k, c) in &l.curves {
@@ -2494,12 +2617,32 @@ impl Scene {
         let empty = HashSet::new();
         let mut baked = vec![];
         for key in keys {
+            if let Some((node, attr)) = key.rsplit_once('.') {
+                if attr.starts_with("rotate") && by_layer_nodes.contains(node) {
+                    continue;
+                }
+            }
             let times = self.anim_curve_times(&key);
             if times.is_empty() {
                 continue;
             }
             let samples: Vec<(f64, f64)> = times.into_iter().map(|t| (t, self.anim_value_without(&key, t, &empty))).collect();
             baked.push((key, samples));
+        }
+        for node in &by_layer_nodes {
+            let mut times = vec![];
+            for attr in ["rotateX", "rotateY", "rotateZ"] {
+                times.extend(self.anim_curve_times(&Anim::key(node, attr)));
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            times.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+            if times.is_empty() {
+                continue;
+            }
+            let samples: Vec<(f64, [f64; 3])> = times.iter().map(|t| (*t, self.anim_rotation_with_layers(node, *t, &active))).collect();
+            for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
+                baked.push((Anim::key(node, attr), samples.iter().map(|(t, v)| (*t, v[i])).collect()));
+            }
         }
         self.checkpoint("flatten animation layers");
         for (key, samples) in baked {
@@ -2718,57 +2861,7 @@ impl Scene {
                 }
             }
             for node in &by_layer_nodes {
-                let Some(ro) = self.nodes.get(node).map(|n| n.xf.ro.clone()) else { continue };
-                let base_rot = [
-                    self.anim_base_value(&Anim::key(node, "rotateX"), t),
-                    self.anim_base_value(&Anim::key(node, "rotateY"), t),
-                    self.anim_base_value(&Anim::key(node, "rotateZ"), t),
-                ];
-                let mut cur = base_rot;
-                for layer in &layers {
-                    let weight = self.anim_layer_effective_weight_at(layer, t);
-                    if weight <= 1e-6 {
-                        continue;
-                    }
-                    let mut vals = [0.0, 0.0, 0.0];
-                    let mut any = false;
-                    for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
-                        let c = layer.curves.get(&Anim::key(node, attr));
-                        if let Some(c) = c.filter(|c| !c.keys.is_empty() && !c.mute) {
-                            vals[i] = c.eval(t);
-                            any = true;
-                        } else if layer.override_mode {
-                            vals[i] = cur[i];
-                        }
-                    }
-                    if !any {
-                        continue;
-                    }
-                    if layer.rotation_by_layer {
-                        let q_layer = quat_from_euler_deg(vals, &ro);
-                        let q_cur = quat_from_euler_deg(cur, &ro);
-                        let q_out = if layer.override_mode {
-                            let q_from = if layer.passthrough { q_cur } else { quat_from_euler_deg(base_rot, &ro) };
-                            q_from.slerp(q_layer, weight)
-                        } else {
-                            q_cur * DQuat::IDENTITY.slerp(quat_from_euler_deg(vals, &ro), weight)
-                        };
-                        cur = euler_deg_from_quat_near(q_out, &ro, cur);
-                    } else {
-                        for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
-                            if layer.curves.get(&Anim::key(node, attr)).is_none_or(|c| c.keys.is_empty() || c.mute) {
-                                continue;
-                            }
-                            let lv = vals[i];
-                            if layer.override_mode {
-                                let base = if layer.passthrough { cur[i] } else { base_rot[i] };
-                                cur[i] = base + (lv - base) * weight;
-                            } else {
-                                cur[i] += lv * weight;
-                            }
-                        }
-                    }
-                }
+                let cur = self.anim_rotation_with_layers(node, t, &layers);
                 for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
                     let r = NodeRef::Dag(node.clone());
                     self.set_attr_ex(&r, attr, json!(cur[i]), false);
@@ -4520,6 +4613,79 @@ mod tests {
         assert!((s.get_attr_f(&a, "rotateX") - want[0]).abs() < 1e-9, "by-layer X");
         assert!((s.get_attr_f(&a, "rotateY") - want[1]).abs() < 1e-9, "by-layer Y");
         assert!((s.get_attr_f(&a, "rotateZ") - want[2]).abs() < 1e-9, "by-layer Z");
+    }
+
+    #[test]
+    fn flatten_bakes_by_layer_rotations() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut layer = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
+        let mut cy = AnimCurve::new(&a, "rotateY");
+        cy.set_key(0.0, 90.0, "linear");
+        layer.curves.insert(Anim::key(&a, "rotateY"), cy);
+        layer.attrs.push(Anim::key(&a, "rotateY"));
+        layer.weight = 0.5;
+        layer.rotation_by_layer = true;
+        s.anim_layers = vec![layer];
+        s.set_time(0.0);
+        let before = [s.get_attr_f(&a, "rotateX"), s.get_attr_f(&a, "rotateY"), s.get_attr_f(&a, "rotateZ")];
+        assert!(s.flatten_anim_layers());
+        s.set_time(0.0);
+        for (attr, want) in ["rotateX", "rotateY", "rotateZ"].iter().zip(before) {
+            assert!((s.get_attr_f(&a, attr) - want).abs() < 1e-9, "{attr} changed after flatten");
+        }
+    }
+
+    #[test]
+    fn merging_additive_layers_keeps_visibility_on() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let target = anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 0.0)]);
+        let source = anim_test_layer(&s, "al2", &a, "visibility", false, &[(0.0, 1.0)]);
+        s.anim_layers = vec![target, source];
+        s.set_time(0.0);
+        assert!(s.nodes[&a].visible);
+        assert!(s.merge_anim_layers("al1", &["al2".into()]));
+        s.set_time(0.0);
+        assert!(s.nodes[&a].visible, "merge turned visibility off");
+    }
+
+    #[test]
+    fn merging_by_layer_rotations_keeps_visibility_on() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut target = anim_test_layer(&s, "al1", &a, "visibility", false, &[(0.0, 0.0)]);
+        target.weight = 0.5;
+        let mut source = anim_test_layer(&s, "al2", &a, "rotateX", true, &[(0.0, 90.0)]);
+        source.rotation_by_layer = true;
+        s.anim_layers = vec![target, source];
+        s.set_time(0.0);
+        assert!(s.nodes[&a].visible, "visibility should be on before the merge");
+        assert!(s.merge_anim_layers("al1", &["al2".into()]));
+        s.set_time(0.0);
+        assert!(s.nodes[&a].visible, "merge turned visibility off");
+    }
+
+    #[test]
+    fn merging_by_layer_rotations_preserves_the_pose() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut target = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
+        target.weight = 0.5;
+        target.passthrough = true;
+        target.rotation_by_layer = true;
+        let mut source = anim_test_layer(&s, "al2", &a, "rotateY", true, &[(0.0, 90.0)]);
+        source.rotation_by_layer = true;
+        s.anim_layers = vec![target, source];
+        s.set_time(0.0);
+        let before = [s.get_attr_f(&a, "rotateX"), s.get_attr_f(&a, "rotateY"), s.get_attr_f(&a, "rotateZ")];
+        assert!(s.merge_anim_layers("al1", &["al2".into()]));
+        assert_eq!(s.anim_layers.len(), 1);
+        s.set_time(0.0);
+        for (attr, want) in ["rotateX", "rotateY", "rotateZ"].iter().zip(before) {
+            let got = s.get_attr_f(&a, attr);
+            assert!((got - want).abs() < 1e-9, "{attr} changed after merge: {want} -> {got} (before {before:?})");
+        }
     }
 
     #[test]
