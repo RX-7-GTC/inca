@@ -911,7 +911,8 @@ pub fn menu_disabled(ui: &mut egui::Ui, label: &str) {
 
 /// A dim explanatory row inside a menu, aligned with the other rows.
 pub fn menu_note(ui: &mut egui::Ui, label: &str) {
-    let r = ui.label(egui::RichText::new(menu_label(label)).color(crate::theme::TEXT_DIM));
+    // Buttons preserve the leading gutter spaces; labels trim them.
+    let r = ui.add(egui::Button::new(egui::RichText::new(menu_label(label)).color(crate::theme::TEXT_DIM)).frame(false).sense(egui::Sense::hover()));
     menu_row_band(ui, r.rect);
 }
 

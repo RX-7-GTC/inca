@@ -778,9 +778,12 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
     app.panels.ol_rows = rows;
 }
 
-fn outliner_cmd(app: &mut IncaApp, ui: &mut egui::Ui, label: &str, action: &str) {
+fn outliner_cmd(app: &mut IncaApp, ui: &mut egui::Ui, label: &str, action: &str) -> bool {
     if crate::menus::menu_item(app, ui, label) {
         app.action(action);
+        true
+    } else {
+        false
     }
 }
 
@@ -1054,37 +1057,45 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
             }
         }
     }
-    crate::menus::show_plain_context_menu(&resp, |ui| {
+    crate::menus::show_context_menu(app, &resp, |app, ui| {
         if !app.s.sel.iter().any(|s| s == id) {
             app.select_names(&[id.to_string()], SelMode::Replace);
         }
-        if ui.button("Rename").clicked() {
+        if crate::menus::menu_item(app, ui, "Rename") {
             if !startup {
                 app.panels.renaming = Some((id.to_string(), full_name.clone()));
             }
             ui.close();
         }
-        outliner_cmd(app, ui, "Select Hierarchy", "selectHierarchy");
+        if outliner_cmd(app, ui, "Select Hierarchy", "selectHierarchy") {
+            ui.close();
+        }
         ui.separator();
         for (l, a) in [("Group", "group"), ("Ungroup", "ungroup"), ("Duplicate", "duplicate"), ("Unparent", "unparent"), ("Delete", "deleteSel")] {
-            outliner_cmd(app, ui, l, a);
+            if outliner_cmd(app, ui, l, a) {
+                ui.close();
+            }
         }
         ui.separator();
         for (l, a) in [("Hide", "hideSelection"), ("Show", "showSelection"), ("Isolate Select", "isolateSelect")] {
-            outliner_cmd(app, ui, l, a);
+            if outliner_cmd(app, ui, l, a) {
+                ui.close();
+            }
         }
         ui.separator();
         for (l, a) in [("Frame Selection", "frameSelected"), ("Attribute Editor", "attributeEditor")] {
-            outliner_cmd(app, ui, l, a);
+            if outliner_cmd(app, ui, l, a) {
+                ui.close();
+            }
         }
         ui.separator();
-        if ui.button("Expand All").clicked() {
+        if crate::menus::menu_item(app, ui, "Expand All") {
             for s in app.s.sel.clone() {
                 app.panels.expanded.extend(app.s.subtree(&s));
             }
             ui.close();
         }
-        if ui.button("Collapse All").clicked() {
+        if crate::menus::menu_item(app, ui, "Collapse All") {
             app.panels.expanded.clear();
             ui.close();
         }
@@ -1711,8 +1722,8 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
             cb_arm(app);
         }
         if channel_menu {
-            crate::menus::show_plain_context_menu(&lresp, |ui| {
-                ui.label(RichText::new("Channels").strong().color(theme::TEXT_DIM));
+            crate::menus::show_context_menu(app, &lresp, |app, ui| {
+                crate::menus::menu_note(ui, "Channels");
                 ui.separator();
                 channels_menu(app, ui);
             });
