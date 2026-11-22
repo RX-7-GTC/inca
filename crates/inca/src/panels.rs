@@ -583,6 +583,12 @@ pub struct PanelState {
     pub merge_to_bottom: bool,
     pub merge_options: inca_core::anim::MergeLayerOptions,
     pub merge_options_open: bool,
+    /// Animation layer tabs loaded in the Attribute Editor, in load order.
+    pub anim_layers_ae: Vec<String>,
+    pub anim_layer_ae_name: String,
+    pub anim_layer_ae_saved: String,
+    /// Layer tab to select on the next Attribute Editor frame.
+    pub anim_layer_ae_focus: Option<String>,
     /// Collapsed animation-layer parents.
     pub anim_layer_collapsed: std::collections::HashSet<String>,
     /// Layer being middle-dragged for parenting.
@@ -5093,6 +5099,172 @@ fn anim_layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
     app.s.touch();
 }
 
+fn anim_layer_open_ae(app: &mut IncaApp) {
+    let Some(id) = app.s.anim_layer_current.clone() else { return };
+    if let Some(l) = app.s.anim_layers.iter().find(|l| l.id == id) {
+        if !app.panels.anim_layers_ae.contains(&id) {
+            app.panels.anim_layers_ae.push(id.clone());
+        }
+        app.panels.anim_layer_ae_name = l.name.clone();
+        app.panels.anim_layer_ae_saved = l.name.clone();
+        app.panels.anim_layer_ae_focus = Some(id);
+        app.panels.ae_layer = None;
+        app.snode_sel = None;
+        app.panels.ae_tab_scroll = 0.0;
+        app.right_tab = RightTab::AttributeEditor;
+        app.show_right = true;
+    }
+}
+
+/// Animation layer attributes inside the Attribute Editor panel, like Maya's animLayer node.
+fn anim_layer_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
+    let Some(name) = app.s.anim_layers.iter().find(|l| l.id == lid).map(|l| l.name.clone()) else { return };
+    if app.panels.anim_layer_ae_saved != name {
+        app.panels.anim_layer_ae_name = name.clone();
+        app.panels.anim_layer_ae_saved = name.clone();
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("animLayer:").color(theme::TEXT_DIM));
+        let w = (ui.available_width() - 100.0).max(40.0);
+        let te = ui.add(egui::TextEdit::singleline(&mut app.panels.anim_layer_ae_name).desired_width(w));
+        if te.lost_focus() || (te.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+            let new = app.panels.anim_layer_ae_name.trim().to_string();
+            if !new.is_empty() && new != name {
+                anim_layer_rename_commit(app, lid, &new);
+                app.panels.anim_layer_ae_saved = app.s.anim_layers.iter().find(|l| l.id == lid).map(|l| l.name.clone()).unwrap_or(name);
+                app.panels.anim_layer_ae_name = app.panels.anim_layer_ae_saved.clone();
+            }
+        }
+        if ui.button("Focus").on_hover_text("Show this layer in the Animation Layer Editor").clicked() {
+            app.s.anim_layer_current = Some(lid.to_string());
+            app.panels.anim_layer_sel = vec![lid.to_string()];
+        }
+    });
+    let h = ui.available_height() - 26.0;
+    egui::ScrollArea::vertical().id_salt("anim_layer_aescroll").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| {
+        anim_layer_ae_body(app, ui, lid);
+    });
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui.add_sized([104.0, 20.0], egui::Button::new("Select Objects")).on_hover_text("Select the objects assigned to this layer").clicked() {
+            let ids = app.s.anim_layers.iter().find(|l| l.id == lid).map(|l| l.members.clone()).unwrap_or_default();
+            app.select_names(&ids, SelMode::Replace);
+        }
+        if ui.add_sized([72.0, 20.0], egui::Button::new("Close")).clicked() {
+            app.panels.anim_layers_ae.clear();
+            app.panels.anim_layer_ae_focus = None;
+            app.show_right = false;
+        }
+    });
+}
+
+fn anim_layer_ae_body(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
+    let Some(layer) = app.s.anim_layers.iter().find(|l| l.id == lid).cloned() else { return };
+    let t = app.s.time.current;
+    let mut key_weight = false;
+    let mut weight = layer.weight_at(t);
+    let mut mute = layer.mute;
+    let mut solo = layer.solo;
+    let mut lock = layer.lock;
+    let mut override_mode = layer.override_mode;
+    let mut passthrough = layer.passthrough;
+    let mut rotation_by_layer = layer.rotation_by_layer;
+    let mut scale_additive = layer.scale_additive;
+    let mut ghost = layer.ghost;
+    let mut ghost_color = layer.ghost_color;
+    let parent = layer.parent.as_ref().and_then(|pid| app.s.anim_layers.iter().find(|l| &l.id == pid).map(|l| l.name.clone()));
+    let children: Vec<String> = app.s.anim_layers.iter().filter(|l| l.parent.as_deref() == Some(lid)).map(|l| l.name.clone()).collect();
+    theme::section_header(ui, "Animation Layer Attributes");
+    egui::Grid::new("anim_layer_ae_grid").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
+        ui.label("Weight");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut weight).speed(0.01).range(0.0..=1.0).max_decimals(2));
+            if ui.small_button("Key").on_hover_text("Key the layer weight at the current frame").clicked() {
+                key_weight = true;
+            }
+        });
+        ui.end_row();
+        ui.label("State");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut mute, "Mute");
+            ui.checkbox(&mut solo, "Solo");
+            ui.checkbox(&mut lock, "Lock");
+        });
+        ui.end_row();
+        ui.label("Layer Mode");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut override_mode, false, "Additive");
+            ui.radio_value(&mut override_mode, true, "Override");
+            ui.add_enabled_ui(override_mode, |ui| {
+                ui.checkbox(&mut passthrough, "Passthrough");
+            });
+        });
+        ui.end_row();
+        ui.label("Rotation Accumulation");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut rotation_by_layer, false, "By Component");
+            ui.radio_value(&mut rotation_by_layer, true, "By Layer");
+        });
+        ui.end_row();
+        ui.label("Scale Accumulation");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut scale_additive, false, "Multiply");
+            ui.radio_value(&mut scale_additive, true, "Additive");
+        });
+        ui.end_row();
+        ui.label("Ghost");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut ghost, "Ghost");
+            for c in GHOST_COLORS {
+                if ghost_swatch(ui, c) {
+                    ghost_color = c;
+                }
+            }
+        });
+        ui.end_row();
+        ui.label("Parent Layer");
+        ui.label(parent.as_deref().unwrap_or("None"));
+        ui.end_row();
+        ui.label("Children");
+        ui.label(if children.is_empty() { "None".to_string() } else { children.join(", ") });
+        ui.end_row();
+        ui.label("Membership");
+        ui.label(format!("{} object(s), {} attribute(s)", layer.members.len(), layer.attrs.len()));
+        ui.end_row();
+    });
+    if key_weight {
+        anim_layer_key_weight(app, lid, Some(weight));
+    } else if (weight - layer.weight_at(t)).abs() > 1e-9 {
+        anim_layer_set_weight(app, lid, weight);
+    }
+    // Solo and mute both rewrite mute/lock on the layer, so only apply one state change per frame.
+    if solo != layer.solo {
+        anim_layer_solo(app, lid);
+    } else if mute != layer.mute {
+        anim_layer_mute(app, lid);
+    } else if lock != layer.lock {
+        anim_layer_lock(app, lid);
+    }
+    if override_mode != layer.override_mode {
+        anim_layer_set_override(app, lid, override_mode);
+    }
+    if passthrough != layer.passthrough {
+        anim_layer_set_passthrough(app, lid, passthrough);
+    }
+    if rotation_by_layer != layer.rotation_by_layer {
+        anim_layer_set_rotation_accumulation(app, lid, rotation_by_layer);
+    }
+    if scale_additive != layer.scale_additive {
+        anim_layer_set_scale_accumulation(app, lid, scale_additive);
+    }
+    if ghost != layer.ghost || ghost_color != layer.ghost_color {
+        anim_layer_update(app, lid, "ghost animation layer", |l| {
+            l.ghost = ghost;
+            l.ghost_color = ghost_color;
+        });
+    }
+}
+
 fn anim_layer_create_options(app: &mut IncaApp, ctx: &egui::Context) {
     if !app.panels.create_layer_options_open {
         return;
@@ -5263,6 +5435,11 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 if menu_item(app, ui, "Select Branch") {
                     anim_layer_select_branch(app);
                 }
+                ui.add_enabled_ui(app.s.anim_layer_current.is_some(), |ui| {
+                    if menu_item(app, ui, "Attribute Editor") {
+                        anim_layer_open_ae(app);
+                    }
+                });
                 ui.separator();
                 let current = app.s.anim_layer_current.clone();
                 let can_merge = app.panels.anim_layer_sel.len() >= 2;
@@ -5528,6 +5705,11 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             if menu_item(app, ui, "Rename") {
                                 app.panels.anim_layer_rename = Some((l.id.clone(), l.name.clone()));
                                 app.panels.anim_layer_rename_new = true;
+                                ui.close();
+                            }
+                            if menu_item(app, ui, "Attribute Editor...") {
+                                app.s.anim_layer_current = Some(l.id.clone());
+                                anim_layer_open_ae(app);
                                 ui.close();
                             }
                             if menu_item(app, ui, "Delete") {
@@ -6602,6 +6784,9 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             if menu_item(app, ui, "Load Selected Attributes") {
                 app.panels.ae_locked = None;
                 app.panels.ae_layer = None;
+                app.panels.anim_layers_ae.clear();
+                app.panels.anim_layer_ae_focus = None;
+                app.panels.ae_tab = 0;
             }
         }
         "Selected" => {
@@ -6646,6 +6831,20 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
     });
+    // Animation layers associated with the selected objects get an Attribute Editor tab
+    // automatically, like Maya.
+    for l in &app.s.anim_layers {
+        let associated = app.s.sel.iter().any(|n| {
+            l.members.contains(n) || l.attrs.iter().any(|k| k.rsplit_once('.').is_some_and(|(node, _)| node == n))
+        });
+        if associated && !app.panels.anim_layers_ae.contains(&l.id) {
+            app.panels.anim_layers_ae.push(l.id.clone());
+        }
+    }
+    app.panels.anim_layers_ae.retain(|id| app.s.anim_layers.iter().any(|l| &l.id == id));
+    if app.panels.anim_layer_ae_focus.as_ref().is_some_and(|id| !app.panels.anim_layers_ae.contains(id)) {
+        app.panels.anim_layer_ae_focus = None;
+    }
     if let Some(lid) = app.panels.ae_layer.clone() {
         if !app.s.layers.iter().any(|l| l.id == lid) || app.s.sel != app.panels.ae_layer_sel {
             app.panels.ae_layer = None;
@@ -6658,15 +6857,24 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         shading_attribute_editor(app, ui);
         return;
     }
-    let Some(id) = target else {
+    let node_tabs = target.as_deref().map(|id| ae_tabs(app, id)).unwrap_or_default();
+    let layer_tabs: Vec<(String, String)> = app
+        .panels
+        .anim_layers_ae
+        .iter()
+        .filter_map(|lid| app.s.anim_layers.iter().find(|l| &l.id == lid).map(|l| (l.id.clone(), l.name.clone())))
+        .collect();
+    let tab_count = node_tabs.len() + layer_tabs.len();
+    if tab_count == 0 {
         ui.label(RichText::new("Select an object to see its attributes.").color(theme::TEXT_DIM));
         return;
-    };
-    let tabs = ae_tabs(app, &id);
-    if tabs.is_empty() {
-        return;
     }
-    let mut tab = app.panels.ae_tab.min(tabs.len() - 1);
+    let mut tab = app.panels.ae_tab.min(tab_count - 1);
+    if let Some(focus) = app.panels.anim_layer_ae_focus.take() {
+        if let Some(i) = layer_tabs.iter().position(|(id, _)| id == &focus) {
+            tab = node_tabs.len() + i;
+        }
+    }
     ui.horizontal(|ui| {
         let scroll_w = (ui.available_width() - 46.0).max(80.0);
         let out = egui::ScrollArea::horizontal()
@@ -6676,9 +6884,15 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             .horizontal_scroll_offset(app.panels.ae_tab_scroll)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (i, (t, _)) in tabs.iter().enumerate() {
+                    for (i, (t, _)) in node_tabs.iter().enumerate() {
                         if ui.selectable_label(tab == i, t).clicked() {
                             tab = i;
+                        }
+                    }
+                    for (i, (_, name)) in layer_tabs.iter().enumerate() {
+                        let idx = node_tabs.len() + i;
+                        if ui.selectable_label(tab == idx, name).clicked() {
+                            tab = idx;
                         }
                     }
                 });
@@ -6692,10 +6906,22 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     });
     app.panels.ae_tab = tab;
+    if tab >= node_tabs.len() {
+        let li = tab - node_tabs.len();
+        if let Some((lid, _)) = layer_tabs.get(li) {
+            anim_layer_attribute_editor(app, ui, lid);
+        }
+        return;
+    }
+    let node_i = tab;
+    let Some(id) = target else { return };
+    let Some((title, tab_ref)) = node_tabs.get(node_i) else { return };
+    let title = title.clone();
+    let tab_ref = tab_ref.clone();
     // node row: transform/shape label, Focus, Presets, lock; then Show/Hide
     ui.horizontal(|ui| {
-        let kind = match &tabs[tab].1 {
-            NodeRef::Dag(_) if tab == 0 => "transform:",
+        let kind = match &tab_ref {
+            NodeRef::Dag(_) if node_i == 0 => "transform:",
             NodeRef::Dag(_) => "shape:",
             NodeRef::History(..) => "history:",
             NodeRef::Material(_) => "material:",
@@ -6703,7 +6929,6 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             NodeRef::Place2D(_) => "placement:",
         };
         ui.label(RichText::new(kind).color(theme::TEXT_DIM));
-        let title = tabs[tab].0.clone();
         if app.panels.ae_name.0 != title {
             app.panels.ae_name = (title.clone(), title.clone());
         }
@@ -6718,7 +6943,7 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         if ui.button("Focus").on_hover_text("Show the selected node").clicked() {
             app.panels.ae_locked = None;
         }
-        let preset_node = tabs[tab].1.clone();
+        let preset_node = tab_ref.clone();
         let preset_kind = ae_preset_kind(app, &preset_node);
         ui.add_enabled_ui(preset_kind.is_some(), |ui| {
             let button = ui.menu_button("Presets", |ui| {
@@ -6771,7 +6996,7 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         });
     });
     let h = ui.available_height() - 26.0;
-    egui::ScrollArea::vertical().id_salt("aescroll").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
+    egui::ScrollArea::vertical().id_salt("aescroll").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &node_tabs, node_i));
     ui.separator();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
@@ -6785,9 +7010,12 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         if b(ui, "Load Attributes", w * 1.4) {
             app.panels.ae_locked = None;
             app.panels.ae_layer = None;
+            app.panels.anim_layers_ae.clear();
+            app.panels.anim_layer_ae_focus = None;
+            app.panels.ae_tab = 0;
         }
         if b(ui, "Copy Tab", w) {
-            app.panels.ae_copies.push((id.clone(), tab));
+            app.panels.ae_copies.push((id.clone(), node_i));
         }
         if b(ui, "Close", w) {
             app.show_right = false;
@@ -8023,6 +8251,52 @@ mod tests {
         app.s.set_time(5.0);
         let v = app.s.get_attr_f(&nid, "translateX");
         assert!((v - 5.0).abs() < 1e-9, "merged pose is {v}, curves: {:?}", app.s.anim_layers[0].curves.values().map(|c| c.keys.iter().map(|k| (k.t, k.v)).collect::<Vec<_>>()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn layer_attributes_editor_opens_for_the_current_layer() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        for _ in 0..2 {
+            anim_layer_new(&mut app, false);
+        }
+        let current = app.s.anim_layer_current.clone().expect("current layer");
+        let name = app.s.anim_layers.iter().find(|l| l.id == current).expect("layer").name.clone();
+        app.panels.anim_layers_ae.clear();
+        anim_layer_open_ae(&mut app);
+        assert!(app.panels.anim_layers_ae.contains(&current));
+        assert_eq!(app.panels.anim_layer_ae_name, name);
+        assert_eq!(app.panels.anim_layer_ae_saved, name);
+        assert_eq!(app.panels.anim_layer_ae_focus.as_deref(), Some(current.as_str()));
+        assert_eq!(app.right_tab, RightTab::AttributeEditor);
+        assert!(app.show_right);
+    }
+
+    #[test]
+    fn animation_layer_gets_an_attribute_editor_tab() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        let node_tabs = ae_tabs(&app, &nid).len();
+        app.right_tab = RightTab::AttributeEditor;
+        app.show_right = true;
+        let mut out = ctx.run_ui(raw(vec![], 0.0), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+        out.textures_delta.clear();
+        assert!(app.panels.anim_layers_ae.contains(&lid), "an associated layer should get a tab automatically");
+        assert_ne!(app.panels.ae_tab, node_tabs, "the automatic tab must not steal the node tab");
+        anim_layer_open_ae(&mut app);
+        let mut out = ctx.run_ui(raw(vec![], 0.1), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+        out.textures_delta.clear();
+        assert_eq!(app.panels.ae_tab, node_tabs, "the layer tab should follow the node tabs");
+        assert!(app.panels.anim_layer_ae_focus.is_none());
     }
 
     #[test]
