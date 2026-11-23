@@ -1187,7 +1187,7 @@ pub fn right_panel(app: &mut IncaApp, ui: &mut egui::Ui) {
         RightTab::ChannelBox => {
             channel_box_menu(app, ui);
             let h = ui.available_height();
-            egui::ScrollArea::vertical().id_salt("cbscroll").max_height(h * 0.68).auto_shrink([false, false]).show(ui, |ui| channel_box(app, ui));
+            egui::ScrollArea::vertical().id_salt("cbscroll").content_margin(scroll_gutter(ui)).max_height(h * 0.68).auto_shrink([false, false]).show(ui, |ui| channel_box(app, ui));
             ui.separator();
             layer_editor(app, ui);
         }
@@ -1469,24 +1469,39 @@ fn channel_row(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: 
     channel_row_impl(app, ui, targets, attr, label, kind, min, max, None);
 }
 
-/// Attribute Editor limit row: Min/Max XYZ plus the enable checkbox.
+/// Attribute Editor limit field: a fixed-width box so Min/Max columns line up across rows.
+fn limit_drag(ui: &mut egui::Ui, value: &mut f64) -> bool {
+    let old = ui.spacing().interact_size.x;
+    ui.spacing_mut().interact_size.x = 74.0;
+    let changed = ui
+        .add(egui::DragValue::new(value).speed(0.1).custom_formatter(|n, _| {
+            if n.abs() >= 10_000.0 {
+                format!("{n:.0}")
+            } else {
+                format!("{n:.1}")
+            }
+        }))
+        .changed();
+    ui.spacing_mut().interact_size.x = old;
+    changed
+}
+
+/// Attribute Editor limit rows: shared grid columns keep every Min/Max box aligned.
 fn limit_row(ui: &mut egui::Ui, label: &str, lim: &mut Limit, changed: &mut bool) {
-    egui::Grid::new(("limit", label)).num_columns(6).spacing([3.0, 3.0]).show(ui, |ui| {
-        ui.label(label);
-        ui.label("Min");
-        for i in 0..3 {
-            *changed |= ui.add_sized([42.0, 18.0], egui::DragValue::new(&mut lim.min[i]).speed(0.1)).changed();
-        }
-        *changed |= ui.checkbox(&mut lim.on, "Limit").changed();
-        ui.end_row();
-        ui.label("");
-        ui.label("Max");
-        for i in 0..3 {
-            *changed |= ui.add_sized([42.0, 18.0], egui::DragValue::new(&mut lim.max[i]).speed(0.1)).changed();
-        }
-        ui.label("");
-        ui.end_row();
-    });
+    ui.label(label);
+    ui.label("Min");
+    for i in 0..3 {
+        *changed |= limit_drag(ui, &mut lim.min[i]);
+    }
+    *changed |= ui.checkbox(&mut lim.on, "Limit").changed();
+    ui.end_row();
+    ui.label("");
+    ui.label("Max");
+    for i in 0..3 {
+        *changed |= limit_drag(ui, &mut lim.max[i]);
+    }
+    ui.label("");
+    ui.end_row();
 }
 
 /// Attribute Editor vector row: one label followed by three numeric fields.
@@ -1496,8 +1511,7 @@ fn channel_vec_row(app: &mut IncaApp, ui: &mut egui::Ui, rows: &mut Vec<CbRow>, 
         ui.painter().text(lr.right_center() - egui::vec2(6.0, 0.0), egui::Align2::RIGHT_CENTER, label, egui::FontId::proportional(12.0), theme::TEXT);
         let gap = ui.spacing().item_spacing.x;
         let w = ((ui.available_width() - gap * 2.0) / 3.0).max(24.0);
-        for (i, attr) in attrs.iter().enumerate() {
-            let w = if i == 2 { ui.available_width().max(24.0) } else { w };
+        for attr in attrs.iter() {
             cb_numeric_cell(app, ui, w, targets, attr, ChanKind::Float, None, None, decimals, rows, lr, false);
         }
     });
@@ -3876,6 +3890,15 @@ fn layer_set_members(app: &mut IncaApp, lid: &str, ids: &[String], member: bool)
     app.s.touch();
 }
 
+/// A permanent right gutter keeps a floating scroll bar off the value fields. The allocated
+/// width is zero so the content does not shift when the bar appears.
+fn scroll_gutter(ui: &mut egui::Ui) -> egui::Margin {
+    let scroll = &mut ui.spacing_mut().scroll;
+    scroll.floating = true;
+    scroll.floating_allocated_width = 0.0;
+    egui::Margin { left: 0, right: 14, top: 0, bottom: 0 }
+}
+
 /// Display layer attributes inside the Attribute Editor panel.
 fn layer_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
     let Some(name) = app.s.layers.iter().find(|l| l.id == lid).map(|l| l.name.clone()) else { return };
@@ -3900,7 +3923,7 @@ fn layer_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
         }
     });
     let h = ui.available_height() - 26.0;
-    egui::ScrollArea::vertical().id_salt("layer_aescroll").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("layer_aescroll").content_margin(scroll_gutter(ui)).max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| {
         layer_ae_body(app, ui, lid);
     });
     ui.separator();
@@ -5141,7 +5164,7 @@ fn anim_layer_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) 
         }
     });
     let h = ui.available_height() - 26.0;
-    egui::ScrollArea::vertical().id_salt("anim_layer_aescroll").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("anim_layer_aescroll").content_margin(scroll_gutter(ui)).max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| {
         anim_layer_ae_body(app, ui, lid);
     });
     ui.separator();
@@ -6697,7 +6720,7 @@ fn shading_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.label(RichText::new(&tabs[tab].0).strong());
     });
     let h = ui.available_height() - 26.0;
-    egui::ScrollArea::vertical().id_salt("aescroll_snode").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
+    egui::ScrollArea::vertical().id_salt("aescroll_snode").content_margin(scroll_gutter(ui)).max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
 }
 
 fn ae_preset_kind(app: &IncaApp, node: &NodeRef) -> Option<String> {
@@ -6996,7 +7019,7 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         });
     });
     let h = ui.available_height() - 26.0;
-    egui::ScrollArea::vertical().id_salt("aescroll").max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &node_tabs, node_i));
+    egui::ScrollArea::vertical().id_salt("aescroll").content_margin(scroll_gutter(ui)).max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &node_tabs, node_i));
     ui.separator();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
@@ -7058,7 +7081,7 @@ pub fn ae_copies(app: &mut IncaApp, ctx: &egui::Context) {
             }
             window.show(ctx, |ui| {
                 ui.push_id(("aecopy", i), |ui| {
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
+                            egui::ScrollArea::vertical().content_margin(scroll_gutter(ui)).auto_shrink([false, false]).show(ui, |ui| ae_body(app, ui, &tabs, tab));
                 });
             })
         });
@@ -7173,9 +7196,11 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
             if theme::fold_ae_closed(ui, "Limit Information") {
                 let mut lim = app.s.node(id).map(|n| n.xf.lim.clone()).unwrap_or_default();
                 let mut changed = false;
-                limit_row(ui, "Translate", &mut lim.translate, &mut changed);
-                limit_row(ui, "Rotate", &mut lim.rotate, &mut changed);
-                limit_row(ui, "Scale", &mut lim.scale, &mut changed);
+                egui::Grid::new("limit_info").num_columns(6).spacing([3.0, 3.0]).show(ui, |ui| {
+                    limit_row(ui, "Translate", &mut lim.translate, &mut changed);
+                    limit_row(ui, "Rotate", &mut lim.rotate, &mut changed);
+                    limit_row(ui, "Scale", &mut lim.scale, &mut changed);
+                });
                 if changed {
                     if !app.panels.ae_limit_editing {
                         app.s.checkpoint("limits");
