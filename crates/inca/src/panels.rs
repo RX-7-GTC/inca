@@ -1476,7 +1476,7 @@ fn channel_row(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], attr: 
 /// Attribute Editor limit field: a fixed-width box so Min/Max columns line up across rows.
 fn limit_drag(ui: &mut egui::Ui, value: &mut f64) -> bool {
     let old = ui.spacing().interact_size.x;
-    ui.spacing_mut().interact_size.x = 74.0;
+    ui.spacing_mut().interact_size.x = 66.0;
     let changed = ui
         .add(egui::DragValue::new(value).speed(0.1).custom_formatter(|n, _| {
             if n.abs() >= 10_000.0 {
@@ -7084,6 +7084,59 @@ fn ae_save_preset(app: &mut IncaApp, node: &NodeRef, kind: &str, name: &str) {
     app.help = format!("Saved {kind} preset \"{name}\"");
 }
 
+/// BaseAnimation gets a tab when the selected objects have base curves, or when layer tabs
+/// are already loaded (Maya shows it alongside animation layers).
+fn ae_base_tab_visible(app: &IncaApp, has_layer_tabs: bool) -> bool {
+    has_layer_tabs || app.s.anim.curves.values().any(|c| !c.keys.is_empty() && app.s.sel.contains(&c.node))
+}
+
+fn anim_base_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("animLayer:").color(theme::TEXT_DIM));
+        ui.label(RichText::new("BaseAnimation").strong());
+    });
+    let h = ui.available_height() - 26.0;
+    egui::ScrollArea::vertical().id_salt("base_aescroll").content_margin(scroll_gutter(ui)).max_height(h.max(40.0)).auto_shrink([false, false]).show(ui, |ui| {
+        theme::section_header(ui, "Base Animation Attributes");
+        egui::Grid::new("base_ae_grid").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
+            ui.label("Weight");
+            let mut weight = 1.0;
+            ui.add_enabled(false, egui::DragValue::new(&mut weight).range(0.0..=1.0).max_decimals(2)).on_disabled_hover_text("BaseAnimation always contributes at full weight");
+            ui.end_row();
+            ui.label("State");
+            ui.horizontal(|ui| {
+                let mut off = false;
+                ui.add_enabled(false, egui::Checkbox::new(&mut off, "Mute"));
+                ui.add_enabled(false, egui::Checkbox::new(&mut off, "Solo"));
+                ui.add_enabled(false, egui::Checkbox::new(&mut off, "Lock"));
+            });
+            ui.end_row();
+        });
+        theme::section_header(ui, "Animated Attributes");
+        let objects = app.s.sel.clone();
+        let mut any = false;
+        for nid in &objects {
+            let mut curves: Vec<&inca_core::anim::AnimCurve> = app.s.anim.curves.values().filter(|c| &c.node == nid && !c.keys.is_empty()).collect();
+            if curves.is_empty() {
+                continue;
+            }
+            any = true;
+            curves.sort_by_key(|c| (anim_attr_rank(&c.attr), c.attr.clone()));
+            ui.label(RichText::new(shown_node_name(app, &app.s.name_of(nid))).strong());
+            egui::Grid::new(("base_curves", nid)).num_columns(2).spacing([10.0, 3.0]).show(ui, |ui| {
+                for c in curves {
+                    ui.label(inca_core::ops::nice_name(&c.attr));
+                    ui.label(inca_core::math::fmt_num(c.eval(app.s.time.current)));
+                    ui.end_row();
+                }
+            });
+        }
+        if !any {
+            ui.label(RichText::new("No BaseAnimation curves for the selected objects.").color(theme::TEXT_DIM));
+        }
+    });
+}
+
 pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::menus::{menu_check, menu_item, panel_bar, MenuSource};
     let target = ae_target(app);
@@ -7178,7 +7231,8 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         .iter()
         .filter_map(|lid| app.s.anim_layers.iter().find(|l| &l.id == lid).map(|l| (l.id.clone(), l.name.clone())))
         .collect();
-    let tab_count = node_tabs.len() + layer_tabs.len();
+    let base_slot = usize::from(ae_base_tab_visible(app, !layer_tabs.is_empty()));
+    let tab_count = node_tabs.len() + layer_tabs.len() + base_slot;
     if tab_count == 0 {
         ui.label(RichText::new("Select an object to see its attributes.").color(theme::TEXT_DIM));
         return;
@@ -7190,7 +7244,7 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     }
     ui.horizontal(|ui| {
-        let scroll_w = (ui.available_width() - 46.0).max(80.0);
+        let scroll_w = (ui.available_width() - 64.0).max(80.0);
         let out = egui::ScrollArea::horizontal()
             .id_salt("aetabs")
             .max_width(scroll_w)
@@ -7209,14 +7263,21 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             tab = idx;
                         }
                     }
+                    if base_slot == 1 {
+                        let idx = node_tabs.len() + layer_tabs.len();
+                        if ui.selectable_label(tab == idx, "BaseAnimation").clicked() {
+                            tab = idx;
+                        }
+                    }
                 });
             });
-        app.panels.ae_tab_scroll = out.state.offset.x;
+        let max_scroll = (out.content_size.x - out.inner_rect.width()).max(0.0);
+        app.panels.ae_tab_scroll = out.state.offset.x.min(max_scroll);
         if ui.small_button("◀").on_hover_text("Scroll tabs left").clicked() {
             app.panels.ae_tab_scroll = (app.panels.ae_tab_scroll - 80.0).max(0.0);
         }
         if ui.small_button("▶").on_hover_text("Scroll tabs right").clicked() {
-            app.panels.ae_tab_scroll += 80.0;
+            app.panels.ae_tab_scroll = (app.panels.ae_tab_scroll + 80.0).min(max_scroll);
         }
     });
     app.panels.ae_tab = tab;
@@ -7224,6 +7285,8 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let li = tab - node_tabs.len();
         if let Some((lid, _)) = layer_tabs.get(li) {
             anim_layer_attribute_editor(app, ui, lid);
+        } else {
+            anim_base_attribute_editor(app, ui);
         }
         return;
     }
@@ -8543,6 +8606,28 @@ mod tests {
     }
 
     #[test]
+    fn attribute_editor_width_stays_stable_with_layer_tabs() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        anim_layer_open_ae(&mut app);
+        let id = egui::Id::new(("rightpanel", RightTab::AttributeEditor));
+        let mut widths = vec![];
+        for i in 0..8 {
+            let mut out = ctx.run_ui(raw(vec![egui::Event::PointerMoved(egui::pos2(700.0 + i as f32 * 3.0, 300.0))], i as f64 * 0.1), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+            out.textures_delta.clear();
+            widths.push(egui::containers::panel::PanelState::load(&ctx, id).map(|s| s.outer_rect.width()).expect("AE panel width"));
+        }
+        assert!(widths.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5), "AE panel grew with layer tabs: {widths:?}");
+        assert!(widths[0] < 420.0, "AE panel opened wider than its minimum: {widths:?}");
+    }
+
+    #[test]
     fn merging_layers_keeps_the_top_layer() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
@@ -8656,6 +8741,22 @@ mod tests {
         let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("layer");
         assert!(layer.attrs.contains(&inca_core::anim::Anim::key(&nid, "translateX")));
         assert_eq!(app.panels.anim_layer_membership.as_deref(), Some(lid.as_str()));
+    }
+
+    #[test]
+    fn base_animation_tab_appears_for_animated_selection() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        assert!(!ae_base_tab_visible(&app, false));
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(1.0)));
+        assert!(ae_base_tab_visible(&app, false), "base curves should add the tab");
+        app.s.sel.clear();
+        assert!(!ae_base_tab_visible(&app, false), "no selection, no base tab");
+        assert!(ae_base_tab_visible(&app, true), "layer tabs force the base tab");
     }
 
     #[test]
