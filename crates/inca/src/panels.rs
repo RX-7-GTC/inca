@@ -589,6 +589,10 @@ pub struct PanelState {
     pub anim_layer_ae_saved: String,
     /// Layer tab to select on the next Attribute Editor frame.
     pub anim_layer_ae_focus: Option<String>,
+    /// Membership editor: selected animation layer and expanded attribute/object rows.
+    pub anim_layer_membership: Option<String>,
+    pub anim_layer_membership_open: std::collections::HashSet<String>,
+    pub anim_membership_open: std::collections::HashSet<String>,
     /// Collapsed animation-layer parents.
     pub anim_layer_collapsed: std::collections::HashSet<String>,
     /// Layer being middle-dragged for parenting.
@@ -4659,6 +4663,240 @@ fn anim_layer_attrs_from_picks(app: &mut IncaApp, add: bool) {
     app.s.touch();
 }
 
+/// Expand old object-level layers to explicit attributes before editing membership.
+fn anim_layer_membership_normalize(app: &mut IncaApp) {
+    for i in 0..app.s.anim_layers.len() {
+        if !app.s.anim_layers[i].attrs.is_empty() || app.s.anim_layers[i].members.is_empty() {
+            continue;
+        }
+        let mut attrs = vec![];
+        for node in &app.s.anim_layers[i].members {
+            for attr in app.s.keyable_attrs(node) {
+                attrs.push(inca_core::anim::Anim::key(node, &attr));
+            }
+        }
+        attrs.sort();
+        attrs.dedup();
+        app.s.anim_layers[i].attrs = attrs;
+    }
+}
+
+fn anim_layer_membership_show(app: &mut IncaApp) {
+    anim_layer_membership_normalize(app);
+    let id = app.s.anim_layer_current.clone().or_else(|| app.s.anim_layers.first().map(|l| l.id.clone()));
+    if let Some(id) = id {
+        app.panels.anim_layer_membership = Some(id);
+    }
+}
+
+/// Toggle one attribute on a layer. Removing an attribute also removes its layer curve.
+fn anim_layer_membership_toggle(app: &mut IncaApp, lid: &str, node: &str, attr: &str) {
+    let key = inca_core::anim::Anim::key(node, attr);
+    let Some(layer) = app.s.anim_layers.iter().find(|l| l.id == lid) else { return };
+    if layer.attrs.contains(&key) {
+        app.s.checkpoint("remove attribute from animation layer");
+        let mut removed_curve = false;
+        if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == lid) {
+            removed_curve = l.curves.shift_remove(&key).is_some();
+            l.attrs.retain(|k| k != &key);
+            let still = l.attrs.iter().any(|k| k.rsplit_once('.').is_some_and(|(n, _)| n == node));
+            if !still {
+                l.members.retain(|m| m != node);
+            }
+        }
+        if removed_curve {
+            app.s.restore_anim_static(std::slice::from_ref(&key));
+        }
+        app.s.set_time(app.s.time.current);
+        app.s.touch();
+    } else {
+        app.s.checkpoint("add attribute to animation layer");
+        app.s.remember_anim_static(&[node.to_string()]);
+        if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == lid) {
+            if !l.attrs.contains(&key) {
+                l.attrs.push(key);
+                l.attrs.sort();
+            }
+            if !l.members.iter().any(|m| m == node) {
+                l.members.push(node.to_string());
+            }
+        }
+        app.s.set_time(app.s.time.current);
+        app.s.touch();
+    }
+}
+
+fn anim_attr_rank(attr: &str) -> usize {
+    inca_core::scene::CHANNELS.iter().position(|c| c == &attr).unwrap_or(usize::MAX)
+}
+
+/// Relationship Editor for animation layers: layers on the left, selected objects and their
+/// attributes on the right. Clicking an attribute toggles it on the selected layer.
+pub(crate) fn anim_layer_membership_dialog(app: &mut IncaApp, ctx: &egui::Context) {
+    let Some(mut lid) = app.panels.anim_layer_membership.clone() else { return };
+    if !app.s.anim_layers.iter().any(|l| l.id == lid) {
+        let Some(first) = app.s.anim_layers.first().map(|l| l.id.clone()) else {
+            app.panels.anim_layer_membership = None;
+            return;
+        };
+        lid = first;
+        app.panels.anim_layer_membership = Some(lid.clone());
+    }
+    let layers = app.s.anim_layers.clone();
+    let order = anim_layer_order(&layers, &std::collections::HashSet::new());
+    let objects = app.s.sel.clone();
+    let layer_name = layers.iter().find(|l| l.id == lid).map(|l| l.name.clone()).unwrap_or_default();
+    let mut open = true;
+    let is_open = open;
+    let mut close = false;
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("anim_layer_membership_editor"), is_open, |app, fix| {
+        let mut window = egui::Window::new("Relationship Editor").id(egui::Id::new("anim_layer_membership_editor")).default_size([760.0, 520.0]).resizable(true);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.open(&mut open).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Animation layers").strong());
+                ui.label(RichText::new(format!("{layer_name} — {} selected object(s)", objects.len())).color(theme::TEXT_DIM));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.separator();
+            ui.columns(2, |cols| {
+                cols[0].vertical(|ui| {
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Animation Layers").strong()));
+                    egui::ScrollArea::vertical().id_salt("anim_membership_layers").max_height(400.0).auto_shrink([false, false]).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        for (layer, depth) in &order {
+                            let selected = app.panels.anim_layer_membership.as_deref() == Some(layer.id.as_str());
+                            let expanded = app.panels.anim_layer_membership_open.contains(&layer.id);
+                            let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+                            if selected {
+                                ui.painter().rect_filled(r, 0.0, theme::HI);
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(r, 0.0, Color32::from_gray(0x4d));
+                            }
+                            let x = r.min.x + 4.0 + *depth as f32 * 12.0;
+                            if !layer.attrs.is_empty() {
+                                let c = egui::pos2(x + 4.0, r.center().y);
+                                let pts = if expanded {
+                                    vec![c + egui::vec2(-3.0, -2.0), c + egui::vec2(3.0, -2.0), c + egui::vec2(0.0, 2.0)]
+                                } else {
+                                    vec![c + egui::vec2(-2.0, -3.0), c + egui::vec2(2.0, 0.0), c + egui::vec2(-2.0, 3.0)]
+                                };
+                                ui.painter().add(egui::Shape::convex_polygon(pts, theme::TEXT, egui::Stroke::NONE));
+                            }
+                            ui.painter().text(egui::pos2(x + 14.0, r.center().y), egui::Align2::LEFT_CENTER, &layer.name, egui::FontId::proportional(12.0), if selected { Color32::WHITE } else { theme::TEXT });
+                            let on_arrow = resp.interact_pointer_pos().is_some_and(|p| p.x < x + 14.0);
+                            if resp.clicked() {
+                                if on_arrow && !layer.attrs.is_empty() {
+                                    if expanded {
+                                        app.panels.anim_layer_membership_open.remove(&layer.id);
+                                    } else {
+                                        app.panels.anim_layer_membership_open.insert(layer.id.clone());
+                                    }
+                                } else {
+                                    app.panels.anim_layer_membership = Some(layer.id.clone());
+                                    app.s.anim_layer_current = Some(layer.id.clone());
+                                    app.panels.anim_layer_sel = vec![layer.id.clone()];
+                                }
+                            }
+                            if expanded {
+                                let mut attrs = layer.attrs.clone();
+                                attrs.sort_by_key(|k| {
+                                    let (node, attr) = k.rsplit_once('.').unwrap_or(("", k.as_str()));
+                                    (node.to_lowercase(), anim_attr_rank(attr), attr.to_string())
+                                });
+                                if attrs.is_empty() {
+                                    ui.label(RichText::new("No attributes").color(theme::TEXT_DIM));
+                                }
+                                for key in attrs {
+                                    let (node, attr) = key.rsplit_once('.').unwrap_or(("", key.as_str()));
+                                    let node_name = shown_node_name(app, &app.s.name_of(node));
+                                    let text = format!("{node_name}  {}", inca_core::ops::nice_name(attr));
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(x - r.min.x + 16.0);
+                                        ui.label(RichText::new(text).color(theme::TEXT_DIM).small());
+                                    });
+                                }
+                            }
+                        }
+                    });
+                });
+                cols[1].vertical(|ui| {
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Selected Objects").strong()));
+                    let selected_layer = app.s.anim_layers.iter().find(|l| l.id == lid).cloned();
+                    if objects.is_empty() {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Select objects in the scene to view their attributes.").color(theme::TEXT_DIM));
+                    }
+                    egui::ScrollArea::vertical().id_salt("anim_membership_objects").max_height(400.0).auto_shrink([false, false]).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        for nid in &objects {
+                            let Some(n) = app.s.node(nid) else { continue };
+                            let name = shown_node_name(app, &n.name);
+                            let icon = kind_icon(n);
+                            let expanded = app.panels.anim_membership_open.contains(nid);
+                            let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::click());
+                            if resp.hovered() {
+                                ui.painter().rect_filled(r, 0.0, Color32::from_gray(0x4d));
+                            }
+                            let c = egui::pos2(r.min.x + 8.0, r.center().y);
+                            let pts = if expanded {
+                                vec![c + egui::vec2(-3.5, -2.0), c + egui::vec2(3.5, -2.0), c + egui::vec2(0.0, 2.5)]
+                            } else {
+                                vec![c + egui::vec2(-2.0, -3.5), c + egui::vec2(2.5, 0.0), c + egui::vec2(-2.0, 3.5)]
+                            };
+                            ui.painter().add(egui::Shape::convex_polygon(pts, theme::TEXT, egui::Stroke::NONE));
+                            crate::icons::paint(ui, egui::Rect::from_min_size(egui::pos2(r.min.x + 18.0, r.center().y - 7.5), egui::vec2(15.0, 15.0)), icon, Color32::from_white_alpha(255));
+                            ui.painter().text(egui::pos2(r.min.x + 38.0, r.center().y), egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(12.0), theme::TEXT);
+                            if resp.clicked() {
+                                if expanded {
+                                    app.panels.anim_membership_open.remove(nid);
+                                } else {
+                                    app.panels.anim_membership_open.insert(nid.clone());
+                                }
+                            }
+                            if expanded {
+                                let mut attrs = app.s.keyable_attrs(nid);
+                                attrs.sort_by_key(|a| (anim_attr_rank(a), a.clone()));
+                                for attr in attrs {
+                                    let key = inca_core::anim::Anim::key(nid, &attr);
+                                    let member = selected_layer.as_ref().is_some_and(|l| l.attrs.contains(&key));
+                                    let (ar, aresp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::click());
+                                    if member {
+                                        ui.painter().rect_filled(ar, 0.0, theme::HI);
+                                    } else if aresp.hovered() {
+                                        ui.painter().rect_filled(ar, 0.0, Color32::from_gray(0x4d));
+                                    }
+                                    let label = inca_core::ops::nice_name(&attr);
+                                    ui.painter().text(egui::pos2(ar.min.x + 30.0, ar.center().y), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(12.0), if member { Color32::WHITE } else { theme::TEXT });
+                                    if member {
+                                        ui.painter().circle_filled(egui::pos2(ar.right() - 8.0, ar.center().y), 3.0, Color32::from_rgb(0x7f, 0xd0, 0x9a));
+                                    }
+                                    if aresp.clicked() {
+                                        if let Some(cur) = app.panels.anim_layer_membership.clone() {
+                                            anim_layer_membership_toggle(app, &cur, nid, &attr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+        })
+    });
+    if !open || close {
+        app.panels.anim_layer_membership = None;
+        app.panels.anim_layer_membership_open.clear();
+        app.panels.anim_membership_open.clear();
+    }
+}
+
 fn anim_layer_select_objects(app: &mut IncaApp, id: &str) {
     let ids = app.s.anim_layers.iter().find(|l| l.id == id).map(|l| l.members.clone()).unwrap_or_default();
     app.select_names(&ids, SelMode::Replace);
@@ -5458,6 +5696,11 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 if menu_item(app, ui, "Select Branch") {
                     anim_layer_select_branch(app);
                 }
+                ui.add_enabled_ui(!app.s.anim_layers.is_empty(), |ui| {
+                    if menu_item(app, ui, "Membership...") {
+                        anim_layer_membership_show(app);
+                    }
+                });
                 ui.add_enabled_ui(app.s.anim_layer_current.is_some(), |ui| {
                     if menu_item(app, ui, "Attribute Editor") {
                         anim_layer_open_ae(app);
@@ -5733,6 +5976,12 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             if menu_item(app, ui, "Attribute Editor...") {
                                 app.s.anim_layer_current = Some(l.id.clone());
                                 anim_layer_open_ae(app);
+                                ui.close();
+                            }
+                            if menu_item(app, ui, "Membership...") {
+                                app.s.anim_layer_current = Some(l.id.clone());
+                                app.panels.anim_layer_sel = vec![l.id.clone()];
+                                anim_layer_membership_show(app);
                                 ui.close();
                             }
                             if menu_item(app, ui, "Delete") {
@@ -8322,6 +8571,66 @@ mod tests {
         out.textures_delta.clear();
         assert_eq!(app.panels.ae_tab, node_tabs, "the layer tab should follow the node tabs");
         assert!(app.panels.anim_layer_ae_focus.is_none());
+    }
+
+    #[test]
+    fn membership_toggle_adds_and_removes_individual_attributes() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        let key = inca_core::anim::Anim::key(&nid, "translateY");
+        assert!(app.s.set_key(&nid, "translateY", Some(0.0), Some(3.0)));
+        anim_layer_membership_toggle(&mut app, &lid, &nid, "translateY");
+        let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("layer");
+        assert!(!layer.attrs.contains(&key), "attribute was not removed");
+        assert!(!layer.curves.contains_key(&key), "its layer curve was not removed");
+        assert!(layer.members.contains(&nid), "other attributes still need the object");
+        app.s.set_time(0.0);
+        assert!(app.s.get_attr_f(&nid, "translateY").abs() < 1e-9, "removed animation was not restored");
+        anim_layer_membership_toggle(&mut app, &lid, &nid, "translateY");
+        let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("layer");
+        assert!(layer.attrs.contains(&key), "attribute was not added back");
+        assert!(layer.members.contains(&nid));
+    }
+
+    #[test]
+    fn membership_editor_expands_legacy_object_membership() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        anim_layer_new(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        let layer = app.s.anim_layers.iter_mut().find(|l| l.id == lid).expect("layer");
+        layer.members = vec![nid.clone()];
+        layer.attrs.clear();
+        anim_layer_membership_show(&mut app);
+        let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("layer");
+        assert!(layer.attrs.contains(&inca_core::anim::Anim::key(&nid, "translateX")));
+        assert_eq!(app.panels.anim_layer_membership.as_deref(), Some(lid.as_str()));
+    }
+
+    #[test]
+    fn membership_editor_opens_as_a_floating_window() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let mut frame = eframe::Frame::_new_kittest();
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        anim_layer_membership_show(&mut app);
+        let mut out = ctx.run_ui(raw(vec![], 0.0), |ui| eframe::App::ui(&mut app, ui, &mut frame));
+        out.textures_delta.clear();
+        let id = egui::Id::new("anim_layer_membership_editor");
+        assert!(ctx.memory(|m| m.area_rect(id)).is_some(), "Membership window did not open");
     }
 
     #[test]
