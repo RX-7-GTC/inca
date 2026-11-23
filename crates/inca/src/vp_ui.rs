@@ -2502,17 +2502,16 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             draw_scale_axis_cubes(painter, draw_pivot, draw_rot, cv, app.vps[idx].rect, gizmo_size, app.manip_size, Some(h), free, free, factors);
         }
     }
-    // Highlight a remembered/active handle by drawing it again in yellow above the full gizmo.
+    // Highlight a remembered/active handle by drawing it again above the full gizmo.
     // Using the gizmo's own geometry keeps the selected shape identical to the hovered one.
-    // Skip it while the cursor is on that handle so the pale hover tint stays visible.
+    // While the cursor is on that handle, draw the overlay in the hover colour instead of
+    // suppressing it; the base gizmo's own hover tint can arrive a frame later, which made the
+    // selected axis flash back to its red/green/blue colour.
     if solo.is_none() && scale_custom_axis.is_none() && !(mode_tool == Tool::Rotate && app.vp_state.drag.as_ref().is_some_and(|d| d.vp == idx)) {
-        if let Some(h) = active_draw
-            .filter(|m| !matches!(m, GizmoMode::TranslateView | GizmoMode::ScaleUniform | GizmoMode::Arcball))
-            .filter(|m| hover_handle != Some(*m))
-        {
+        if let Some(h) = active_draw.filter(|m| !matches!(m, GizmoMode::TranslateView | GizmoMode::ScaleUniform | GizmoMode::Arcball)) {
             let mut hl_base = base;
             hl_base.mode_override = Some(h);
-            hl_base.visuals.highlight_color = Some(MANIP_SELECTED);
+            hl_base.visuals.highlight_color = Some(if hover_handle == Some(h) { MANIP_HOVER } else { MANIP_SELECTED });
             let mut hl_gizmo = Gizmo::new(hl_base);
             hl_gizmo.update(GizmoInteraction { cursor_pos: (cursor.x, cursor.y), hovered: true, drag_started: false, dragging: false }, &[visual_tf]);
             paint_gizmo(painter, hl_gizmo.draw());
