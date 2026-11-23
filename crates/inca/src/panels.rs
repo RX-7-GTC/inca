@@ -462,6 +462,33 @@ pub struct LayerEditDraft {
     pub focus_name: bool,
 }
 
+/// Which keyable attributes Add Selected Objects / Create Layer from Selected use.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum AddObjectsMode {
+    #[default]
+    AllKeyable,
+    FromChannelBox,
+    AllKeyableExcept,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct AddObjectsExcept {
+    pub translate: bool,
+    pub rotate: bool,
+    pub scale: bool,
+    pub dynamic: bool,
+    pub boolean: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttrGroup {
+    Translate,
+    Rotate,
+    Scale,
+    Boolean,
+    Dynamic,
+}
+
 #[derive(Default)]
 pub struct PanelState {
     pub outliner_filter: String,
@@ -579,6 +606,10 @@ pub struct PanelState {
     pub layer_default_rotation_by_layer: bool,
     pub layer_default_scale_additive: bool,
     pub create_layer_options_open: bool,
+    /// Add Selected Objects / Create Layer from Selected attribute filter.
+    pub add_objects_options_open: bool,
+    pub add_objects_mode: AddObjectsMode,
+    pub add_objects_except: AddObjectsExcept,
     /// Merge Layers option box: target direction and core merge options.
     pub merge_to_bottom: bool,
     pub merge_options: inca_core::anim::MergeLayerOptions,
@@ -4553,16 +4584,80 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
     app.s.touch();
 }
 
+fn anim_attr_group(app: &IncaApp, node: &str, attr: &str) -> AttrGroup {
+    if attr.starts_with("translate") {
+        AttrGroup::Translate
+    } else if attr.starts_with("rotate") {
+        AttrGroup::Rotate
+    } else if attr.starts_with("scale") {
+        AttrGroup::Scale
+    } else if attr == "visibility" || app.s.get_attr(&NodeRef::Dag(node.to_string()), attr).is_some_and(|v| v.is_boolean()) {
+        AttrGroup::Boolean
+    } else {
+        AttrGroup::Dynamic
+    }
+}
+
+fn anim_attr_keys_nodes(keys: &[String]) -> Vec<String> {
+    let mut nodes = vec![];
+    for k in keys {
+        if let Some((node, _)) = k.rsplit_once('.') {
+            if !nodes.iter().any(|n: &String| n == node) {
+                nodes.push(node.to_string());
+            }
+        }
+    }
+    nodes
+}
+
+/// Attributes Add Selected Objects / Create Layer from Selected should assign.
+fn anim_layer_add_keys(app: &IncaApp) -> Vec<String> {
+    let mut keys = vec![];
+    if app.panels.add_objects_mode == AddObjectsMode::FromChannelBox {
+        for p in &app.panels.cb_pick {
+            let attr = inca_core::scene::alias(&p.attr).to_string();
+            for t in &p.targets {
+                if let NodeRef::Dag(nid) = t {
+                    if app.s.node(nid).is_some_and(|n| n.is_keyable(&attr)) {
+                        keys.push(inca_core::anim::Anim::key(nid, &attr));
+                    }
+                }
+            }
+        }
+    } else {
+        let except = app.panels.add_objects_mode == AddObjectsMode::AllKeyableExcept;
+        for node in &app.s.sel {
+            for attr in app.s.keyable_attrs(node) {
+                if except {
+                    let excluded = match anim_attr_group(app, node, &attr) {
+                        AttrGroup::Translate => app.panels.add_objects_except.translate,
+                        AttrGroup::Rotate => app.panels.add_objects_except.rotate,
+                        AttrGroup::Scale => app.panels.add_objects_except.scale,
+                        AttrGroup::Boolean => app.panels.add_objects_except.boolean,
+                        AttrGroup::Dynamic => app.panels.add_objects_except.dynamic,
+                    };
+                    if excluded {
+                        continue;
+                    }
+                }
+                keys.push(inca_core::anim::Anim::key(node, &attr));
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 fn anim_layer_new_from_selected(app: &mut IncaApp, override_mode: bool) {
     if app.s.sel.is_empty() {
         return;
     }
-    let sel = app.s.sel.clone();
-    let attrs: Vec<String> = sel.iter().flat_map(|n| app.s.keyable_attrs(n).into_iter().map(|a| inca_core::anim::Anim::key(n, &a))).collect();
+    let attrs = anim_layer_add_keys(app);
     anim_layer_new(app, override_mode);
     if let Some(id) = app.s.anim_layer_current.clone() {
         if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
-            l.members = sel;
+            l.members = anim_attr_keys_nodes(&attrs);
             l.attrs = attrs;
         }
         app.s.touch();
@@ -4574,38 +4669,62 @@ fn anim_layer_add_remove_selected(app: &mut IncaApp, id: &str, add: bool) {
     if app.s.sel.is_empty() {
         return;
     }
-    let sel = app.s.sel.clone();
-    let attrs: Vec<String> = sel.iter().flat_map(|n| app.s.keyable_attrs(n).into_iter().map(|a| inca_core::anim::Anim::key(n, &a))).collect();
-    app.s.checkpoint(if add { "add objects to animation layer" } else { "remove objects from animation layer" });
     if add {
-        app.s.remember_anim_static(&sel);
-    }
-    let mut removed_curves = vec![];
-    if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
-        if add {
-            for n in &sel {
-                if !l.members.contains(n) {
-                    l.members.push(n.clone());
+        let keys = anim_layer_add_keys(app);
+        if keys.is_empty() {
+            app.help = if app.panels.add_objects_mode == AddObjectsMode::FromChannelBox {
+                "Select attributes in the Channel Box first".into()
+            } else {
+                "No attributes matched the Add Selected Objects options".into()
+            };
+            return;
+        }
+        let nodes = anim_attr_keys_nodes(&keys);
+        app.s.checkpoint("add objects to animation layer");
+        app.s.remember_anim_static(&nodes);
+        if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
+            for n in nodes {
+                if !l.members.contains(&n) {
+                    l.members.push(n);
                 }
             }
-            for k in attrs {
+            for k in keys {
                 if !l.attrs.contains(&k) {
                     l.attrs.push(k);
                 }
             }
-        } else {
-            let owned = |k: &String| sel.iter().any(|n| k.rsplit_once('.').is_some_and(|(node, _)| node == n));
-            removed_curves.extend(l.curves.keys().filter(|k| owned(k)).cloned());
-            l.attrs.retain(|k| !owned(k));
-            l.curves.retain(|k, _| !owned(k));
-            l.members.retain(|m| !sel.contains(m));
         }
+        app.s.touch();
+        return;
+    }
+    let sel = app.s.sel.clone();
+    app.s.checkpoint("remove objects from animation layer");
+    let mut removed_curves = vec![];
+    if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
+        let owned = |k: &String| sel.iter().any(|n| k.rsplit_once('.').is_some_and(|(node, _)| node == n));
+        removed_curves.extend(l.curves.keys().filter(|k| owned(k)).cloned());
+        l.attrs.retain(|k| !owned(k));
+        l.curves.retain(|k, _| !owned(k));
+        l.members.retain(|m| !sel.contains(m));
     }
     if !removed_curves.is_empty() {
         app.s.restore_anim_static(&removed_curves);
         app.s.set_time(app.s.time.current);
     }
     app.s.touch();
+}
+
+fn anim_layer_add_selected(app: &mut IncaApp) {
+    let id = app.s.anim_layer_current.clone().or_else(|| app.panels.anim_layer_sel.first().cloned());
+    let Some(id) = id else {
+        app.help = "Select an animation layer first".into();
+        return;
+    };
+    if app.s.sel.is_empty() {
+        app.help = "Select objects to add".into();
+        return;
+    }
+    anim_layer_add_remove_selected(app, &id, true);
 }
 
 /// Add or remove the Channel Box's picked attributes on the current animation layer.
@@ -5649,12 +5768,69 @@ fn anim_layer_merge_options(app: &mut IncaApp, ctx: &egui::Context) {
     }
 }
 
+fn anim_layer_add_objects_options(app: &mut IncaApp, ctx: &egui::Context) {
+    if !app.panels.add_objects_options_open {
+        return;
+    }
+    let mut open = true;
+    let is_open = open;
+    let mut close = false;
+    let mut apply = false;
+    let mut apply_close = false;
+    let mut mode = app.panels.add_objects_mode;
+    let mut except = app.panels.add_objects_except;
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("AnimLayerAddObjectsOptions"), is_open, |_app, fix| {
+        let mut window = egui::Window::new("Add Objects To Animation Layers Options").open(&mut open).collapsible(false).resizable(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+            ui.label(RichText::new("Attributes to add").strong());
+            ui.radio_value(&mut mode, AddObjectsMode::AllKeyable, "All keyable");
+            ui.radio_value(&mut mode, AddObjectsMode::FromChannelBox, "From Channel Box");
+            ui.radio_value(&mut mode, AddObjectsMode::AllKeyableExcept, "All keyable except:");
+            ui.add_enabled_ui(mode == AddObjectsMode::AllKeyableExcept, |ui| {
+                ui.indent("add_except", |ui| {
+                    ui.checkbox(&mut except.translate, "Translate");
+                    ui.checkbox(&mut except.rotate, "Rotate");
+                    ui.checkbox(&mut except.scale, "Scale");
+                    ui.checkbox(&mut except.dynamic, "Dynamic");
+                    ui.checkbox(&mut except.boolean, "Boolean");
+                });
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Apply").on_hover_text("Add the selected objects to the current layer").clicked() {
+                    apply = true;
+                }
+                if ui.button("Apply and Close").clicked() {
+                    apply = true;
+                    apply_close = true;
+                }
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        })
+    });
+    app.panels.add_objects_mode = mode;
+    app.panels.add_objects_except = except;
+    app.panels.add_objects_options_open = open && !close;
+    if apply {
+        anim_layer_add_selected(app);
+    }
+    if apply_close {
+        app.panels.add_objects_options_open = false;
+    }
+}
+
 fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     use crate::icons;
     use crate::menus::{menu_check, menu_item, menu_submenu, panel_bar, MenuSource};
     let ctx = ui.ctx().clone();
     anim_layer_create_options(app, &ctx);
     anim_layer_merge_options(app, &ctx);
+    anim_layer_add_objects_options(app, &ctx);
     // Keep the selection valid and make external changes to the current layer (new, merge,
     // extract, delete, scene load) show up as a one-layer selection.
     app.panels.anim_layer_sel.retain(|id| app.s.anim_layers.iter().any(|l| &l.id == id));
@@ -5696,9 +5872,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 ui.separator();
                 ui.add_enabled_ui(app.s.anim_layer_current.is_some() && !app.s.sel.is_empty(), |ui| {
                     if menu_item(app, ui, "Add Selected Objects") {
-                        if let Some(id) = app.s.anim_layer_current.clone() {
-                            anim_layer_add_remove_selected(app, &id, true);
-                        }
+                        anim_layer_add_selected(app);
                     }
                     if menu_item(app, ui, "Remove Selected Objects") {
                         if let Some(id) = app.s.anim_layer_current.clone() {
@@ -5706,6 +5880,9 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
+                if menu_item(app, ui, "Add Selected Objects Options...") {
+                    app.panels.add_objects_options_open = true;
+                }
                 ui.add_enabled_ui(app.s.anim_layer_current.is_some(), |ui| {
                     if menu_item(app, ui, "Select Objects") {
                         if let Some(id) = app.s.anim_layer_current.clone() {
@@ -8795,6 +8972,42 @@ mod tests {
         assert_eq!(layer.weight_curve.keys.len(), 1, "Empty must keep the layer weight animation");
         app.s.set_time(0.0);
         assert!(app.s.get_attr_f(&nid, "translateX").abs() < 1e-9, "removed layer animation was not restored");
+    }
+
+    #[test]
+    fn add_objects_options_filter_attribute_groups() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        app.panels.add_objects_mode = AddObjectsMode::AllKeyableExcept;
+        app.panels.add_objects_except.translate = true;
+        app.panels.add_objects_except.boolean = true;
+        anim_layer_new_from_selected(&mut app, false);
+        let layer = &app.s.anim_layers[0];
+        let has = |attr: &str| layer.attrs.contains(&inca_core::anim::Anim::key(&nid, attr));
+        assert!(!has("translateX") && !has("translateY") && !has("translateZ"), "translate should be excluded");
+        assert!(!has("visibility"), "boolean should be excluded");
+        assert!(has("rotateX") && has("scaleY"), "other keyable attributes should remain");
+        assert!(layer.members.contains(&nid));
+    }
+
+    #[test]
+    fn add_objects_options_from_channel_box_uses_picks() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        app.panels.add_objects_mode = AddObjectsMode::FromChannelBox;
+        app.panels.cb_pick = vec![CbPick { targets: vec![NodeRef::Dag(nid.clone())], attr: "translateY".into(), int: false, min: None, max: None }];
+        anim_layer_new_from_selected(&mut app, false);
+        let layer = &app.s.anim_layers[0];
+        assert_eq!(layer.attrs, vec![inca_core::anim::Anim::key(&nid, "translateY")]);
+        assert_eq!(layer.members, vec![nid]);
     }
 
     #[test]
