@@ -19,7 +19,9 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("pasteKeys", "Paste Keys", ""),
     ("bakeKeys", "Bake Simulation", ""),
     ("createGhost", "Ghost Selected", ""),
+    ("unghostSelected", "Unghost Selected", ""),
     ("unghostAll", "Unghost All", ""),
+    ("toggleGhosts", "Show/Hide ghosts", ""),
     ("motionTrail", "Create Motion Trail", ""),
     ("playblast", "Playblast", ""),
     ("deleteAllLights", "Lights (All)", ""),
@@ -769,6 +771,8 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         }
         "bakeKeys" => crate::edit_cmds::bake(app),
         "createGhost" => crate::anim_extras::ghost(app),
+        "unghostSelected" => crate::anim_extras::unghost_selected(app),
+        "toggleGhosts" => crate::anim_extras::toggle_ghosts(app),
         "dynamicsReset" => {
             app.s.reset_dynamics();
             let t = app.s.time.start;

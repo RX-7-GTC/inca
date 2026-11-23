@@ -614,6 +614,10 @@ pub struct PanelState {
     pub merge_to_bottom: bool,
     pub merge_options: inca_core::anim::MergeLayerOptions,
     pub merge_options_open: bool,
+    /// Animation layer Attribute Editor / Membership state.
+    pub layer_ghost_mode: crate::anim_extras::LayerGhostMode,
+    pub ghost_options_open: bool,
+    pub ghost_options: crate::anim_extras::GhostOptions,
     /// Animation layer tabs loaded in the Attribute Editor, in load order.
     pub anim_layers_ae: Vec<String>,
     pub anim_layer_ae_name: String,
@@ -5960,6 +5964,16 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                 });
             }
             "Options" => {
+                for (mode, label) in [
+                    (crate::anim_extras::LayerGhostMode::AutoSelected, "Auto Ghost Selected Objects"),
+                    (crate::anim_extras::LayerGhostMode::AutoLayer, "Auto Ghost Objects In Layer"),
+                    (crate::anim_extras::LayerGhostMode::Manual, "Turn On Ghosts Manually"),
+                ] {
+                    if menu_check(app, ui, app.panels.layer_ghost_mode == mode, label) {
+                        app.panels.layer_ghost_mode = mode;
+                    }
+                }
+                ui.separator();
                 if let Some(id) = app.s.anim_layer_current.clone() {
                     let (mute, solo, lock) = app.s.anim_layers.iter().find(|l| l.id == id).map(|l| (l.mute, l.solo, l.lock)).unwrap_or((false, false, false));
                     if menu_check(app, ui, mute, "Mute Current Layer") {

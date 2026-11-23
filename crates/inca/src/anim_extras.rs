@@ -15,9 +15,83 @@ pub struct Ghost {
     alpha: f32,
 }
 
+/// How layer Ghost buttons choose the objects to ghost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayerGhostMode {
+    /// Selected objects on the ghosted layer.
+    #[default]
+    AutoSelected,
+    /// Every object belonging to the ghosted layer.
+    AutoLayer,
+    /// Objects manually ghosted with Visualize > Ghost Selected.
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GhostType {
+    #[default]
+    GlobalPreferences,
+    CustomFrames,
+    CustomFrameSteps,
+    CustomKeySteps,
+    Keyframes,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GhostRange {
+    #[default]
+    TimeSlider,
+    StartEnd,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GhostOptions {
+    pub ghost_type: GhostType,
+    pub frames: String,
+    pub steps_before: i32,
+    pub steps_after: i32,
+    pub step_size: i32,
+    pub range: GhostRange,
+    pub start: f64,
+    pub end: f64,
+    pub hierarchy: bool,
+    pub use_ghost_driver: bool,
+    pub geometry: bool,
+    pub locator: bool,
+    pub joint: bool,
+    pub other: bool,
+}
+
+impl Default for GhostOptions {
+    fn default() -> Self {
+        Self {
+            ghost_type: GhostType::GlobalPreferences,
+            frames: "1,10,20".into(),
+            steps_before: 3,
+            steps_after: 3,
+            step_size: 1,
+            range: GhostRange::TimeSlider,
+            start: 1.0,
+            end: 100.0,
+            hierarchy: true,
+            use_ghost_driver: false,
+            geometry: true,
+            locator: true,
+            joint: true,
+            other: false,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct AnimViz {
     pub ghosts: Vec<Ghost>,
+    /// Object roots explicitly ghosted with Visualize > Ghost Selected.
+    pub ghost_objs: Vec<String>,
+    /// The objects selected by Ghost Options (hierarchy and object types applied).
+    ghost_targets: Vec<String>,
+    /// Hide every ghost without clearing the ghost sets.
+    pub ghosts_hidden: bool,
     /// Layers evaluated up to a ghosted layer, rebuilt when the scene or time changes.
     pub layer_ghosts: Vec<Ghost>,
     /// world positions per frame, one trail per object
@@ -26,6 +100,8 @@ pub struct AnimViz {
     ghost_time: f64,
     /// Selection used by the last BaseAnimation ghost build.
     ghost_sel: Vec<String>,
+    ghost_targets_sel: Vec<String>,
+    ghost_mode: Option<LayerGhostMode>,
     /// Bumped when the ghost geometry changes, so the viewport texture is redrawn.
     pub ghost_gen: u64,
 }
@@ -35,13 +111,25 @@ fn capture(app: &IncaApp, objs: &[String], col: [f32; 3], alpha: f32) -> Vec<Gho
     let mut out = vec![];
     for o in objs {
         let wm = app.s.world_matrix(o);
-        let Some(pm) = app.s.node(o).and_then(|n| n.mesh()).map(|m| &m.mesh) else { continue };
         let mut tris = vec![];
-        for fi in 0..pm.f.len() {
-            for tr in pm.triangulate_face(fi) {
-                for &c in &tr {
-                    let p = wm.transform_point3(pm.v[pm.f[fi][c] as usize]);
-                    tris.push(MeshVertex { pos: [p.x as f32, p.y as f32, p.z as f32], normal: [0.0, 1.0, 0.0], color: col, ..Default::default() });
+        if let Some(pm) = app.s.node(o).and_then(|n| n.mesh()).map(|m| &m.mesh) {
+            for fi in 0..pm.f.len() {
+                for tr in pm.triangulate_face(fi) {
+                    for &c in &tr {
+                        let p = wm.transform_point3(pm.v[pm.f[fi][c] as usize]);
+                        tris.push(MeshVertex { pos: [p.x as f32, p.y as f32, p.z as f32], normal: [0.0, 1.0, 0.0], color: col, ..Default::default() });
+                    }
+                }
+            }
+        } else {
+            // Joints, locators and other non-mesh nodes ghost as a small pivot diamond.
+            let p = wm.transform_point3(DVec3::ZERO);
+            let r = 0.08;
+            let v = [p + DVec3::X * r, p - DVec3::X * r, p + DVec3::Y * r, p - DVec3::Y * r, p + DVec3::Z * r, p - DVec3::Z * r];
+            for f in [[0, 2, 4], [2, 1, 4], [1, 3, 4], [3, 0, 4], [2, 0, 5], [1, 2, 5], [3, 1, 5], [0, 3, 5]] {
+                for idx in f {
+                    let q = v[idx];
+                    tris.push(MeshVertex { pos: [q.x as f32, q.y as f32, q.z as f32], normal: [0.0, 1.0, 0.0], color: col, ..Default::default() });
                 }
             }
         }
@@ -57,44 +145,268 @@ fn goto(app: &mut IncaApp, t: f64) {
     app.s.refresh_many(&moved);
 }
 
-/// Ghost Selected: translucent copies of the selected meshes at the neighbouring keys
-/// (or every `every` frames), blue before the current frame and red after.
-pub fn ghost(app: &mut IncaApp) {
-    let steps = crate::options::get(app, "createGhost", "steps").max(1.0) as usize;
-    let every = crate::options::get(app, "createGhost", "every").max(0.0);
-    let objs: Vec<String> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).filter(|i| app.s.node(i).is_some_and(|n| n.mesh().is_some())).collect();
-    if objs.is_empty() {
-        app.last_result = "// Warning: Select animated objects to ghost".into();
+fn selection_roots(app: &IncaApp) -> Vec<String> {
+    let mut roots = app.s.sel.clone();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn ghost_targets_from_roots(app: &IncaApp, roots: &[String], opts: &GhostOptions) -> Vec<String> {
+    let mut out = vec![];
+    for root in roots {
+        let ids = if opts.hierarchy { app.s.subtree(root) } else { vec![root.clone()] };
+        for id in ids {
+            let Some(n) = app.s.node(&id) else { continue };
+            let keep = if n.mesh().is_some() {
+                opts.geometry
+            } else if n.kind == "joint" {
+                opts.joint
+            } else if n.kind == "locator" {
+                opts.locator
+            } else {
+                opts.other
+            };
+            if keep {
+                out.push(id);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn parse_ghost_frames(text: &str) -> Vec<f64> {
+    text.split(',').filter_map(|s| s.trim().parse::<f64>().ok()).collect()
+}
+
+fn ghost_times(app: &IncaApp, targets: &[String], opts: &GhostOptions, t0: f64) -> Vec<f64> {
+    let mut times = vec![];
+    let (range_start, range_end) = match opts.range {
+        GhostRange::TimeSlider => (app.s.time.start, app.s.time.end),
+        GhostRange::StartEnd => (opts.start.min(opts.end), opts.start.max(opts.end)),
+    };
+    let in_range = |t: f64| t >= range_start - 1e-6 && t <= range_end + 1e-6;
+    match opts.ghost_type {
+        GhostType::GlobalPreferences => {
+            for i in 1..=3 {
+                times.push(t0 - i as f64);
+                times.push(t0 + i as f64);
+            }
+        }
+        GhostType::CustomFrameSteps => {
+            let step = opts.step_size.max(1) as f64;
+            for i in 1..=opts.steps_before.max(0) {
+                times.push(t0 - i as f64 * step);
+            }
+            for i in 1..=opts.steps_after.max(0) {
+                times.push(t0 + i as f64 * step);
+            }
+        }
+        GhostType::CustomKeySteps | GhostType::Keyframes => {
+            let keyed: Vec<String> = if opts.use_ghost_driver { targets.first().cloned().into_iter().collect() } else { targets.to_vec() };
+            let mut ks = app.s.anim_key_times(&keyed);
+            ks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            ks.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+            if opts.ghost_type == GhostType::Keyframes {
+                times.extend(ks.into_iter().filter(|t| in_range(*t)));
+            } else {
+                let step = opts.step_size.max(1) as usize;
+                let before: Vec<f64> = ks.iter().copied().filter(|t| *t < t0).collect();
+                let after: Vec<f64> = ks.iter().copied().filter(|t| *t > t0).collect();
+                times.extend(before.iter().rev().step_by(step).take(opts.steps_before.max(0) as usize));
+                times.extend(after.iter().step_by(step).take(opts.steps_after.max(0) as usize));
+            }
+        }
+        GhostType::CustomFrames => times.extend(parse_ghost_frames(&opts.frames)),
+    }
+    times.retain(|t| in_range(*t) && (*t - t0).abs() > 1e-6);
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    times.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    times
+}
+
+fn rebuild_selected_ghosts(app: &mut IncaApp) {
+    let t0 = app.s.time.current;
+    app.viz.ghost_objs.retain(|i| app.s.node(i).is_some());
+    app.viz.ghost_objs.sort();
+    app.viz.ghost_objs.dedup();
+    let opts = app.panels.ghost_options.clone();
+    let targets = ghost_targets_from_roots(app, &app.viz.ghost_objs, &opts);
+    app.viz.ghost_targets = targets.clone();
+    if targets.is_empty() {
+        app.viz.ghosts.clear();
         return;
     }
-    let t0 = app.s.time.current;
-    let mut times: Vec<f64> = vec![];
-    if every > 0.0 {
-        for i in 1..=steps {
-            times.push(t0 - i as f64 * every);
-            times.push(t0 + i as f64 * every);
-        }
-    } else {
-        let keyed: Vec<String> = app.s.sel.clone();
-        let ks = app.s.anim_key_times(&keyed);
-        let before: Vec<f64> = ks.iter().copied().filter(|t| *t < t0).collect();
-        times.extend(before.iter().rev().take(steps));
-        times.extend(ks.iter().copied().filter(|t| *t > t0).take(steps));
-    }
+    let times = ghost_times(app, &targets, &opts, t0);
     app.viz.ghosts.clear();
     for t in times {
         goto(app, t);
         let col = if t < t0 { [0.33, 0.47, 1.0] } else { [1.0, 0.47, 0.33] };
         let alpha = 0.18 + 0.1 / (1.0 + (t - t0).abs() as f32 / 10.0);
-        app.viz.ghosts.extend(capture(app, &objs, col, alpha));
+        app.viz.ghosts.extend(capture(app, &targets, col, alpha));
     }
     goto(app, t0);
+}
+
+/// Ghost Selected: add the selected object roots to the persistent ghost set and rebuild.
+pub fn ghost(app: &mut IncaApp) {
+    let roots = selection_roots(app);
+    if roots.is_empty() {
+        app.last_result = "// Warning: Select animated objects to ghost".into();
+        return;
+    }
+    let opts = app.panels.ghost_options.clone();
+    if ghost_targets_from_roots(app, &roots, &opts).is_empty() {
+        app.last_result = "// Warning: No selected objects match the Ghost Options".into();
+        return;
+    }
+    app.viz.ghost_objs.extend(roots);
+    rebuild_selected_ghosts(app);
     app.echo("ghosting;");
 }
 
+/// Unghost Selected: remove the selected object roots from the persistent ghost set.
+pub fn unghost_selected(app: &mut IncaApp) {
+    let roots = selection_roots(app);
+    if roots.is_empty() {
+        return;
+    }
+    app.viz.ghost_objs.retain(|o| !roots.contains(o));
+    rebuild_selected_ghosts(app);
+    app.echo("unghostSelected;");
+}
+
 pub fn unghost(app: &mut IncaApp) {
+    app.viz.ghost_objs.clear();
+    app.viz.ghost_targets.clear();
     app.viz.ghosts.clear();
     app.echo("unghostAll;");
+}
+
+/// Rebuild ghosts after changing Ghost Options without adding a new selection.
+pub fn rebuild_ghosts(app: &mut IncaApp) {
+    rebuild_selected_ghosts(app);
+}
+
+fn ghost_type_label(t: GhostType) -> &'static str {
+    match t {
+        GhostType::GlobalPreferences => "Global preferences",
+        GhostType::CustomFrames => "Custom frames",
+        GhostType::CustomFrameSteps => "Custom frame steps",
+        GhostType::CustomKeySteps => "Custom key steps",
+        GhostType::Keyframes => "Keyframes",
+    }
+}
+
+/// Visualize > Ghost Selected > options box.
+pub fn options_window(app: &mut IncaApp, ctx: &egui::Context) {
+    if !app.panels.ghost_options_open {
+        return;
+    }
+    let mut open = true;
+    let is_open = open;
+    let mut opts = app.panels.ghost_options.clone();
+    let mut ghost_now = false;
+    let mut apply = false;
+    let mut close = false;
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("GhostSelectedOptions"), is_open, |_app, fix| {
+        let mut window = egui::Window::new("Ghost Options").id(egui::Id::new("GhostSelectedOptions")).open(&mut open).collapsible(false).resizable(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+            egui::Grid::new("ghost_options_grid").num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
+                ui.label("Type of ghosting");
+                egui::ComboBox::from_id_salt("ghost_type").selected_text(ghost_type_label(opts.ghost_type)).show_ui(ui, |ui| {
+                    for t in [GhostType::GlobalPreferences, GhostType::CustomFrames, GhostType::CustomFrameSteps, GhostType::CustomKeySteps, GhostType::Keyframes] {
+                        ui.selectable_value(&mut opts.ghost_type, t, ghost_type_label(t));
+                    }
+                });
+                ui.end_row();
+                ui.label("Frames to display");
+                ui.add_enabled(opts.ghost_type == GhostType::CustomFrames, egui::TextEdit::singleline(&mut opts.frames).desired_width(180.0));
+                ui.end_row();
+                let steps = matches!(opts.ghost_type, GhostType::CustomFrameSteps | GhostType::CustomKeySteps);
+                ui.label("Steps before current frame");
+                ui.add_enabled(steps, egui::DragValue::new(&mut opts.steps_before).range(0..=100));
+                ui.end_row();
+                ui.label("Steps after current frame");
+                ui.add_enabled(steps, egui::DragValue::new(&mut opts.steps_after).range(0..=100));
+                ui.end_row();
+                ui.label("Step size");
+                ui.add_enabled(steps, egui::DragValue::new(&mut opts.step_size).range(1..=100));
+                ui.end_row();
+                let keyed = opts.ghost_type == GhostType::Keyframes;
+                ui.label("Frame range");
+                ui.add_enabled_ui(keyed, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut opts.range, GhostRange::TimeSlider, "Time Slider");
+                        ui.radio_value(&mut opts.range, GhostRange::StartEnd, "Start/End");
+                    });
+                });
+                ui.end_row();
+                let custom_range = keyed && opts.range == GhostRange::StartEnd;
+                ui.label("Start frame");
+                ui.add_enabled(custom_range, egui::DragValue::new(&mut opts.start).speed(1.0));
+                ui.end_row();
+                ui.label("End frame");
+                ui.add_enabled(custom_range, egui::DragValue::new(&mut opts.end).speed(1.0));
+                ui.end_row();
+                ui.label("Hierarchy");
+                ui.checkbox(&mut opts.hierarchy, "");
+                ui.end_row();
+                ui.label("Use ghost driver");
+                ui.add_enabled(matches!(opts.ghost_type, GhostType::CustomKeySteps | GhostType::Keyframes), egui::Checkbox::new(&mut opts.use_ghost_driver, ""));
+                ui.end_row();
+                ui.label("Object type");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut opts.geometry, "Geometry");
+                    ui.checkbox(&mut opts.locator, "Locator");
+                    ui.checkbox(&mut opts.joint, "Joint");
+                    ui.checkbox(&mut opts.other, "All other types");
+                });
+                ui.end_row();
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Ghost").clicked() {
+                    ghost_now = true;
+                }
+                if ui.button("Apply").clicked() {
+                    apply = true;
+                }
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        })
+    });
+    app.panels.ghost_options = opts;
+    if ghost_now {
+        if app.s.sel.is_empty() {
+            app.help = "Select objects to ghost".into();
+        } else {
+            ghost(app);
+            app.panels.ghost_options_open = false;
+        }
+    } else if apply || close || !open {
+        rebuild_ghosts(app);
+    }
+    if close || !open {
+        app.panels.ghost_options_open = false;
+    }
+}
+
+/// Show/Hide ghosts: globally show or hide every ghost without forgetting the ghost sets.
+pub fn toggle_ghosts(app: &mut IncaApp) {
+    app.viz.ghosts_hidden = !app.viz.ghosts_hidden;
+    app.viz.ghost_gen += 1;
+}
+
+pub fn ghosts_visible(viz: &AnimViz) -> bool {
+    !viz.ghosts_hidden && (!viz.ghosts.is_empty() || !viz.layer_ghosts.is_empty())
 }
 
 /// Rebuild the ghosts for the layers (and BaseAnimation) with their Ghost button on.
@@ -103,6 +415,9 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
     let any = app.s.anim_base_ghost || app.s.anim_layers.iter().any(|l| l.ghost);
     let t = app.s.time.current;
     let sel = app.s.sel.clone();
+    let mode = app.panels.layer_ghost_mode;
+    let opts = app.panels.ghost_options.clone();
+    let manual = app.viz.ghost_targets.clone();
     if !any {
         if !app.viz.layer_ghosts.is_empty() {
             app.viz.layer_ghosts.clear();
@@ -111,15 +426,22 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
         app.viz.ghost_rev = app.s.rev;
         app.viz.ghost_time = t;
         app.viz.ghost_sel = sel;
+        app.viz.ghost_targets_sel = manual;
+        app.viz.ghost_mode = Some(mode);
         return;
     }
-    if app.viz.ghost_rev == app.s.rev && app.viz.ghost_time.to_bits() == t.to_bits() && app.viz.ghost_sel == sel {
+    if app.viz.ghost_rev == app.s.rev && app.viz.ghost_time.to_bits() == t.to_bits() && app.viz.ghost_sel == sel && app.viz.ghost_targets_sel == manual && app.viz.ghost_mode == Some(mode) {
         return;
     }
     let is_mesh = |i: &String| app.s.node(i).is_some_and(|n| n.mesh().is_some());
-    let selected_meshes: Vec<String> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).filter(is_mesh).collect();
-    let base_objs: Vec<String> = if app.s.anim_base_ghost { selected_meshes.clone() } else { vec![] };
-    // A layer ghost shows only its own objects, and only while they are selected.
+    let selected_targets = ghost_targets_from_roots(app, &app.s.sel, &opts);
+    let base_objs: Vec<String> = if app.s.anim_base_ghost { selected_targets.clone() } else { vec![] };
+    // Layer ghosts follow the live selection in every mode; Manual differs only in how normal
+    // Ghost Selected objects are collected.
+    let allowed: Option<&Vec<String>> = match mode {
+        LayerGhostMode::AutoLayer => None,
+        LayerGhostMode::AutoSelected | LayerGhostMode::Manual => Some(&selected_targets),
+    };
     let layers: Vec<(usize, [f32; 3], Vec<String>)> = app
         .s
         .anim_layers
@@ -137,7 +459,9 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
             }
             objs.sort();
             objs.dedup();
-            objs.retain(|o| selected_meshes.contains(o));
+            if let Some(allowed) = allowed {
+                objs.retain(|o| allowed.contains(o));
+            }
             (!objs.is_empty()).then_some((i, l.ghost_color, objs))
         })
         .collect();
@@ -163,6 +487,8 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
     app.viz.ghost_rev = app.s.rev;
     app.viz.ghost_time = t;
     app.viz.ghost_sel = sel;
+    app.viz.ghost_targets_sel = manual;
+    app.viz.ghost_mode = Some(mode);
 }
 
 /// Create Motion Trail: the selected objects' pivots over the playback range.
@@ -191,8 +517,10 @@ pub fn motion_trail(app: &mut IncaApp) {
 /// Ghost and trail geometry for a viewport.
 pub fn draws(viz: &AnimViz) -> Vec<DrawCmd> {
     let mut d = vec![];
-    for g in viz.ghosts.iter().chain(viz.layer_ghosts.iter()) {
-        d.push(DrawCmd { pass: Pass::MeshBlend, geo: Geo::TransientTris(g.tris.clone()), u: DrawUniform::new(Mat4::IDENTITY).unlit().alpha(g.alpha) });
+    if !viz.ghosts_hidden {
+        for g in viz.ghosts.iter().chain(viz.layer_ghosts.iter()) {
+            d.push(DrawCmd { pass: Pass::MeshBlend, geo: Geo::TransientTris(g.tris.clone()), u: DrawUniform::new(Mat4::IDENTITY).unlit().alpha(g.alpha) });
+        }
     }
     let col = [0.55, 0.85, 1.0, 1.0];
     for tr in &viz.trails {
@@ -607,6 +935,239 @@ mod tests {
     }
 
     #[test]
+    fn ghost_selected_accumulates_and_unghosts_selected() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let a = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        let b = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        for id in [&a, &b] {
+            app.s.set_key(id, "translateX", Some(0.0), Some(0.0));
+            app.s.set_key(id, "translateX", Some(10.0), Some(5.0));
+        }
+        app.s.set_time(5.0);
+        app.s.select(std::slice::from_ref(&a), inca_core::scene::SelMode::Replace);
+        ghost(&mut app);
+        assert_eq!(app.viz.ghost_objs, vec![a.clone()]);
+        assert!(!app.viz.ghosts.is_empty());
+        app.s.select(std::slice::from_ref(&b), inca_core::scene::SelMode::Replace);
+        ghost(&mut app);
+        assert_eq!(app.viz.ghost_objs, vec![a.clone(), b.clone()], "ghosting another object must add it");
+        unghost_selected(&mut app);
+        assert_eq!(app.viz.ghost_objs, vec![a.clone()], "Unghost Selected removed the wrong object");
+        assert!(!app.viz.ghosts.is_empty(), "remaining ghost was lost");
+        unghost(&mut app);
+        assert!(app.viz.ghost_objs.is_empty() && app.viz.ghosts.is_empty());
+    }
+
+    #[test]
+    fn show_hide_ghosts_keeps_the_ghost_set() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let a = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.set_key(&a, "translateX", Some(0.0), Some(0.0));
+        app.s.set_key(&a, "translateX", Some(10.0), Some(5.0));
+        app.s.set_time(5.0);
+        app.s.select(std::slice::from_ref(&a), inca_core::scene::SelMode::Replace);
+        ghost(&mut app);
+        assert!(ghosts_visible(&app.viz));
+        assert!(!draws(&app.viz).is_empty());
+        toggle_ghosts(&mut app);
+        assert!(!ghosts_visible(&app.viz));
+        assert!(draws(&app.viz).is_empty(), "hidden ghosts still draw");
+        assert_eq!(app.viz.ghost_objs, vec![a], "Show/Hide must not forget the ghost");
+        toggle_ghosts(&mut app);
+        assert!(!draws(&app.viz).is_empty(), "shown ghosts did not return");
+    }
+
+    #[test]
+    fn manual_layer_ghost_uses_ghost_selected_objects() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let a = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.select(std::slice::from_ref(&a), inca_core::scene::SelMode::Replace);
+        app.s.anim_layers.push(inca_core::anim::AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            weight_curve: Default::default(),
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            passthrough: false,
+            rotation_by_layer: false,
+            scale_additive: false,
+            members: vec![a.clone()],
+            attrs: vec![],
+            parent: None,
+            ghost: true,
+            ghost_color: inca_core::anim::ghost_red(),
+            curves: Default::default(),
+        });
+        app.panels.layer_ghost_mode = LayerGhostMode::Manual;
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!(!app.viz.layer_ghosts.is_empty(), "Manual mode should fall back to the selection");
+        ghost(&mut app);
+        layer_ghost_tick(&mut app);
+        assert!(!app.viz.layer_ghosts.is_empty(), "Ghost Selected did not enable the manual layer ghost");
+        assert!(app.viz.ghost_targets.contains(&a));
+    }
+
+    #[test]
+    fn switching_to_manual_keeps_existing_auto_ghosts() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let a = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.select(std::slice::from_ref(&a), inca_core::scene::SelMode::Replace);
+        app.s.anim_layers.push(inca_core::anim::AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            weight_curve: Default::default(),
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            passthrough: false,
+            rotation_by_layer: false,
+            scale_additive: false,
+            members: vec![a.clone()],
+            attrs: vec![],
+            parent: None,
+            ghost: true,
+            ghost_color: inca_core::anim::ghost_red(),
+            curves: Default::default(),
+        });
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!(!app.viz.layer_ghosts.is_empty());
+        app.panels.layer_ghost_mode = LayerGhostMode::Manual;
+        layer_ghost_tick(&mut app);
+        assert!(!app.viz.layer_ghosts.is_empty(), "switching to Manual hid the current ghost");
+        assert!(app.viz.ghost_objs.is_empty(), "switching to Manual must not freeze the selection");
+    }
+
+    #[test]
+    fn ghost_options_filter_hierarchy_and_object_types() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let mesh = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        let group = app.s.group(std::slice::from_ref(&mesh), "ghostGroup");
+        let locator = app.s.create_locator("ghostLocator");
+        app.panels.ghost_options.geometry = true;
+        app.panels.ghost_options.locator = false;
+        app.panels.ghost_options.joint = false;
+        app.panels.ghost_options.other = false;
+        app.panels.ghost_options.hierarchy = false;
+        app.s.select(std::slice::from_ref(&group), inca_core::scene::SelMode::Replace);
+        ghost(&mut app);
+        assert!(app.viz.ghost_objs.is_empty(), "hierarchy off should not ghost a group's children");
+        app.panels.ghost_options.hierarchy = true;
+        ghost(&mut app);
+        assert_eq!(app.viz.ghost_targets, vec![mesh.clone()], "hierarchy should ghost the child mesh");
+        unghost(&mut app);
+        app.s.select(std::slice::from_ref(&locator), inca_core::scene::SelMode::Replace);
+        app.panels.ghost_options.locator = true;
+        ghost(&mut app);
+        assert_eq!(app.viz.ghost_targets, vec![locator.clone()], "locator should be ghosted");
+        assert!(!app.viz.ghosts.is_empty(), "locator ghost has no pivot marker");
+        unghost(&mut app);
+        app.panels.ghost_options.locator = false;
+        ghost(&mut app);
+        assert!(app.viz.ghost_objs.is_empty(), "disabled locator should not be ghosted");
+    }
+
+    #[test]
+    fn manual_layer_ghost_falls_back_to_selection() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let a = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.select(std::slice::from_ref(&a), inca_core::scene::SelMode::Replace);
+        app.s.anim_layers.push(inca_core::anim::AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            weight_curve: Default::default(),
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            passthrough: false,
+            rotation_by_layer: false,
+            scale_additive: false,
+            members: vec![a.clone()],
+            attrs: vec![],
+            parent: None,
+            ghost: true,
+            ghost_color: inca_core::anim::ghost_red(),
+            curves: Default::default(),
+        });
+        app.panels.layer_ghost_mode = LayerGhostMode::Manual;
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!(!app.viz.layer_ghosts.is_empty(), "Manual mode hid the selected layer object");
+    }
+
+    #[test]
+    fn manual_layer_ghost_tracks_selection_across_layers() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let a = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        let b = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        for (id, member, color) in [("al1", a.clone(), [1.0, 0.0, 0.0]), ("al2", b.clone(), [0.0, 0.0, 1.0])] {
+            app.s.anim_layers.push(inca_core::anim::AnimLayer {
+                id: id.into(),
+                name: id.into(),
+                weight: 1.0,
+                weight_curve: Default::default(),
+                mute: false,
+                solo: false,
+                lock: false,
+                override_mode: false,
+                passthrough: false,
+                rotation_by_layer: false,
+                scale_additive: false,
+                members: vec![member],
+                attrs: vec![],
+                parent: None,
+                ghost: true,
+                ghost_color: color,
+                curves: Default::default(),
+            });
+        }
+        app.panels.layer_ghost_mode = LayerGhostMode::Manual;
+        app.s.select(std::slice::from_ref(&a), inca_core::scene::SelMode::Replace);
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert_eq!(app.viz.layer_ghosts.len(), 1, "only the selected layer object should ghost");
+        assert_eq!(app.viz.layer_ghosts[0].tris.first().map(|v| v.color), Some([1.0, 0.0, 0.0]));
+        app.s.select(std::slice::from_ref(&b), inca_core::scene::SelMode::Replace);
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert_eq!(app.viz.layer_ghosts.len(), 1, "the old selection stayed ghosted");
+        assert_eq!(app.viz.layer_ghosts[0].tris.first().map(|v| v.color), Some([0.0, 0.0, 1.0]));
+        app.s.sel.clear();
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!(app.viz.layer_ghosts.is_empty(), "deselecting left the ghost behind");
+    }
+
+    #[test]
     fn layer_ghost_ignores_objects_not_in_the_layer() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
@@ -649,5 +1210,15 @@ mod tests {
         app.s.touch();
         layer_ghost_tick(&mut app);
         assert!(app.viz.layer_ghosts.is_empty(), "layer objects should not ghost when nothing is selected");
+        app.panels.layer_ghost_mode = LayerGhostMode::AutoLayer;
+        layer_ghost_tick(&mut app);
+        assert_eq!(app.viz.layer_ghosts.len(), 1, "Auto Ghost Objects In Layer should ghost unselected layer objects");
+        app.panels.layer_ghost_mode = LayerGhostMode::Manual;
+        layer_ghost_tick(&mut app);
+        assert!(app.viz.layer_ghosts.is_empty(), "Manual mode ghosted an empty selection");
+        app.s.select(std::slice::from_ref(&a), inca_core::scene::SelMode::Replace);
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert_eq!(app.viz.layer_ghosts.len(), 1, "Manual mode did not follow the selection");
     }
 }

@@ -305,6 +305,7 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context, _frame: &mut eframe::Frame) 
     }
     crate::rig_tools::sdk_window(app, ctx);
     crate::anim_extras::window(app, ctx);
+    crate::anim_extras::options_window(app, ctx);
     crate::panels::anim_layer_membership_dialog(app, ctx);
     let mut open = app.win.help;
     let is_open = open;

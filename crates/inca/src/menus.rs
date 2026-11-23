@@ -213,7 +213,7 @@ pub fn set_menus(ms: MenuSet) -> Vec<(&'static str, Vec<M>)> {
         MenuSet::Animation => vec![
             ("Key", vec![A("setKey"), A("keyTranslate"), A("keyRotate"), A("keyScale"), Sep, A("setDrivenKeyWindow"), Sep, A("copyKeys"), A("pasteKeys"), A("deleteKeysCurrent"), A("bakeKeys"), Sep, A("toggleAutoKey")]),
             ("Playback", vec![A("playToggle"), A("playBackwards"), A("stopPlayback"), Sep, A("nextFrame"), A("prevFrame"), A("nextKey"), A("prevKey"), A("goToStart"), A("goToEnd"), Sep, A("playblast")]),
-            ("Visualize", vec![A("graphEditor"), A("dopeSheet"), Sep, A("createGhost"), A("unghostAll"), A("motionTrail")]),
+            ("Visualize", vec![A("graphEditor"), A("dopeSheet"), Sep, A("createGhost"), A("unghostSelected"), A("unghostAll"), A("toggleGhosts"), A("motionTrail")]),
         ],
         MenuSet::Fx => vec![
             ("Particles", vec![A("createEmitter"), A("createDirectionalEmitter"), A("createParticles"), A("emitFromObject")]),
@@ -615,6 +615,7 @@ pub fn toggle_state(app: &IncaApp, id: &str) -> Option<bool> {
         "panelRangeslider" => app.detached.contains("rangeslider"),
         "panelCmdline" => app.detached.contains("cmdline"),
         "toggleAutoKey" => app.s.time.auto_key,
+        "toggleGhosts" => !app.viz.ghosts_hidden,
         _ => return None,
     })
 }

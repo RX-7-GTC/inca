@@ -223,7 +223,9 @@ pub fn describe(id: &str) -> Option<&'static str> {
         "goToEnd" => "Moves the playhead to the last frame.",
         "toggleAutoKey" => "Turns auto-keying on or off.",
         "createGhost" => "Creates ghost copies of the selected animated objects.",
+        "unghostSelected" => "Removes ghost copies for the selected objects.",
         "unghostAll" => "Removes all ghost copies.",
+        "toggleGhosts" => "Shows or hides every ghost copy.",
         "motionTrail" => "Creates a motion trail for the selected object.",
 
         // Views and display

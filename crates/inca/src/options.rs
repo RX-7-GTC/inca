@@ -64,6 +64,8 @@ pub type Values = BTreeMap<String, BTreeMap<String, f64>>;
 pub fn open(app: &mut IncaApp, action: &str) {
     if action == "duplicateSpecial" {
         app.dup_special_open = true;
+    } else if action == "createGhost" {
+        app.panels.ghost_options_open = true;
     } else if spec(action).is_some() {
         app.option_dialog = Some(action.to_string());
     }
