@@ -5408,6 +5408,33 @@ fn anim_layer_duplicate(app: &mut IncaApp, no_animation: bool) {
     app.s.touch();
 }
 
+fn anim_layer_export(app: &mut IncaApp, id: &str, branch: bool) {
+    let Some(layer) = app.s.anim_layers.iter().find(|l| l.id == id) else { return };
+    let stem: String = layer.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') { c } else { '_' }).collect();
+    let default = format!("{stem}.{}", inca_core::layer_io::LAYER_FILE_EXT);
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Inca Animation Layer", &[inca_core::layer_io::LAYER_FILE_EXT, "json"])
+        .set_file_name(default)
+        .save_file()
+    else {
+        return;
+    };
+    let mut path = path;
+    if path.extension().is_none() {
+        path.set_extension(inca_core::layer_io::LAYER_FILE_EXT);
+    }
+    match inca_core::layer_io::export_file(&app.s, id, branch, &path) {
+        Ok(n) => {
+            app.help = format!("Exported {n} animation layer(s) to {}", path.display());
+            app.last_result = format!("// Exported {n} animation layer(s) to {}", path.display());
+        }
+        Err(e) => {
+            app.help = format!("Animation layer export failed: {e}");
+            app.last_result = format!("// Animation layer export failed: {e}");
+        }
+    }
+}
+
 fn anim_layer_select_all(app: &mut IncaApp) {
     app.panels.anim_layer_sel = app.s.anim_layers.iter().map(|l| l.id.clone()).collect();
     if let Some(cur) = &app.s.anim_layer_current {
@@ -5926,6 +5953,19 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                 });
                 ui.separator();
+                ui.add_enabled_ui(app.s.anim_layer_current.is_some(), |ui| {
+                    if menu_item(app, ui, "Export Layer...") {
+                        if let Some(id) = app.s.anim_layer_current.clone() {
+                            anim_layer_export(app, &id, false);
+                        }
+                    }
+                    if menu_item(app, ui, "Export Branch...") {
+                        if let Some(id) = app.s.anim_layer_current.clone() {
+                            anim_layer_export(app, &id, true);
+                        }
+                    }
+                });
+                ui.separator();
                 let current = app.s.anim_layer_current.clone();
                 let can_merge = app.panels.anim_layer_sel.len() >= 2;
                 let can_down = current.as_deref().is_some_and(|id| {
@@ -6211,6 +6251,14 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                                 app.s.anim_layer_current = Some(l.id.clone());
                                 app.panels.anim_layer_sel = vec![l.id.clone()];
                                 anim_layer_membership_show(app);
+                                ui.close();
+                            }
+                            if menu_item(app, ui, "Export Layer...") {
+                                anim_layer_export(app, &l.id, false);
+                                ui.close();
+                            }
+                            if menu_item(app, ui, "Export Branch...") {
+                                anim_layer_export(app, &l.id, true);
                                 ui.close();
                             }
                             if menu_item(app, ui, "Empty") {
