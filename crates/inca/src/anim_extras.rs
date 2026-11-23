@@ -24,6 +24,8 @@ pub struct AnimViz {
     pub trails: Vec<Vec<DVec3>>,
     ghost_rev: u64,
     ghost_time: f64,
+    /// Selection used by the last BaseAnimation ghost build.
+    ghost_sel: Vec<String>,
     /// Bumped when the ghost geometry changes, so the viewport texture is redrawn.
     pub ghost_gen: u64,
 }
@@ -100,6 +102,7 @@ pub fn unghost(app: &mut IncaApp) {
 pub fn layer_ghost_tick(app: &mut IncaApp) {
     let any = app.s.anim_base_ghost || app.s.anim_layers.iter().any(|l| l.ghost);
     let t = app.s.time.current;
+    let sel = app.s.sel.clone();
     if !any {
         if !app.viz.layer_ghosts.is_empty() {
             app.viz.layer_ghosts.clear();
@@ -107,48 +110,49 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
         }
         app.viz.ghost_rev = app.s.rev;
         app.viz.ghost_time = t;
+        app.viz.ghost_sel = sel;
         return;
     }
-    if app.viz.ghost_rev == app.s.rev && app.viz.ghost_time.to_bits() == t.to_bits() {
+    if app.viz.ghost_rev == app.s.rev && app.viz.ghost_time.to_bits() == t.to_bits() && app.viz.ghost_sel == sel {
         return;
     }
     let is_mesh = |i: &String| app.s.node(i).is_some_and(|n| n.mesh().is_some());
-    let mut objs: Vec<String> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).filter(is_mesh).collect();
-    if objs.is_empty() {
-        let all = app.s.anim_base_ghost;
-        for l in app.s.anim_layers.iter().filter(|l| l.ghost || all) {
-            for m in &l.members {
-                objs.extend(app.s.subtree(m).into_iter().filter(is_mesh));
+    let selected_meshes: Vec<String> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).filter(is_mesh).collect();
+    let base_objs: Vec<String> = if app.s.anim_base_ghost { selected_meshes.clone() } else { vec![] };
+    // A layer ghost shows only its own objects, and only while they are selected.
+    let layers: Vec<(usize, [f32; 3], Vec<String>)> = app
+        .s
+        .anim_layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.ghost)
+        .filter_map(|(i, l)| {
+            let mut nodes = l.members.clone();
+            nodes.extend(l.curves.values().map(|c| c.node.clone()));
+            nodes.sort();
+            nodes.dedup();
+            let mut objs = vec![];
+            for n in &nodes {
+                objs.extend(app.s.subtree(n).into_iter().filter(is_mesh));
             }
-        }
-    }
-    if objs.is_empty() {
-        for l in app.s.anim_layers.iter().filter(|l| l.ghost) {
-            for c in l.curves.values() {
-                objs.extend(app.s.subtree(&c.node).into_iter().filter(is_mesh));
-            }
-        }
-        if app.s.anim_base_ghost {
-            for c in app.s.anim.curves.values() {
-                objs.extend(app.s.subtree(&c.node).into_iter().filter(is_mesh));
-            }
-        }
-    }
-    objs.sort();
-    objs.dedup();
-    if objs.is_empty() {
+            objs.sort();
+            objs.dedup();
+            objs.retain(|o| selected_meshes.contains(o));
+            (!objs.is_empty()).then_some((i, l.ghost_color, objs))
+        })
+        .collect();
+    if base_objs.is_empty() && layers.is_empty() {
         if !app.viz.layer_ghosts.is_empty() {
             app.viz.layer_ghosts.clear();
             app.viz.ghost_gen += 1;
         }
     } else {
         let mut out = vec![];
-        if app.s.anim_base_ghost {
+        if app.s.anim_base_ghost && !base_objs.is_empty() {
             app.s.apply_anim_upto(None);
-            out.extend(capture(app, &objs, app.s.anim_base_ghost_color, 0.35));
+            out.extend(capture(app, &base_objs, app.s.anim_base_ghost_color, 0.35));
         }
-        let layers: Vec<(usize, [f32; 3])> = app.s.anim_layers.iter().enumerate().filter(|(_, l)| l.ghost).map(|(i, l)| (i, l.ghost_color)).collect();
-        for (i, color) in layers {
+        for (i, color, objs) in layers {
             app.s.apply_anim_upto(Some(i));
             out.extend(capture(app, &objs, color, 0.35));
         }
@@ -158,6 +162,7 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
     }
     app.viz.ghost_rev = app.s.rev;
     app.viz.ghost_time = t;
+    app.viz.ghost_sel = sel;
 }
 
 /// Create Motion Trail: the selected objects' pivots over the playback range.
@@ -599,5 +604,50 @@ mod tests {
         app.s.touch();
         layer_ghost_tick(&mut app);
         assert!(app.viz.layer_ghosts.is_empty(), "ghosts stayed on");
+    }
+
+    #[test]
+    fn layer_ghost_ignores_objects_not_in_the_layer() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let a = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        let b = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.select(&[a.clone(), b.clone()], inca_core::scene::SelMode::Replace);
+        app.s.anim_layers.push(inca_core::anim::AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight: 1.0,
+            weight_curve: Default::default(),
+            mute: false,
+            solo: false,
+            lock: false,
+            override_mode: false,
+            passthrough: false,
+            rotation_by_layer: false,
+            scale_additive: false,
+            members: vec![a.clone()],
+            attrs: vec![],
+            parent: None,
+            ghost: true,
+            ghost_color: inca_core::anim::ghost_red(),
+            curves: Default::default(),
+        });
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert_eq!(app.viz.layer_ghosts.len(), 1, "ghosted layer captured a selected object outside the layer");
+        app.s.select(std::slice::from_ref(&b), inca_core::scene::SelMode::Replace);
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!(app.viz.layer_ghosts.is_empty(), "selected object outside the layer should have no layer ghost");
+        app.s.select(std::slice::from_ref(&a), inca_core::scene::SelMode::Replace);
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert_eq!(app.viz.layer_ghosts.len(), 1, "layer object should ghost while selected");
+        app.s.sel.clear();
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!(app.viz.layer_ghosts.is_empty(), "layer objects should not ghost when nothing is selected");
     }
 }
