@@ -5317,6 +5317,39 @@ fn anim_layer_select_branch(app: &mut IncaApp) {
     }
 }
 
+fn anim_layer_empty_ids(app: &mut IncaApp, ids: Vec<String>) {
+    let ids: Vec<String> = ids.into_iter().filter(|id| app.s.anim_layers.iter().any(|l| &l.id == id)).collect();
+    if ids.is_empty() {
+        return;
+    }
+    app.s.checkpoint("empty animation layers");
+    let mut removed = vec![];
+    for l in &mut app.s.anim_layers {
+        if ids.contains(&l.id) {
+            removed.extend(l.curves.keys().cloned());
+            l.attrs.clear();
+            l.members.clear();
+            l.curves.clear();
+        }
+    }
+    if !removed.is_empty() {
+        app.s.restore_anim_static(&removed);
+    }
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+    app.help = format!("Emptied {} animation layer(s)", ids.len());
+}
+
+fn anim_layer_empty_selected(app: &mut IncaApp) {
+    let mut ids = app.panels.anim_layer_sel.clone();
+    if ids.is_empty() {
+        if let Some(id) = &app.s.anim_layer_current {
+            ids.push(id.clone());
+        }
+    }
+    anim_layer_empty_ids(app, ids);
+}
+
 fn anim_layer_delete_empty(app: &mut IncaApp) {
     let ids: Vec<String> = app.s.anim_layers.iter().filter(|l| l.attrs.is_empty() && l.curves.is_empty()).map(|l| l.id.clone()).collect();
     if ids.is_empty() {
@@ -5686,6 +5719,11 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                         anim_layer_delete(app, &id);
                     }
                 }
+                ui.add_enabled_ui(!app.panels.anim_layer_sel.is_empty() || app.s.anim_layer_current.is_some(), |ui| {
+                    if menu_item(app, ui, "Empty Selected Layers") {
+                        anim_layer_empty_selected(app);
+                    }
+                });
                 if menu_item(app, ui, "Delete Empty Layers") {
                     anim_layer_delete_empty(app);
                 }
@@ -5982,6 +6020,10 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                                 app.s.anim_layer_current = Some(l.id.clone());
                                 app.panels.anim_layer_sel = vec![l.id.clone()];
                                 anim_layer_membership_show(app);
+                                ui.close();
+                            }
+                            if menu_item(app, ui, "Empty") {
+                                anim_layer_empty_ids(app, vec![l.id.clone()]);
                                 ui.close();
                             }
                             if menu_item(app, ui, "Delete") {
@@ -8631,6 +8673,27 @@ mod tests {
         out.textures_delta.clear();
         let id = egui::Id::new("anim_layer_membership_editor");
         assert!(ctx.memory(|m| m.area_rect(id)).is_some(), "Membership window did not open");
+    }
+
+    #[test]
+    fn emptying_a_layer_removes_its_attributes_and_curves() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        app.s.set_time(0.0);
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(4.0)));
+        anim_layer_key_weight(&mut app, &lid, Some(0.5));
+        anim_layer_empty_ids(&mut app, vec![lid.clone()]);
+        let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("emptied layer is kept");
+        assert!(layer.attrs.is_empty() && layer.members.is_empty() && layer.curves.is_empty());
+        assert_eq!(layer.weight_curve.keys.len(), 1, "Empty must keep the layer weight animation");
+        app.s.set_time(0.0);
+        assert!(app.s.get_attr_f(&nid, "translateX").abs() < 1e-9, "removed layer animation was not restored");
     }
 
     #[test]
