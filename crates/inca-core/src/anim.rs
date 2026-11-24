@@ -105,11 +105,19 @@ pub struct MergeLayerOptions {
     pub include_children: bool,
     pub result_mode: MergeLayerMode,
     pub delete_layers: bool,
+    /// Sample every N frames when Smart Bake is off.
+    pub sample_by: u32,
+    /// Put result keys only where the source curves have keys.
+    pub smart_bake: bool,
+    /// Add keys between source keys when the blended shape deviates too far.
+    pub increase_fidelity: bool,
+    /// Allowed deviation percentage for Increase Fidelity.
+    pub fidelity_tolerance: u32,
 }
 
 impl Default for MergeLayerOptions {
     fn default() -> Self {
-        Self { include_children: true, result_mode: MergeLayerMode::Automatic, delete_layers: true }
+        Self { include_children: true, result_mode: MergeLayerMode::Automatic, delete_layers: true, sample_by: 1, smart_bake: false, increase_fidelity: false, fidelity_tolerance: 1 }
     }
 }
 

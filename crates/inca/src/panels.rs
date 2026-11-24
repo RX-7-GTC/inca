@@ -5843,6 +5843,21 @@ fn anim_layer_merge_options(app: &mut IncaApp, ctx: &egui::Context) {
             ui.checkbox(&mut opts.delete_layers, "Delete Baked (Merged) Layers");
             ui.separator();
             ui.horizontal(|ui| {
+                ui.label("Sample by");
+                ui.add(egui::DragValue::new(&mut opts.sample_by).range(1..=100));
+            });
+            ui.checkbox(&mut opts.smart_bake, "Smart Bake");
+            ui.add_enabled_ui(opts.smart_bake, |ui| {
+                ui.checkbox(&mut opts.increase_fidelity, "Increase Fidelity");
+            });
+            ui.add_enabled_ui(opts.smart_bake && opts.increase_fidelity, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Fidelity Keys Tolerance");
+                    ui.add(egui::DragValue::new(&mut opts.fidelity_tolerance).range(0..=100).suffix("%"));
+                });
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
                 ui.add_enabled_ui(count >= 2, |ui| {
                     if ui.button("Merge").clicked() {
                         merge = true;

@@ -2341,7 +2341,7 @@ impl Scene {
         v
     }
 
-    fn anim_curve_times(&self, key: &str) -> Vec<f64> {
+    fn anim_curve_key_times(&self, key: &str) -> Vec<f64> {
         let mut ts: Vec<f64> = self
             .anim
             .curves
@@ -2352,11 +2352,16 @@ impl Scene {
             .collect();
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         ts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        ts
+    }
+
+    fn anim_curve_times_by(&self, key: &str, sample_by: f64) -> Vec<f64> {
+        let mut ts = self.anim_curve_key_times(key);
         if let (Some(lo), Some(hi)) = (ts.first().copied(), ts.last().copied()) {
             // Bake on frames (like Maya's merge) so between-key shapes survive. Very long
             // ranges are capped instead of generating a key for every frame.
             // shortcut: 2000 samples per curve, raise if long clips need more fidelity.
-            let step = ((hi - lo) / 2000.0).max(1.0);
+            let step = sample_by.max(1.0).max((hi - lo) / 2000.0);
             let mut t = if step <= 1.0 { lo.ceil() } else { lo + step };
             while t < hi {
                 ts.push(t);
@@ -2366,6 +2371,10 @@ impl Scene {
             ts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
         }
         ts
+    }
+
+    fn anim_curve_times(&self, key: &str) -> Vec<f64> {
+        self.anim_curve_times_by(key, 1.0)
     }
 
     fn anim_layer_subtree_ids(&self, id: &str) -> Vec<String> {
@@ -2520,9 +2529,31 @@ impl Scene {
         let mut baked = vec![];
         let mut cannot_bake = false;
         for key in keys {
-            let times = self.anim_curve_times(&key);
-            if times.is_empty() {
+            let key_times = self.anim_curve_key_times(&key);
+            if key_times.is_empty() {
                 continue;
+            }
+            let mut times = if opts.smart_bake { key_times.clone() } else { self.anim_curve_times_by(&key, opts.sample_by as f64) };
+            if opts.smart_bake && opts.increase_fidelity {
+                let boundary = absorb.as_deref().unwrap_or(target);
+                let step = opts.sample_by.max(1) as f64;
+                for pair in key_times.windows(2) {
+                    let (a, b) = (pair[0], pair[1]);
+                    let wa = self.anim_value_through(&key, a, boundary);
+                    let wb = self.anim_value_through(&key, b, boundary);
+                    let tol = ((wb - wa).abs() * opts.fidelity_tolerance as f64 / 100.0).max(1e-9);
+                    let mut t = a + step;
+                    while t < b - 1e-6 {
+                        let want = self.anim_value_through(&key, t, boundary);
+                        let linear = wa + (wb - wa) * (t - a) / (b - a);
+                        if (want - linear).abs() > tol {
+                            times.push(t);
+                        }
+                        t += step;
+                    }
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                times.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
             }
             let attr = key.rsplit_once('.').map(|(_, a)| a).unwrap_or("");
             let samples: Vec<(f64, f64)> = times
@@ -2576,7 +2607,8 @@ impl Scene {
                 let Some(ro) = self.nodes.get(node).map(|n| n.xf.ro.clone()) else { continue };
                 let mut times = vec![];
                 for attr in ["rotateX", "rotateY", "rotateZ"] {
-                    times.extend(self.anim_curve_times(&Anim::key(node, attr)));
+                    let key = Anim::key(node, attr);
+                    times.extend(if opts.smart_bake { self.anim_curve_key_times(&key) } else { self.anim_curve_times_by(&key, opts.sample_by as f64) });
                 }
                 times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 times.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
@@ -4534,6 +4566,47 @@ mod tests {
         s.graph_curve_mut(&key).unwrap().keys[0].v = 0.5;
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateX") - 5.0).abs() < 1e-9, "edited weight keys affect the pose");
+    }
+
+    #[test]
+    fn merge_smart_bake_and_sample_by_control_key_times() {
+        let mut smart_scene = Scene::new();
+        let a = smart_scene.create_mesh("polyCube", &Params::new(), None);
+        smart_scene.anim_layers = vec![
+            anim_test_layer(&smart_scene, "al1", &a, "translateX", false, &[(0.0, 2.0), (5.0, 4.0), (10.0, 2.0)]),
+            anim_test_layer(&smart_scene, "al2", &a, "translateX", false, &[(0.0, 0.0), (5.0, 1.0), (10.0, 0.0)]),
+        ];
+        let key = Anim::key(&a, "translateX");
+        let smart = MergeLayerOptions { smart_bake: true, ..Default::default() };
+        assert!(smart_scene.merge_anim_layers_with("al1", &["al2".into()], smart));
+        let times: Vec<f64> = smart_scene.anim_layers[0].curves[&key].keys.iter().map(|k| k.t).collect();
+        assert_eq!(times, vec![0.0, 5.0, 10.0], "Smart Bake should keep only source key times");
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.anim_layers = vec![
+            anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 2.0), (5.0, 4.0), (10.0, 2.0)]),
+            anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 0.0), (5.0, 1.0), (10.0, 0.0)]),
+        ];
+        let sampled = MergeLayerOptions { smart_bake: false, sample_by: 2, ..Default::default() };
+        assert!(s.merge_anim_layers_with("al1", &["al2".into()], sampled));
+        let times: Vec<f64> = s.anim_layers[0].curves[&key].keys.iter().map(|k| k.t).collect();
+        assert_eq!(times, vec![0.0, 2.0, 4.0, 5.0, 6.0, 8.0, 10.0], "Sample By 2 should bake every second frame plus source keys");
+    }
+
+    #[test]
+    fn merge_increase_fidelity_adds_keys_between_spline_keys() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let mut target = anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 0.0), (5.0, 10.0), (10.0, 0.0)]);
+        let key = Anim::key(&a, "translateX");
+        for k in &mut target.curves.get_mut(&key).unwrap().keys {
+            k.it = "spline".into();
+            k.ot = "spline".into();
+        }
+        s.anim_layers = vec![target, anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 0.0), (10.0, 0.0)])];
+        let opts = MergeLayerOptions { smart_bake: true, increase_fidelity: true, fidelity_tolerance: 1, ..Default::default() };
+        assert!(s.merge_anim_layers_with("al1", &["al2".into()], opts));
+        assert!(s.anim_layers[0].curves[&key].keys.len() > 3, "Increase Fidelity did not add keys");
     }
 
     #[test]
