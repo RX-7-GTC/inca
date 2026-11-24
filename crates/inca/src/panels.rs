@@ -5105,6 +5105,29 @@ fn anim_layer_merge_down(app: &mut IncaApp, id: &str) {
     }
 }
 
+fn anim_layer_extract_base(app: &mut IncaApp, selected_only: bool) {
+    let nodes: Vec<String> = if selected_only { app.s.sel.clone() } else { app.s.nodes.keys().cloned().collect() };
+    if nodes.is_empty() {
+        app.help = if selected_only { "Select objects to extract non-layered animation".into() } else { "There are no objects in the scene".into() };
+        return;
+    }
+    let Some(id) = app.s.extract_base_animation(&nodes, "BaseAnimation_extract") else {
+        app.help = if selected_only { "The selected objects have no non-layered animation".into() } else { "There is no non-layered animation to extract".into() };
+        return;
+    };
+    if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
+        l.rotation_by_layer = app.panels.layer_default_rotation_by_layer;
+        l.scale_additive = app.panels.layer_default_scale_additive;
+        l.passthrough = app.panels.layer_default_passthrough.unwrap_or(true);
+    }
+    app.panels.anim_layer_sel = vec![id.clone()];
+    app.panels.anim_layer_collapsed.clear();
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+    let name = app.s.anim_layers.iter().find(|l| l.id == id).map(|l| l.name.clone()).unwrap_or_else(|| "BaseAnimation_extract".into());
+    app.help = format!("Extracted non-layered animation to {name}");
+}
+
 fn anim_layer_extract_selected(app: &mut IncaApp, id: &str) {
     if app.s.sel.is_empty() {
         app.help = "Select objects to extract from the current animation layer".into();
@@ -6009,6 +6032,15 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                 });
                 ui.separator();
+                ui.add_enabled_ui(!app.s.sel.is_empty(), |ui| {
+                    if menu_item(app, ui, "Extract Non-Layered Animation for Selected Objects") {
+                        anim_layer_extract_base(app, true);
+                    }
+                });
+                if menu_item(app, ui, "Extract Non-Layered Animation for All Objects") {
+                    anim_layer_extract_base(app, false);
+                }
+                ui.separator();
                 let current = app.s.anim_layer_current.clone();
                 let can_merge = app.panels.anim_layer_sel.len() >= 2;
                 let can_down = current.as_deref().is_some_and(|id| {
@@ -6447,7 +6479,7 @@ fn anim_base_row(app: &mut IncaApp, ui: &mut egui::Ui) {
             ui.spacing_mut().item_spacing.x = 3.0;
             let fixed = 46.0 + 5.0 * 20.0 + 6.0 * 3.0;
             let name_w = (ui.available_width() - fixed).max(60.0);
-            let (name_rect, name_resp) = ui.allocate_exact_size(egui::vec2(name_w, ROW_H), egui::Sense::click());
+            let (name_rect, name_resp) = ui.allocate_exact_size(egui::vec2(name_w, ROW_H), egui::Sense::click_and_drag());
             ui.painter().text(
                 egui::pos2(name_rect.min.x + 4.0, name_rect.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -6459,6 +6491,16 @@ fn anim_base_row(app: &mut IncaApp, ui: &mut egui::Ui) {
                 app.s.anim_layer_current = None;
                 app.panels.anim_layer_sel.clear();
             }
+            crate::menus::show_context_menu(app, &name_resp, |app, ui| {
+                if crate::menus::menu_item(app, ui, "Extract Non-Layered Animation for Selected Objects") {
+                    anim_layer_extract_base(app, true);
+                    ui.close();
+                }
+                if crate::menus::menu_item(app, ui, "Extract Non-Layered Animation for All Objects") {
+                    anim_layer_extract_base(app, false);
+                    ui.close();
+                }
+            });
             // keep the Lock in the same column as the layer rows; BaseAnimation has no
             // weight, mute, solo or mode
             for w in [46.0, 20.0, 20.0] {

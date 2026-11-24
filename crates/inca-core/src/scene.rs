@@ -2800,6 +2800,62 @@ impl Scene {
         Some(id)
     }
 
+    /// Move non-layered (BaseAnimation) curves for `nodes` to a new top Override layer.
+    /// Returns the new layer id, or None when those objects have no base animation.
+    pub fn extract_base_animation(&mut self, nodes: &[String], base_name: &str) -> Option<String> {
+        let node_set: HashSet<&str> = nodes.iter().map(|s| s.as_str()).collect();
+        let keys: Vec<String> = self.anim.curves.iter().filter(|(_, c)| node_set.contains(c.node.as_str()) && !c.keys.is_empty()).map(|(k, _)| k.clone()).collect();
+        if keys.is_empty() {
+            return None;
+        }
+        self.checkpoint("extract non-layered animation");
+        let id = self.new_id("al");
+        let mut name = base_name.to_string();
+        let mut i = 1;
+        while self.anim_layers.iter().any(|l| l.name == name) {
+            name = format!("{base_name}{i}");
+            i += 1;
+        }
+        let mut curves = IndexMap::new();
+        for key in &keys {
+            if let Some(c) = self.anim.curves.shift_remove(key) {
+                curves.insert(key.clone(), c);
+            }
+        }
+        let mut attrs = keys;
+        attrs.sort();
+        attrs.dedup();
+        let mut members: Vec<String> = attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
+        members.sort();
+        members.dedup();
+        self.anim_layers.insert(
+            0,
+            AnimLayer {
+                id: id.clone(),
+                name,
+                weight: 1.0,
+                weight_curve: Default::default(),
+                mute: false,
+                solo: false,
+                lock: false,
+                override_mode: true,
+                passthrough: true,
+                rotation_by_layer: false,
+                scale_additive: false,
+                members,
+                attrs,
+                parent: None,
+                ghost: false,
+                ghost_color: crate::anim::ghost_red(),
+                curves,
+            },
+        );
+        self.anim_layer_current = Some(id.clone());
+        self.apply_anim();
+        self.touch();
+        Some(id)
+    }
+
     /// Remove a node's curves from the base animation and every animation layer.
     pub fn remove_anim_node(&mut self, node: &str) {
         self.anim.remove_node(node);
@@ -4410,6 +4466,41 @@ mod tests {
         s.anim_layers[0].passthrough = true;
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateX") - 10.0).abs() < 1e-9, "passthrough at weight 0 exposes the layer below");
+    }
+
+    #[test]
+    fn extract_base_animation_moves_curves_and_preserves_the_pose() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        let b = s.create_mesh("polyCube", &Params::new(), None);
+        for id in [&a, &b] {
+            s.set_key(id, "translateX", Some(0.0), Some(0.0));
+            s.set_key(id, "translateX", Some(10.0), Some(10.0));
+        }
+        s.set_time(5.0);
+        let id = s.extract_base_animation(std::slice::from_ref(&a), "BaseAnimation_extract").expect("extract");
+        assert_eq!(s.anim_layer_current.as_deref(), Some(id.as_str()));
+        let layer = &s.anim_layers[0];
+        assert_eq!(layer.name, "BaseAnimation_extract");
+        assert!(layer.override_mode && layer.passthrough);
+        assert!(layer.attrs.contains(&Anim::key(&a, "translateX")));
+        assert!(!s.anim.curves.contains_key(&Anim::key(&a, "translateX")), "base curve was not moved");
+        assert!(s.anim.curves.contains_key(&Anim::key(&b, "translateX")), "other object's base curve moved");
+        s.set_time(5.0);
+        assert!((s.get_attr_f(&a, "translateX") - 5.0).abs() < 1e-9, "extraction changed the pose");
+        assert!((s.get_attr_f(&b, "translateX") - 5.0).abs() < 1e-9);
+        let second = s.extract_base_animation(std::slice::from_ref(&b), "BaseAnimation_extract").expect("extract all");
+        assert_eq!(s.anim_layers[0].name, "BaseAnimation_extract1");
+        assert_eq!(s.anim_layer_current.as_deref(), Some(second.as_str()));
+        assert!(s.anim.curves.is_empty());
+    }
+
+    #[test]
+    fn extract_base_animation_returns_none_without_animation() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        assert!(s.extract_base_animation(&[a], "BaseAnimation_extract").is_none());
+        assert!(s.anim_layers.is_empty());
     }
 
     #[test]
