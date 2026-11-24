@@ -3250,7 +3250,6 @@ mod tests {
         s.anim_layers.push(crate::anim::AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,

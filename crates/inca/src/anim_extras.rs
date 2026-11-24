@@ -904,7 +904,6 @@ mod tests {
         app.s.anim_layers.push(inca_core::anim::AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -994,7 +993,6 @@ mod tests {
         app.s.anim_layers.push(inca_core::anim::AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -1031,7 +1029,6 @@ mod tests {
         app.s.anim_layers.push(inca_core::anim::AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -1099,7 +1096,6 @@ mod tests {
         app.s.anim_layers.push(inca_core::anim::AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -1133,7 +1129,6 @@ mod tests {
             app.s.anim_layers.push(inca_core::anim::AnimLayer {
                 id: id.into(),
                 name: id.into(),
-                weight: 1.0,
                 weight_curve: Default::default(),
                 mute: false,
                 solo: false,
@@ -1179,7 +1174,6 @@ mod tests {
         app.s.anim_layers.push(inca_core::anim::AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,

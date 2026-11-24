@@ -4566,7 +4566,6 @@ fn anim_layer_new(app: &mut IncaApp, override_mode: bool) {
         inca_core::anim::AnimLayer {
             id: id.clone(),
             name,
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -5031,6 +5030,7 @@ fn anim_layer_delete(app: &mut IncaApp, id: &str) {
     let children: Vec<String> = anim_layer_children(&app.s.anim_layers, Some(id)).iter().map(|l| l.id.clone()).collect();
     let keys: Vec<String> = app.s.anim_layers.iter().filter(|l| l.id == id).flat_map(|l| l.curves.keys().cloned()).collect();
     app.s.anim_layers.retain(|l| l.id != id);
+    app.s.remove_dep_node(id);
     for c in children {
         if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == c) {
             l.parent = parent.clone();
@@ -5222,8 +5222,8 @@ fn anim_layer_set_weight(app: &mut IncaApp, id: &str, w: f64) {
         app.panels.anim_layer_weight_edit = true;
     }
     let t = app.s.time.current;
+    app.s.set_anim_layer_weight(id, w);
     if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
-        l.weight = w;
         if !l.weight_curve.keys.is_empty() {
             l.weight_curve.set_key(t, w, "auto");
         }
@@ -5235,11 +5235,12 @@ fn anim_layer_set_weight(app: &mut IncaApp, id: &str, w: f64) {
 /// Key the layer weight at the current frame. `value` also sets the weight before keying.
 fn anim_layer_key_weight(app: &mut IncaApp, id: &str, value: Option<f64>) {
     let t = app.s.time.current;
-    let Some(l) = app.s.anim_layers.iter().find(|l| l.id == id) else { return };
-    let w = value.unwrap_or_else(|| l.weight_at(t));
+    let w = value.unwrap_or_else(|| {
+        app.s.anim_layers.iter().find(|l| l.id == id).map(|l| app.s.anim_layer_weight_at(l, t)).unwrap_or(1.0)
+    });
     app.s.checkpoint("key animation layer weight");
+    app.s.set_anim_layer_weight(id, w);
     if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
-        l.weight = w;
         l.weight_curve.set_key(t, w, "auto");
     }
     app.s.set_time(t);
@@ -5379,6 +5380,7 @@ fn anim_layer_duplicate(app: &mut IncaApp, no_animation: bool) {
         return;
     };
     let layers = app.s.anim_layers.clone();
+    let weights: std::collections::HashMap<String, f64> = selected.iter().map(|id| (id.clone(), app.s.anim_layer_weight(id))).collect();
     let mut id_map = std::collections::HashMap::new();
     let mut clones = vec![];
     for id in &selected {
@@ -5421,6 +5423,11 @@ fn anim_layer_duplicate(app: &mut IncaApp, no_animation: bool) {
         app.s.anim_layers.insert(pos, clone.clone());
     }
     inserted.sort_by_key(|id| app.s.anim_layers.iter().position(|l| &l.id == id).unwrap_or(usize::MAX));
+    for (orig, new) in &id_map {
+        if let Some(w) = weights.get(orig) {
+            app.s.set_anim_layer_weight(new, *w);
+        }
+    }
     if let Some(cur) = app.s.anim_layer_current.as_ref().and_then(|c| id_map.get(c)) {
         app.s.anim_layer_current = Some(cur.clone());
     } else {
@@ -5574,6 +5581,7 @@ fn anim_layer_delete_empty(app: &mut IncaApp) {
         let parent = app.s.anim_layers.iter().find(|l| &l.id == id).and_then(|l| l.parent.clone());
         let children: Vec<String> = app.s.anim_layers.iter().filter(|l| l.parent.as_deref() == Some(id)).map(|l| l.id.clone()).collect();
         app.s.anim_layers.retain(|l| &l.id != id);
+        app.s.remove_dep_node(id);
         for c in children {
             if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == c) {
                 l.parent = parent.clone();
@@ -5669,7 +5677,7 @@ fn anim_layer_ae_body(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
     let Some(layer) = app.s.anim_layers.iter().find(|l| l.id == lid).cloned() else { return };
     let t = app.s.time.current;
     let mut key_weight = false;
-    let mut weight = layer.weight_at(t);
+    let mut weight = app.s.anim_layer_weight_at(&layer, t);
     let mut mute = layer.mute;
     let mut solo = layer.solo;
     let mut lock = layer.lock;
@@ -5741,7 +5749,7 @@ fn anim_layer_ae_body(app: &mut IncaApp, ui: &mut egui::Ui, lid: &str) {
     });
     if key_weight {
         anim_layer_key_weight(app, lid, Some(weight));
-    } else if (weight - layer.weight_at(t)).abs() > 1e-9 {
+    } else if (weight - app.s.anim_layer_weight_at(&layer, t)).abs() > 1e-9 {
         anim_layer_set_weight(app, lid, weight);
     }
     // Solo and mute both rewrite mute/lock on the layer, so only apply one state change per frame.
@@ -6370,7 +6378,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             }
                         });
                     }
-                    let mut w = l.weight_at(app.s.time.current);
+                    let mut w = app.s.anim_layer_weight_at(l, app.s.time.current);
                     if ui.add_sized([46.0, ROW_H], egui::DragValue::new(&mut w).speed(0.01).range(0.0..=1.0).max_decimals(2)).changed() {
                         anim_layer_set_weight(app, &l.id, w);
                     }
@@ -6435,7 +6443,7 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         let mut w = current
             .as_ref()
             .and_then(|id| app.s.anim_layers.iter().find(|l| &l.id == id))
-            .map(|l| l.weight_at(app.s.time.current))
+            .map(|l| app.s.anim_layer_weight_at(l, app.s.time.current))
             .unwrap_or(1.0);
         let enabled = current.is_some();
         let avail = ui.available_width();
@@ -8714,13 +8722,16 @@ mod tests {
         assert!(app.s.nodes[&nid].visible, "mode toggle hid the object");
         assert!((app.s.get_attr_f(&nid, "rotateY") - mid).abs() < 1e-9, "switching back did not restore the additive result");
         assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9, "switching back did not restore the scale");
-        anim_layer_update(&mut app, &lid, "layer weight", |l| l.weight = 0.5);
+        app.s.set_anim_layer_weight(&lid, 0.5);
+        app.s.set_time(app.s.time.current);
         assert!((app.s.get_attr_f(&nid, "rotateY") - mid / 2.0).abs() < 1e-9, "weight does not blend the pose");
         assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9, "weight changed the scale");
-        anim_layer_update(&mut app, &lid, "layer weight", |l| l.weight = 0.0);
+        app.s.set_anim_layer_weight(&lid, 0.0);
+        app.s.set_time(app.s.time.current);
         assert!((app.s.get_attr_f(&nid, "rotateY")).abs() < 1e-9, "weight 0 did not return to the static pose");
         assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9);
-        anim_layer_update(&mut app, &lid, "layer weight", |l| l.weight = 1.0);
+        app.s.set_anim_layer_weight(&lid, 1.0);
+        app.s.set_time(app.s.time.current);
         anim_layer_update(&mut app, &lid, "layer mute", |l| l.mute = true);
         assert!((app.s.get_attr_f(&nid, "rotateY")).abs() < 1e-9, "mute did not return to the static pose");
         assert!((app.s.get_attr_f(&nid, "scaleX") - 1.0).abs() < 1e-9);
@@ -8880,11 +8891,13 @@ mod tests {
         let source = app.s.anim_layer_current.clone().expect("layer");
         app.s.set_time(0.0);
         assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(4.0)));
+        app.s.set_anim_layer_weight(&source, 0.3);
         anim_layer_duplicate(&mut app, false);
         assert_eq!(app.s.anim_layers.len(), 2);
         let copy = app.s.anim_layer_current.clone().expect("copy");
         let copy_layer = app.s.anim_layers.iter().find(|l| l.id == copy).expect("copy layer");
         assert!(copy_layer.curves.contains_key(&inca_core::anim::Anim::key(&nid, "translateX")));
+        assert!((app.s.anim_layer_weight(&copy) - 0.3).abs() < 1e-9, "duplicate did not copy the layer weight");
         assert_ne!(copy, source);
         anim_layer_duplicate(&mut app, true);
         assert_eq!(app.s.anim_layers.len(), 3);
@@ -8967,14 +8980,14 @@ mod tests {
         anim_layer_key_weight(&mut app, &lid, Some(1.0));
         let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("layer");
         assert_eq!(layer.weight_curve.keys.len(), 2);
-        assert!((layer.weight_at(1.0) - 0.25).abs() < 1e-9);
-        assert!((layer.weight_at(10.0) - 1.0).abs() < 1e-9);
-        let mid = layer.weight_at(5.0);
+        assert!((app.s.anim_layer_weight_at(layer, 1.0) - 0.25).abs() < 1e-9);
+        assert!((app.s.anim_layer_weight_at(layer, 10.0) - 1.0).abs() < 1e-9);
+        let mid = app.s.anim_layer_weight_at(layer, 5.0);
         app.s.set_time(5.0);
         anim_layer_key_weight(&mut app, &lid, None);
         let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("layer");
         assert_eq!(layer.weight_curve.keys.len(), 3);
-        assert!((layer.weight_at(5.0) - mid).abs() < 1e-9, "K changed the weight");
+        assert!((app.s.anim_layer_weight_at(layer, 5.0) - mid).abs() < 1e-9, "K changed the weight");
     }
 
     #[test]

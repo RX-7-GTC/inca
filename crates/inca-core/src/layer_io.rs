@@ -104,7 +104,7 @@ pub fn export_json(s: &Scene, root_id: &str, branch: bool) -> Result<String, Str
         layers.push(ExportedLayer {
             name: l.name.clone(),
             parent: l.parent.as_ref().filter(|p| ids.contains(*p)).and_then(|p| s.anim_layers.iter().find(|l| &l.id == p).map(|l| l.name.clone())),
-            weight: l.weight,
+            weight: s.anim_layer_weight(&l.id),
             weight_curve: l.weight_curve.clone(),
             mute: l.mute,
             solo: l.solo,
@@ -183,8 +183,10 @@ pub fn import_json(s: &mut Scene, json: &str) -> Result<ImportReport, String> {
     let mut missing_objects = std::collections::BTreeSet::new();
     let mut missing_attrs = std::collections::BTreeSet::new();
     let mut imported: Vec<AnimLayer> = vec![];
+    let mut weights: Vec<(String, f64)> = vec![];
     for src in &file.layers {
         let id = s.new_id("al");
+        weights.push((id.clone(), src.weight));
         let name = unique_layer_name(&src.name, &mut used_names);
         exported_names.insert(src.name.clone(), id.clone());
         let mut curves = indexmap::IndexMap::new();
@@ -246,7 +248,6 @@ pub fn import_json(s: &mut Scene, json: &str) -> Result<ImportReport, String> {
         imported.push(AnimLayer {
             id,
             name,
-            weight: src.weight,
             weight_curve: src.weight_curve.clone(),
             mute: src.mute,
             solo: src.solo,
@@ -276,6 +277,10 @@ pub fn import_json(s: &mut Scene, json: &str) -> Result<ImportReport, String> {
     all.append(&mut s.anim_layers);
     s.anim_layers = all;
     s.normalize_anim_layer_hierarchy();
+    s.ensure_anim_layer_nodes();
+    for (id, weight) in weights {
+        s.set_anim_layer_weight(&id, weight);
+    }
     if let Some(root) = &root {
         s.anim_layer_current = Some(root.clone());
     }
@@ -303,7 +308,7 @@ mod tests {
     use crate::scene::Scene;
     use indexmap::IndexMap;
 
-    fn layer(s: &Scene, id: &str, parent: Option<&str>, node: &str, attr: &str) -> AnimLayer {
+    fn layer(_s: &Scene, id: &str, parent: Option<&str>, node: &str, attr: &str) -> AnimLayer {
         let key = Anim::key(node, attr);
         let mut curve = AnimCurve::new(node, attr);
         curve.set_key(0.0, 1.0, "linear");
@@ -312,7 +317,6 @@ mod tests {
         AnimLayer {
             id: id.into(),
             name: format!("Layer {id}"),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,

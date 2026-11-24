@@ -11,9 +11,6 @@ fn auto() -> String {
 fn constant() -> String {
     "constant".into()
 }
-fn one() -> f64 {
-    1.0
-}
 pub fn ghost_red() -> [f32; 3] {
     [0.85, 0.10, 0.10]
 }
@@ -27,9 +24,7 @@ fn passthrough_default() -> bool {
 pub struct AnimLayer {
     pub id: String,
     pub name: String,
-    #[serde(default = "one")]
-    pub weight: f64,
-    /// Animated layer weight. Empty keys means the static `weight` is used.
+    /// Animated layer weight. Empty keys means the node's `weight` attribute is used.
     #[serde(default)]
     pub weight_curve: AnimCurve,
     #[serde(default)]
@@ -71,14 +66,6 @@ pub struct AnimLayer {
 }
 
 impl AnimLayer {
-    pub fn weight_at(&self, t: f64) -> f64 {
-        if self.weight_curve.keys.is_empty() {
-            self.weight
-        } else {
-            self.weight_curve.eval(t)
-        }
-    }
-
     /// Whether this layer owns `node.attr`. Old scenes without an attribute list keep
     /// their object-level membership until the loader migrates them.
     pub fn has_attr(&self, node: &str, attr: &str) -> bool {

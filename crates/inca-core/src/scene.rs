@@ -992,6 +992,50 @@ impl Scene {
         true
     }
 
+    /// Make sure every animation layer has its real `animLayer` dependency node.
+    pub fn ensure_anim_layer_nodes(&mut self) {
+        let layers: Vec<(String, String)> = self.anim_layers.iter().map(|l| (l.id.clone(), l.name.clone())).collect();
+        for (id, name) in layers {
+            if let Some(n) = self.deps.node_mut(&id) {
+                if n.name != name {
+                    self.names.remove(&n.name);
+                    n.name = name.clone();
+                }
+                self.names.insert(name);
+                if n.spec("weight").is_none() {
+                    n.add_attr("weight", crate::graph::AttrSpec::float(1.0).range(0.0, 1.0));
+                }
+            } else {
+                let mut n = crate::graph::DepNode::new(&id, &name, "animLayer");
+                n.add_attr("weight", crate::graph::AttrSpec::float(1.0).range(0.0, 1.0));
+                self.deps.insert(n);
+                self.names.insert(name);
+            }
+        }
+    }
+
+    /// Layer weight from its node (the scalar part; animated weights use `anim_layer_weight_at`).
+    pub fn anim_layer_weight(&self, id: &str) -> f64 {
+        self.deps.get(&crate::graph::PlugRef::new(id, "weight")).and_then(|v| v.as_f64()).unwrap_or(1.0)
+    }
+
+    pub fn anim_layer_weight_at(&self, l: &AnimLayer, t: f64) -> f64 {
+        if l.weight_curve.keys.is_empty() {
+            self.anim_layer_weight(&l.id)
+        } else {
+            l.weight_curve.eval(t)
+        }
+    }
+
+    pub fn set_anim_layer_weight(&mut self, id: &str, weight: f64) -> bool {
+        self.ensure_anim_layer_nodes();
+        let ok = self.deps.set(&crate::graph::PlugRef::new(id, "weight"), serde_json::json!(weight));
+        if ok {
+            self.touch();
+        }
+        ok
+    }
+
     pub fn find_dep(&self, name: &str) -> Option<&crate::graph::DepNode> {
         self.deps.find(name)
     }
@@ -1957,11 +2001,11 @@ impl Scene {
 
     /// Children's weight is multiplied by every ancestor's weight.
     pub fn anim_layer_effective_weight_at(&self, l: &AnimLayer, t: f64) -> f64 {
-        let mut w = l.weight_at(t);
+        let mut w = self.anim_layer_weight_at(l, t);
         let mut p = self.anim_layer_parent(l);
         for _ in 0..self.anim_layers.len() {
             let Some(pl) = p else { break };
-            w *= pl.weight_at(t);
+            w *= self.anim_layer_weight_at(pl, t);
             p = self.anim_layer_parent(pl);
         }
         w
@@ -2738,6 +2782,11 @@ impl Scene {
             }
         }
         self.anim_layers.retain(|l| !merged.contains(&l.id) || keep_empty.contains(&l.id));
+        for id in &merged {
+            if !keep_empty.contains(id) {
+                self.remove_dep_node(id);
+            }
+        }
         self.normalize_anim_layer_hierarchy();
         self.anim_layer_current = Some(target.to_string());
         self.apply_anim();
@@ -2807,7 +2856,11 @@ impl Scene {
                 }
             }
         }
+        let old_ids: Vec<String> = self.anim_layers.iter().map(|l| l.id.clone()).collect();
         self.anim_layers.clear();
+        for id in old_ids {
+            self.remove_dep_node(&id);
+        }
         self.anim_layer_current = None;
         self.anim_solo_saved.clear();
         self.apply_anim();
@@ -2827,6 +2880,7 @@ impl Scene {
         self.checkpoint("extract animation layer objects");
         let id = self.new_id("al");
         let src = self.anim_layers[source_i].clone();
+        let src_weight = self.anim_layer_weight(&src.id);
         let mut curves = IndexMap::new();
         for key in &keys {
             if let Some(c) = src.curves.get(key) {
@@ -2853,7 +2907,6 @@ impl Scene {
             AnimLayer {
                 id: id.clone(),
                 name: name.to_string(),
-                weight: src.weight,
                 weight_curve: src.weight_curve.clone(),
                 mute: src.mute,
                 solo: src.solo,
@@ -2871,6 +2924,8 @@ impl Scene {
             },
         );
         self.anim_layer_current = Some(id.clone());
+        self.ensure_anim_layer_nodes();
+        self.set_anim_layer_weight(&id, src_weight);
         self.apply_anim();
         self.touch();
         Some(id)
@@ -2909,7 +2964,6 @@ impl Scene {
             AnimLayer {
                 id: id.clone(),
                 name,
-                weight: 1.0,
                 weight_curve: Default::default(),
                 mute: false,
                 solo: false,
@@ -3001,6 +3055,7 @@ impl Scene {
     /// Evaluate BaseAnimation and the layers from the bottom up to and including `upto`.
     /// `None` evaluates BaseAnimation alone (used when building layer ghosts).
     pub fn apply_anim_upto(&mut self, upto: Option<usize>) {
+        self.ensure_anim_layer_nodes();
         let t = self.time.current;
         let vals: Vec<(String, String, f64)> = self.anim.curves.values().filter(|c| !c.keys.is_empty() && !c.mute).map(|c| (c.node.clone(), c.attr.clone(), c.eval(t))).collect();
         let mut moved: Vec<Id> = vec![];
@@ -3237,6 +3292,9 @@ impl Scene {
     pub fn ref_by_id(&self, id: &str) -> Option<NodeRef> {
         if self.nodes.contains_key(id) {
             return Some(NodeRef::Dag(id.into()));
+        }
+        if self.deps.nodes.contains_key(id) {
+            return Some(NodeRef::Dependency(id.into()));
         }
         if self.mats.contains_key(id) {
             return Some(NodeRef::Material(id.into()));
@@ -4057,6 +4115,11 @@ pub const LIGHT_TYPES: &[(&str, &str)] = &[
 mod tests {
     use super::*;
 
+    fn set_layer_weight(s: &mut Scene, index: usize, weight: f64) {
+        let id = s.anim_layers[index].id.clone();
+        s.set_anim_layer_weight(&id, weight);
+    }
+
     #[test]
     fn transform_shear_rotate_axis_and_inheritance() {
         let mut s = Scene::new();
@@ -4336,7 +4399,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -4354,7 +4416,7 @@ mod tests {
         });
         s.set_time(5.0);
         assert!((s.get_attr_f(&a, "translateX") - 20.0).abs() < 1e-9, "override layer wins");
-        s.anim_layers[0].weight = 0.5;
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(5.0);
         assert!((s.get_attr_f(&a, "translateX") - 12.5).abs() < 1e-9, "weight blends");
         s.anim_layers[0].mute = true;
@@ -4375,7 +4437,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -4409,8 +4470,7 @@ mod tests {
         assert!(s.anim.curves[&Anim::key(&a, "translateX")].find(4.0).is_none());
     }
 
-    fn anim_test_layer(s: &Scene, id: &str, node: &str, attr: &str, override_mode: bool, pts: &[(f64, f64)]) -> AnimLayer {
-        let mut c = AnimCurve::new(node, attr);
+    fn anim_test_layer(s: &Scene, id: &str, node: &str, attr: &str, override_mode: bool, pts: &[(f64, f64)]) -> AnimLayer {        let mut c = AnimCurve::new(node, attr);
         for (t, v) in pts {
             c.set_key(*t, *v, "linear");
         }
@@ -4420,7 +4480,6 @@ mod tests {
         AnimLayer {
             id: id.into(),
             name: id.into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -4533,15 +4592,15 @@ mod tests {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
         let lower = anim_test_layer(&s, "al2", &a, "translateX", true, &[(0.0, 10.0)]);
-        let mut upper = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 30.0)]);
-        upper.weight = 0.5;
+        let upper = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 30.0)]);
         s.anim_layers = vec![upper, lower];
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateX") - 15.0).abs() < 1e-9, "opaque override should ignore the layer below");
         s.anim_layers[0].passthrough = true;
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateX") - 20.0).abs() < 1e-9, "passthrough should blend with the layer below");
-        s.anim_layers[0].weight = 0.0;
+        set_layer_weight(&mut s, 0, 0.0);
         s.anim_layers[0].passthrough = false;
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateX")).abs() < 1e-9, "opaque override at weight 0 must still block lower layers");
@@ -4660,6 +4719,21 @@ mod tests {
     }
 
     #[test]
+    fn anim_layer_weight_is_stored_on_its_node() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.anim_layers = vec![anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 1.0)])];
+        s.set_time(0.0);
+        let layer_ref = NodeRef::Dependency("al1".into());
+        assert_eq!(s.get_attr(&layer_ref, "weight"), Some(json!(1.0)), "layer node was not created");
+        assert!(s.set_anim_layer_weight("al1", 0.25));
+        assert_eq!(s.get_attr(&layer_ref, "weight"), Some(json!(0.25)));
+        assert!((s.anim_layer_effective_weight_at(&s.anim_layers[0], 0.0) - 0.25).abs() < 1e-9);
+        assert!(s.set_attr(&layer_ref, "weight", json!(0.5)));
+        assert!((s.anim_layer_effective_weight_at(&s.anim_layers[0], 0.0) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn dependency_nodes_are_first_class_scene_nodes() {
         let mut s = Scene::new();
         let id = s.create_dep_node("testNode", "TestNode1");
@@ -4749,7 +4823,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 0.5,
             weight_curve: Default::default(),
             mute: true,
             solo: false,
@@ -4805,7 +4878,6 @@ mod tests {
             s.anim_layers.push(AnimLayer {
                 id: id.into(),
                 name: id.into(),
-                weight: 1.0,
                 weight_curve: Default::default(),
                 mute: false,
                 solo: false,
@@ -4839,7 +4911,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -4888,7 +4959,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -4914,15 +4984,15 @@ mod tests {
         s.set_key(&a, "rotateY", None, None);
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "rotateY") - 80.0).abs() < 1e-9);
-        s.anim_layers[0].weight = 0.5;
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "rotateY") - 40.0).abs() < 1e-9, "weight does not blend the pose");
         assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9, "weight changed the scale");
-        s.anim_layers[0].weight = 0.0;
+        set_layer_weight(&mut s, 0, 0.0);
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9, "weight 0 did not return to the static pose");
         assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
-        s.anim_layers[0].weight = 1.0;
+        set_layer_weight(&mut s, 0, 1.0);
         s.anim_layers[0].mute = true;
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9, "mute did not return to the static pose");
@@ -4943,7 +5013,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -4968,11 +5037,11 @@ mod tests {
         s.set_attr_f(&a, "rotateY", 80.0);
         s.set_key(&a, "rotateY", None, None);
         s.set_time(10.0);
-        s.anim_layers[0].weight = 0.5;
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "rotateY") - 40.0).abs() < 1e-9);
         assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9, "override weight scaled the object");
-        s.anim_layers[0].weight = 0.0;
+        set_layer_weight(&mut s, 0, 0.0);
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9);
         assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
@@ -4987,8 +5056,8 @@ mod tests {
         cy.set_key(0.0, 90.0, "linear");
         layer.curves.insert(Anim::key(&a, "rotateY"), cy);
         layer.attrs.push(Anim::key(&a, "rotateY"));
-        layer.weight = 0.5;
         s.anim_layers = vec![layer];
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "rotateX") - 45.0).abs() < 1e-9);
         assert!((s.get_attr_f(&a, "rotateY") - 45.0).abs() < 1e-9);
@@ -5010,9 +5079,9 @@ mod tests {
         cy.set_key(0.0, 90.0, "linear");
         layer.curves.insert(Anim::key(&a, "rotateY"), cy);
         layer.attrs.push(Anim::key(&a, "rotateY"));
-        layer.weight = 0.5;
         layer.rotation_by_layer = true;
         s.anim_layers = vec![layer];
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
         let before = [s.get_attr_f(&a, "rotateX"), s.get_attr_f(&a, "rotateY"), s.get_attr_f(&a, "rotateZ")];
         assert!(s.flatten_anim_layers());
@@ -5041,16 +5110,16 @@ mod tests {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
         let mut target = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
-        target.weight = 0.5;
         target.rotation_by_layer = true;
         let mut source = anim_test_layer(&s, "al2", &a, "rotateY", true, &[(0.0, 90.0)]);
         source.rotation_by_layer = true;
         s.anim_layers = vec![target, source];
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
         let before = [s.get_attr_f(&a, "rotateX"), s.get_attr_f(&a, "rotateY"), s.get_attr_f(&a, "rotateZ")];
         assert!(s.merge_anim_layers("al1", &["al2".into()]));
         assert_eq!(s.anim_layers.len(), 1);
-        assert!((s.anim_layers[0].weight - 0.5).abs() < 1e-9, "merge changed the weight");
+        assert!((s.anim_layer_weight("al1") - 0.5).abs() < 1e-9, "merge changed the weight");
         s.set_time(0.0);
         for (attr, want) in ["rotateX", "rotateY", "rotateZ"].iter().zip(before) {
             let got = s.get_attr_f(&a, attr);
@@ -5063,10 +5132,10 @@ mod tests {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
         let mut target = anim_test_layer(&s, "al1", &a, "visibility", false, &[(0.0, 0.0)]);
-        target.weight = 0.5;
         let mut source = anim_test_layer(&s, "al2", &a, "rotateX", true, &[(0.0, 90.0)]);
         source.rotation_by_layer = true;
         s.anim_layers = vec![target, source];
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
         assert!(s.nodes[&a].visible, "visibility should be on before the merge");
         assert!(s.merge_anim_layers("al1", &["al2".into()]));
@@ -5079,18 +5148,18 @@ mod tests {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
         let mut target = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
-        target.weight = 1.0;
         target.weight_curve.set_key(0.0, 1.0, "linear");
         target.passthrough = true;
         target.rotation_by_layer = true;
         let mut source = anim_test_layer(&s, "al2", &a, "rotateY", true, &[(0.0, 90.0)]);
         source.rotation_by_layer = true;
         s.anim_layers = vec![target, source];
+        set_layer_weight(&mut s, 0, 1.0);
         s.set_time(0.0);
         let before = [s.get_attr_f(&a, "rotateX"), s.get_attr_f(&a, "rotateY"), s.get_attr_f(&a, "rotateZ")];
         assert!(s.merge_anim_layers("al1", &["al2".into()]));
         assert_eq!(s.anim_layers.len(), 1);
-        assert!((s.anim_layers[0].weight - 1.0).abs() < 1e-9);
+        assert!((s.anim_layer_weight("al1") - 1.0).abs() < 1e-9);
         assert_eq!(s.anim_layers[0].weight_curve.keys.len(), 1, "merge cleared the weight curve");
         s.set_time(0.0);
         for (attr, want) in ["rotateX", "rotateY", "rotateZ"].iter().zip(before) {
@@ -5142,7 +5211,7 @@ mod tests {
         assert!((c.keys[0].v - 1.0).abs() < 1e-9, "additive scale should key the delta, got {}", c.keys[0].v);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "scaleX") - 2.0).abs() < 1e-9);
-        s.anim_layers[0].weight = 0.5;
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "scaleX") - 1.5).abs() < 1e-9);
     }
@@ -5153,15 +5222,15 @@ mod tests {
         let a = s.create_mesh("polyCube", &Params::new(), None);
         let mut target = anim_test_layer(&s, "al1", &a, "scaleX", false, &[(0.0, 0.0)]);
         target.scale_additive = true;
-        target.weight = 0.5;
         let mut source = anim_test_layer(&s, "al2", &a, "scaleX", false, &[(0.0, 0.5)]);
         source.scale_additive = true;
         s.anim_layers = vec![target, source];
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
         let before = s.get_attr_f(&a, "scaleX");
         assert!((before - 1.5).abs() < 1e-9);
         assert!(s.merge_anim_layers("al1", &["al2".into()]));
-        assert!((s.anim_layers[0].weight - 0.5).abs() < 1e-9, "merge changed the target weight");
+        assert!((s.anim_layer_weight("al1") - 0.5).abs() < 1e-9, "merge changed the target weight");
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "scaleX") - before).abs() < 1e-9);
     }
@@ -5174,10 +5243,10 @@ mod tests {
         s.anim_layers = vec![layer];
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "scaleX") - 3.0).abs() < 1e-9, "additive scale should multiply the base");
-        s.anim_layers[0].weight = 0.5;
+        set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "scaleX") - 3.0_f64.sqrt()).abs() < 1e-9, "weight should be a scale exponent");
-        s.anim_layers[0].weight = 1.0;
+        set_layer_weight(&mut s, 0, 1.0);
         s.set_anim_layer_override("al1", true);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "scaleX") - 3.0).abs() < 1e-9, "absolute scale key should survive the mode switch");
@@ -5211,7 +5280,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -5276,7 +5344,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "parent".into(),
             name: "Parent".into(),
-            weight: 0.5,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -5295,7 +5362,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "child".into(),
             name: "Child".into(),
-            weight: 0.5,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -5312,6 +5378,8 @@ mod tests {
             curves,
         });
         s.anim_layer_current = Some("child".into());
+        s.set_anim_layer_weight("parent", 0.5);
+        s.set_anim_layer_weight("child", 0.5);
         s.set_time(5.0);
         assert!((s.get_attr_f(&a, "translateX") - 2.5).abs() < 1e-9, "weights multiply");
         if let Some(p) = s.anim_layers.iter_mut().find(|l| l.id == "parent") {
@@ -5322,8 +5390,8 @@ mod tests {
         assert!(!s.set_key(&a, "translateX", Some(6.0), Some(9.0)), "muted child received a key");
         if let Some(p) = s.anim_layers.iter_mut().find(|l| l.id == "parent") {
             p.mute = false;
-            p.weight = 1.0;
         }
+        s.set_anim_layer_weight("parent", 1.0);
         s.set_time(5.0);
         assert!((s.get_attr_f(&a, "translateX") - 5.0).abs() < 1e-9, "parent weight did not update");
     }
@@ -5335,7 +5403,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
@@ -5374,7 +5441,6 @@ mod tests {
         s.anim_layers.push(AnimLayer {
             id: "al1".into(),
             name: "Layer 1".into(),
-            weight: 1.0,
             weight_curve: Default::default(),
             mute: false,
             solo: false,
