@@ -536,6 +536,8 @@ pub enum NodeRef {
     Material(Id),
     Texture(Id),
     Place2D(Id),
+    /// A non-DAG node in `Scene::deps` (animation layer, shading node, utility node).
+    Dependency(Id),
 }
 
 #[derive(Clone)]
@@ -548,6 +550,8 @@ pub struct Snapshot {
 
 pub struct Scene {
     pub nodes: IndexMap<Id, Node>,
+    /// Non-DAG dependency nodes (layers, shading nodes, utility nodes).
+    pub deps: crate::graph::DepGraph,
     pub roots: Vec<Id>,
     pub names: HashSet<String>,
     pub mats: IndexMap<Id, Material>,
@@ -625,6 +629,7 @@ impl Scene {
     pub fn new() -> Self {
         let mut s = Scene {
             nodes: IndexMap::new(),
+            deps: crate::graph::DepGraph::default(),
             roots: vec![],
             names: HashSet::new(),
             mats: IndexMap::new(),
@@ -962,6 +967,35 @@ impl Scene {
         self.nodes.values().find(|n| n.name == name).or_else(|| self.nodes.values().find(|n| n.shape_name.as_deref() == Some(name))).map(|n| n.id.clone())
     }
 
+    /// Create a generic non-DAG node. Attributes are registered by the caller.
+    pub fn create_dep_node(&mut self, kind: &str, name: &str) -> Id {
+        let id = self.new_id(kind);
+        let name = self.unique_name(name);
+        self.names.insert(name.clone());
+        self.deps.insert(crate::graph::DepNode::new(&id, &name, kind));
+        self.touch();
+        id
+    }
+
+    pub fn dep_node(&self, id: &str) -> Option<&crate::graph::DepNode> {
+        self.deps.node(id)
+    }
+
+    pub fn dep_node_mut(&mut self, id: &str) -> Option<&mut crate::graph::DepNode> {
+        self.deps.node_mut(id)
+    }
+
+    pub fn remove_dep_node(&mut self, id: &str) -> bool {
+        let Some(n) = self.deps.remove(id) else { return false };
+        self.names.remove(&n.name);
+        self.touch();
+        true
+    }
+
+    pub fn find_dep(&self, name: &str) -> Option<&crate::graph::DepNode> {
+        self.deps.find(name)
+    }
+
     pub fn resolve(&self, name: &str) -> Option<NodeRef> {
         if let Some(id) = self.find(name) {
             return Some(NodeRef::Dag(id));
@@ -979,7 +1013,10 @@ impl Scene {
         if let Some(t) = self.texs.values().find(|t| t.name == name) {
             return Some(NodeRef::Texture(t.id.clone()));
         }
-        self.places.values().find(|p| p.name == name).map(|p| NodeRef::Place2D(p.id.clone()))
+        if let Some(p) = self.places.values().find(|p| p.name == name) {
+            return Some(NodeRef::Place2D(p.id.clone()));
+        }
+        self.deps.find(name).map(|n| NodeRef::Dependency(n.id.clone()))
     }
 
     pub fn ref_name(&self, r: &NodeRef) -> String {
@@ -989,6 +1026,7 @@ impl Scene {
             NodeRef::Material(id) => self.mats.get(id).map(|m| m.name.clone()).unwrap_or_default(),
             NodeRef::Texture(id) => self.texs.get(id).map(|m| m.name.clone()).unwrap_or_default(),
             NodeRef::Place2D(id) => self.places.get(id).map(|p| p.name.clone()).unwrap_or_default(),
+            NodeRef::Dependency(id) => self.deps.node(id).map(|n| n.name.clone()).unwrap_or_default(),
         }
     }
 
@@ -1688,6 +1726,7 @@ impl Scene {
             NodeRef::Material(id) => get_compound(&self.mats.get(id)?.attrs, attr),
             NodeRef::Texture(id) => get_compound(&self.texs.get(id)?.attrs, attr),
             NodeRef::Place2D(id) => get_compound(&self.places.get(id)?.attrs, attr),
+            NodeRef::Dependency(id) => self.deps.get(&crate::graph::PlugRef::new(id, attr)),
         }
     }
 
@@ -1848,6 +1887,11 @@ impl Scene {
             }
             NodeRef::Place2D(id) => {
                 let ok = self.places.get_mut(id).is_some_and(|p| set_compound(&mut p.attrs, attr, v));
+                self.touch();
+                ok
+            }
+            NodeRef::Dependency(id) => {
+                let ok = self.deps.set(&crate::graph::PlugRef::new(id, attr), v);
                 self.touch();
                 ok
             }
@@ -3215,7 +3259,7 @@ impl Scene {
     }
     pub fn ref_id(&self, r: &NodeRef) -> Id {
         match r {
-            NodeRef::Dag(i) | NodeRef::Material(i) | NodeRef::Texture(i) | NodeRef::Place2D(i) => i.clone(),
+            NodeRef::Dag(i) | NodeRef::Material(i) | NodeRef::Texture(i) | NodeRef::Place2D(i) | NodeRef::Dependency(i) => i.clone(),
             NodeRef::History(n, i) => self.nodes.get(n).and_then(|n| n.mesh()).and_then(|m| m.history.get(*i)).map(|h| h.id.clone()).unwrap_or_default(),
         }
     }
@@ -3660,6 +3704,7 @@ impl Scene {
             "version": self.version,
             "idCounter": self.id_counter,
             "nodes": nodes,
+            "deps": serde_json::to_value(&self.deps).unwrap_or(Value::Null),
             "shading": ShadingData { mats: self.mats.values().cloned().collect(), texs: self.texs.values().cloned().collect(), places: self.places.values().cloned().collect(), default_mat_id: Some(self.default_mat.clone()) },
             "layers": self.layers,
             "anim": self.anim.serialize(),
@@ -3682,6 +3727,7 @@ impl Scene {
 
     pub fn clear(&mut self) {
         self.nodes.clear();
+        self.deps = Default::default();
         self.roots.clear();
         self.names.clear();
         self.mats.clear();
@@ -3748,6 +3794,10 @@ impl Scene {
         self.layers = serde_json::from_value(data["layers"].clone()).unwrap_or_default();
         for l in &self.layers {
             self.names.insert(l.name.clone());
+        }
+        self.deps = serde_json::from_value(data.get("deps").cloned().unwrap_or(Value::Null)).unwrap_or_default();
+        for n in self.deps.nodes.values() {
+            self.names.insert(n.name.clone());
         }
         let mut by_id: HashMap<String, Id> = HashMap::new();
         for d in data["nodes"].as_array().unwrap() {
@@ -4607,6 +4657,37 @@ mod tests {
         let opts = MergeLayerOptions { smart_bake: true, increase_fidelity: true, fidelity_tolerance: 1, ..Default::default() };
         assert!(s.merge_anim_layers_with("al1", &["al2".into()], opts));
         assert!(s.anim_layers[0].curves[&key].keys.len() > 3, "Increase Fidelity did not add keys");
+    }
+
+    #[test]
+    fn dependency_nodes_are_first_class_scene_nodes() {
+        let mut s = Scene::new();
+        let id = s.create_dep_node("testNode", "TestNode1");
+        {
+            let n = s.dep_node_mut(&id).unwrap();
+            n.add_attr("input", crate::graph::AttrSpec::float(1.0));
+            n.add_attr("output", crate::graph::AttrSpec::float(0.0));
+        }
+        assert_eq!(s.resolve("TestNode1"), Some(NodeRef::Dependency(id.clone())));
+        let input = NodeRef::Dependency(id.clone());
+        assert_eq!(s.get_attr(&input, "input"), Some(json!(1.0)));
+        assert!(s.set_attr(&input, "input", json!(3.0)));
+        assert_eq!(s.get_attr(&input, "input"), Some(json!(3.0)));
+        let id2 = s.create_dep_node("testNode", "TestNode1");
+        {
+            let n = s.dep_node_mut(&id2).unwrap();
+            n.add_attr("input", crate::graph::AttrSpec::float(1.0));
+            n.add_attr("output", crate::graph::AttrSpec::float(0.0));
+        }
+        assert_ne!(s.dep_node(&id2).unwrap().name, s.dep_node(&id).unwrap().name, "dependency node names must be unique");
+        assert!(s.deps.connect(crate::graph::PlugRef::new(&id, "input"), crate::graph::PlugRef::new(&id2, "input")));
+        let input2 = NodeRef::Dependency(id2.clone());
+        assert_eq!(s.get_attr(&input2, "input"), Some(json!(3.0)), "connected plug did not follow its source");
+        let json = s.serialize();
+        let mut loaded = Scene::new();
+        loaded.load(&json).unwrap();
+        assert_eq!(loaded.resolve("TestNode1"), Some(NodeRef::Dependency(id)));
+        assert_eq!(loaded.get_attr(&NodeRef::Dependency(id2), "input"), Some(json!(3.0)));
     }
 
     #[test]

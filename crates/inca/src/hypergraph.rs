@@ -212,7 +212,7 @@ fn layout_connections(s: &Scene, io: &[String]) -> (Vec<Box_>, Vec<(String, Stri
     for c in &s.conns {
         let owner = |id: &str| s.ref_by_id(id).map(|r| match r {
             NodeRef::Dag(i) | NodeRef::History(i, _) => i,
-            NodeRef::Material(i) | NodeRef::Texture(i) | NodeRef::Place2D(i) => i,
+            NodeRef::Material(i) | NodeRef::Texture(i) | NodeRef::Place2D(i) | NodeRef::Dependency(i) => i,
         });
         if let (Some(a), Some(b)) = (owner(&c.src), owner(&c.dst)) {
             if s.node(&a).is_some() && s.node(&b).is_some() {
@@ -1164,6 +1164,7 @@ fn ce_attrs(s: &Scene, r: &NodeRef) -> Vec<CeAttr> {
         NodeRef::Material(id) => material_attrs(s, id),
         NodeRef::Texture(id) => texture_attrs(s, id),
         NodeRef::Place2D(id) => s.places.get(id).map(|p| bag_attrs(&p.attrs, &[], |_| true)).unwrap_or_default(),
+        NodeRef::Dependency(_) => vec![],
     }
 }
 

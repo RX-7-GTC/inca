@@ -799,6 +799,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                         NodeRef::Texture(id) => ("texture", id.clone()),
                         NodeRef::History(..) => return Err("container: publishing history attributes is not supported".into()),
                         NodeRef::Place2D(..) => return Err("container: publishing place2dTexture attributes is not supported".into()),
+                        NodeRef::Dependency(..) => return Err("container: publishing dependency-node attributes is not supported".into()),
                     };
                     if node == cid {
                         return Err("container: cannot publish a container's own attribute".into());
@@ -1040,6 +1041,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 Some(NodeRef::Material(id)) => s.mats[&id].ty.clone(),
                 Some(NodeRef::Texture(id)) => s.texs[&id].ty.clone(),
                 Some(NodeRef::Place2D(_)) => "place2dTexture".into(),
+                Some(NodeRef::Dependency(id)) => s.deps.node(&id).map(|n| n.kind.clone()).unwrap_or_default(),
                 None => return Err(format!("No object matches name: {n}")),
             }))
         }

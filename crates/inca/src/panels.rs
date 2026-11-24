@@ -7643,6 +7643,7 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
             NodeRef::Material(_) => "material:",
             NodeRef::Texture(_) => "texture:",
             NodeRef::Place2D(_) => "placement:",
+            NodeRef::Dependency(_) => "dependency:",
         };
         ui.label(RichText::new(kind).color(theme::TEXT_DIM));
         if app.panels.ae_name.0 != title {
@@ -7796,6 +7797,77 @@ pub fn history_channels(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, i: usize
             channel_row(app, ui, std::slice::from_ref(&r), c.key, &label, c.kind, c.min, c.max);
         }
     }
+}
+
+fn dep_attrs_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
+    let Some(node) = app.s.deps.node(id).cloned() else { return };
+    if node.specs.is_empty() {
+        ui.label(RichText::new("No editable attributes").color(theme::TEXT_DIM));
+        return;
+    }
+    theme::section_header(ui, &format!("{} Attributes", node.kind));
+    egui::Grid::new(("dep_attrs", id)).num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
+        for (name, spec) in &node.specs {
+            if !spec.readable {
+                continue;
+            }
+            ui.label(inca_core::ops::nice_name(name));
+            let value = node.get(name).unwrap_or(Value::Null);
+            match &spec.ty {
+                inca_core::graph::AttrType::Float => {
+                    let mut v = value.as_f64().unwrap_or(0.0);
+                    if ui.add(egui::DragValue::new(&mut v).speed(0.01)).changed() {
+                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(v));
+                    }
+                }
+                inca_core::graph::AttrType::Int => {
+                    let mut v = value.as_i64().unwrap_or(0);
+                    if ui.add(egui::DragValue::new(&mut v).speed(1.0)).changed() {
+                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(v));
+                    }
+                }
+                inca_core::graph::AttrType::Bool => {
+                    let mut v = value.as_bool().unwrap_or_else(|| value.as_f64().is_some_and(|x| x != 0.0));
+                    if ui.checkbox(&mut v, "").changed() {
+                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(v));
+                    }
+                }
+                inca_core::graph::AttrType::Enum(labels) => {
+                    let mut text = value.as_str().unwrap_or_else(|| labels.first().map(|s| s.as_str()).unwrap_or("")).to_string();
+                    egui::ComboBox::from_id_salt(("dep_enum", id, name)).selected_text(&text).show_ui(ui, |ui| {
+                        for label in labels {
+                            ui.selectable_value(&mut text, label.clone(), label);
+                        }
+                    });
+                    if value.as_str() != Some(text.as_str()) {
+                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(text));
+                    }
+                }
+                inca_core::graph::AttrType::Vector => {
+                    let mut v = value.as_array().and_then(|a| Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?])).unwrap_or([0.0; 3]);
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        for x in &mut v {
+                            changed |= ui.add(egui::DragValue::new(x).speed(0.01)).changed();
+                        }
+                    });
+                    if changed {
+                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(v));
+                    }
+                }
+                inca_core::graph::AttrType::String => {
+                    let mut text = value.as_str().unwrap_or("").to_string();
+                    if ui.text_edit_singleline(&mut text).changed() {
+                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(text));
+                    }
+                }
+                inca_core::graph::AttrType::Message => {
+                    ui.label(RichText::new("message").color(theme::TEXT_DIM));
+                }
+            }
+            ui.end_row();
+        }
+    });
 }
 
 fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab: usize) {
@@ -8001,6 +8073,7 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
                 }
             }
         }
+        NodeRef::Dependency(id) => dep_attrs_editor(app, ui, id),
     }
     finish_cb_rows(app, ui, &cb_rows);
 }
