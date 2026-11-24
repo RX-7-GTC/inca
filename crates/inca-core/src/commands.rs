@@ -2932,6 +2932,13 @@ fn file_cmd(s: &mut Scene, a: &Args) -> Result<Val, String> {
     }
     if a.has(&["i", "import"]) {
         let p = path.ok_or("file -i: path required")?;
+        if p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(crate::layer_io::LAYER_FILE_EXT)) {
+            let report = crate::layer_io::import_file(s, &p)?;
+            if !report.missing_objects.is_empty() || !report.missing_attrs.is_empty() {
+                s.warn(format!("Imported layers skipped {} missing object(s) and {} missing attribute(s)", report.missing_objects.len(), report.missing_attrs.len()));
+            }
+            return Ok(strs(report.layers));
+        }
         let made = crate::io::import(s, &p)?;
         s.select(&made, SelMode::Replace);
         return Ok(strs(made.iter().map(|i| s.name_of(i)).collect()));

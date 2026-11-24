@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
 
-pub const IMPORT_EXTS: &[&str] = &["inca", "ma", "mb", "fbx", "obj", "stl", "gltf", "glb"];
+pub const IMPORT_EXTS: &[&str] = &["inca", "ma", "mb", "fbx", "obj", "stl", "gltf", "glb", "inca-layer"];
 pub const EXPORT_EXTS: &[&str] = &["inca", "ma", "fbx", "obj", "stl", "glb"];
 
 fn ext(p: &Path) -> String {
@@ -64,6 +64,13 @@ pub fn import(s: &mut Scene, path: &Path) -> Result<Vec<Id>, String> {
         "ma" => crate::maya::import_ma(s, &std::fs::read_to_string(path).map_err(|e| e.to_string())?),
         "mb" => Err(crate::maya::MB_MESSAGE.into()),
         "fbx" => crate::fbx::import_fbx(s, &std::fs::read(path).map_err(|e| e.to_string())?, path.parent(), &stem(path)),
+        "inca-layer" => {
+            let report = crate::layer_io::import_file(s, path)?;
+            if !report.missing_objects.is_empty() || !report.missing_attrs.is_empty() {
+                s.warn(format!("Imported layers skipped missing objects/attributes ({} / {})", report.missing_objects.len(), report.missing_attrs.len()));
+            }
+            Ok(vec![])
+        }
         e => Err(format!("can't import .{e} files")),
     }
 }

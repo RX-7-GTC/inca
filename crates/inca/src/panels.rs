@@ -5435,6 +5435,46 @@ fn anim_layer_export(app: &mut IncaApp, id: &str, branch: bool) {
     }
 }
 
+fn anim_layer_import(app: &mut IncaApp) {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Inca Animation Layer", &[inca_core::layer_io::LAYER_FILE_EXT, "json"])
+        .pick_file()
+    else {
+        return;
+    };
+    match inca_core::layer_io::import_file(&mut app.s, &path) {
+        Ok(report) => {
+            app.panels.anim_layer_sel = report.root.iter().cloned().collect();
+            app.panels.anim_layer_collapsed.clear();
+            app.s.set_time(app.s.time.current);
+            app.s.touch();
+            let mut msg = format!("Imported {} animation layer(s)", report.layers.len());
+            if !report.missing_objects.is_empty() {
+                msg.push_str(&format!("; {} missing object(s)", report.missing_objects.len()));
+            }
+            if !report.missing_attrs.is_empty() {
+                msg.push_str(&format!("; {} missing attribute(s)", report.missing_attrs.len()));
+            }
+            if !report.missing_objects.is_empty() || !report.missing_attrs.is_empty() {
+                let mut parts = vec![];
+                if !report.missing_objects.is_empty() {
+                    parts.push(format!("missing objects: {}", report.missing_objects.join(", ")));
+                }
+                if !report.missing_attrs.is_empty() {
+                    parts.push(format!("missing attributes: {}", report.missing_attrs.join(", ")));
+                }
+                app.s.warn(format!("Imported layers skipped {}", parts.join("; ")));
+            }
+            app.help = msg.clone();
+            app.last_result = format!("// {msg}");
+        }
+        Err(e) => {
+            app.help = format!("Animation layer import failed: {e}");
+            app.last_result = format!("// Animation layer import failed: {e}");
+        }
+    }
+}
+
 fn anim_layer_select_all(app: &mut IncaApp) {
     app.panels.anim_layer_sel = app.s.anim_layers.iter().map(|l| l.id.clone()).collect();
     if let Some(cur) = &app.s.anim_layer_current {
@@ -5953,6 +5993,9 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                     }
                 });
                 ui.separator();
+                if menu_item(app, ui, "Import Layer...") {
+                    anim_layer_import(app);
+                }
                 ui.add_enabled_ui(app.s.anim_layer_current.is_some(), |ui| {
                     if menu_item(app, ui, "Export Layer...") {
                         if let Some(id) = app.s.anim_layer_current.clone() {

@@ -718,7 +718,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             }
         }
         "importFile" => {
-            if let Some(p) = rfd::FileDialog::new().add_filter("Scenes and models", inca_core::io::IMPORT_EXTS).pick_file() {
+            if let Some(p) = rfd::FileDialog::new().add_filter("Scenes, models and layers", inca_core::io::IMPORT_EXTS).pick_file() {
                 let _ = app.run_mel("import", &format!("file -i \"{}\";", p.display().to_string().replace('\\', "/")));
             }
         }
