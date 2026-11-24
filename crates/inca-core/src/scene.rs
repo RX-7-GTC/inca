@@ -860,11 +860,11 @@ impl Scene {
             locks: Map::new(),
             hidden_channels: BTreeSet::new(),
             nonkeyable: BTreeSet::new(),
+            passthrough: Map::new(),
             shape_name,
             extra: Value::Null,
             expressions: IndexMap::new(),
             shape,
-            passthrough: Map::new(),
             published: IndexMap::new(),
             rev: 1,
         };
@@ -996,21 +996,36 @@ impl Scene {
     pub fn ensure_anim_layer_nodes(&mut self) {
         let layers: Vec<(String, String)> = self.anim_layers.iter().map(|l| (l.id.clone(), l.name.clone())).collect();
         for (id, name) in layers {
-            if let Some(n) = self.deps.node_mut(&id) {
-                if n.name != name {
-                    self.names.remove(&n.name);
-                    n.name = name.clone();
-                }
-                self.names.insert(name);
-                if n.spec("weight").is_none() {
-                    n.add_attr("weight", crate::graph::AttrSpec::float(1.0).range(0.0, 1.0));
-                }
-            } else {
-                let mut n = crate::graph::DepNode::new(&id, &name, "animLayer");
-                n.add_attr("weight", crate::graph::AttrSpec::float(1.0).range(0.0, 1.0));
-                self.deps.insert(n);
-                self.names.insert(name);
+            self.ensure_anim_layer_node(&id, &name);
+        }
+    }
+
+    /// Create or refresh the `animLayer` node for one layer.
+    pub fn ensure_anim_layer_node(&mut self, id: &str, name: &str) {
+        fn add_specs(n: &mut crate::graph::DepNode) {
+            n.add_attr("weight", crate::graph::AttrSpec::float(1.0).range(0.0, 1.0));
+            n.add_attr("mute", crate::graph::AttrSpec::boolean(false));
+            n.add_attr("solo", crate::graph::AttrSpec::boolean(false));
+            n.add_attr("lock", crate::graph::AttrSpec::boolean(false));
+            n.add_attr("override", crate::graph::AttrSpec::boolean(false));
+            n.add_attr("passthrough", crate::graph::AttrSpec::boolean(true));
+            n.add_attr("rotationAccumulationMode", crate::graph::AttrSpec::enumeration(&["By Component", "By Layer"], "By Component"));
+            n.add_attr("scaleAccumulationMode", crate::graph::AttrSpec::enumeration(&["Multiply", "Additive"], "Multiply"));
+            n.add_attr("ghost", crate::graph::AttrSpec::boolean(false));
+            n.add_attr("ghostColor", crate::graph::AttrSpec::vector([0.85, 0.10, 0.10]));
+        }
+        if let Some(n) = self.deps.node_mut(id) {
+            if n.name != name {
+                self.names.remove(&n.name);
+                n.name = name.to_string();
             }
+            self.names.insert(name.to_string());
+            add_specs(n);
+        } else {
+            let mut n = crate::graph::DepNode::new(id, name, "animLayer");
+            add_specs(&mut n);
+            self.deps.insert(n);
+            self.names.insert(name.to_string());
         }
     }
 
@@ -1981,17 +1996,17 @@ impl Scene {
 
     /// Children inherit their ancestors' mutes.
     pub fn anim_layer_effective_mute(&self, l: &AnimLayer) -> bool {
-        if l.mute {
+        if self.anim_layer_mute(&l.id) {
             return true;
         }
         // A soloed child stays active even though Solo muted its ancestors.
-        if self.anim_layers.iter().any(|x| x.solo) && self.anim_layer_soloed(l) {
+        if self.anim_layers.iter().any(|x| self.anim_layer_solo(&x.id)) && self.anim_layer_soloed(l) {
             return false;
         }
         let mut p = self.anim_layer_parent(l);
         for _ in 0..self.anim_layers.len() {
             let Some(pl) = p else { break };
-            if pl.mute {
+            if self.anim_layer_mute(&pl.id) {
                 return true;
             }
             p = self.anim_layer_parent(pl);
@@ -2020,7 +2035,7 @@ impl Scene {
         let mut p = self.anim_layer_parent(l);
         for _ in 0..self.anim_layers.len() {
             let Some(pl) = p else { break };
-            if pl.mute {
+            if self.anim_layer_mute(&pl.id) {
                 return true;
             }
             p = self.anim_layer_parent(pl);
@@ -2030,13 +2045,13 @@ impl Scene {
 
     /// A soloed parent keeps its descendants active.
     pub fn anim_layer_soloed(&self, l: &AnimLayer) -> bool {
-        if l.solo {
+        if self.anim_layer_solo(&l.id) {
             return true;
         }
         let mut p = self.anim_layer_parent(l);
         for _ in 0..self.anim_layers.len() {
             let Some(pl) = p else { break };
-            if pl.solo {
+            if self.anim_layer_solo(&pl.id) {
                 return true;
             }
             p = self.anim_layer_parent(pl);
@@ -2129,7 +2144,7 @@ impl Scene {
             // A locked layer rejects new keys; a layer only receives keys for attributes
             // explicitly assigned to it.
             let Some(l) = self.anim_layers.iter().find(|l| &l.id == lid) else { return false };
-            if l.lock || (!self.anim_layer_soloed(l) && self.anim_layer_parent_muted(l)) || !l.has_attr(id, attr) {
+            if self.anim_layer_lock(&l.id) || (!self.anim_layer_soloed(l) && self.anim_layer_parent_muted(l)) || !l.has_attr(id, attr) {
                 return false;
             }
         } else if self.anim_base_lock {
@@ -2141,10 +2156,10 @@ impl Scene {
             // pose does not add the base animation a second time. Multiply-accumulated scale
             // stores the ratio to the layers below; Additive scale stores a delta.
             if let Some(l) = self.anim_layers.iter().find(|l| &l.id == lid) {
-                if !l.override_mode && attr != "visibility" {
+                if !self.anim_layer_override(&l.id) && attr != "visibility" {
                     let below = self.anim_value_below(&key, t, lid);
                     if attr.starts_with("scale") {
-                        if l.scale_additive {
+                        if self.anim_layer_scale_additive(&l.id) {
                             v -= below;
                         } else if below.abs() > 1e-12 {
                             // Multiply accumulation keys store the layer's scale ratio.
@@ -2254,11 +2269,13 @@ impl Scene {
     /// raw base animation; Override-Passthrough blends with the layers below.
     fn anim_layer_blend(&self, l: &AnimLayer, attr: &str, v: f64, raw: f64, lv: f64, t: f64) -> f64 {
         let w = self.anim_layer_effective_weight_at(l, t);
-        if l.override_mode || attr == "visibility" {
-            let base = if l.override_mode && !l.passthrough { raw } else { v };
+        let override_mode = self.anim_layer_override(&l.id);
+        let passthrough = self.anim_layer_passthrough(&l.id);
+        if override_mode || attr == "visibility" {
+            let base = if override_mode && !passthrough { raw } else { v };
             base + (lv - base) * w
         } else if attr.starts_with("scale") {
-            if l.scale_additive {
+            if self.anim_layer_scale_additive(&l.id) {
                 v + lv * w
             } else {
                 // Maya's default additive scale accumulation is Multiply: scale^weight.
@@ -2285,6 +2302,8 @@ impl Scene {
             if weight <= 1e-6 {
                 continue;
             }
+            let override_mode = self.anim_layer_override(&layer.id);
+            let passthrough = self.anim_layer_passthrough(&layer.id);
             let mut vals = [0.0, 0.0, 0.0];
             let mut any = false;
             for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
@@ -2292,18 +2311,18 @@ impl Scene {
                 if let Some(c) = c.filter(|c| !c.keys.is_empty() && !c.mute) {
                     vals[i] = c.eval(t);
                     any = true;
-                } else if layer.override_mode {
+                } else if override_mode {
                     vals[i] = cur[i];
                 }
             }
             if !any {
                 continue;
             }
-            if layer.rotation_by_layer {
+            if self.anim_layer_rotation_by_layer(&layer.id) {
                 let q_layer = quat_from_euler_deg(vals, &ro);
                 let q_cur = quat_from_euler_deg(cur, &ro);
-                let q_out = if layer.override_mode {
-                    let q_from = if layer.passthrough { q_cur } else { quat_from_euler_deg(base_rot, &ro) };
+                let q_out = if override_mode {
+                    let q_from = if passthrough { q_cur } else { quat_from_euler_deg(base_rot, &ro) };
                     q_from.slerp(q_layer, weight)
                 } else {
                     q_cur * DQuat::IDENTITY.slerp(quat_from_euler_deg(vals, &ro), weight)
@@ -2315,8 +2334,8 @@ impl Scene {
                         continue;
                     }
                     let lv = vals[i];
-                    if layer.override_mode {
-                        let base = if layer.passthrough { cur[i] } else { base_rot[i] };
+                    if override_mode {
+                        let base = if passthrough { cur[i] } else { base_rot[i] };
                         cur[i] = base + (lv - base) * weight;
                     } else {
                         cur[i] += lv * weight;
@@ -2358,7 +2377,7 @@ impl Scene {
         let raw = self.anim_base_value(key, t);
         let mut v = raw;
         let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
-        let solo = self.anim_layers.iter().any(|l| l.solo);
+        let solo = self.anim_layers.iter().any(|l| self.anim_layer_solo(&l.id));
         // layers are stored top-first, so walk the ones below the current layer bottom-up
         for l in self.anim_layers[i + 1..].iter().rev() {
             if self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
@@ -2378,7 +2397,7 @@ impl Scene {
         let raw = self.anim_base_value(key, t);
         let mut v = raw;
         let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
-        let solo = self.anim_layers.iter().any(|l| l.solo);
+        let solo = self.anim_layers.iter().any(|l| self.anim_layer_solo(&l.id));
         for l in self.anim_layers[i..].iter().rev() {
             if self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
@@ -2397,7 +2416,7 @@ impl Scene {
         let raw = self.anim_base_value(key, t);
         let mut v = raw;
         let Some(i) = self.anim_layers.iter().position(|l| l.id == layer_id) else { return v };
-        let solo = self.anim_layers.iter().any(|l| l.solo);
+        let solo = self.anim_layers.iter().any(|l| self.anim_layer_solo(&l.id));
         for l in self.anim_layers[i + 1..].iter().rev() {
             if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
@@ -2415,7 +2434,7 @@ impl Scene {
     fn anim_value_without(&self, key: &str, t: f64, skip: &HashSet<String>) -> f64 {
         let raw = self.anim_base_value(key, t);
         let mut v = raw;
-        let solo = self.anim_layers.iter().any(|l| l.solo);
+        let solo = self.anim_layers.iter().any(|l| self.anim_layer_solo(&l.id));
         for l in self.anim_layers.iter().rev() {
             if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
@@ -2512,33 +2531,107 @@ impl Scene {
         ts
     }
 
+    pub fn anim_layer_bool(&self, id: &str, attr: &str) -> bool {
+        match self.deps.get(&crate::graph::PlugRef::new(id, attr)) {
+            Some(v) => v.as_bool().unwrap_or_else(|| v.as_f64().is_some_and(|x| x != 0.0)),
+            // Passthrough is on for a layer whose node has not been built yet; the rest default off.
+            None => attr == "passthrough",
+        }
+    }
+
+    pub fn anim_layer_mute(&self, id: &str) -> bool {
+        self.anim_layer_bool(id, "mute")
+    }
+
+    pub fn anim_layer_solo(&self, id: &str) -> bool {
+        self.anim_layer_bool(id, "solo")
+    }
+
+    pub fn anim_layer_lock(&self, id: &str) -> bool {
+        self.anim_layer_bool(id, "lock")
+    }
+
+    pub fn anim_layer_ghost(&self, id: &str) -> bool {
+        self.anim_layer_bool(id, "ghost")
+    }
+
+    pub fn anim_layer_ghost_color(&self, id: &str) -> [f32; 3] {
+        let v = self.deps.get(&crate::graph::PlugRef::new(id, "ghostColor")).and_then(|v| v.as_array().cloned());
+        match v.as_deref() {
+            Some([r, g, b, ..]) => [r.as_f64().unwrap_or(0.85) as f32, g.as_f64().unwrap_or(0.10) as f32, b.as_f64().unwrap_or(0.10) as f32],
+            _ => crate::anim::ghost_red(),
+        }
+    }
+
+    pub fn set_anim_layer_ghost_color(&mut self, id: &str, c: [f32; 3]) -> bool {
+        self.ensure_anim_layer_nodes();
+        let ok = self.deps.set(&crate::graph::PlugRef::new(id, "ghostColor"), serde_json::json!([c[0], c[1], c[2]]));
+        if ok {
+            self.touch();
+        }
+        ok
+    }
+
+    pub fn set_anim_layer_bool(&mut self, id: &str, attr: &str, on: bool) -> bool {
+        self.ensure_anim_layer_nodes();
+        let ok = self.deps.set(&crate::graph::PlugRef::new(id, attr), serde_json::json!(on));
+        if ok {
+            self.touch();
+        }
+        ok
+    }
+
+    /// Copy the settings plugs of one layer node to another (used when extracting/duplicating).
+    pub fn copy_anim_layer_attrs(&mut self, from: &str, to: &str) {
+        self.ensure_anim_layer_nodes();
+        let values: Vec<(String, serde_json::Value)> = match self.deps.node(from) {
+            Some(src) => src.attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            None => return,
+        };
+        for (attr, v) in values {
+            self.deps.set(&crate::graph::PlugRef::new(to, &attr), v);
+        }
+    }
+
+    pub fn anim_layer_override(&self, id: &str) -> bool {
+        self.anim_layer_bool(id, "override")
+    }
+
+    pub fn anim_layer_passthrough(&self, id: &str) -> bool {
+        self.anim_layer_bool(id, "passthrough")
+    }
+
+    pub fn anim_layer_rotation_by_layer(&self, id: &str) -> bool {
+        self.deps.get(&crate::graph::PlugRef::new(id, "rotationAccumulationMode")).and_then(|v| v.as_str().map(|s| s == "By Layer")).unwrap_or(false)
+    }
+
+    pub fn anim_layer_scale_additive(&self, id: &str) -> bool {
+        self.deps.get(&crate::graph::PlugRef::new(id, "scaleAccumulationMode")).and_then(|v| v.as_str().map(|s| s == "Additive")).unwrap_or(false)
+    }
+
     /// Change Additive/Override. Maya reinterprets the existing curves: additive offsets
     /// become absolute override values (or the other way round), so set the mode before
     /// adding keys. Passthrough is an independent toggle and is not changed here.
     pub fn set_anim_layer_override(&mut self, id: &str, override_mode: bool) {
-        if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == id) {
-            l.override_mode = override_mode;
-            self.touch();
-        }
+        self.set_anim_layer_bool(id, "override", override_mode);
     }
 
     pub fn set_anim_layer_passthrough(&mut self, id: &str, passthrough: bool) {
-        if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == id) {
-            l.passthrough = passthrough;
-            self.touch();
-        }
+        self.set_anim_layer_bool(id, "passthrough", passthrough);
     }
 
     pub fn set_anim_layer_rotation_by_layer(&mut self, id: &str, by_layer: bool) {
-        if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == id) {
-            l.rotation_by_layer = by_layer;
+        self.ensure_anim_layer_nodes();
+        let value = serde_json::json!(if by_layer { "By Layer" } else { "By Component" });
+        if self.deps.set(&crate::graph::PlugRef::new(id, "rotationAccumulationMode"), value) {
             self.touch();
         }
     }
 
     pub fn set_anim_layer_scale_additive(&mut self, id: &str, additive: bool) {
-        if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == id) {
-            l.scale_additive = additive;
+        self.ensure_anim_layer_nodes();
+        let value = serde_json::json!(if additive { "Additive" } else { "Multiply" });
+        if self.deps.set(&crate::graph::PlugRef::new(id, "scaleAccumulationMode"), value) {
             self.touch();
         }
     }
@@ -2553,9 +2646,10 @@ impl Scene {
 
     pub fn merge_anim_layers_with(&mut self, target: &str, sources: &[String], opts: MergeLayerOptions) -> bool {
         let Some(target_i) = self.anim_layers.iter().position(|l| l.id == target) else { return false };
-        if sources.is_empty() || sources.iter().any(|s| s == target) || self.anim_layers.iter().any(|l| l.solo) {
+        if sources.is_empty() || sources.iter().any(|s| s == target) || self.anim_layers.iter().any(|l| self.anim_layer_solo(&l.id)) {
             return false;
         }
+        self.ensure_anim_layer_nodes();
         let target_layer = self.anim_layers[target_i].clone();
         if self.anim_layer_parent_muted(&target_layer) {
             return false;
@@ -2574,7 +2668,7 @@ impl Scene {
             return false;
         }
         let mut result_override = match opts.result_mode {
-            MergeLayerMode::Automatic => target_layer.override_mode || self.anim_layers.iter().filter(|l| merged.contains(&l.id)).any(|l| l.override_mode),
+            MergeLayerMode::Automatic => self.anim_layer_override(target) || self.anim_layers.iter().filter(|l| merged.contains(&l.id)).any(|l| self.anim_layer_override(&l.id)),
             MergeLayerMode::Additive => false,
             MergeLayerMode::Override => true,
         };
@@ -2590,11 +2684,11 @@ impl Scene {
         } else {
             None
         };
-        let solo = self.anim_layers.iter().any(|l| l.solo);
+        let solo = self.anim_layers.iter().any(|l| self.anim_layer_solo(&l.id));
         let active: Vec<AnimLayer> = self.anim_layers.iter().rev().filter(|l| !self.anim_layer_effective_mute(l) && (!solo || self.anim_layer_soloed(l))).cloned().collect();
         let by_layer_nodes: HashSet<String> = active
             .iter()
-            .filter(|l| (l.id == target || merged.contains(&l.id)) && l.rotation_by_layer)
+            .filter(|l| (l.id == target || merged.contains(&l.id)) && self.anim_layer_rotation_by_layer(&l.id))
             .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
             .collect();
         let result_passthrough = !by_layer_nodes.is_empty();
@@ -2661,7 +2755,7 @@ impl Scene {
                     } else if attr == "visibility" {
                         // Booleans are evaluated with the override formula even on Additive layers.
                         base + (want - base) / weight
-                    } else if attr.starts_with("scale") && target_layer.scale_additive {
+                    } else if attr.starts_with("scale") && self.anim_layer_scale_additive(&target_layer.id) {
                         (want - base) / weight
                     } else if attr.starts_with("scale") {
                         if base.abs() <= 1e-12 {
@@ -2741,10 +2835,6 @@ impl Scene {
         self.checkpoint("merge animation layers");
         if !baked.is_empty() {
             let t = &mut self.anim_layers[target_i];
-            t.override_mode = result_override;
-            t.passthrough = result_passthrough;
-            t.rotation_by_layer |= !by_layer_nodes.is_empty();
-            t.mute = false;
             for (key, samples) in &baked {
                 let (node, attr) = key.rsplit_once('.').unwrap();
                 let c = t.curves.entry(key.clone()).or_insert_with(|| AnimCurve::new(node, attr));
@@ -2765,6 +2855,12 @@ impl Scene {
                 if !t.members.contains(&n) {
                     t.members.push(n);
                 }
+            }
+            self.set_anim_layer_override(target, result_override);
+            self.set_anim_layer_passthrough(target, result_passthrough);
+            self.set_anim_layer_bool(target, "mute", false);
+            if !by_layer_nodes.is_empty() {
+                self.set_anim_layer_rotation_by_layer(target, true);
             }
         }
         // Maya keeps an emptied source layer when Delete Baked Layers is off, and keeps a
@@ -2800,11 +2896,12 @@ impl Scene {
         if self.anim_layers.is_empty() {
             return false;
         }
-        let solo = self.anim_layers.iter().any(|l| l.solo);
+        self.ensure_anim_layer_nodes();
+        let solo = self.anim_layers.iter().any(|l| self.anim_layer_solo(&l.id));
         let active: Vec<AnimLayer> = self.anim_layers.iter().rev().filter(|l| !self.anim_layer_effective_mute(l) && (!solo || self.anim_layer_soloed(l))).cloned().collect();
         let by_layer_nodes: HashSet<String> = active
             .iter()
-            .filter(|l| l.rotation_by_layer)
+            .filter(|l| self.anim_layer_rotation_by_layer(&l.id))
             .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
             .collect();
         let mut keys = HashSet::new();
@@ -2880,7 +2977,6 @@ impl Scene {
         self.checkpoint("extract animation layer objects");
         let id = self.new_id("al");
         let src = self.anim_layers[source_i].clone();
-        let src_weight = self.anim_layer_weight(&src.id);
         let mut curves = IndexMap::new();
         for key in &keys {
             if let Some(c) = src.curves.get(key) {
@@ -2908,24 +3004,14 @@ impl Scene {
                 id: id.clone(),
                 name: name.to_string(),
                 weight_curve: src.weight_curve.clone(),
-                mute: src.mute,
-                solo: src.solo,
-                lock: false,
-                override_mode: src.override_mode,
-                passthrough: src.passthrough,
-                rotation_by_layer: src.rotation_by_layer,
-                scale_additive: src.scale_additive,
                 members,
                 attrs,
                 parent: src.parent.clone(),
-                ghost: src.ghost,
-                ghost_color: src.ghost_color,
                 curves,
             },
         );
         self.anim_layer_current = Some(id.clone());
-        self.ensure_anim_layer_nodes();
-        self.set_anim_layer_weight(&id, src_weight);
+        self.copy_anim_layer_attrs(source, &id);
         self.apply_anim();
         self.touch();
         Some(id)
@@ -2965,22 +3051,16 @@ impl Scene {
                 id: id.clone(),
                 name,
                 weight_curve: Default::default(),
-                mute: false,
-                solo: false,
-                lock: false,
-                override_mode: true,
-                passthrough: true,
-                rotation_by_layer: false,
-                scale_additive: false,
                 members,
                 attrs,
                 parent: None,
-                ghost: false,
-                ghost_color: crate::anim::ghost_red(),
                 curves,
             },
         );
         self.anim_layer_current = Some(id.clone());
+        self.ensure_anim_layer_nodes();
+        self.set_anim_layer_override(&id, true);
+        self.set_anim_layer_passthrough(&id, true);
         self.apply_anim();
         self.touch();
         Some(id)
@@ -3085,7 +3165,7 @@ impl Scene {
         // Animation layers, bottom-to-top so the upper layers win. Solo silences the rest.
         if let Some(upto) = upto {
             let start = upto.min(self.anim_layers.len());
-            let solo = self.anim_layers.iter().any(|l| l.solo);
+            let solo = self.anim_layers.iter().any(|l| self.anim_layer_solo(&l.id));
             let layers: Vec<AnimLayer> = self.anim_layers[start..]
                 .iter()
                 .rev()
@@ -3094,7 +3174,7 @@ impl Scene {
                 .collect();
             let by_layer_nodes: HashSet<String> = layers
                 .iter()
-                .filter(|l| l.rotation_by_layer)
+                .filter(|l| self.anim_layer_rotation_by_layer(&l.id))
                 .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
                 .collect();
             for layer in &layers {
@@ -4400,30 +4480,23 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: true,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![],
             attrs: vec![],
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves,
         });
+        s.set_anim_layer_override("al1", true);
+        s.set_anim_layer_passthrough("al1", false);
         s.set_time(5.0);
         assert!((s.get_attr_f(&a, "translateX") - 20.0).abs() < 1e-9, "override layer wins");
         set_layer_weight(&mut s, 0, 0.5);
         s.set_time(5.0);
         assert!((s.get_attr_f(&a, "translateX") - 12.5).abs() < 1e-9, "weight blends");
-        s.anim_layers[0].mute = true;
+        s.set_anim_layer_bool("al1", "mute", true);
         s.set_time(5.0);
         assert!((s.get_attr_f(&a, "translateX") - 5.0).abs() < 1e-9, "mute returns to base");
-        s.anim_layers[0].mute = false;
-        s.anim_layers[0].solo = true;
+        s.set_anim_layer_bool("al1", "mute", false);
+        s.set_anim_layer_bool("al1", "solo", true);
         s.set_time(5.0);
         assert!((s.get_attr_f(&a, "translateX") - 12.5).abs() < 1e-9, "solo keeps only that layer");
     }
@@ -4438,18 +4511,9 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -4464,35 +4528,30 @@ mod tests {
         assert!(s.anim_key_times(std::slice::from_ref(&a)).contains(&3.0), "timeline sees layer keys");
         assert!(s.anim_curve(&a, "translateX").is_some_and(|c| c.find(3.0).is_some()));
         // locked layers reject keys
-        s.anim_layers[0].lock = true;
+        s.set_anim_layer_bool("al1", "lock", true);
         s.set_key(&a, "translateX", Some(4.0), Some(99.0));
         assert!(s.anim_layers[0].curves[&Anim::key(&a, "translateX")].find(4.0).is_none());
         assert!(s.anim.curves[&Anim::key(&a, "translateX")].find(4.0).is_none());
     }
 
-    fn anim_test_layer(s: &Scene, id: &str, node: &str, attr: &str, override_mode: bool, pts: &[(f64, f64)]) -> AnimLayer {        let mut c = AnimCurve::new(node, attr);
+    fn anim_test_layer(s: &mut Scene, id: &str, node: &str, attr: &str, override_mode: bool, pts: &[(f64, f64)]) -> AnimLayer {
+        let mut c = AnimCurve::new(node, attr);
         for (t, v) in pts {
             c.set_key(*t, *v, "linear");
         }
         let mut curves = IndexMap::new();
         let key = Anim::key(node, attr);
         curves.insert(key.clone(), c);
+        s.ensure_anim_layer_node(id, id);
+        s.set_anim_layer_override(id, override_mode);
+        s.set_anim_layer_passthrough(id, false);
         AnimLayer {
             id: id.into(),
             name: id.into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![node.into()],
             attrs: vec![key],
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves,
         }
     }
@@ -4514,8 +4573,8 @@ mod tests {
         s.set_key(&a, "translateX", Some(0.0), Some(0.0));
         s.set_key(&a, "translateX", Some(10.0), Some(10.0));
         s.anim_layers = vec![
-            anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 2.0), (10.0, -1.0)]),
-            anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 3.0), (10.0, 8.0)]),
+            anim_test_layer(&mut s, "al1", &a, "translateX", false, &[(0.0, 2.0), (10.0, -1.0)]),
+            anim_test_layer(&mut s, "al2", &a, "translateX", false, &[(0.0, 3.0), (10.0, 8.0)]),
         ];
         let times = [0.0, 5.0, 10.0];
         let before = baked_values(&mut s, &a, "translateX", &times);
@@ -4535,13 +4594,13 @@ mod tests {
         s.set_key(&a, "translateX", Some(0.0), Some(0.0));
         s.set_key(&a, "translateX", Some(10.0), Some(10.0));
         s.anim_layers = vec![
-            anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 2.0), (10.0, -1.0)]),
-            anim_test_layer(&s, "al2", &a, "translateX", true, &[(0.0, 3.0), (10.0, 8.0)]),
+            anim_test_layer(&mut s, "al1", &a, "translateX", false, &[(0.0, 2.0), (10.0, -1.0)]),
+            anim_test_layer(&mut s, "al2", &a, "translateX", true, &[(0.0, 3.0), (10.0, 8.0)]),
         ];
         let times = [0.0, 4.0, 10.0];
         let before = baked_values(&mut s, &a, "translateX", &times);
         assert!(s.merge_anim_layers("al1", &["al2".into()]));
-        assert!(s.anim_layers[0].override_mode, "an override source must make the result override");
+        assert!(s.anim_layer_override("al1"), "an override source must make the result override");
         let after = baked_values(&mut s, &a, "translateX", &times);
         for (b, a) in before.iter().zip(after.iter()) {
             assert!((b - a).abs() < 1e-9, "merge changed the animation: {before:?} vs {after:?}");
@@ -4552,9 +4611,9 @@ mod tests {
     fn merge_options_can_exclude_children_and_keep_empty_sources() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let target = anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 1.0)]);
-        let source = anim_test_layer(&s, "al2", &a, "translateY", false, &[(0.0, 2.0)]);
-        let mut child = anim_test_layer(&s, "al3", &a, "translateZ", false, &[(0.0, 3.0)]);
+        let target = anim_test_layer(&mut s, "al1", &a, "translateX", false, &[(0.0, 1.0)]);
+        let source = anim_test_layer(&mut s, "al2", &a, "translateY", false, &[(0.0, 2.0)]);
+        let mut child = anim_test_layer(&mut s, "al3", &a, "translateZ", false, &[(0.0, 3.0)]);
         child.parent = Some("al2".into());
         s.anim_layers = vec![target, source, child];
         let opts = MergeLayerOptions { include_children: false, ..Default::default() };
@@ -4573,14 +4632,14 @@ mod tests {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
         s.anim_layers = vec![
-            anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 1.0)]),
-            anim_test_layer(&s, "al2", &a, "translateX", true, &[(0.0, 5.0)]),
+            anim_test_layer(&mut s, "al1", &a, "translateX", false, &[(0.0, 1.0)]),
+            anim_test_layer(&mut s, "al2", &a, "translateX", true, &[(0.0, 5.0)]),
         ];
         let opts = MergeLayerOptions { result_mode: MergeLayerMode::Additive, delete_layers: false, ..Default::default() };
         s.set_time(0.0);
         let before = s.get_attr_f(&a, "translateX");
         assert!(s.merge_anim_layers_with("al1", &["al2".into()], opts));
-        assert!(!s.anim_layers[0].override_mode, "Additive must override Automatic");
+        assert!(!s.anim_layer_override("al1"), "Additive must override Automatic");
         assert_eq!(s.anim_layers.len(), 2);
         assert!(s.anim_layers.iter().find(|l| l.id == "al2").expect("kept source").curves.is_empty());
         s.set_time(0.0);
@@ -4591,20 +4650,20 @@ mod tests {
     fn override_passthrough_blends_with_layers_below() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let lower = anim_test_layer(&s, "al2", &a, "translateX", true, &[(0.0, 10.0)]);
-        let upper = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 30.0)]);
+        let lower = anim_test_layer(&mut s, "al2", &a, "translateX", true, &[(0.0, 10.0)]);
+        let upper = anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(0.0, 30.0)]);
         s.anim_layers = vec![upper, lower];
         set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateX") - 15.0).abs() < 1e-9, "opaque override should ignore the layer below");
-        s.anim_layers[0].passthrough = true;
+        s.set_anim_layer_passthrough("al1", true);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateX") - 20.0).abs() < 1e-9, "passthrough should blend with the layer below");
         set_layer_weight(&mut s, 0, 0.0);
-        s.anim_layers[0].passthrough = false;
+        s.set_anim_layer_passthrough("al1", false);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateX")).abs() < 1e-9, "opaque override at weight 0 must still block lower layers");
-        s.anim_layers[0].passthrough = true;
+        s.set_anim_layer_passthrough("al1", true);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateX") - 10.0).abs() < 1e-9, "passthrough at weight 0 exposes the layer below");
     }
@@ -4623,7 +4682,7 @@ mod tests {
         assert_eq!(s.anim_layer_current.as_deref(), Some(id.as_str()));
         let layer = &s.anim_layers[0];
         assert_eq!(layer.name, "BaseAnimation_extract");
-        assert!(layer.override_mode && layer.passthrough);
+        assert!(s.anim_layer_override(&layer.id) && s.anim_layer_passthrough(&layer.id));
         assert!(layer.attrs.contains(&Anim::key(&a, "translateX")));
         assert!(!s.anim.curves.contains_key(&Anim::key(&a, "translateX")), "base curve was not moved");
         assert!(s.anim.curves.contains_key(&Anim::key(&b, "translateX")), "other object's base curve moved");
@@ -4648,7 +4707,7 @@ mod tests {
     fn keyed_layer_weight_blends_over_time() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut layer = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 10.0)]);
+        let mut layer = anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(0.0, 10.0)]);
         layer.weight_curve.set_key(0.0, 0.0, "linear");
         layer.weight_curve.set_key(10.0, 1.0, "linear");
         s.anim_layers = vec![layer];
@@ -4664,7 +4723,7 @@ mod tests {
     fn graph_editor_reads_and_edits_layer_weight_curves() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut layer = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 10.0)]);
+        let mut layer = anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(0.0, 10.0)]);
         layer.weight_curve.set_key(0.0, 0.0, "linear");
         layer.weight_curve.set_key(10.0, 1.0, "linear");
         s.anim_layers = vec![layer];
@@ -4682,8 +4741,8 @@ mod tests {
         let mut smart_scene = Scene::new();
         let a = smart_scene.create_mesh("polyCube", &Params::new(), None);
         smart_scene.anim_layers = vec![
-            anim_test_layer(&smart_scene, "al1", &a, "translateX", false, &[(0.0, 2.0), (5.0, 4.0), (10.0, 2.0)]),
-            anim_test_layer(&smart_scene, "al2", &a, "translateX", false, &[(0.0, 0.0), (5.0, 1.0), (10.0, 0.0)]),
+            anim_test_layer(&mut smart_scene, "al1", &a, "translateX", false, &[(0.0, 2.0), (5.0, 4.0), (10.0, 2.0)]),
+            anim_test_layer(&mut smart_scene, "al2", &a, "translateX", false, &[(0.0, 0.0), (5.0, 1.0), (10.0, 0.0)]),
         ];
         let key = Anim::key(&a, "translateX");
         let smart = MergeLayerOptions { smart_bake: true, ..Default::default() };
@@ -4693,8 +4752,8 @@ mod tests {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
         s.anim_layers = vec![
-            anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 2.0), (5.0, 4.0), (10.0, 2.0)]),
-            anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 0.0), (5.0, 1.0), (10.0, 0.0)]),
+            anim_test_layer(&mut s, "al1", &a, "translateX", false, &[(0.0, 2.0), (5.0, 4.0), (10.0, 2.0)]),
+            anim_test_layer(&mut s, "al2", &a, "translateX", false, &[(0.0, 0.0), (5.0, 1.0), (10.0, 0.0)]),
         ];
         let sampled = MergeLayerOptions { smart_bake: false, sample_by: 2, ..Default::default() };
         assert!(s.merge_anim_layers_with("al1", &["al2".into()], sampled));
@@ -4706,13 +4765,13 @@ mod tests {
     fn merge_increase_fidelity_adds_keys_between_spline_keys() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut target = anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 0.0), (5.0, 10.0), (10.0, 0.0)]);
+        let mut target = anim_test_layer(&mut s, "al1", &a, "translateX", false, &[(0.0, 0.0), (5.0, 10.0), (10.0, 0.0)]);
         let key = Anim::key(&a, "translateX");
         for k in &mut target.curves.get_mut(&key).unwrap().keys {
             k.it = "spline".into();
             k.ot = "spline".into();
         }
-        s.anim_layers = vec![target, anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 0.0), (10.0, 0.0)])];
+        s.anim_layers = vec![target, anim_test_layer(&mut s, "al2", &a, "translateX", false, &[(0.0, 0.0), (10.0, 0.0)])];
         let opts = MergeLayerOptions { smart_bake: true, increase_fidelity: true, fidelity_tolerance: 1, ..Default::default() };
         assert!(s.merge_anim_layers_with("al1", &["al2".into()], opts));
         assert!(s.anim_layers[0].curves[&key].keys.len() > 3, "Increase Fidelity did not add keys");
@@ -4722,7 +4781,7 @@ mod tests {
     fn anim_layer_weight_is_stored_on_its_node() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        s.anim_layers = vec![anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 1.0)])];
+        s.anim_layers = vec![anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(0.0, 1.0)])];
         s.set_time(0.0);
         let layer_ref = NodeRef::Dependency("al1".into());
         assert_eq!(s.get_attr(&layer_ref, "weight"), Some(json!(1.0)), "layer node was not created");
@@ -4771,8 +4830,8 @@ mod tests {
         s.set_key(&a, "translateX", Some(0.0), Some(0.0));
         s.set_key(&a, "translateX", Some(10.0), Some(10.0));
         s.anim_layers = vec![
-            anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 20.0), (10.0, 30.0)]),
-            anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 2.0), (10.0, -3.0)]),
+            anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(0.0, 20.0), (10.0, 30.0)]),
+            anim_test_layer(&mut s, "al2", &a, "translateX", false, &[(0.0, 2.0), (10.0, -3.0)]),
         ];
         let times = [0.0, 6.0, 10.0];
         let before = baked_values(&mut s, &a, "translateX", &times);
@@ -4793,7 +4852,7 @@ mod tests {
         let b = s.create_mesh("polyCube", &Params::new(), None);
         s.set_key(&a, "translateX", Some(0.0), Some(0.0));
         s.set_key(&b, "translateX", Some(0.0), Some(0.0));
-        let mut layer = anim_test_layer(&s, "al1", &a, "translateX", true, &[(0.0, 4.0)]);
+        let mut layer = anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(0.0, 4.0)]);
         let mut bc = AnimCurve::new(&b, "translateX");
         bc.set_key(0.0, 9.0, "linear");
         layer.curves.insert(Anim::key(&b, "translateX"), bc);
@@ -4824,21 +4883,15 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: true,
-            solo: false,
-            lock: true,
-            override_mode: true,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
-            ghost: true,
-            ghost_color: [0.2, 0.4, 0.6],
             curves,
         });
         s.anim_layer_current = Some("al1".into());
+        s.ensure_anim_layer_nodes();
+        s.set_anim_layer_bool("al1", "ghost", true);
+        s.set_anim_layer_ghost_color("al1", [0.2, 0.4, 0.6]);
         s.anim_base_lock = true;
         s.anim_base_ghost = true;
         s.anim_base_ghost_color = [0.6, 0.2, 0.4];
@@ -4851,8 +4904,8 @@ mod tests {
         assert_eq!(t.anim_layers[0].name, "Layer 1");
         assert_eq!(t.anim_layers[0].members, vec![a.clone()]);
         assert_eq!(t.anim_layer_current.as_deref(), Some("al1"));
-        assert!(t.anim_layers[0].ghost);
-        assert_eq!(t.anim_layers[0].ghost_color, [0.2, 0.4, 0.6]);
+        assert!(t.anim_layer_ghost("al1"));
+        assert_eq!(t.anim_layer_ghost_color("al1"), [0.2, 0.4, 0.6]);
         assert!(t.anim_layers[0].attrs.contains(&Anim::key(&a, "translateX")));
         assert!(t.anim_base_ghost);
         assert_eq!(t.anim_base_ghost_color, [0.6, 0.2, 0.4]);
@@ -4879,18 +4932,9 @@ mod tests {
                 id: id.into(),
                 name: id.into(),
                 weight_curve: Default::default(),
-                mute: false,
-                solo: false,
-                lock: false,
-                override_mode: false,
-                passthrough: false,
-                rotation_by_layer: false,
-                scale_additive: false,
                 members: vec![a.clone()],
                 attrs: vec![],
                 parent: None,
-                ghost: false,
-                ghost_color: crate::anim::ghost_red(),
                 curves,
             });
         }
@@ -4912,18 +4956,9 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -4945,7 +4980,7 @@ mod tests {
             s.set_time(10.0);
         }
         assert!((s.get_attr_f(&a, "rotateY") - mid).abs() < 1e-9, "additive evaluation compounds");
-        s.anim_layers[0].override_mode = true;
+        s.set_anim_layer_override("al1", true);
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "rotateY") - mid).abs() < 1e-9, "override changes the pose");
         assert!(s.nodes[&a].visible, "overriding a visibility key hid the object");
@@ -4960,18 +4995,9 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -4993,7 +5019,7 @@ mod tests {
         assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9, "weight 0 did not return to the static pose");
         assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
         set_layer_weight(&mut s, 0, 1.0);
-        s.anim_layers[0].mute = true;
+        s.set_anim_layer_bool("al1", "mute", true);
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "rotateY")).abs() < 1e-9, "mute did not return to the static pose");
         assert!((s.get_attr_f(&a, "scaleX") - 1.0).abs() < 1e-9);
@@ -5014,18 +5040,9 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: true,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -5051,7 +5068,7 @@ mod tests {
     fn by_layer_rotation_uses_a_quaternion_slerp() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut layer = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
+        let mut layer = anim_test_layer(&mut s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
         let mut cy = AnimCurve::new(&a, "rotateY");
         cy.set_key(0.0, 90.0, "linear");
         layer.curves.insert(Anim::key(&a, "rotateY"), cy);
@@ -5061,7 +5078,7 @@ mod tests {
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "rotateX") - 45.0).abs() < 1e-9);
         assert!((s.get_attr_f(&a, "rotateY") - 45.0).abs() < 1e-9);
-        s.anim_layers[0].rotation_by_layer = true;
+        s.set_anim_layer_rotation_by_layer("al1", true);
         s.set_time(0.0);
         let q = quat_from_euler_deg([90.0, 90.0, 0.0], "xyz");
         let want = euler_deg_from_quat_near(DQuat::IDENTITY.slerp(q, 0.5), "xyz", [0.0, 0.0, 0.0]);
@@ -5074,12 +5091,12 @@ mod tests {
     fn flatten_bakes_by_layer_rotations() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut layer = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
+        let mut layer = anim_test_layer(&mut s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
         let mut cy = AnimCurve::new(&a, "rotateY");
         cy.set_key(0.0, 90.0, "linear");
         layer.curves.insert(Anim::key(&a, "rotateY"), cy);
         layer.attrs.push(Anim::key(&a, "rotateY"));
-        layer.rotation_by_layer = true;
+        s.set_anim_layer_rotation_by_layer("al1", true);
         s.anim_layers = vec![layer];
         set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
@@ -5095,8 +5112,8 @@ mod tests {
     fn merging_additive_layers_keeps_visibility_on() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let target = anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 0.0)]);
-        let source = anim_test_layer(&s, "al2", &a, "visibility", false, &[(0.0, 1.0)]);
+        let target = anim_test_layer(&mut s, "al1", &a, "translateX", false, &[(0.0, 0.0)]);
+        let source = anim_test_layer(&mut s, "al2", &a, "visibility", false, &[(0.0, 1.0)]);
         s.anim_layers = vec![target, source];
         s.set_time(0.0);
         assert!(s.nodes[&a].visible);
@@ -5109,10 +5126,10 @@ mod tests {
     fn by_layer_merge_preserves_the_target_weight() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut target = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
-        target.rotation_by_layer = true;
-        let mut source = anim_test_layer(&s, "al2", &a, "rotateY", true, &[(0.0, 90.0)]);
-        source.rotation_by_layer = true;
+        let mut target = anim_test_layer(&mut s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
+        s.set_anim_layer_rotation_by_layer("al1", true);
+        let mut source = anim_test_layer(&mut s, "al2", &a, "rotateY", true, &[(0.0, 90.0)]);
+        s.set_anim_layer_rotation_by_layer("al2", true);
         s.anim_layers = vec![target, source];
         set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
@@ -5131,9 +5148,9 @@ mod tests {
     fn merging_by_layer_rotations_keeps_visibility_on() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut target = anim_test_layer(&s, "al1", &a, "visibility", false, &[(0.0, 0.0)]);
-        let mut source = anim_test_layer(&s, "al2", &a, "rotateX", true, &[(0.0, 90.0)]);
-        source.rotation_by_layer = true;
+        let mut target = anim_test_layer(&mut s, "al1", &a, "visibility", false, &[(0.0, 0.0)]);
+        let mut source = anim_test_layer(&mut s, "al2", &a, "rotateX", true, &[(0.0, 90.0)]);
+        s.set_anim_layer_rotation_by_layer("al2", true);
         s.anim_layers = vec![target, source];
         set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
@@ -5147,12 +5164,12 @@ mod tests {
     fn merging_by_layer_rotations_preserves_the_pose() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut target = anim_test_layer(&s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
+        let mut target = anim_test_layer(&mut s, "al1", &a, "rotateX", true, &[(0.0, 90.0)]);
         target.weight_curve.set_key(0.0, 1.0, "linear");
-        target.passthrough = true;
-        target.rotation_by_layer = true;
-        let mut source = anim_test_layer(&s, "al2", &a, "rotateY", true, &[(0.0, 90.0)]);
-        source.rotation_by_layer = true;
+        s.set_anim_layer_passthrough("al1", true);
+        s.set_anim_layer_rotation_by_layer("al1", true);
+        let mut source = anim_test_layer(&mut s, "al2", &a, "rotateY", true, &[(0.0, 90.0)]);
+        s.set_anim_layer_rotation_by_layer("al2", true);
         s.anim_layers = vec![target, source];
         set_layer_weight(&mut s, 0, 1.0);
         s.set_time(0.0);
@@ -5172,7 +5189,7 @@ mod tests {
     fn additive_scale_keys_store_the_ratio_to_the_layers_below() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut lower = anim_test_layer(&s, "al2", &a, "scaleY", false, &[(0.0, 0.0)]);
+        let mut lower = anim_test_layer(&mut s, "al2", &a, "scaleY", false, &[(0.0, 0.0)]);
         lower.attrs = vec![Anim::key(&a, "scaleY")];
         lower.curves.clear();
         let mut upper = lower.clone();
@@ -5198,8 +5215,8 @@ mod tests {
     fn additive_scale_accumulation_adds_and_keys_deltas() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut layer = anim_test_layer(&s, "al1", &a, "scaleX", false, &[(0.0, 0.0)]);
-        layer.scale_additive = true;
+        let mut layer = anim_test_layer(&mut s, "al1", &a, "scaleX", false, &[(0.0, 0.0)]);
+        s.set_anim_layer_scale_additive("al1", true);
         layer.attrs = vec![Anim::key(&a, "scaleX")];
         layer.curves.clear();
         s.anim_layers = vec![layer];
@@ -5220,10 +5237,10 @@ mod tests {
     fn merging_additive_scale_preserves_the_pose() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let mut target = anim_test_layer(&s, "al1", &a, "scaleX", false, &[(0.0, 0.0)]);
-        target.scale_additive = true;
-        let mut source = anim_test_layer(&s, "al2", &a, "scaleX", false, &[(0.0, 0.5)]);
-        source.scale_additive = true;
+        let mut target = anim_test_layer(&mut s, "al1", &a, "scaleX", false, &[(0.0, 0.0)]);
+        s.set_anim_layer_scale_additive("al1", true);
+        let mut source = anim_test_layer(&mut s, "al2", &a, "scaleX", false, &[(0.0, 0.5)]);
+        s.set_anim_layer_scale_additive("al2", true);
         s.anim_layers = vec![target, source];
         set_layer_weight(&mut s, 0, 0.5);
         s.set_time(0.0);
@@ -5239,7 +5256,7 @@ mod tests {
     fn additive_scale_multiplies_and_keeps_absolute_keys() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let layer = anim_test_layer(&s, "al1", &a, "scaleX", false, &[(0.0, 3.0)]);
+        let layer = anim_test_layer(&mut s, "al1", &a, "scaleX", false, &[(0.0, 3.0)]);
         s.anim_layers = vec![layer];
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "scaleX") - 3.0).abs() < 1e-9, "additive scale should multiply the base");
@@ -5256,8 +5273,8 @@ mod tests {
     fn override_reads_the_additive_offset_after_a_mode_switch() {
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
-        let lower = anim_test_layer(&s, "al2", &a, "translateX", false, &[(0.0, 10.0)]);
-        let upper = anim_test_layer(&s, "al1", &a, "translateX", false, &[(0.0, 0.0)]);
+        let lower = anim_test_layer(&mut s, "al2", &a, "translateX", false, &[(0.0, 10.0)]);
+        let upper = anim_test_layer(&mut s, "al1", &a, "translateX", false, &[(0.0, 0.0)]);
         s.anim_layers = vec![upper, lower];
         s.anim_layer_current = Some("al1".into());
         s.set_time(0.0);
@@ -5281,18 +5298,9 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: CHANNELS.iter().map(|c| Anim::key(&a, c)).collect(),
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -5345,36 +5353,18 @@ mod tests {
             id: "parent".into(),
             name: "Parent".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![],
             attrs: vec![],
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layers.push(AnimLayer {
             id: "child".into(),
             name: "Child".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: Some("parent".into()),
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves,
         });
         s.anim_layer_current = Some("child".into());
@@ -5383,13 +5373,15 @@ mod tests {
         s.set_time(5.0);
         assert!((s.get_attr_f(&a, "translateX") - 2.5).abs() < 1e-9, "weights multiply");
         if let Some(p) = s.anim_layers.iter_mut().find(|l| l.id == "parent") {
-            p.mute = true;
+            let id = p.id.clone();
+            s.set_anim_layer_bool(&id, "mute", true);
         }
         s.set_time(5.0);
         assert!(s.get_attr_f(&a, "translateX").abs() < 1e-9, "parent mute did not mute the child");
         assert!(!s.set_key(&a, "translateX", Some(6.0), Some(9.0)), "muted child received a key");
         if let Some(p) = s.anim_layers.iter_mut().find(|l| l.id == "parent") {
-            p.mute = false;
+            let id = p.id.clone();
+            s.set_anim_layer_bool(&id, "mute", false);
         }
         s.set_anim_layer_weight("parent", 1.0);
         s.set_time(5.0);
@@ -5404,18 +5396,9 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![Anim::key(&a, "translateX")],
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves: IndexMap::new(),
         });
         s.anim_layer_current = Some("al1".into());
@@ -5442,18 +5425,9 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![],
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves,
         });
         let data = s.serialize();

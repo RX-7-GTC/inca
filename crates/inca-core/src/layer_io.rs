@@ -106,17 +106,17 @@ pub fn export_json(s: &Scene, root_id: &str, branch: bool) -> Result<String, Str
             parent: l.parent.as_ref().filter(|p| ids.contains(*p)).and_then(|p| s.anim_layers.iter().find(|l| &l.id == p).map(|l| l.name.clone())),
             weight: s.anim_layer_weight(&l.id),
             weight_curve: l.weight_curve.clone(),
-            mute: l.mute,
-            solo: l.solo,
-            lock: l.lock,
-            override_mode: l.override_mode,
-            passthrough: l.passthrough,
-            rotation_by_layer: l.rotation_by_layer,
-            scale_additive: l.scale_additive,
+            mute: s.anim_layer_mute(&l.id),
+            solo: s.anim_layer_solo(&l.id),
+            lock: s.anim_layer_lock(&l.id),
+            override_mode: s.anim_layer_override(&l.id),
+            passthrough: s.anim_layer_passthrough(&l.id),
+            rotation_by_layer: s.anim_layer_rotation_by_layer(&l.id),
+            scale_additive: s.anim_layer_scale_additive(&l.id),
             members: l.members.iter().map(|id| exported_name(s, id)).collect(),
             attrs: l.attrs.iter().map(|k| exported_attr(s, k)).collect(),
-            ghost: l.ghost,
-            ghost_color: l.ghost_color,
+            ghost: s.anim_layer_ghost(&l.id),
+            ghost_color: s.anim_layer_ghost_color(&l.id),
             curves: l
                 .curves
                 .values()
@@ -184,9 +184,13 @@ pub fn import_json(s: &mut Scene, json: &str) -> Result<ImportReport, String> {
     let mut missing_attrs = std::collections::BTreeSet::new();
     let mut imported: Vec<AnimLayer> = vec![];
     let mut weights: Vec<(String, f64)> = vec![];
+    let mut modes: Vec<(String, bool, bool, bool, bool)> = vec![];
+    let mut states: Vec<(String, bool, bool, bool, bool, [f32; 3])> = vec![];
     for src in &file.layers {
         let id = s.new_id("al");
         weights.push((id.clone(), src.weight));
+        modes.push((id.clone(), src.override_mode, src.passthrough, src.rotation_by_layer, src.scale_additive));
+        states.push((id.clone(), src.mute, src.solo, src.lock, src.ghost, src.ghost_color));
         let name = unique_layer_name(&src.name, &mut used_names);
         exported_names.insert(src.name.clone(), id.clone());
         let mut curves = indexmap::IndexMap::new();
@@ -249,18 +253,9 @@ pub fn import_json(s: &mut Scene, json: &str) -> Result<ImportReport, String> {
             id,
             name,
             weight_curve: src.weight_curve.clone(),
-            mute: src.mute,
-            solo: src.solo,
-            lock: src.lock,
-            override_mode: src.override_mode,
-            passthrough: src.passthrough,
-            rotation_by_layer: src.rotation_by_layer,
-            scale_additive: src.scale_additive,
             members,
             attrs,
             parent: None,
-            ghost: src.ghost,
-            ghost_color: src.ghost_color,
             curves,
         });
     }
@@ -280,6 +275,19 @@ pub fn import_json(s: &mut Scene, json: &str) -> Result<ImportReport, String> {
     s.ensure_anim_layer_nodes();
     for (id, weight) in weights {
         s.set_anim_layer_weight(&id, weight);
+    }
+    for (id, override_mode, passthrough, rotation, scale) in modes {
+        s.set_anim_layer_override(&id, override_mode);
+        s.set_anim_layer_passthrough(&id, passthrough);
+        s.set_anim_layer_rotation_by_layer(&id, rotation);
+        s.set_anim_layer_scale_additive(&id, scale);
+    }
+    for (id, mute, solo, lock, ghost, ghost_color) in states {
+        s.set_anim_layer_bool(&id, "mute", mute);
+        s.set_anim_layer_bool(&id, "solo", solo);
+        s.set_anim_layer_bool(&id, "lock", lock);
+        s.set_anim_layer_bool(&id, "ghost", ghost);
+        s.set_anim_layer_ghost_color(&id, ghost_color);
     }
     if let Some(root) = &root {
         s.anim_layer_current = Some(root.clone());
@@ -318,18 +326,9 @@ mod tests {
             id: id.into(),
             name: format!("Layer {id}"),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: true,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![node.into()],
             attrs: vec![key],
             parent: parent.map(str::to_string),
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves,
         }
     }

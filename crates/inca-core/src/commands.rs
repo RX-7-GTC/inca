@@ -3251,18 +3251,9 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![crate::anim::Anim::key(&a, "translateX")],
             parent: None,
-            ghost: false,
-            ghost_color: crate::anim::ghost_red(),
             curves: Default::default(),
         });
         s.anim_layer_current = Some("al1".into());

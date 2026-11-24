@@ -412,7 +412,7 @@ pub fn ghosts_visible(viz: &AnimViz) -> bool {
 /// Rebuild the ghosts for the layers (and BaseAnimation) with their Ghost button on.
 /// Each ghost is the result up to and including that layer at the current frame.
 pub fn layer_ghost_tick(app: &mut IncaApp) {
-    let any = app.s.anim_base_ghost || app.s.anim_layers.iter().any(|l| l.ghost);
+    let any = app.s.anim_base_ghost || app.s.anim_layers.iter().any(|l| app.s.anim_layer_ghost(&l.id));
     let t = app.s.time.current;
     let sel = app.s.sel.clone();
     let mode = app.panels.layer_ghost_mode;
@@ -447,7 +447,7 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
         .anim_layers
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.ghost)
+        .filter(|(_, l)| app.s.anim_layer_ghost(&l.id))
         .filter_map(|(i, l)| {
             let mut nodes = l.members.clone();
             nodes.extend(l.curves.values().map(|c| c.node.clone()));
@@ -462,7 +462,7 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
             if let Some(allowed) = allowed {
                 objs.retain(|o| allowed.contains(o));
             }
-            (!objs.is_empty()).then_some((i, l.ghost_color, objs))
+            (!objs.is_empty()).then_some((i, app.s.anim_layer_ghost_color(&l.id), objs))
         })
         .collect();
     if base_objs.is_empty() && layers.is_empty() {
@@ -471,6 +471,10 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
             app.viz.ghost_gen += 1;
         }
     } else {
+        // Ghost capture evaluates the scene at intermediate layer states. Save the live pose so
+        // a manual transform made since the last time change (a gizmo drag, a typed value) is
+        // not overwritten when the scene returns to the current frame.
+        let live: Vec<(String, inca_core::scene::Xform, bool)> = app.s.nodes.iter().map(|(id, n)| (id.clone(), n.xf.clone(), n.visible)).collect();
         let mut out = vec![];
         if app.s.anim_base_ghost && !base_objs.is_empty() {
             app.s.apply_anim_upto(None);
@@ -481,6 +485,12 @@ pub fn layer_ghost_tick(app: &mut IncaApp) {
             out.extend(capture(app, &objs, color, 0.35));
         }
         app.s.set_time(t);
+        for (id, xf, visible) in live {
+            if let Some(n) = app.s.nodes.get_mut(&id) {
+                n.xf = xf;
+                n.visible = visible;
+            }
+        }
         app.viz.layer_ghosts = out;
         app.viz.ghost_gen += 1;
     }
@@ -905,24 +915,16 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![nid.clone()],
             attrs: vec![],
             parent: None,
-            ghost: true,
-            ghost_color: inca_core::anim::ghost_red(),
             curves: Default::default(),
         });
+        app.s.set_anim_layer_bool("al1", "ghost", true);
         app.s.touch();
         layer_ghost_tick(&mut app);
         assert!(!app.viz.layer_ghosts.is_empty(), "layer ghost was not built");
-        app.s.anim_layers[0].ghost = false;
+        app.s.set_anim_layer_bool("al1", "ghost", false);
         app.s.anim_base_ghost = true;
         app.s.touch();
         layer_ghost_tick(&mut app);
@@ -931,6 +933,26 @@ mod tests {
         app.s.touch();
         layer_ghost_tick(&mut app);
         assert!(app.viz.layer_ghosts.is_empty(), "ghosts stayed on");
+    }
+
+    #[test]
+    fn ghost_tick_does_not_reset_a_manual_move() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), inca_core::scene::SelMode::Replace);
+        app.s.set_key(&nid, "translateX", Some(0.0), Some(0.0));
+        app.s.set_key(&nid, "translateX", Some(10.0), Some(10.0));
+        app.s.set_time(0.0);
+        app.s.anim_base_ghost = true;
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        app.s.set_attr_f(&nid, "translateX", 4.0);
+        app.s.touch();
+        layer_ghost_tick(&mut app);
+        assert!((app.s.get_attr_f(&nid, "translateX") - 4.0).abs() < 1e-9, "ghost tick reset a manual move");
     }
 
     #[test]
@@ -994,25 +1016,16 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![],
             parent: None,
-            ghost: true,
-            ghost_color: inca_core::anim::ghost_red(),
             curves: Default::default(),
         });
+        app.s.set_anim_layer_bool("al1", "ghost", true);
         app.panels.layer_ghost_mode = LayerGhostMode::Manual;
         app.s.touch();
         layer_ghost_tick(&mut app);
-        assert!(!app.viz.layer_ghosts.is_empty(), "Manual mode should fall back to the selection");
-        ghost(&mut app);
+        assert!(!app.viz.layer_ghosts.is_empty(), "Manual mode should fall back to the selection");        ghost(&mut app);
         layer_ghost_tick(&mut app);
         assert!(!app.viz.layer_ghosts.is_empty(), "Ghost Selected did not enable the manual layer ghost");
         assert!(app.viz.ghost_targets.contains(&a));
@@ -1030,20 +1043,12 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![],
             parent: None,
-            ghost: true,
-            ghost_color: inca_core::anim::ghost_red(),
             curves: Default::default(),
         });
+        app.s.set_anim_layer_bool("al1", "ghost", true);
         app.s.touch();
         layer_ghost_tick(&mut app);
         assert!(!app.viz.layer_ghosts.is_empty());
@@ -1097,20 +1102,12 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![],
             parent: None,
-            ghost: true,
-            ghost_color: inca_core::anim::ghost_red(),
             curves: Default::default(),
         });
+        app.s.set_anim_layer_bool("al1", "ghost", true);
         app.panels.layer_ghost_mode = LayerGhostMode::Manual;
         app.s.touch();
         layer_ghost_tick(&mut app);
@@ -1130,20 +1127,13 @@ mod tests {
                 id: id.into(),
                 name: id.into(),
                 weight_curve: Default::default(),
-                mute: false,
-                solo: false,
-                lock: false,
-                override_mode: false,
-                passthrough: false,
-                rotation_by_layer: false,
-                scale_additive: false,
                 members: vec![member],
                 attrs: vec![],
                 parent: None,
-                ghost: true,
-                ghost_color: color,
                 curves: Default::default(),
             });
+            app.s.set_anim_layer_bool(id, "ghost", true);
+            app.s.set_anim_layer_ghost_color(id, color);
         }
         app.panels.layer_ghost_mode = LayerGhostMode::Manual;
         app.s.select(std::slice::from_ref(&a), inca_core::scene::SelMode::Replace);
@@ -1175,20 +1165,12 @@ mod tests {
             id: "al1".into(),
             name: "Layer 1".into(),
             weight_curve: Default::default(),
-            mute: false,
-            solo: false,
-            lock: false,
-            override_mode: false,
-            passthrough: false,
-            rotation_by_layer: false,
-            scale_additive: false,
             members: vec![a.clone()],
             attrs: vec![],
             parent: None,
-            ghost: true,
-            ghost_color: inca_core::anim::ghost_red(),
             curves: Default::default(),
         });
+        app.s.set_anim_layer_bool("al1", "ghost", true);
         app.s.touch();
         layer_ghost_tick(&mut app);
         assert_eq!(app.viz.layer_ghosts.len(), 1, "ghosted layer captured a selected object outside the layer");

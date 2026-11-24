@@ -15,10 +15,6 @@ pub fn ghost_red() -> [f32; 3] {
     [0.85, 0.10, 0.10]
 }
 
-fn passthrough_default() -> bool {
-    true
-}
-
 /// One animation layer above BaseAnimation. Curves are keyed by "nodeId.attr", like `Anim`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AnimLayer {
@@ -27,26 +23,6 @@ pub struct AnimLayer {
     /// Animated layer weight. Empty keys means the node's `weight` attribute is used.
     #[serde(default)]
     pub weight_curve: AnimCurve,
-    #[serde(default)]
-    pub mute: bool,
-    #[serde(default)]
-    pub solo: bool,
-    #[serde(default)]
-    pub lock: bool,
-
-    /// true = override, false = additive.
-    #[serde(default)]
-    pub override_mode: bool,
-    /// Override layer with variable opacity: blend with the layers below instead of the raw
-    /// base animation. On by default, independently of Additive/Override.
-    #[serde(default = "passthrough_default")]
-    pub passthrough: bool,
-    /// Combine rotations per Euler component (false) or as a quaternion per layer (true).
-    #[serde(default)]
-    pub rotation_by_layer: bool,
-    /// Additive scale uses Additive accumulation instead of the default Multiply.
-    #[serde(default)]
-    pub scale_additive: bool,
     /// Objects explicitly assigned to the layer.
     #[serde(default)]
     pub members: Vec<String>,
@@ -56,11 +32,6 @@ pub struct AnimLayer {
     /// Parent layer in the stack; None = top level.
     #[serde(default)]
     pub parent: Option<String>,
-    /// Draw the stack up to and including this layer as a translucent ghost.
-    #[serde(default)]
-    pub ghost: bool,
-    #[serde(default = "ghost_red")]
-    pub ghost_color: [f32; 3],
     #[serde(default)]
     pub curves: indexmap::IndexMap<String, AnimCurve>,
 }
