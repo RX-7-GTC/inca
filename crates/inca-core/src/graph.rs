@@ -190,7 +190,7 @@ impl DepGraph {
         if !self.plug_exists(&source) || !self.plug_exists(&destination) {
             return false;
         }
-        if self.node(&destination.node).is_some_and(|n| n.spec(&destination.attr).is_some_and(|s| !s.writable)) {
+        if self.node(&destination.node).is_some_and(|n| n.spec(&destination.attr).is_some_and(|s| !s.writable && s.ty != AttrType::Message)) {
             return false;
         }
         // Reject cycles by walking backwards from the proposed source.

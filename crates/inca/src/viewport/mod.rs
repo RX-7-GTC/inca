@@ -29,8 +29,9 @@ pub const C_DOT: [f32; 3] = [74.0 / 255.0, 138.0 / 255.0, 214.0 / 255.0];
 pub const C_AFFECTED: [f32; 4] = [0.78, 0.235, 0.82, 1.0];
 
 /// The wire colour assigned to a display layer (`None` when the layer has no colour).
-fn layer_wire_color(layer: Option<&inca_core::scene::Layer>) -> Option<[f32; 4]> {
-    let a = layer?.color.as_ref()?.as_array()?;
+fn layer_wire_color(s: &Scene, layer: Option<&inca_core::scene::Layer>) -> Option<[f32; 4]> {
+    let a = s.display_layer_color(&layer?.id)?;
+    let a = a.as_array()?;
     if a.len() < 3 {
         return None;
     }
@@ -1381,10 +1382,10 @@ pub fn build_draws(
         }
         // Display layer per-object overrides: shading/texturing, bounding-box LOD and colour.
         let layer = s.layer_for(&id);
-        let bbox_mode = layer.is_some_and(|l| l.lod == "bbox");
-        let shaded = layer.is_none_or(|l| l.shading);
-        let textured = vp.shade == ShadeMode::Textured && layer.is_none_or(|l| l.texturing);
-        let layer_col = layer_wire_color(layer);
+        let bbox_mode = layer.is_some_and(|l| s.display_layer_lod(&l.id) == "bbox");
+        let shaded = layer.is_none_or(|l| s.display_layer_shading(&l.id));
+        let textured = vp.shade == ShadeMode::Textured && layer.is_none_or(|l| s.display_layer_texturing(&l.id));
+        let layer_col = layer_wire_color(s, layer);
         let wm = s.world_matrix(&id).as_mat4();
         let selected = vp.show_sel_highlight && s.sel.iter().any(|x| x == &id || s.is_ancestor(x, &id));
         let is_lead = vp.show_sel_highlight && lead.as_ref().is_some_and(|l| l == &id || s.is_ancestor(l, &id));

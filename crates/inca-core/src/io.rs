@@ -20,6 +20,7 @@ fn stem(p: &Path) -> String {
 
 pub fn save_scene(s: &mut Scene, path: &Path) -> Result<(), String> {
     s.ensure_anim_layer_nodes();
+    s.ensure_display_layer_nodes();
     let data = s.serialize();
     std::fs::write(path, serde_json::to_string(&data).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     s.file = Some(path.to_path_buf());

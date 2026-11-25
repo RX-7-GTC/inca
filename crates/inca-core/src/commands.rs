@@ -2466,6 +2466,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 created,
                 extra: Default::default(),
             });
+            s.ensure_display_layer_nodes();
             if !a.has(&["e", "empty"]) {
                 for o in targets(s, &a) {
                     if let Some(n) = s.nodes.get_mut(&o) {

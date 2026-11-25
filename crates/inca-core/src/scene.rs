@@ -437,6 +437,35 @@ fn full_lod() -> String {
     "full".into()
 }
 
+fn add_display_specs(n: &mut crate::graph::DepNode) {
+    n.add_attr("visibility", crate::graph::AttrSpec::boolean(true));
+    n.add_attr("displayType", crate::graph::AttrSpec::enumeration(&["normal", "template", "reference"], "normal"));
+    n.add_attr("colorSet", crate::graph::AttrSpec::boolean(false));
+    n.add_attr("color", crate::graph::AttrSpec::vector([0.5, 0.5, 0.5]));
+    n.add_attr("playback", crate::graph::AttrSpec::boolean(true));
+    n.add_attr("enabled", crate::graph::AttrSpec::boolean(true));
+    n.add_attr("shading", crate::graph::AttrSpec::boolean(true));
+    n.add_attr("texturing", crate::graph::AttrSpec::boolean(true));
+    n.add_attr("lod", crate::graph::AttrSpec::enumeration(&["full", "bbox"], "full"));
+    n.add_attr("animPlayback", crate::graph::AttrSpec::boolean(true));
+    n.add_attr("layerManager", crate::graph::AttrSpec::message());
+}
+
+impl Layer {
+    /// Clear the pre-node fields after their values have moved into a `displayLayer` node.
+    fn reset_legacy_state(&mut self) {
+        self.visible = true;
+        self.mode = "normal".into();
+        self.color = None;
+        self.playback = true;
+        self.enabled = true;
+        self.shading = true;
+        self.texturing = true;
+        self.lod = "full".into();
+        self.anim_playback = true;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimeState {
@@ -673,7 +702,80 @@ impl Scene {
         };
         s.init_default_materials();
         s.create_startup_cameras();
+        s.ensure_default_display_layer();
+        s.ensure_layer_manager();
+        s.ensure_display_layer_nodes();
         s
+    }
+
+    /// Maya always has a bottom `defaultLayer`; objects without an explicit display layer belong
+    /// to it.
+    pub fn ensure_default_display_layer(&mut self) {
+        if !self.layers.iter().any(|l| l.id == "defaultLayer") {
+            self.layers.push(Layer {
+                id: "defaultLayer".into(),
+                name: "defaultLayer".into(),
+                visible: true,
+                mode: "normal".into(),
+                color: None,
+                playback: true,
+                enabled: true,
+                shading: true,
+                texturing: true,
+                lod: "full".into(),
+                anim_playback: true,
+                created: 0,
+                extra: Default::default(),
+            });
+        }
+        if let Some(pos) = self.layers.iter().position(|l| l.id == "defaultLayer") {
+            if pos + 1 < self.layers.len() {
+                let l = self.layers.remove(pos);
+                self.layers.push(l);
+            }
+        }
+        if self.current_layer.as_ref().is_none_or(|id| !self.layers.iter().any(|l| &l.id == id)) {
+            self.current_layer = Some("defaultLayer".into());
+        }
+    }
+
+    /// Change the display layer new objects are added to and mirror it on `layerManager`.
+    pub fn set_current_display_layer(&mut self, id: &str) {
+        if !self.layers.iter().any(|l| l.id == id) {
+            return;
+        }
+        self.current_layer = Some(id.to_string());
+        self.ensure_layer_manager();
+        let _ = self.deps.set(&crate::graph::PlugRef::new("layerManager", "currentLayer"), json!(id));
+        self.touch();
+    }
+
+    /// Maya's singleton `layerManager` node. Display layers connect their `layerManager`
+    /// input to its `displayLayers` output.
+    pub fn ensure_layer_manager(&mut self) -> Id {
+        if self.deps.node("layerManager").is_none() {
+            let mut n = crate::graph::DepNode::new("layerManager", "layerManager", "layerManager");
+            n.add_attr("displayLayers", crate::graph::AttrSpec::message());
+            n.add_attr("currentLayer", crate::graph::AttrSpec::string("defaultLayer"));
+            self.deps.insert(n);
+            self.names.insert("layerManager".into());
+        } else if let Some(n) = self.deps.node_mut("layerManager") {
+            if n.name != "layerManager" {
+                self.names.remove(&n.name);
+                n.name = "layerManager".into();
+                self.names.insert("layerManager".into());
+            }
+            if n.spec("displayLayers").is_none() {
+                n.add_attr("displayLayers", crate::graph::AttrSpec::message());
+            }
+            if n.spec("currentLayer").is_none() {
+                n.add_attr("currentLayer", crate::graph::AttrSpec::string("defaultLayer"));
+            }
+        }
+        if let Some(current) = self.current_layer.clone() {
+            let _ = self.deps.set(&crate::graph::PlugRef::new("layerManager", "currentLayer"), json!(current));
+        }
+        "layerManager".into()
     }
 
     // ------------------------------------------------------------ ids & names
@@ -842,7 +944,7 @@ impl Scene {
             Shape::Group => None,
             _ => Some(self.unique_name(&shape_name_for(&name))),
         };
-        let layer = if self.add_new_to_current { self.current_layer.clone() } else { None };
+        let layer = if self.add_new_to_current { self.current_layer.clone().filter(|id| id != "defaultLayer") } else { None };
         let node = Node {
             id: id.clone(),
             name,
@@ -4319,7 +4421,9 @@ impl Scene {
         self.sel = data["sel"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).filter(|i| self.nodes.contains_key(i)).collect()).unwrap_or_default();
         self.project = data["project"].as_str().map(String::from);
         self.import_js_rig();
+        self.sync_display_layer_order();
         self.ensure_anim_layer_nodes();
+        self.ensure_display_layer_nodes();
         self.touch();
         Ok(())
     }
@@ -4329,10 +4433,210 @@ impl Scene {
         *self = Scene { project: self.project.take(), ..Scene::new() };
     }
 
-    /// The effective display layer of a node, ignoring disabled layers.
+    /// The effective display layer of a node, ignoring disabled layers. Unassigned objects
+    /// belong to `defaultLayer`.
     pub fn layer_for(&self, id: &str) -> Option<&Layer> {
-        let lid = self.nodes.get(id)?.layer.as_ref()?;
-        self.layers.iter().find(|l| &l.id == lid && l.enabled)
+        let lid = self.nodes.get(id)?.layer.as_deref().unwrap_or("defaultLayer");
+        self.layers.iter().find(|l| l.id == lid && self.display_layer_enabled(&l.id))
+    }
+
+    /// Rebuild `layerManager.displayLayers` in the current `Scene::layers` order.
+    fn rebuild_display_layer_connections(&mut self) {
+        let src = crate::graph::PlugRef::new("layerManager", "displayLayers");
+        self.deps.connections.retain(|c| !(c.source == src && c.destination.attr == "layerManager"));
+        for l in &self.layers {
+            let dst = crate::graph::PlugRef::new(&l.id, "layerManager");
+            if self.deps.node(&l.id).is_some() {
+                self.deps.connect(src.clone(), dst);
+            }
+        }
+    }
+
+    /// Reorder the display-layer stack. The order of `layerManager.displayLayers` connections is
+    /// authoritative; `Scene::layers` is kept as the UI mirror.
+    pub fn set_display_layer_order(&mut self, ids: &[String]) {
+        self.ensure_display_layer_nodes();
+        let mut ordered: Vec<Layer> = Vec::with_capacity(self.layers.len());
+        for id in ids.iter().filter(|id| id.as_str() != "defaultLayer") {
+            if let Some(pos) = self.layers.iter().position(|l| &l.id == id) {
+                ordered.push(self.layers.remove(pos));
+            }
+        }
+        ordered.append(&mut self.layers);
+        self.layers = ordered;
+        if let Some(pos) = self.layers.iter().position(|l| l.id == "defaultLayer") {
+            if pos + 1 < self.layers.len() {
+                let l = self.layers.remove(pos);
+                self.layers.push(l);
+            }
+        }
+        self.rebuild_display_layer_connections();
+        self.touch();
+    }
+
+    /// Adopt the manager's connection order into the UI layer list.
+    fn sync_display_layer_order(&mut self) {
+        let src = crate::graph::PlugRef::new("layerManager", "displayLayers");
+        let order: Vec<String> = self.deps.connections.iter().filter(|c| c.source == src).map(|c| c.destination.node.clone()).collect();
+        if order.is_empty() {
+            return;
+        }
+        let mut ordered: Vec<Layer> = Vec::with_capacity(self.layers.len());
+        for id in order {
+            if let Some(pos) = self.layers.iter().position(|l| l.id == id) {
+                ordered.push(self.layers.remove(pos));
+            }
+        }
+        ordered.append(&mut self.layers);
+        self.layers = ordered;
+    }
+
+    /// Create or refresh the real `displayLayer` dependency node for every layer.
+    pub fn ensure_display_layer_nodes(&mut self) {
+        self.ensure_default_display_layer();
+        self.ensure_layer_manager();
+        let layers: Vec<Layer> = self.layers.clone();
+        for l in &layers {
+            if self.deps.node(&l.id).is_none() {
+                let mut n = crate::graph::DepNode::new(&l.id, &l.name, "displayLayer");
+                add_display_specs(&mut n);
+                n.attrs.insert("visibility".into(), json!(l.visible));
+                n.attrs.insert("displayType".into(), json!(l.mode));
+                n.attrs.insert("playback".into(), json!(l.playback));
+                n.attrs.insert("enabled".into(), json!(l.enabled));
+                n.attrs.insert("shading".into(), json!(l.shading));
+                n.attrs.insert("texturing".into(), json!(l.texturing));
+                n.attrs.insert("lod".into(), json!(l.lod));
+                n.attrs.insert("animPlayback".into(), json!(l.anim_playback));
+                let rgb = l.color.as_ref().and_then(|v| v.as_array()).filter(|a| a.len() >= 3).map(|a| [a[0].as_f64().unwrap_or(0.5), a[1].as_f64().unwrap_or(0.5), a[2].as_f64().unwrap_or(0.5)]);
+                n.attrs.insert("colorSet".into(), json!(rgb.is_some()));
+                if let Some(rgb) = rgb {
+                    n.attrs.insert("color".into(), json!(rgb));
+                }
+                self.deps.insert(n);
+                self.names.insert(l.name.clone());
+            } else {
+                self.rename_dep_node(&l.id, &l.name);
+                if let Some(n) = self.deps.node_mut(&l.id) {
+                    add_display_specs(n);
+                }
+            }
+        }
+        // Each displayLayer's `layerManager` input comes from the singleton manager.
+        self.rebuild_display_layer_connections();
+        let live: std::collections::HashSet<String> = self.layers.iter().map(|l| l.id.clone()).collect();
+        let orphans: Vec<String> = self.deps.nodes.values().filter(|n| n.kind == "displayLayer" && !live.contains(&n.id)).map(|n| n.id.clone()).collect();
+        for id in orphans {
+            self.remove_dep_node(&id);
+        }
+        for l in &mut self.layers {
+            l.reset_legacy_state();
+        }
+    }
+
+    fn display_layer_legacy<'a>(&'a self, id: &str) -> Option<&'a Layer> {
+        self.layers.iter().find(|l| l.id == id)
+    }
+
+    fn display_layer_bool(&self, id: &str, attr: &str, legacy: impl Fn(&Layer) -> bool) -> bool {
+        if let Some(v) = self.deps.node(id).and_then(|n| n.get(attr)) {
+            return v.as_bool().unwrap_or_else(|| v.as_f64().is_some_and(|x| x != 0.0));
+        }
+        self.display_layer_legacy(id).map(legacy).unwrap_or(true)
+    }
+
+    pub fn display_layer_visible(&self, id: &str) -> bool {
+        self.display_layer_bool(id, "visibility", |l| l.visible)
+    }
+
+    pub fn display_layer_playback(&self, id: &str) -> bool {
+        self.display_layer_bool(id, "playback", |l| l.playback)
+    }
+
+    pub fn display_layer_enabled(&self, id: &str) -> bool {
+        self.display_layer_bool(id, "enabled", |l| l.enabled)
+    }
+
+    pub fn display_layer_shading(&self, id: &str) -> bool {
+        self.display_layer_bool(id, "shading", |l| l.shading)
+    }
+
+    pub fn display_layer_texturing(&self, id: &str) -> bool {
+        self.display_layer_bool(id, "texturing", |l| l.texturing)
+    }
+
+    pub fn display_layer_anim_playback(&self, id: &str) -> bool {
+        self.display_layer_bool(id, "animPlayback", |l| l.anim_playback)
+    }
+
+    pub fn display_layer_mode(&self, id: &str) -> String {
+        if let Some(v) = self.deps.node(id).and_then(|n| n.get("displayType")) {
+            return v.as_str().unwrap_or("normal").to_string();
+        }
+        self.display_layer_legacy(id).map(|l| l.mode.clone()).unwrap_or_else(|| "normal".into())
+    }
+
+    pub fn display_layer_lod(&self, id: &str) -> String {
+        if let Some(v) = self.deps.node(id).and_then(|n| n.get("lod")) {
+            return v.as_str().unwrap_or("full").to_string();
+        }
+        self.display_layer_legacy(id).map(|l| l.lod.clone()).unwrap_or_else(|| "full".into())
+    }
+
+    pub fn display_layer_color(&self, id: &str) -> Option<Value> {
+        if let Some(v) = self.deps.node(id).and_then(|n| n.get("colorSet")) {
+            if !v.as_bool().unwrap_or(false) {
+                return None;
+            }
+            let c = self.deps.node(id).and_then(|n| n.get("color"))?;
+            return c.is_array().then_some(c);
+        }
+        self.display_layer_legacy(id).and_then(|l| l.color.clone())
+    }
+
+    pub fn set_display_layer_bool(&mut self, id: &str, attr: &str, on: bool) -> bool {
+        if id == "defaultLayer" && attr != "enabled" {
+            return false;
+        }
+        self.ensure_display_layer_nodes();
+        let ok = self.deps.set(&crate::graph::PlugRef::new(id, attr), json!(on));
+        if ok {
+            self.touch();
+        }
+        ok
+    }
+
+    pub fn set_display_layer_mode(&mut self, id: &str, mode: &str) {
+        if id == "defaultLayer" {
+            return;
+        }
+        self.ensure_display_layer_nodes();
+        if self.deps.set(&crate::graph::PlugRef::new(id, "displayType"), json!(mode)) {
+            self.touch();
+        }
+    }
+
+    pub fn set_display_layer_lod(&mut self, id: &str, lod: &str) {
+        if id == "defaultLayer" {
+            return;
+        }
+        self.ensure_display_layer_nodes();
+        if self.deps.set(&crate::graph::PlugRef::new(id, "lod"), json!(lod)) {
+            self.touch();
+        }
+    }
+
+    pub fn set_display_layer_color(&mut self, id: &str, color: Option<Value>) {
+        if id == "defaultLayer" {
+            return;
+        }
+        self.ensure_display_layer_nodes();
+        let rgb = color.as_ref().and_then(|v| v.as_array()).filter(|a| a.len() >= 3).map(|a| [a[0].as_f64().unwrap_or(0.5), a[1].as_f64().unwrap_or(0.5), a[2].as_f64().unwrap_or(0.5)]);
+        self.deps.set(&crate::graph::PlugRef::new(id, "colorSet"), json!(rgb.is_some()));
+        if let Some(rgb) = rgb {
+            self.deps.set(&crate::graph::PlugRef::new(id, "color"), json!(rgb));
+        }
+        self.touch();
     }
 
     /// Visible = node + all ancestors visible and the display layer visible.
@@ -4343,8 +4647,8 @@ impl Scene {
             if !n.visible {
                 return false;
             }
-            if let Some(layer) = n.layer.as_ref().and_then(|l| self.layers.iter().find(|x| &x.id == l)) {
-                if layer.enabled && (!layer.visible || (!layer.playback && self.playing)) {
+            if let Some(lid) = n.layer.as_deref().or(Some("defaultLayer")) {
+                if self.display_layer_enabled(lid) && (!self.display_layer_visible(lid) || (!self.display_layer_playback(lid) && self.playing)) {
                     return false;
                 }
             }
@@ -4359,9 +4663,8 @@ impl Scene {
         let mut c = Some(id.to_string());
         while let Some(i) = c {
             let Some(n) = self.nodes.get(&i) else { return false };
-            if n.template
-                || n.layer.as_ref().is_some_and(|l| self.layers.iter().any(|x| &x.id == l && x.enabled && x.mode == "template"))
-            {
+            let lid = n.layer.as_deref().unwrap_or("defaultLayer");
+            if n.template || (self.display_layer_enabled(lid) && self.display_layer_mode(lid) == "template") {
                 return true;
             }
             c = n.parent.clone();
@@ -4376,8 +4679,8 @@ impl Scene {
             if n.template {
                 return true;
             }
-            if let Some(l) = &n.layer {
-                if self.layers.iter().any(|x| &x.id == l && x.enabled && x.mode != "normal") {
+            if let Some(l) = n.layer.as_deref().or(Some("defaultLayer")) {
+                if self.display_layer_enabled(l) && self.display_layer_mode(l) != "normal" {
                     return true;
                 }
             }
@@ -5992,28 +6295,157 @@ mod tests {
     }
 
     #[test]
+    fn layer_manager_owns_display_layer_order() {
+        let mut s = Scene::new();
+        let a = test_layer(&mut s, "a");
+        let b = test_layer(&mut s, "b");
+        let c = test_layer(&mut s, "c");
+        s.ensure_display_layer_nodes();
+        let order = |s: &Scene| -> Vec<String> {
+            let src = crate::graph::PlugRef::new("layerManager", "displayLayers");
+            s.deps.connections.iter().filter(|c| c.source == src).map(|c| c.destination.node.clone()).collect()
+        };
+        assert_eq!(order(&s), vec![a.clone(), b.clone(), c.clone(), "defaultLayer".to_string()]);
+        s.set_display_layer_order(&[c.clone(), b.clone(), a.clone()]);
+        assert_eq!(s.layers.iter().map(|l| l.id.clone()).collect::<Vec<_>>(), vec![c.clone(), b.clone(), a.clone(), "defaultLayer".to_string()]);
+        assert_eq!(order(&s), vec![c.clone(), b.clone(), a.clone(), "defaultLayer".to_string()]);
+        let data = s.serialize();
+        let mut t = Scene::new();
+        t.load(&data).expect("load");
+        assert_eq!(t.layers.iter().map(|l| l.id.clone()).collect::<Vec<_>>(), vec![c.clone(), b.clone(), a.clone(), "defaultLayer".to_string()]);
+        assert_eq!(order(&t), vec![c, b, a, "defaultLayer".to_string()]);
+    }
+
+    #[test]
+    fn default_layer_owns_unassigned_objects_and_current_layer() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        assert!(s.layers.iter().any(|l| l.id == "defaultLayer"));
+        assert_eq!(s.current_layer.as_deref(), Some("defaultLayer"));
+        s.set_display_layer_bool("defaultLayer", "visibility", false);
+        s.set_display_layer_bool("defaultLayer", "shading", false);
+        s.set_display_layer_bool("defaultLayer", "texturing", false);
+        s.set_display_layer_bool("defaultLayer", "playback", false);
+        assert!(s.is_visible(&a), "defaultLayer drawing overrides must stay locked");
+        assert!(s.display_layer_visible("defaultLayer"));
+        assert!(s.display_layer_shading("defaultLayer"));
+        assert!(s.display_layer_texturing("defaultLayer"));
+        assert!(s.display_layer_playback("defaultLayer"));
+        s.set_display_layer_mode("defaultLayer", "template");
+        s.set_display_layer_lod("defaultLayer", "bbox");
+        s.set_display_layer_color("defaultLayer", Some(json!([1.0, 0.0, 0.0])));
+        assert_eq!(s.display_layer_mode("defaultLayer"), "normal");
+        assert_eq!(s.display_layer_lod("defaultLayer"), "full");
+        assert!(s.display_layer_color("defaultLayer").is_none());
+        let custom = test_layer(&mut s, "custom");
+        s.set_current_display_layer(&custom);
+        assert_eq!(s.current_layer.as_deref(), Some(custom.as_str()));
+        assert_eq!(
+            s.get_attr(&NodeRef::Dependency("layerManager".into()), "currentLayer"),
+            Some(json!(custom.clone())),
+            "current layer was not mirrored on layerManager"
+        );
+    }
+
+    #[test]
+    fn display_layer_state_is_stored_on_its_node() {
+        let mut s = Scene::new();
+        let lid = test_layer(&mut s, "layer1");
+        s.ensure_display_layer_nodes();
+        let n = s.deps.node(&lid).expect("displayLayer node");
+        assert_eq!(n.kind, "displayLayer");
+        assert_eq!(s.deps.node("layerManager").map(|n| n.kind.as_str()), Some("layerManager"));
+        assert_eq!(
+            s.deps.source_of(&crate::graph::PlugRef::new(&lid, "layerManager")),
+            Some(crate::graph::PlugRef::new("layerManager", "displayLayers")),
+            "displayLayer is not connected to layerManager"
+        );
+        assert_eq!(s.get_attr(&NodeRef::Dependency(lid.clone()), "visibility"), Some(json!(true)));
+        s.set_display_layer_bool(&lid, "visibility", false);
+        s.set_display_layer_bool(&lid, "playback", false);
+        s.set_display_layer_mode(&lid, "template");
+        s.set_display_layer_lod(&lid, "bbox");
+        s.set_display_layer_color(&lid, Some(json!([0.2, 0.4, 0.6])));
+        assert!(!s.display_layer_visible(&lid));
+        assert!(!s.display_layer_playback(&lid));
+        assert_eq!(s.display_layer_mode(&lid), "template");
+        assert_eq!(s.display_layer_lod(&lid), "bbox");
+        assert_eq!(s.display_layer_color(&lid), Some(json!([0.2, 0.4, 0.6])));
+        let l = s.layers.iter().find(|l| l.id == lid).expect("layer");
+        assert!(l.visible && l.playback && l.mode == "normal" && l.lod == "full" && l.color.is_none(), "legacy fields were not cleared");
+    }
+
+    #[test]
+    fn legacy_display_layer_fields_migrate_into_the_node() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let lid = test_layer(&mut s, "layer1");
+        s.nodes.get_mut(&id).unwrap().layer = Some(lid.clone());
+        let l = s.layers.iter_mut().find(|l| l.id == lid).unwrap();
+        l.visible = false;
+        l.mode = "template".into();
+        l.color = Some(json!([1.0, 0.0, 0.0]));
+        l.playback = false;
+        l.enabled = false;
+        l.shading = false;
+        l.texturing = false;
+        l.lod = "bbox".into();
+        l.anim_playback = false;
+        s.ensure_display_layer_nodes();
+        assert!(!s.display_layer_visible(&lid));
+        assert_eq!(s.display_layer_mode(&lid), "template");
+        assert_eq!(s.display_layer_color(&lid), Some(json!([1.0, 0.0, 0.0])));
+        assert!(!s.display_layer_playback(&lid));
+        assert!(!s.display_layer_enabled(&lid));
+        assert!(!s.display_layer_shading(&lid));
+        assert!(!s.display_layer_texturing(&lid));
+        assert_eq!(s.display_layer_lod(&lid), "bbox");
+        assert!(!s.display_layer_anim_playback(&lid));
+        assert!(s.is_visible(&id), "disabled overrides must not hide the object");
+    }
+
+    #[test]
+    fn display_layer_node_state_survives_load() {
+        let mut s = Scene::new();
+        let lid = test_layer(&mut s, "layer1");
+        s.ensure_display_layer_nodes();
+        s.set_display_layer_mode(&lid, "reference");
+        s.set_display_layer_bool(&lid, "visibility", false);
+        s.set_display_layer_color(&lid, Some(json!([0.1, 0.2, 0.3])));
+        let data = s.serialize();
+        let mut t = Scene::new();
+        t.load(&data).expect("load");
+        assert_eq!(t.display_layer_mode(&lid), "reference");
+        assert!(!t.display_layer_visible(&lid));
+        assert_eq!(t.display_layer_color(&lid), Some(json!([0.1, 0.2, 0.3])));
+        t.layers.clear();
+        t.ensure_display_layer_nodes();
+        assert!(t.deps.node(&lid).is_none(), "deleted layer left its displayLayer node");
+    }
+
+    #[test]
     fn display_layer_visibility_playback_and_overrides() {
         let mut s = Scene::new();
         let id = s.create_mesh("polyCube", &Params::new(), None);
         let lid = test_layer(&mut s, "layer1");
-        s.nodes.get_mut(&id).unwrap().layer = Some(lid);
+        s.nodes.get_mut(&id).unwrap().layer = Some(lid.clone());
         assert!(s.is_visible(&id));
-        s.layers[0].visible = false;
+        s.set_display_layer_bool(&lid, "visibility", false);
         assert!(!s.is_visible(&id));
         // Enable Overrides off ignores every layer setting
-        s.layers[0].enabled = false;
+        s.set_display_layer_bool(&lid, "enabled", false);
         assert!(s.is_visible(&id));
-        s.layers[0].enabled = true;
-        s.layers[0].visible = true;
-        s.layers[0].playback = false;
+        s.set_display_layer_bool(&lid, "enabled", true);
+        s.set_display_layer_bool(&lid, "visibility", true);
+        s.set_display_layer_bool(&lid, "playback", false);
         assert!(s.is_visible(&id), "P off hid the layer while stopped");
         s.playing = true;
         assert!(!s.is_visible(&id), "P off did not hide the layer during playback");
         s.playing = false;
-        s.layers[0].mode = "template".into();
+        s.set_display_layer_mode(&lid, "template");
         assert!(s.is_templated_display(&id));
         assert!(s.is_template(&id));
-        s.layers[0].enabled = false;
+        s.set_display_layer_bool(&lid, "enabled", false);
         assert!(!s.is_templated_display(&id));
         assert!(!s.is_template(&id));
     }
