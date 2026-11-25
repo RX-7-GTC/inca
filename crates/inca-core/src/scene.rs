@@ -992,11 +992,226 @@ impl Scene {
         true
     }
 
-    /// Make sure every animation layer has its real `animLayer` dependency node.
+    /// Make sure every animation layer has its real `animLayer` dependency node, and that every
+    /// layered channel has its `animBlendNode` and `animCurve` nodes (Maya's layer network).
     pub fn ensure_anim_layer_nodes(&mut self) {
         let layers: Vec<(String, String)> = self.anim_layers.iter().map(|l| (l.id.clone(), l.name.clone())).collect();
         for (id, name) in layers {
             self.ensure_anim_layer_node(&id, &name);
+        }
+        self.migrate_legacy_layer_curves();
+        let layers: Vec<(String, String, Vec<String>)> = self.anim_layers.iter().map(|l| (l.id.clone(), l.name.clone(), l.attrs.clone())).collect();
+        for (lid, lname, attrs) in &layers {
+            for key in attrs {
+                self.ensure_anim_blend_node(lid, lname, key, false);
+            }
+        }
+        let mut expected = std::collections::HashSet::new();
+        for (lid, _, attrs) in &layers {
+            for key in attrs {
+                expected.insert(Self::anim_layer_blend_id(lid, key));
+                if self.anim_layer_curve(lid, key).is_some_and(|c| !c.keys.is_empty()) {
+                    expected.insert(Self::anim_layer_curve_id(lid, key));
+                }
+            }
+        }
+        // Chain each channel's blend nodes bottom-up: lower layer output -> inputA.
+        for (lid, _, attrs) in &layers {
+            let Some(i) = self.anim_layers.iter().position(|l| &l.id == lid) else { continue };
+            for key in attrs {
+                let bid = Self::anim_layer_blend_id(lid, key);
+                let cid = Self::anim_layer_curve_id(lid, key);
+                let curve_out = crate::graph::PlugRef::new(&bid, "inputB");
+                if self.deps.node(&cid).is_some() {
+                    let input_b = crate::graph::PlugRef::new(&cid, "output");
+                    if self.deps.source_of(&curve_out) != Some(input_b.clone()) {
+                        self.deps.disconnect(&curve_out);
+                        self.deps.connect(input_b, curve_out);
+                    }
+                } else {
+                    self.deps.disconnect(&curve_out);
+                }
+                let input_a = crate::graph::PlugRef::new(&bid, "inputA");
+                let below = self.anim_layers.iter().skip(i + 1).find(|l| l.attrs.contains(key)).map(|l| Self::anim_layer_blend_id(&l.id, key));
+                match below {
+                    Some(lower) => {
+                        let src = crate::graph::PlugRef::new(&lower, "output");
+                        let dest = crate::graph::PlugRef::new(&bid, "inputA");
+                        if self.deps.source_of(&dest) != Some(src.clone()) {
+                            self.deps.disconnect(&dest);
+                            self.deps.connect(src, dest);
+                        }
+                    }
+                    None => {
+                        self.deps.disconnect(&input_a);
+                    }
+                }
+            }
+        }
+        let orphans: Vec<String> = self
+            .deps
+            .nodes
+            .values()
+            .filter(|n| (n.id.starts_with("ab|") || n.id.starts_with("ac|")) && !expected.contains(&n.id))
+            .map(|n| n.id.clone())
+            .collect();
+        for id in orphans {
+            self.remove_dep_node(&id);
+        }
+    }
+
+    /// Move curves from the pre-node layer storage into their `animCurve` nodes.
+    fn migrate_legacy_layer_curves(&mut self) {
+        let mut pending = vec![];
+        for l in &mut self.anim_layers {
+            if l.curves.is_empty() {
+                continue;
+            }
+            let curves = std::mem::take(&mut l.curves);
+            for (key, curve) in curves {
+                if !l.attrs.contains(&key) {
+                    l.attrs.push(key.clone());
+                }
+                l.attrs.sort();
+                l.attrs.dedup();
+                pending.push((l.id.clone(), l.name.clone(), key, curve));
+            }
+        }
+        for (lid, lname, key, curve) in pending {
+            self.ensure_anim_blend_node(&lid, &lname, &key, true);
+            let cid = Self::anim_layer_curve_id(&lid, &key);
+            if let Some(n) = self.deps.node_mut(&cid) {
+                n.curve = Some(curve);
+            }
+        }
+    }
+
+    pub fn anim_layer_blend_id(layer: &str, key: &str) -> String {
+        format!("ab|{layer}|{key}")
+    }
+
+    pub fn anim_layer_curve_id(layer: &str, key: &str) -> String {
+        format!("ac|{layer}|{key}")
+    }
+
+    fn channel_parts(key: &str) -> (&str, &str) {
+        key.rsplit_once('.').unwrap_or(("", key))
+    }
+
+    fn channel_node_base(&self, layer: &str, key: &str) -> String {
+        let (node, attr) = Self::channel_parts(key);
+        let mut object = self.name_of(node);
+        if object.is_empty() {
+            object = node.to_string();
+        }
+        let clean = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect::<String>();
+        format!("{}_{}_{}", clean(&object), clean(attr), clean(layer))
+    }
+
+    fn rename_dep_node(&mut self, id: &str, base: &str) -> String {
+        if let Some(n) = self.deps.node(id) {
+            self.names.remove(&n.name);
+        }
+        let name = self.unique_name(base);
+        if let Some(n) = self.deps.node_mut(id) {
+            n.name = name.clone();
+        }
+        name
+    }
+
+    /// Create or refresh the blend node for one layered channel. A curve node is created only
+    /// when `with_curve` is set or one already exists, like Maya.
+    fn ensure_anim_blend_node(&mut self, layer: &str, layer_name: &str, key: &str, with_curve: bool) {
+        let bid = Self::anim_layer_blend_id(layer, key);
+        let cid = Self::anim_layer_curve_id(layer, key);
+        let (node, attr) = Self::channel_parts(key);
+        let base = self.channel_node_base(layer_name, key);
+        let curve_base = format!("{base}_inputB");
+        if self.deps.node(&bid).is_none() {
+            let mut n = crate::graph::DepNode::new(&bid, &base, "animBlendNode");
+            n.add_attr("inputA", crate::graph::AttrSpec::float(0.0));
+            n.add_attr("inputB", crate::graph::AttrSpec::float(0.0));
+            n.add_attr("weight", crate::graph::AttrSpec::float(1.0).range(0.0, 1.0));
+            n.add_attr("output", crate::graph::AttrSpec::float(0.0).read_only());
+            self.deps.insert(n);
+            self.names.insert(base.clone());
+        }
+        if with_curve && self.deps.node(&cid).is_none() {
+            let mut n = crate::graph::DepNode::new(&cid, &curve_base, "animCurve");
+            n.add_attr("output", crate::graph::AttrSpec::float(0.0).read_only());
+            n.add_attr("keyCount", crate::graph::AttrSpec::int(0).read_only());
+            n.curve = Some(AnimCurve::new(node, attr));
+            self.deps.insert(n);
+            self.names.insert(curve_base.clone());
+        }
+        // Keep node names in sync with the object, attribute and layer names.
+        let blend_name = self.rename_dep_node(&bid, &base);
+        if self.deps.node(&cid).is_some() {
+            self.rename_dep_node(&cid, &format!("{blend_name}_inputB"));
+            if let Some(n) = self.deps.node_mut(&cid) {
+                if n.curve.is_none() {
+                    n.curve = Some(AnimCurve::new(node, attr));
+                }
+                let count = n.curve.as_ref().map(|c| c.keys.len()).unwrap_or(0) as i64;
+                n.attrs.insert("keyCount".into(), serde_json::json!(count));
+            }
+        }
+    }
+
+    /// Make sure one layered channel owns its curve node and attribute membership.
+    pub fn ensure_anim_layer_curve(&mut self, layer: &str, key: &str) -> bool {
+        self.migrate_legacy_layer_curves();
+        let Some((name, attrs)) = self.anim_layers.iter().find(|l| l.id == layer).map(|l| (l.name.clone(), l.attrs.clone())) else { return false };
+        let _ = attrs;
+        self.ensure_anim_blend_node(layer, &name, key, true);
+        if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == layer) {
+            if !l.attrs.contains(&key.to_string()) {
+                l.attrs.push(key.to_string());
+                l.attrs.sort();
+                l.attrs.dedup();
+            }
+        }
+        self.deps.node(&Self::anim_layer_curve_id(layer, key)).is_some()
+    }
+
+    /// Curve data for one layered channel.
+    pub fn anim_layer_curve(&self, layer: &str, key: &str) -> Option<&AnimCurve> {
+        if let Some(c) = self.deps.node(&Self::anim_layer_curve_id(layer, key)).and_then(|n| n.curve.as_ref()) {
+            return Some(c);
+        }
+        // Compatibility until `ensure_anim_layer_nodes` migrates the old layer storage.
+        self.anim_layers.iter().find(|l| l.id == layer).and_then(|l| l.curves.get(key))
+    }
+
+    pub fn anim_layer_curve_mut(&mut self, layer: &str, key: &str) -> Option<&mut AnimCurve> {
+        let id = Self::anim_layer_curve_id(layer, key);
+        self.deps.node_mut(&id)?.curve.as_mut()
+    }
+
+    /// Borrow every curve of a layer in attribute order.
+    fn anim_layer_curve_values<'a>(&'a self, l: &'a AnimLayer) -> impl Iterator<Item = &'a AnimCurve> + 'a {
+        l.attrs.iter().filter_map(move |k| self.anim_layer_curve(&l.id, k))
+    }
+
+    /// All curve entries of a layer, keyed by "node.attr".
+    pub fn anim_layer_curves(&self, layer: &str) -> IndexMap<String, AnimCurve> {
+        let mut out = IndexMap::new();
+        let Some(l) = self.anim_layers.iter().find(|l| l.id == layer) else { return out };
+        for key in &l.attrs {
+            if let Some(c) = self.anim_layer_curve(layer, key) {
+                out.insert(key.clone(), c.clone());
+            }
+        }
+        out
+    }
+
+    /// Delete the blend/curve nodes belonging to one layer.
+    pub fn remove_anim_layer_nodes(&mut self, layer: &str) {
+        let prefix = format!("ab|{layer}|");
+        let curve_prefix = format!("ac|{layer}|");
+        let ids: Vec<String> = self.deps.nodes.values().filter(|n| n.id.starts_with(&prefix) || n.id.starts_with(&curve_prefix)).map(|n| n.id.clone()).collect();
+        for id in ids {
+            self.remove_dep_node(&id);
         }
     }
 
@@ -2170,7 +2385,8 @@ impl Scene {
                     }
                 }
             }
-            self.anim_layers.iter_mut().find(|l| &l.id == lid).map(|l| l.curves.entry(key).or_insert_with(|| AnimCurve::new(id, attr)))
+            self.ensure_anim_layer_curve(lid, &key);
+            self.anim_layer_curve_mut(lid, &key)
         } else {
             self.anim.curve_mut(id, attr, true)
         };
@@ -2186,22 +2402,117 @@ impl Scene {
 
     /// Curves shown and edited in the timeline and graph editor: the current animation layer,
     /// or BaseAnimation when no layer is selected.
-    pub fn anim_curves(&self) -> &IndexMap<String, AnimCurve> {
-        self.anim_layer_current
-            .as_ref()
-            .and_then(|id| self.anim_layers.iter().find(|l| &l.id == id))
-            .map(|l| &l.curves)
-            .unwrap_or(&self.anim.curves)
+    pub fn anim_curves(&self) -> IndexMap<String, AnimCurve> {
+        match self.anim_layer_current.as_ref().filter(|id| self.anim_layers.iter().any(|l| &l.id == *id)) {
+            Some(id) => self.anim_layer_curves(id),
+            None => self.anim.curves.clone(),
+        }
     }
 
-    pub fn anim_curves_mut(&mut self) -> &mut IndexMap<String, AnimCurve> {
-        let current = self.anim_layer_current.clone();
-        if let Some(id) = current {
-            if let Some(i) = self.anim_layers.iter().position(|l| l.id == id) {
-                return &mut self.anim_layers[i].curves;
+    /// Curve keys of the current set (layer or BaseAnimation).
+    pub fn anim_curve_keys(&self) -> Vec<String> {
+        match self.anim_layer_current.as_ref().filter(|id| self.anim_layers.iter().any(|l| &l.id == *id)) {
+            Some(id) => self.anim_layers.iter().find(|l| &l.id == id).map(|l| l.attrs.clone()).unwrap_or_default(),
+            None => self.anim.curves.keys().cloned().collect(),
+        }
+    }
+
+    pub fn anim_curve_for_key(&self, key: &str) -> Option<&AnimCurve> {
+        match self.anim_layer_current.as_ref().filter(|id| self.anim_layers.iter().any(|l| &l.id == *id)) {
+            Some(id) => self.anim_layer_curve(id, key),
+            None => self.anim.curves.get(key),
+        }
+    }
+
+    pub fn anim_curve_mut_key(&mut self, key: &str) -> Option<&mut AnimCurve> {
+        let current = self.anim_layer_current.clone().filter(|id| self.anim_layers.iter().any(|l| l.id == *id));
+        match current {
+            Some(id) => {
+                self.ensure_anim_layer_curve(&id, key);
+                self.anim_layer_curve_mut(&id, key)
+            }
+            None => {
+                let (node, attr) = key.rsplit_once('.')?;
+                self.anim.curve_mut(node, attr, true)
             }
         }
-        &mut self.anim.curves
+    }
+
+    /// Insert or replace a curve in the current set.
+    pub fn insert_anim_curve(&mut self, key: String, curve: AnimCurve) {
+        let count = curve.keys.len() as i64;
+        let current = self.anim_layer_current.clone().filter(|id| self.anim_layers.iter().any(|l| l.id == *id));
+        match current {
+            Some(id) => {
+                self.ensure_anim_layer_curve(&id, &key);
+                if let Some(c) = self.anim_layer_curve_mut(&id, &key) {
+                    *c = curve;
+                }
+                if let Some(n) = self.deps.node_mut(&Self::anim_layer_curve_id(&id, &key)) {
+                    n.attrs.insert("keyCount".into(), serde_json::json!(count));
+                }
+            }
+            None => {
+                self.anim.curves.insert(key, curve);
+            }
+        }
+        self.touch();
+    }
+
+    /// Remove a curve from the current set.
+    pub fn remove_anim_curve(&mut self, key: &str) -> Option<AnimCurve> {
+        let current = self.anim_layer_current.clone().filter(|id| self.anim_layers.iter().any(|l| l.id == *id));
+        match current {
+            Some(id) => {
+                let cid = Self::anim_layer_curve_id(&id, key);
+                let curve = self.deps.node_mut(&cid).and_then(|n| n.curve.take());
+                if let Some(l) = self.anim_layers.iter_mut().find(|l| l.id == id) {
+                    l.attrs.retain(|a| a != key);
+                }
+                self.touch();
+                curve
+            }
+            None => self.anim.curves.shift_remove(key),
+        }
+    }
+
+    /// Visit every curve in the current set for in-place edits.
+    pub fn for_each_anim_curve_mut(&mut self, mut f: impl FnMut(&mut AnimCurve)) {
+        let current = self.anim_layer_current.clone().filter(|id| self.anim_layers.iter().any(|l| l.id == *id));
+        match current {
+            Some(id) => {
+                let keys: Vec<String> = self.anim_layers.iter().find(|l| l.id == id).map(|l| l.attrs.clone()).unwrap_or_default();
+                for key in keys {
+                    if let Some(c) = self.anim_layer_curve_mut(&id, &key) {
+                        f(c);
+                    }
+                }
+            }
+            None => {
+                for c in self.anim.curves.values_mut() {
+                    f(c);
+                }
+            }
+        }
+    }
+
+    /// Remove empty current curves after key edits. Layer membership is kept; only the
+    /// channel's curve/blend nodes are removed, so the next evaluation rebuilds the blend node.
+    pub fn retain_anim_curves(&mut self, mut keep: impl FnMut(&AnimCurve) -> bool) {
+        let current = self.anim_layer_current.clone().filter(|id| self.anim_layers.iter().any(|l| l.id == *id));
+        match current {
+            Some(id) => {
+                let keys: Vec<String> = self.anim_layers.iter().find(|l| l.id == id).map(|l| l.attrs.clone()).unwrap_or_default();
+                for key in keys {
+                    let drop = self.anim_layer_curve(&id, &key).is_some_and(|c| !keep(c));
+                    if drop {
+                        self.remove_dep_node(&Self::anim_layer_blend_id(&id, &key));
+                        self.remove_dep_node(&Self::anim_layer_curve_id(&id, &key));
+                    }
+                }
+            }
+            None => self.anim.curves.retain(|_, c| keep(c)),
+        }
     }
 
     /// Synthetic Graph Editor key for an animation layer's weight curve.
@@ -2214,18 +2525,18 @@ impl Scene {
         if let Some(id) = key.strip_prefix("/animLayerWeight/") {
             return self.anim_layers.iter().find(|l| l.id == id).filter(|l| !l.weight_curve.keys.is_empty()).map(|l| &l.weight_curve);
         }
-        self.anim_curves().get(key)
+        self.anim_curve_for_key(key)
     }
 
     pub fn graph_curve_mut(&mut self, key: &str) -> Option<&mut AnimCurve> {
         if let Some(id) = key.strip_prefix("/animLayerWeight/") {
             return self.anim_layers.iter_mut().find(|l| l.id == id).map(|l| &mut l.weight_curve);
         }
-        self.anim_curves_mut().get_mut(key)
+        self.anim_curve_mut_key(key)
     }
 
     pub fn anim_curve(&self, node: &str, attr: &str) -> Option<&AnimCurve> {
-        self.anim_curves().get(&Anim::key(node, attr))
+        self.anim_curve_for_key(&Anim::key(node, attr))
     }
 
     /// Snapshot the static channel values layers blend from. Call before the user poses the object.
@@ -2307,7 +2618,8 @@ impl Scene {
             let mut vals = [0.0, 0.0, 0.0];
             let mut any = false;
             for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
-                let c = layer.curves.get(&Anim::key(node, attr));
+                let key = Anim::key(node, attr);
+                let c = self.anim_layer_curve(&layer.id, &key);
                 if let Some(c) = c.filter(|c| !c.keys.is_empty() && !c.mute) {
                     vals[i] = c.eval(t);
                     any = true;
@@ -2330,7 +2642,7 @@ impl Scene {
                 cur = euler_deg_from_quat_near(q_out, &ro, cur);
             } else {
                 for (i, attr) in ["rotateX", "rotateY", "rotateZ"].iter().enumerate() {
-                    if layer.curves.get(&Anim::key(node, attr)).is_none_or(|c| c.keys.is_empty() || c.mute) {
+                    if self.anim_layer_curve(&layer.id, &Anim::key(node, attr)).is_none_or(|c| c.keys.is_empty() || c.mute) {
                         continue;
                     }
                     let lv = vals[i];
@@ -2383,7 +2695,7 @@ impl Scene {
             if self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
-            let Some(c) = l.curves.get(key) else { continue };
+            let Some(c) = self.anim_layer_curve(&l.id, key) else { continue };
             if c.keys.is_empty() || c.mute {
                 continue;
             }
@@ -2402,7 +2714,7 @@ impl Scene {
             if self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
-            let Some(c) = l.curves.get(key) else { continue };
+            let Some(c) = self.anim_layer_curve(&l.id, key) else { continue };
             if c.keys.is_empty() || c.mute {
                 continue;
             }
@@ -2421,7 +2733,7 @@ impl Scene {
             if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
-            let Some(c) = l.curves.get(key) else { continue };
+            let Some(c) = self.anim_layer_curve(&l.id, key) else { continue };
             if c.keys.is_empty() || c.mute {
                 continue;
             }
@@ -2439,7 +2751,7 @@ impl Scene {
             if skip.contains(&l.id) || self.anim_layer_effective_mute(l) || (solo && !self.anim_layer_soloed(l)) {
                 continue;
             }
-            let Some(c) = l.curves.get(key) else { continue };
+            let Some(c) = self.anim_layer_curve(&l.id, key) else { continue };
             if c.keys.is_empty() || c.mute {
                 continue;
             }
@@ -2454,7 +2766,7 @@ impl Scene {
             .curves
             .get(key)
             .into_iter()
-            .chain(self.anim_layers.iter().filter_map(|l| l.curves.get(key)))
+            .chain(self.anim_layers.iter().filter_map(|l| self.anim_layer_curve(&l.id, key)))
             .flat_map(|c| c.keys.iter().map(|k| k.t))
             .collect();
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -2504,16 +2816,10 @@ impl Scene {
 
     pub fn anim_curve_mut(&mut self, node: &str, attr: &str, create: bool) -> Option<&mut AnimCurve> {
         let k = Anim::key(node, attr);
-        let curves = self.anim_curves_mut();
-        if create && !curves.contains_key(&k) {
-            curves.insert(k.clone(), AnimCurve::new(node, attr));
+        if !create && self.anim_curve_for_key(&k).is_none() {
+            return None;
         }
-        curves.get_mut(&k)
-    }
-
-    pub fn anim_curves_of(&self, node: &str) -> impl Iterator<Item = &AnimCurve> {
-        let node = node.to_string();
-        self.anim_curves().values().filter(move |c| c.node == node)
+        self.anim_curve_mut_key(&k)
     }
 
     pub fn anim_is_keyed(&self, node: &str, attr: &str) -> bool {
@@ -2689,7 +2995,7 @@ impl Scene {
         let by_layer_nodes: HashSet<String> = active
             .iter()
             .filter(|l| (l.id == target || merged.contains(&l.id)) && self.anim_layer_rotation_by_layer(&l.id))
-            .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
+            .flat_map(|l| self.anim_layer_curve_values(l).filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
             .collect();
         let result_passthrough = !by_layer_nodes.is_empty();
         if result_passthrough {
@@ -2702,9 +3008,11 @@ impl Scene {
             if self.anim_layer_effective_mute(l) {
                 continue;
             }
-            for (k, c) in &l.curves {
-                if !c.keys.is_empty() && !c.mute && !(c.attr.starts_with("rotate") && by_layer_nodes.contains(&c.node)) {
-                    keys.insert(k.clone());
+            for k in &l.attrs {
+                if let Some(c) = self.anim_layer_curve(&l.id, k) {
+                    if !c.keys.is_empty() && !c.mute && !(c.attr.starts_with("rotate") && by_layer_nodes.contains(&c.node)) {
+                        keys.insert(k.clone());
+                    }
                 }
             }
         }
@@ -2834,26 +3142,27 @@ impl Scene {
         }
         self.checkpoint("merge animation layers");
         if !baked.is_empty() {
-            let t = &mut self.anim_layers[target_i];
             for (key, samples) in &baked {
                 let (node, attr) = key.rsplit_once('.').unwrap();
-                let c = t.curves.entry(key.clone()).or_insert_with(|| AnimCurve::new(node, attr));
-                c.keys.clear();
-                c.mute = false;
-                for (time, value) in samples {
-                    c.set_key(*time, *value, "auto");
+                self.ensure_anim_layer_curve(target, key);
+                if let Some(c) = self.anim_layer_curve_mut(target, key) {
+                    c.keys.clear();
+                    c.mute = false;
+                    for (time, value) in samples {
+                        c.set_key(*time, *value, "auto");
+                    }
                 }
-                if !t.attrs.contains(key) {
-                    t.attrs.push(key.clone());
-                }
+                let _ = (node, attr);
             }
-            t.attrs.sort();
-            t.attrs.dedup();
-            let nodes: HashSet<String> = t.attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
-            t.members.retain(|m| nodes.contains(m));
-            for n in nodes {
-                if !t.members.contains(&n) {
-                    t.members.push(n);
+            if let Some(t) = self.anim_layers.iter_mut().find(|l| l.id == target) {
+                t.attrs.sort();
+                t.attrs.dedup();
+                let nodes: HashSet<String> = t.attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
+                t.members.retain(|m| nodes.contains(m));
+                for n in nodes {
+                    if !t.members.contains(&n) {
+                        t.members.push(n);
+                    }
                 }
             }
             self.set_anim_layer_override(target, result_override);
@@ -2872,14 +3181,15 @@ impl Scene {
             .collect();
         for id in &keep_empty {
             if let Some(l) = self.anim_layers.iter_mut().find(|l| &l.id == id) {
-                l.curves.clear();
                 l.attrs.clear();
                 l.members.clear();
             }
+            self.remove_anim_layer_nodes(id);
         }
         self.anim_layers.retain(|l| !merged.contains(&l.id) || keep_empty.contains(&l.id));
         for id in &merged {
             if !keep_empty.contains(id) {
+                self.remove_anim_layer_nodes(id);
                 self.remove_dep_node(id);
             }
         }
@@ -2902,12 +3212,12 @@ impl Scene {
         let by_layer_nodes: HashSet<String> = active
             .iter()
             .filter(|l| self.anim_layer_rotation_by_layer(&l.id))
-            .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
+            .flat_map(|l| self.anim_layer_curve_values(l).filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
             .collect();
         let mut keys = HashSet::new();
         for l in &self.anim_layers {
-            for (k, c) in &l.curves {
-                if !c.keys.is_empty() {
+            for k in &l.attrs {
+                if self.anim_layer_curve(&l.id, k).is_some_and(|c| !c.keys.is_empty()) {
                     keys.insert(k.clone());
                 }
             }
@@ -2956,6 +3266,7 @@ impl Scene {
         let old_ids: Vec<String> = self.anim_layers.iter().map(|l| l.id.clone()).collect();
         self.anim_layers.clear();
         for id in old_ids {
+            self.remove_anim_layer_nodes(&id);
             self.remove_dep_node(&id);
         }
         self.anim_layer_current = None;
@@ -2969,35 +3280,26 @@ impl Scene {
     /// it, so the evaluated result is preserved. Returns the new layer id.
     pub fn extract_anim_layer_objects(&mut self, source: &str, nodes: &[String], name: &str) -> Option<String> {
         let source_i = self.anim_layers.iter().position(|l| l.id == source)?;
+        self.migrate_legacy_layer_curves();
         let node_set: HashSet<&str> = nodes.iter().map(|s| s.as_str()).collect();
-        let keys: Vec<String> = self.anim_layers[source_i].curves.iter().filter(|(_, c)| node_set.contains(c.node.as_str())).map(|(k, _)| k.clone()).collect();
+        let keys: Vec<String> = self.anim_layers[source_i]
+            .attrs
+            .iter()
+            .filter(|k| self.anim_layer_curve(source, k).is_some_and(|c| node_set.contains(c.node.as_str())))
+            .cloned()
+            .collect();
         if keys.is_empty() {
             return None;
         }
         self.checkpoint("extract animation layer objects");
         let id = self.new_id("al");
         let src = self.anim_layers[source_i].clone();
-        let mut curves = IndexMap::new();
-        for key in &keys {
-            if let Some(c) = src.curves.get(key) {
-                curves.insert(key.clone(), c.clone());
-            }
-        }
         let mut attrs = keys.clone();
         attrs.sort();
         attrs.dedup();
         let mut members: Vec<String> = attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
         members.sort();
         members.dedup();
-        {
-            let s = &mut self.anim_layers[source_i];
-            for key in &keys {
-                s.curves.shift_remove(key);
-            }
-            s.attrs.retain(|a| !keys.contains(a));
-            let remaining: HashSet<String> = s.attrs.iter().chain(s.curves.keys()).filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
-            s.members.retain(|m| remaining.contains(m));
-        }
         self.anim_layers.insert(
             source_i,
             AnimLayer {
@@ -3007,11 +3309,25 @@ impl Scene {
                 members,
                 attrs,
                 parent: src.parent.clone(),
-                curves,
+                curves: Default::default(),
             },
         );
-        self.anim_layer_current = Some(id.clone());
+        self.ensure_anim_layer_nodes();
         self.copy_anim_layer_attrs(source, &id);
+        for key in &keys {
+            if let Some(c) = self.anim_layer_curve(source, key).cloned() {
+                self.ensure_anim_layer_curve(&id, key);
+                if let Some(dst) = self.anim_layer_curve_mut(&id, key) {
+                    *dst = c;
+                }
+            }
+        }
+        if let Some(s) = self.anim_layers.iter_mut().find(|l| l.id == source) {
+            s.attrs.retain(|a| !keys.contains(a));
+            let remaining: HashSet<String> = s.attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
+            s.members.retain(|m| remaining.contains(m));
+        }
+        self.anim_layer_current = Some(id.clone());
         self.apply_anim();
         self.touch();
         Some(id)
@@ -3069,8 +3385,21 @@ impl Scene {
     /// Remove a node's curves from the base animation and every animation layer.
     pub fn remove_anim_node(&mut self, node: &str) {
         self.anim.remove_node(node);
+        let mut removed = vec![];
         for l in &mut self.anim_layers {
-            l.curves.retain(|_, c| c.node != node);
+            let before = l.attrs.len();
+            l.attrs.retain(|k| {
+                let hit = k.rsplit_once('.').is_some_and(|(n, _)| n == node);
+                if hit {
+                    removed.push((l.id.clone(), k.clone()));
+                }
+                !hit
+            });
+            let _ = before;
+        }
+        for (lid, key) in removed {
+            self.remove_dep_node(&Self::anim_layer_blend_id(&lid, &key));
+            self.remove_dep_node(&Self::anim_layer_curve_id(&lid, &key));
         }
     }
 
@@ -3152,7 +3481,7 @@ impl Scene {
         }
         // Layers blend from the static pose, so muted or zero-weight layers return to it
         // instead of leaving the value from the previous evaluation.
-        let mut driven: Vec<String> = self.anim_layers.iter().flat_map(|l| l.curves.keys().cloned()).collect();
+        let mut driven: Vec<String> = self.anim_layers.iter().flat_map(|l| l.attrs.iter().cloned()).collect();
         driven.sort();
         driven.dedup();
         for key in &driven {
@@ -3175,33 +3504,39 @@ impl Scene {
             let by_layer_nodes: HashSet<String> = layers
                 .iter()
                 .filter(|l| self.anim_layer_rotation_by_layer(&l.id))
-                .flat_map(|l| l.curves.values().filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
+                .flat_map(|l| self.anim_layer_curve_values(l).filter(|c| c.attr.starts_with("rotate")).map(|c| c.node.clone()))
                 .collect();
-            for layer in &layers {
-                for c in layer.curves.values() {
-                    if c.keys.is_empty() || c.mute {
-                        continue;
+            // Snapshot the curves so the channel writes below do not hold a borrow on the graph.
+            let entries: Vec<(String, String, String, f64)> = layers
+                .iter()
+                .flat_map(|l| {
+                    self.anim_layer_curve_values(l)
+                        .filter(|c| !c.keys.is_empty() && !c.mute)
+                        .map(|c| (l.id.clone(), c.node.clone(), c.attr.clone(), c.eval(t)))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for (lid, node, attr, lv) in entries {
+                if !self.nodes.contains_key(&node) && self.history_ref_by_id(&node).is_none() {
+                    continue;
+                }
+                if attr.starts_with("rotate") && by_layer_nodes.contains(&node) {
+                    continue;
+                }
+                let key = Anim::key(&node, &attr);
+                let Some(layer) = layers.iter().find(|l| l.id == lid) else { continue };
+                let base = self.anim_value_below(&key, t, &lid);
+                // Boolean channels (visibility) always behave as override, as in Maya.
+                let v = self.anim_layer_blend(layer, &attr, base, self.anim_base_value(&key, t), lv, t);
+                self.set_layer_blend_plugs(&lid, &key, base, lv, self.anim_layer_effective_weight_at(layer, t), v);
+                if self.nodes.contains_key(&node) {
+                    let r = NodeRef::Dag(node.clone());
+                    self.set_attr_ex(&r, &attr, json!(v), false);
+                    if !moved.contains(&node) {
+                        moved.push(node.clone());
                     }
-                    if !self.nodes.contains_key(&c.node) && self.history_ref_by_id(&c.node).is_none() {
-                        continue;
-                    }
-                    if c.attr.starts_with("rotate") && by_layer_nodes.contains(&c.node) {
-                        continue;
-                    }
-                    let lv = c.eval(t);
-                    let key = Anim::key(&c.node, &c.attr);
-                    let base = self.anim_value_below(&key, t, &layer.id);
-                    // Boolean channels (visibility) always behave as override, as in Maya.
-                    let v = self.anim_layer_blend(layer, &c.attr, base, self.anim_base_value(&key, t), lv, t);
-                    if self.nodes.contains_key(&c.node) {
-                        let r = NodeRef::Dag(c.node.clone());
-                        self.set_attr_ex(&r, &c.attr, json!(v), false);
-                        if !moved.contains(&c.node) {
-                            moved.push(c.node.clone());
-                        }
-                    } else if let Some(r) = self.history_ref_by_id(&c.node) {
-                        self.set_attr(&r, &c.attr, json!(v));
-                    }
+                } else if let Some(r) = self.history_ref_by_id(&node) {
+                    self.set_attr(&r, &attr, json!(v));
                 }
             }
             for node in &by_layer_nodes {
@@ -3219,6 +3554,23 @@ impl Scene {
         moved.extend(self.apply_expressions());
         moved.extend(self.eval_constraints());
         self.refresh_many(&moved);
+    }
+
+    /// Publish the current evaluation into the channel's blend node and curve output.
+    fn set_layer_blend_plugs(&mut self, layer: &str, key: &str, input_a: f64, input_b: f64, weight: f64, output: f64) {
+        let cid = Self::anim_layer_curve_id(layer, key);
+        let bid = Self::anim_layer_blend_id(layer, key);
+        if let Some(n) = self.deps.node_mut(&cid) {
+            n.attrs.insert("output".into(), json!(input_b));
+            let count = n.curve.as_ref().map(|c| c.keys.len()).unwrap_or(0) as i64;
+            n.attrs.insert("keyCount".into(), json!(count));
+        }
+        for (attr, v) in [("inputA", input_a), ("inputB", input_b), ("weight", weight)] {
+            self.deps.set(&crate::graph::PlugRef::new(&bid, attr), json!(v));
+        }
+        if let Some(n) = self.deps.node_mut(&bid) {
+            n.attrs.insert("output".into(), json!(output));
+        }
     }
 
     /// Propagate direct connections (`dst = src`) until values settle; returns the DAG nodes
@@ -3967,6 +4319,7 @@ impl Scene {
         self.sel = data["sel"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).filter(|i| self.nodes.contains_key(i)).collect()).unwrap_or_default();
         self.project = data["project"].as_str().map(String::from);
         self.import_js_rig();
+        self.ensure_anim_layer_nodes();
         self.touch();
         Ok(())
     }
@@ -4520,7 +4873,7 @@ mod tests {
         s.set_time(3.0);
         s.set_key(&a, "translateX", Some(3.0), Some(7.0));
         assert!(s.anim.curves[&Anim::key(&a, "translateX")].find(3.0).is_none(), "key must not go to the base");
-        let c = s.anim_layers[0].curves.get(&Anim::key(&a, "translateX")).expect("layer curve");
+        let c = layer_curve(&s, "al1", &a, "translateX");
         let base = s.anim.curves[&Anim::key(&a, "translateX")].eval(3.0);
         assert!((c.eval(3.0) - (7.0 - base)).abs() < 1e-9, "additive key stores the delta");
         s.set_time(3.0);
@@ -4530,8 +4883,12 @@ mod tests {
         // locked layers reject keys
         s.set_anim_layer_bool("al1", "lock", true);
         s.set_key(&a, "translateX", Some(4.0), Some(99.0));
-        assert!(s.anim_layers[0].curves[&Anim::key(&a, "translateX")].find(4.0).is_none());
+        assert!(layer_curve(&s, "al1", &a, "translateX").find(4.0).is_none());
         assert!(s.anim.curves[&Anim::key(&a, "translateX")].find(4.0).is_none());
+    }
+
+    fn layer_curve<'a>(s: &'a Scene, layer: &str, node: &str, attr: &str) -> &'a AnimCurve {
+        s.anim_layer_curve(layer, &Anim::key(node, attr)).expect("layer curve")
     }
 
     fn anim_test_layer(s: &mut Scene, id: &str, node: &str, attr: &str, override_mode: bool, pts: &[(f64, f64)]) -> AnimLayer {
@@ -4620,8 +4977,8 @@ mod tests {
         assert!(s.merge_anim_layers_with("al1", &["al2".into()], opts));
         assert_eq!(s.anim_layers.len(), 3, "the emptied parent must stay for its child");
         let kept = s.anim_layers.iter().find(|l| l.id == "al2").expect("kept parent");
-        assert!(kept.curves.is_empty() && kept.attrs.is_empty());
-        assert!(s.anim_layers.iter().find(|l| l.id == "al3").expect("child").curves.contains_key(&Anim::key(&a, "translateZ")));
+        assert!(kept.attrs.is_empty());
+        assert!(s.anim_layer_curve("al3", &Anim::key(&a, "translateZ")).is_some());
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "translateY") - 2.0).abs() < 1e-9, "source animation was not merged");
         assert!((s.get_attr_f(&a, "translateZ") - 3.0).abs() < 1e-9, "unselected child animation was merged");
@@ -4747,7 +5104,7 @@ mod tests {
         let key = Anim::key(&a, "translateX");
         let smart = MergeLayerOptions { smart_bake: true, ..Default::default() };
         assert!(smart_scene.merge_anim_layers_with("al1", &["al2".into()], smart));
-        let times: Vec<f64> = smart_scene.anim_layers[0].curves[&key].keys.iter().map(|k| k.t).collect();
+        let times: Vec<f64> = layer_curve(&smart_scene, "al1", &a, "translateX").keys.iter().map(|k| k.t).collect();
         assert_eq!(times, vec![0.0, 5.0, 10.0], "Smart Bake should keep only source key times");
         let mut s = Scene::new();
         let a = s.create_mesh("polyCube", &Params::new(), None);
@@ -4757,7 +5114,7 @@ mod tests {
         ];
         let sampled = MergeLayerOptions { smart_bake: false, sample_by: 2, ..Default::default() };
         assert!(s.merge_anim_layers_with("al1", &["al2".into()], sampled));
-        let times: Vec<f64> = s.anim_layers[0].curves[&key].keys.iter().map(|k| k.t).collect();
+        let times: Vec<f64> = layer_curve(&s, "al1", &a, "translateX").keys.iter().map(|k| k.t).collect();
         assert_eq!(times, vec![0.0, 2.0, 4.0, 5.0, 6.0, 8.0, 10.0], "Sample By 2 should bake every second frame plus source keys");
     }
 
@@ -4774,7 +5131,7 @@ mod tests {
         s.anim_layers = vec![target, anim_test_layer(&mut s, "al2", &a, "translateX", false, &[(0.0, 0.0), (10.0, 0.0)])];
         let opts = MergeLayerOptions { smart_bake: true, increase_fidelity: true, fidelity_tolerance: 1, ..Default::default() };
         assert!(s.merge_anim_layers_with("al1", &["al2".into()], opts));
-        assert!(s.anim_layers[0].curves[&key].keys.len() > 3, "Increase Fidelity did not add keys");
+        assert!(layer_curve(&s, "al1", &a, "translateX").keys.len() > 3, "Increase Fidelity did not add keys");
     }
 
     #[test]
@@ -4863,12 +5220,83 @@ mod tests {
         assert_eq!(s.anim_layers.len(), 2);
         assert_eq!(s.anim_layers[0].id, new_id);
         assert_eq!(s.anim_layers[0].name, "Layer 1_extract");
-        assert_eq!(s.anim_layers[0].curves.len(), 1);
-        assert!(s.anim_layers[0].curves.contains_key(&Anim::key(&a, "translateX")));
-        assert_eq!(s.anim_layers[1].curves.len(), 1);
-        assert!(s.anim_layers[1].curves.contains_key(&Anim::key(&b, "translateX")));
+        assert!(s.anim_layer_curve(&new_id, &Anim::key(&a, "translateX")).is_some());
+        assert!(s.anim_layer_curve("al1", &Anim::key(&b, "translateX")).is_some());
         assert_eq!(s.anim_layers[1].members, vec![b]);
         assert_eq!(s.anim_layer_current.as_deref(), Some(new_id.as_str()));
+    }
+
+    #[test]
+    fn layered_channels_create_maya_style_blend_and_curve_nodes() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.anim_layers = vec![anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(0.0, 10.0)])];
+        s.set_time(0.0);
+        let blend = s.find_dep("pCube1_translateX_al1").expect("animBlendNode");
+        assert_eq!(blend.kind, "animBlendNode");
+        let curve = s.find_dep("pCube1_translateX_al1_inputB").expect("animCurve");
+        assert_eq!(curve.kind, "animCurve");
+        assert_eq!(curve.curve.as_ref().map(|c| c.keys.len()), Some(1), "keys live on the animCurve node");
+        let src = crate::graph::PlugRef::new(&curve.id, "output");
+        let dst = crate::graph::PlugRef::new(&blend.id, "inputB");
+        assert_eq!(s.deps.source_of(&dst), Some(src), "curve output is not wired to the blend node");
+        assert_eq!(s.deps.get(&dst), Some(json!(10.0)), "blend inputB does not evaluate the curve");
+        assert_eq!(s.deps.get(&crate::graph::PlugRef::new(&blend.id, "output")), Some(json!(10.0)));
+    }
+
+    #[test]
+    fn layer_curve_nodes_survive_save_and_load() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.anim_layers = vec![anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(0.0, 10.0), (5.0, 4.0)])];
+        s.set_time(2.5);
+        let data = s.serialize();
+        let mut t = Scene::new();
+        t.load(&data).expect("load");
+        let c = t.anim_layer_curve("al1", &Anim::key(&a, "translateX")).expect("curve node");
+        assert_eq!(c.keys.len(), 2);
+        assert!((c.eval(2.5) - 7.0).abs() < 1e-9);
+        assert!(t.find_dep("pCube1_translateX_al1").is_some());
+    }
+
+    #[test]
+    fn deleting_a_layer_removes_its_channel_nodes() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        s.anim_layers = vec![anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(0.0, 10.0)])];
+        s.set_time(0.0);
+        assert!(s.find_dep("pCube1_translateX_al1").is_some());
+        s.remove_anim_layer_nodes("al1");
+        s.remove_dep_node("al1");
+        assert!(s.find_dep("pCube1_translateX_al1").is_none());
+        assert!(s.find_dep("pCube1_translateX_al1_inputB").is_none());
+    }
+
+    #[test]
+    fn file_round_trip_does_not_bake_layer_curves() {
+        let mut s = Scene::new();
+        let a = s.create_mesh("polyCube", &Params::new(), None);
+        for (t, v) in [(1.0, 0.0), (10.0, 5.0), (15.0, 2.0)] {
+            s.set_key(&a, "translateX", Some(t), Some(v));
+        }
+        s.anim_layers = vec![anim_test_layer(&mut s, "al1", &a, "translateX", true, &[(1.0, 0.0), (10.0, 3.0), (15.0, 1.0)])];
+        s.set_time(1.0);
+        let path = std::env::temp_dir().join(format!("inca_round_trip_{}.inca", std::process::id()));
+        crate::io::save_scene(&mut s, &path).expect("save");
+        let mut t = Scene::new();
+        crate::io::open_scene(&mut t, &path).expect("open");
+        let _ = std::fs::remove_file(&path);
+        let c = t.anim_layer_curve("al1", &Anim::key(&a, "translateX")).expect("layer curve");
+        assert_eq!(c.keys.len(), 3, "layer curve was baked on load");
+        assert_eq!(c.keys.iter().map(|k| k.t).collect::<Vec<_>>(), vec![1.0, 10.0, 15.0]);
+        let base = &t.anim.curves[&Anim::key(&a, "translateX")];
+        assert_eq!(base.keys.len(), 3, "base curve was baked on load");
+        for time in [1.0, 5.0, 10.0, 15.0, 24.0] {
+            t.set_time(time);
+        }
+        let c = t.anim_layer_curve("al1", &Anim::key(&a, "translateX")).expect("layer curve");
+        assert_eq!(c.keys.len(), 3, "evaluating after load changed the layer keys");
+        assert_eq!(t.anim.curves[&Anim::key(&a, "translateX")].keys.len(), 3, "evaluating after load changed the base keys");
     }
 
     #[test]
@@ -4912,7 +5340,7 @@ mod tests {
         assert!(t.anim_base_lock, "base lock survives the load");
         assert_eq!(t.anim_solo_saved, vec![("al1".into(), false, true)], "solo restore state survives the load");
         assert!((t.anim_static[&Anim::key(&a, "scaleX")] - 1.0).abs() < 1e-9, "static pose survives the load");
-        let c = t.anim_layers[0].curves.get(&Anim::key(&a, "translateX")).expect("curve survives");
+        let c = t.anim_layer_curve("al1", &Anim::key(&a, "translateX")).expect("curve survives");
         assert!((c.eval(0.0) - 2.0).abs() < 1e-9);
     }
 
@@ -4971,7 +5399,7 @@ mod tests {
         s.set_time(20.0);
         s.set_attr_f(&a, "rotateY", 90.0);
         s.set_key(&a, "rotateY", None, None);
-        let c = s.anim_layers[0].curves.get(&Anim::key(&a, "rotateY")).expect("layer curve");
+        let c = layer_curve(&s, "al1", &a, "rotateY");
         assert!((c.eval(20.0) - 90.0).abs() < 1e-9, "additive key stored {}", c.eval(20.0));
         s.set_time(10.0);
         let mid = s.get_attr_f(&a, "rotateY");
@@ -5205,7 +5633,7 @@ mod tests {
         s.anim_layer_current = Some("al1".into());
         s.set_attr_f(&a, "scaleY", 3.0);
         assert!(s.set_key(&a, "scaleY", Some(0.0), None));
-        let c = &s.anim_layers[0].curves[&Anim::key(&a, "scaleY")];
+        let c = layer_curve(&s, "al1", &a, "scaleY");
         assert!((c.keys[0].v - 1.5).abs() < 1e-9, "top additive scale should store the ratio 3/2, got {}", c.keys[0].v);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "scaleY") - 3.0).abs() < 1e-9, "result should match Maya's 3");
@@ -5224,7 +5652,7 @@ mod tests {
         s.set_time(0.0);
         s.set_attr_f(&a, "scaleX", 2.0);
         assert!(s.set_key(&a, "scaleX", Some(0.0), None));
-        let c = &s.anim_layers[0].curves[&Anim::key(&a, "scaleX")];
+        let c = layer_curve(&s, "al1", &a, "scaleX");
         assert!((c.keys[0].v - 1.0).abs() < 1e-9, "additive scale should key the delta, got {}", c.keys[0].v);
         s.set_time(0.0);
         assert!((s.get_attr_f(&a, "scaleX") - 2.0).abs() < 1e-9);
@@ -5312,7 +5740,10 @@ mod tests {
         s.set_attr_f(&a, "translateX", 8.0);
         s.set_key(&a, "translateX", None, None);
         let key = Anim::key(&a, "translateX");
-        let value_at = |s: &Scene, t: f64| s.anim_layers[0].curves[&key].keys[s.anim_layers[0].curves[&key].find(t).unwrap()].v;
+        let value_at = |s: &Scene, t: f64| {
+            let c = layer_curve(s, "al1", &a, "translateX");
+            c.keys[c.find(t).unwrap()].v
+        };
         assert!((value_at(&s, 10.0) - 3.0).abs() < 1e-9, "additive key stores the offset");
         s.set_time(10.0);
         assert!((s.get_attr_f(&a, "translateX") - 8.0).abs() < 1e-9);
@@ -5404,8 +5835,8 @@ mod tests {
         s.anim_layer_current = Some("al1".into());
         assert!(s.set_key(&a, "translateX", Some(1.0), Some(5.0)));
         assert!(!s.set_key(&a, "translateY", Some(1.0), Some(5.0)));
-        assert!(s.anim_layers[0].curves.contains_key(&Anim::key(&a, "translateX")));
-        assert!(!s.anim_layers[0].curves.contains_key(&Anim::key(&a, "translateY")));
+        assert!(s.anim_layer_curve("al1", &Anim::key(&a, "translateX")).is_some());
+        assert!(s.anim_layer_curve("al1", &Anim::key(&a, "translateY")).is_none());
         assert!(!s.anim.curves.contains_key(&Anim::key(&a, "translateY")), "rejected key leaked to BaseAnimation");
         // an empty layer owns no attributes
         s.anim_layers[0].attrs.clear();

@@ -1,5 +1,6 @@
 //! Keyframe animation: anim curves with Maya-style tangents and infinity modes.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 pub const TANGENTS: &[&str] = &["auto", "spline", "clamped", "linear", "flat", "step", "plateau", "fixed"];
@@ -32,8 +33,10 @@ pub struct AnimLayer {
     /// Parent layer in the stack; None = top level.
     #[serde(default)]
     pub parent: Option<String>,
-    #[serde(default)]
-    pub curves: indexmap::IndexMap<String, AnimCurve>,
+    /// Legacy curve storage from before layer curves became `animCurve` dependency nodes.
+    /// `Scene::ensure_anim_layer_nodes` moves these into nodes and clears the map.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub curves: IndexMap<String, AnimCurve>,
 }
 
 impl AnimLayer {

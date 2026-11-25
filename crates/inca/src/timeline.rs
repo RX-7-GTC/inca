@@ -218,7 +218,10 @@ pub(crate) fn key_range(app: &IncaApp) -> (f64, f64) {
 fn move_keys(app: &mut IncaApp, lo: f64, hi: f64, d: f64) {
     app.s.checkpoint("move keys");
     let sel = app.s.sel.clone();
-    for c in app.s.anim_curves_mut().values_mut().filter(|c| sel.contains(&c.node)) {
+    app.s.for_each_anim_curve_mut(|c| {
+        if !sel.contains(&c.node) {
+            return;
+        }
         let (moving, rest): (Vec<_>, Vec<_>) = c.keys.drain(..).partition(|k| k.t >= lo - 1e-4 && k.t <= hi + 1e-4);
         c.keys = rest.into_iter().filter(|k| !(k.t >= lo + d - 1e-4 && k.t <= hi + d + 1e-4)).collect();
         c.keys.extend(moving.into_iter().map(|mut k| {
@@ -226,7 +229,7 @@ fn move_keys(app: &mut IncaApp, lo: f64, hi: f64, d: f64) {
             k
         }));
         c.sort();
-    }
+    });
     app.s.apply_anim();
     app.s.rev += 1;
 }
@@ -234,10 +237,12 @@ fn move_keys(app: &mut IncaApp, lo: f64, hi: f64, d: f64) {
 fn delete_keys(app: &mut IncaApp, lo: f64, hi: f64) {
     app.s.checkpoint("delete keys");
     let sel = app.s.sel.clone();
-    for c in app.s.anim_curves_mut().values_mut().filter(|c| sel.contains(&c.node)) {
-        c.keys.retain(|k| !(k.t >= lo - 1e-4 && k.t <= hi + 1e-4));
-    }
-    app.s.anim_curves_mut().retain(|_, c| !c.keys.is_empty());
+    app.s.for_each_anim_curve_mut(|c| {
+        if sel.contains(&c.node) {
+            c.keys.retain(|k| !(k.t >= lo - 1e-4 && k.t <= hi + 1e-4));
+        }
+    });
+    app.s.retain_anim_curves(|c| !c.keys.is_empty());
     app.s.apply_anim();
     app.s.rev += 1;
 }
@@ -328,12 +333,15 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             if ui.button(label).clicked() {
                 app.s.checkpoint("tangents");
                 let sel = app.s.sel.clone();
-                for c in app.s.anim_curves_mut().values_mut().filter(|c| sel.contains(&c.node)) {
+                app.s.for_each_anim_curve_mut(|c| {
+                    if !sel.contains(&c.node) {
+                        return;
+                    }
                     for k in c.keys.iter_mut().filter(|k| k.t >= lo - 1e-4 && k.t <= hi + 1e-4) {
                         k.it = t.to_string();
                         k.ot = t.to_string();
                     }
-                }
+                });
                 app.s.apply_anim();
                 app.s.rev += 1;
                 ui.close();

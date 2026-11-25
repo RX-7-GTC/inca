@@ -117,8 +117,8 @@ pub fn export_json(s: &Scene, root_id: &str, branch: bool) -> Result<String, Str
             attrs: l.attrs.iter().map(|k| exported_attr(s, k)).collect(),
             ghost: s.anim_layer_ghost(&l.id),
             ghost_color: s.anim_layer_ghost_color(&l.id),
-            curves: l
-                .curves
+            curves: s
+                .anim_layer_curves(&l.id)
                 .values()
                 .filter(|c| !c.keys.is_empty())
                 .map(|c| {
@@ -377,7 +377,7 @@ mod tests {
         let l = &dst.anim_layers[0];
         let key = Anim::key(&new_node, "translateX");
         assert!(l.attrs.contains(&key));
-        assert!(l.curves.contains_key(&key));
+        assert!(dst.anim_layer_curve(&l.id, &key).is_some());
         assert_eq!(l.members, vec![new_node.clone()]);
         assert_eq!(dst.anim_layer_current.as_deref(), Some(l.id.as_str()));
     }

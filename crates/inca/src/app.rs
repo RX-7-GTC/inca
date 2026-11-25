@@ -204,6 +204,9 @@ pub struct IncaApp {
     /// Material or texture selected in the Hypershade/Hypergraph. Mutually exclusive with
     /// `s.sel`, like Maya's single selection: one Attribute Editor target at a time.
     pub snode_sel: Option<String>,
+    /// Dependency node selected in the Outliner (animLayer, shading utility...). Mutually
+    /// exclusive with `s.sel`, so one panel shows one selected node at a time.
+    pub dep_sel: Option<String>,
     /// UI elements switched off (workspace::ELEMENTS keys)
     pub hidden: std::collections::BTreeSet<String>,
     /// what Ctrl+Space hid, to bring back
@@ -463,6 +466,7 @@ impl IncaApp {
             right_tab: cc.storage.and_then(|s| eframe::get_value(s, "rightTab")).unwrap_or(RightTab::ChannelBox),
             show_right: cc.storage.and_then(|s| eframe::get_value(s, "showRight")).unwrap_or(true),
             snode_sel: None,
+            dep_sel: None,
             show_outliner: cc.storage.and_then(|s| eframe::get_value(s, "showOutliner")).unwrap_or(false),
             detached: Default::default(),
             detach_pos: Default::default(),
@@ -1021,6 +1025,7 @@ impl IncaApp {
         // The viewport/outliner take over the Attribute Editor, but the Hypershade
         // Property Editor keeps the last shading node (Maya behavior).
         self.snode_sel = None;
+        self.dep_sel = None;
         self.windows_state.hs.graph_sel.clear();
         let names: Vec<String> = ids.iter().map(|i| self.s.name_of(i)).collect();
         let flag = match mode {
@@ -1478,6 +1483,9 @@ impl eframe::App for IncaApp {
             self.snode_sel = None;
             self.windows_state.hs.graph_sel.clear();
         }
+        if self.dep_sel.is_some() && (!self.s.sel.is_empty() || self.dep_sel.as_ref().is_some_and(|id| self.s.deps.node(id).is_none())) {
+            self.dep_sel = None;
+        }
         // constraints follow their targets live (gizmo drags, channel edits)
         crate::prefs::apply(self, &ctx);
         crate::anim_extras::tick(self, &ctx);
@@ -1637,7 +1645,7 @@ mod tests {
         let mut curve = inca_core::anim::AnimCurve::new("pCube1", "translateX");
         curve.set_key(1.0, 0.0, "linear");
         curve.set_key(10.0, 1.0, "linear");
-        app.s.anim_curves_mut().insert(ck.clone(), curve);
+        app.s.insert_anim_curve(ck.clone(), curve);
         app.windows_state.ge_keys = vec![(ck.clone(), 0)];
         app.win.graph_editor = true;
         app.windows_state.ge_window_rect = Some(egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)));
@@ -1686,7 +1694,7 @@ mod tests {
         let mut curve = inca_core::anim::AnimCurve::new("pCube1", "translateX");
         curve.set_key(1.0, 0.0, "linear");
         curve.set_key(10.0, 1.0, "linear");
-        app.s.anim_curves_mut().insert(ck.clone(), curve);
+        app.s.insert_anim_curve(ck.clone(), curve);
         app.windows_state.ge_keys = vec![(ck.clone(), 0)];
         app.win.graph_editor = true;
         app.action("copy");
@@ -1766,7 +1774,7 @@ mod tests {
         let mut curve = inca_core::anim::AnimCurve::new("pCube1", "translateX");
         curve.set_key(1.0, 0.0, "linear");
         curve.set_key(10.0, 1.0, "linear");
-        app.s.anim_curves_mut().insert(ck.clone(), curve);
+        app.s.insert_anim_curve(ck.clone(), curve);
         app.windows_state.ge_keys = vec![(ck, 0)];
         app.win.graph_editor = true;
         app.windows_state.ge_window_rect = Some(egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(600.0, 400.0)));

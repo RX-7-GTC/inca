@@ -601,6 +601,8 @@ pub struct PanelState {
     pub anim_layer_sel: Vec<String>,
     /// A weight edit is one undo step from press to release.
     anim_layer_weight_edit: bool,
+    /// Dependency-node AE/Channel Box drag key: one undo step from press to release.
+    dep_edit: Option<String>,
     /// Defaults used by Create Layer / Create Layer from Selected.
     pub layer_default_passthrough: Option<bool>,
     pub layer_default_rotation_by_layer: bool,
@@ -781,20 +783,46 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
         let o = app.panels.ol;
         if !o.dag_only && o.sets {
             for n in ["defaultLightSet", "defaultObjectSet"] {
-                plain_row(ui, 0, "olSet", n, Color32::from_gray(0xd0));
+                if filter.is_empty() || n.to_lowercase().contains(&filter) {
+                    plain_row(ui, 0, "olSet", n, Color32::from_gray(0xd0), false);
+                }
             }
         }
         if o.materials {
             let mats: Vec<String> = app.s.mats.values().map(|m| m.name.clone()).collect();
             for m in mats {
-                if plain_row(ui, 0, "olMaterial", &m, theme::TEXT).clicked() {
+                if !filter.is_empty() && !m.to_lowercase().contains(&filter) {
+                    continue;
+                }
+                if plain_row(ui, 0, "olMaterial", &m, theme::TEXT, false).clicked() {
                     let _ = app.run_mel("select material", &format!("select -r {m};"));
+                }
+            }
+        }
+        // Dependency nodes are listed when Display > DAG Objects Only is off, like Maya.
+        // The animLayer node itself is hidden; its per-channel blend/curve network is shown.
+        if !o.dag_only {
+            for (id, name, kind) in outliner_dep_rows(&app.s) {
+                if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
+                    continue;
+                }
+                let icon = match kind.as_str() {
+                    "animCurve" => "olCurve",
+                    _ => "olDependency",
+                };
+                let selected = app.dep_sel.as_deref() == Some(id.as_str());
+                if plain_row(ui, 1, icon, &name, theme::TEXT, selected).clicked() {
+                    app.s.checkpoint_selection("select");
+                    app.s.select(&[], SelMode::Replace);
+                    app.snode_sel = None;
+                    app.dep_sel = Some(id.clone());
+                    app.echo(format!("select -r {name};"));
                 }
             }
         }
         // empty space: click deselects, drop unparents
         let (_, zone) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ui.available_height().max(40.0)), egui::Sense::click());
-        if zone.clicked() && !app.s.sel.is_empty() {
+        if zone.clicked() && (!app.s.sel.is_empty() || app.dep_sel.is_some()) {
             app.s.checkpoint_selection("select");
             app.select_names(&[], SelMode::Replace);
         }
@@ -847,10 +875,25 @@ fn matches_filter(app: &IncaApp, id: &str, f: &str) -> bool {
 
 const ROW_H: f32 = 19.0;
 
+/// Dependency nodes shown in the Outliner when DAG Objects Only is off. The animLayer node is
+/// hidden, like Maya; its per-channel blend and curve nodes are listed instead.
+fn outliner_dep_rows(s: &inca_core::scene::Scene) -> Vec<(String, String, String)> {
+    let mut deps: Vec<(String, String, String)> = s.deps.nodes.values().filter(|n| n.kind != "animLayer").map(|n| (n.id.clone(), n.name.clone(), n.kind.clone())).collect();
+    let rank = |k: &str| match k {
+        "animBlendNode" => 0,
+        "animCurve" => 1,
+        _ => 2,
+    };
+    deps.sort_by(|a, b| rank(&a.2).cmp(&rank(&b.2)).then_with(|| a.1.cmp(&b.1)));
+    deps
+}
+
 /// A non-node row (shape, set, material).
-fn plain_row(ui: &mut egui::Ui, depth: usize, icon: &str, text: &str, col: Color32) -> egui::Response {
+fn plain_row(ui: &mut egui::Ui, depth: usize, icon: &str, text: &str, col: Color32, selected: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::click());
-    if resp.hovered() {
+    if selected {
+        ui.painter().rect_filled(r, 0.0, theme::HI);
+    } else if resp.hovered() {
         ui.painter().rect_filled(r, 0.0, Color32::from_gray(0x4d));
     }
     let x = r.min.x + 4.0 + depth as f32 * 16.0 + 12.0;
@@ -1156,7 +1199,7 @@ fn outliner_row(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, depth: usize, fi
     });
     if open {
         if let Some(sn) = shape_name {
-            plain_row(ui, depth + 1, icon, &sn, Color32::from_gray(0xaa));
+            plain_row(ui, depth + 1, icon, &sn, Color32::from_gray(0xaa), false);
         }
         for k in kids {
             outliner_row(app, ui, &k, depth + 1, filter, rows);
@@ -1901,6 +1944,20 @@ fn finish_cb_rows(app: &mut IncaApp, ui: &egui::Ui, rows: &[CbRow]) {
 }
 
 pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
+    if let Some(id) = app.dep_sel.clone() {
+        if let Some(node) = app.s.deps.node(&id) {
+            let name = node.name.clone();
+            let kind = node.kind.clone();
+            ui.label(RichText::new(shown_node_name(app, &name)).heading());
+            ui.label(RichText::new(kind).color(theme::TEXT_DIM));
+            app.panels.cb_fields.clear();
+            app.panels.cb_editing = None;
+            app.panels.cb_row_rects.clear();
+            dep_attrs_editor(app, ui, &id);
+            return;
+        }
+        app.dep_sel = None;
+    }
     let Some(lead) = app.s.lead().cloned() else {
         ui.label(RichText::new("Nothing selected").color(theme::TEXT_DIM));
         app.panels.cb_fields.clear();
@@ -2684,9 +2741,9 @@ fn rename_custom_attr(app: &mut IncaApp, id: &str, old: &str, new: &str) {
         }
     }
     let old_key = inca_core::anim::Anim::key(id, old);
-    if let Some(mut c) = app.s.anim_curves_mut().shift_remove(&old_key) {
+    if let Some(mut c) = app.s.remove_anim_curve(&old_key) {
         c.attr = new.to_string();
-        app.s.anim_curves_mut().insert(inca_core::anim::Anim::key(id, new), c);
+        app.s.insert_anim_curve(inca_core::anim::Anim::key(id, new), c);
     }
     for c in &mut app.s.conns {
         if c.src == id && c.src_attr == old {
@@ -2772,7 +2829,7 @@ fn delete_channel_keys(app: &mut IncaApp) -> usize {
         for t in &p.targets {
             if let NodeRef::Dag(id) = t {
                 let key = inca_core::anim::Anim::key(id, &p.attr);
-                if app.s.anim_curves_mut().shift_remove(&key).is_some() {
+                if app.s.remove_anim_curve(&key).is_some() {
                     n += 1;
                 }
             }
@@ -2816,7 +2873,7 @@ fn break_channel_connections(app: &mut IncaApp) {
             let id = app.s.ref_id(t);
             app.s.conns.retain(|c| !(c.dst == id.as_str() && c.dst_attr == p.attr));
             let key = inca_core::anim::Anim::key(&id, &p.attr);
-            if app.s.anim_curves_mut().shift_remove(&key).is_some_and(|c| !c.keys.is_empty()) {
+            if app.s.remove_anim_curve(&key).is_some_and(|c| !c.keys.is_empty()) {
                 keys += 1;
             }
         }
@@ -2966,18 +3023,18 @@ fn mute_channels(app: &mut IncaApp, mute: bool, all: bool) {
     let mut n = 0;
     if all {
         let sel = app.s.sel.clone();
-        for c in app.s.anim_curves_mut().values_mut() {
+        app.s.for_each_anim_curve_mut(|c| {
             if sel.contains(&c.node) && !c.keys.is_empty() && c.mute != mute {
                 c.mute = mute;
                 n += 1;
             }
-        }
+        });
     } else {
         for p in app.panels.cb_pick.clone() {
             for t in &p.targets {
                 if let NodeRef::Dag(id) = t {
                     let key = inca_core::anim::Anim::key(id, &p.attr);
-                    if let Some(c) = app.s.anim_curves_mut().get_mut(&key) {
+                    if let Some(c) = app.s.anim_curve_mut_key(&key) {
                         if !c.keys.is_empty() && c.mute != mute {
                             c.mute = mute;
                             n += 1;
@@ -4755,6 +4812,7 @@ fn anim_layer_attrs_from_picks(app: &mut IncaApp, add: bool) {
         app.s.remember_anim_static(&ids);
     }
     let mut removed_curves = vec![];
+    let mut remove_keys = vec![];
     if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
         if add {
             for k in keys {
@@ -4768,12 +4826,17 @@ fn anim_layer_attrs_from_picks(app: &mut IncaApp, add: bool) {
                 }
             }
         } else {
-            removed_curves.extend(l.curves.keys().filter(|k| keys.contains(k)).cloned());
+            remove_keys = l.attrs.iter().filter(|k| keys.contains(k)).cloned().collect();
+            removed_curves = remove_keys.clone();
             l.attrs.retain(|k| !keys.contains(k));
             l.curves.retain(|k, _| !keys.contains(k));
             let keep: Vec<String> = l.attrs.iter().filter_map(|k| k.rsplit_once('.').map(|(n, _)| n.to_string())).collect();
             l.members.retain(|m| keep.contains(m));
         }
+    }
+    for key in &remove_keys {
+        app.s.remove_dep_node(&inca_core::scene::Scene::anim_layer_blend_id(&id, key));
+        app.s.remove_dep_node(&inca_core::scene::Scene::anim_layer_curve_id(&id, key));
     }
     if !removed_curves.is_empty() {
         app.s.restore_anim_static(&removed_curves);
@@ -5025,8 +5088,9 @@ fn anim_layer_delete(app: &mut IncaApp, id: &str) {
     app.s.checkpoint("delete animation layer");
     let parent = app.s.anim_layers.iter().find(|l| l.id == id).and_then(|l| l.parent.clone());
     let children: Vec<String> = anim_layer_children(&app.s.anim_layers, Some(id)).iter().map(|l| l.id.clone()).collect();
-    let keys: Vec<String> = app.s.anim_layers.iter().filter(|l| l.id == id).flat_map(|l| l.curves.keys().cloned()).collect();
+    let keys: Vec<String> = app.s.anim_layers.iter().filter(|l| l.id == id).flat_map(|l| l.attrs.iter().cloned()).collect();
     app.s.anim_layers.retain(|l| l.id != id);
+    app.s.remove_anim_layer_nodes(id);
     app.s.remove_dep_node(id);
     for c in children {
         if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == c) {
@@ -5428,6 +5492,17 @@ fn anim_layer_duplicate(app: &mut IncaApp, no_animation: bool) {
     inserted.sort_by_key(|id| app.s.anim_layers.iter().position(|l| &l.id == id).unwrap_or(usize::MAX));
     for (orig, new) in &id_map {
         app.s.copy_anim_layer_attrs(orig, new);
+        if no_animation {
+            continue;
+        }
+        let keys: Vec<String> = app.s.anim_layers.iter().find(|l| &l.id == orig).map(|l| l.attrs.clone()).unwrap_or_default();
+        for key in keys {
+            let Some(c) = app.s.anim_layer_curve(orig, &key).cloned() else { continue };
+            app.s.ensure_anim_layer_curve(new, &key);
+            if let Some(dst) = app.s.anim_layer_curve_mut(new, &key) {
+                *dst = c;
+            }
+        }
     }
     if let Some(cur) = app.s.anim_layer_current.as_ref().and_then(|c| id_map.get(c)) {
         app.s.anim_layer_current = Some(cur.clone());
@@ -5547,11 +5622,14 @@ fn anim_layer_empty_ids(app: &mut IncaApp, ids: Vec<String>) {
     let mut removed = vec![];
     for l in &mut app.s.anim_layers {
         if ids.contains(&l.id) {
-            removed.extend(l.curves.keys().cloned());
+            removed.extend(l.attrs.iter().cloned());
             l.attrs.clear();
             l.members.clear();
             l.curves.clear();
         }
+    }
+    for id in &ids {
+        app.s.remove_anim_layer_nodes(id);
     }
     if !removed.is_empty() {
         app.s.restore_anim_static(&removed);
@@ -5582,6 +5660,7 @@ fn anim_layer_delete_empty(app: &mut IncaApp) {
         let parent = app.s.anim_layers.iter().find(|l| &l.id == id).and_then(|l| l.parent.clone());
         let children: Vec<String> = app.s.anim_layers.iter().filter(|l| l.parent.as_deref() == Some(id)).map(|l| l.id.clone()).collect();
         app.s.anim_layers.retain(|l| &l.id != id);
+        app.s.remove_anim_layer_nodes(id);
         app.s.remove_dep_node(id);
         for c in children {
             if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == c) {
@@ -5612,6 +5691,7 @@ fn anim_layer_rename_commit(app: &mut IncaApp, id: &str, new: &str) {
     if let Some(l) = app.s.anim_layers.iter_mut().find(|l| l.id == id) {
         l.name = want.to_string();
     }
+    app.s.ensure_anim_layer_nodes();
     app.s.touch();
 }
 
@@ -6349,6 +6429,16 @@ fn anim_layer_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
                             if menu_item(app, ui, "Attribute Editor...") {
                                 app.s.anim_layer_current = Some(l.id.clone());
                                 anim_layer_open_ae(app);
+                                ui.close();
+                            }
+                            if menu_item(app, ui, "Select Layer Node") {
+                                // The node is the animLayer dependency node, not the layer's objects.
+                                app.s.ensure_anim_layer_node(&l.id, &l.name);
+                                app.s.checkpoint_selection("select");
+                                app.s.select(&[], SelMode::Replace);
+                                app.snode_sel = None;
+                                app.dep_sel = Some(l.id.clone());
+                                app.echo(format!("select -r {};", l.name));
                                 ui.close();
                             }
                             if menu_item(app, ui, "Membership...") {
@@ -7584,6 +7674,13 @@ pub fn attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
         shading_attribute_editor(app, ui);
         return;
     }
+    if let Some(id) = app.dep_sel.clone() {
+        if app.s.deps.node(&id).is_some() {
+            dep_attrs_editor(app, ui, &id);
+            return;
+        }
+        app.dep_sel = None;
+    }
     let node_tabs = target.as_deref().map(|id| ae_tabs(app, id)).unwrap_or_default();
     let layer_tabs: Vec<(String, String)> = app
         .panels
@@ -7820,48 +7917,74 @@ pub fn history_channels(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, i: usize
     }
 }
 
+fn dep_attr_set(app: &mut IncaApp, id: &str, name: &str, v: Value) {
+    let key = format!("{id}.{name}");
+    if app.panels.dep_edit.as_deref() != Some(key.as_str()) {
+        app.s.checkpoint("edit dependency node");
+        app.panels.dep_edit = Some(key);
+    }
+    app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, v);
+    app.s.set_time(app.s.time.current);
+    app.s.touch();
+}
+
 fn dep_attrs_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
+    if !ui.ctx().input(|i| i.pointer.any_down()) {
+        app.panels.dep_edit = None;
+    }
     let Some(node) = app.s.deps.node(id).cloned() else { return };
     if node.specs.is_empty() {
         ui.label(RichText::new("No editable attributes").color(theme::TEXT_DIM));
         return;
     }
     theme::section_header(ui, &format!("{} Attributes", node.kind));
-    egui::Grid::new(("dep_attrs", id)).num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
+    egui::Grid::new(ui.make_persistent_id(("dep_attrs", id))).num_columns(2).spacing([10.0, 5.0]).show(ui, |ui| {
         for (name, spec) in &node.specs {
             if !spec.readable {
                 continue;
             }
             ui.label(inca_core::ops::nice_name(name));
             let value = node.get(name).unwrap_or(Value::Null);
+            if !spec.writable {
+                let text = match &value {
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::String(s) => s.clone(),
+                    Value::Array(a) => a.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "),
+                    _ => String::new(),
+                };
+                ui.label(RichText::new(text).color(theme::TEXT_DIM));
+                ui.end_row();
+                continue;
+            }
             match &spec.ty {
                 inca_core::graph::AttrType::Float => {
                     let mut v = value.as_f64().unwrap_or(0.0);
                     if ui.add(egui::DragValue::new(&mut v).speed(0.01)).changed() {
-                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(v));
+                        dep_attr_set(app, id, name, json!(v));
                     }
                 }
                 inca_core::graph::AttrType::Int => {
                     let mut v = value.as_i64().unwrap_or(0);
                     if ui.add(egui::DragValue::new(&mut v).speed(1.0)).changed() {
-                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(v));
+                        dep_attr_set(app, id, name, json!(v));
                     }
                 }
                 inca_core::graph::AttrType::Bool => {
                     let mut v = value.as_bool().unwrap_or_else(|| value.as_f64().is_some_and(|x| x != 0.0));
                     if ui.checkbox(&mut v, "").changed() {
-                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(v));
+                        dep_attr_set(app, id, name, json!(v));
                     }
                 }
                 inca_core::graph::AttrType::Enum(labels) => {
                     let mut text = value.as_str().unwrap_or_else(|| labels.first().map(|s| s.as_str()).unwrap_or("")).to_string();
-                    egui::ComboBox::from_id_salt(("dep_enum", id, name)).selected_text(&text).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt(ui.make_persistent_id(("dep_enum", id, name))).selected_text(&text).show_ui(ui, |ui| {
                         for label in labels {
                             ui.selectable_value(&mut text, label.clone(), label);
                         }
                     });
                     if value.as_str() != Some(text.as_str()) {
-                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(text));
+                        dep_attr_set(app, id, name, json!(text));
                     }
                 }
                 inca_core::graph::AttrType::Vector => {
@@ -7873,13 +7996,13 @@ fn dep_attrs_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
                         }
                     });
                     if changed {
-                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(v));
+                        dep_attr_set(app, id, name, json!(v));
                     }
                 }
                 inca_core::graph::AttrType::String => {
                     let mut text = value.as_str().unwrap_or("").to_string();
                     if ui.text_edit_singleline(&mut text).changed() {
-                        app.s.set_attr(&NodeRef::Dependency(id.to_string()), name, json!(text));
+                        dep_attr_set(app, id, name, json!(text));
                     }
                 }
                 inca_core::graph::AttrType::Message => {
@@ -8781,11 +8904,12 @@ mod tests {
         app.s.set_attr_f(&nid, "translateX", 3.0);
         assert!(app.s.set_key(&nid, "translateX", None, None));
         let key = inca_core::anim::Anim::key(&nid, "translateX");
-        assert!(app.s.anim_layers[0].curves.contains_key(&key));
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        assert!(app.s.anim_layer_curve(&lid, &key).is_some_and(|c| !c.keys.is_empty()));
         app.panels.cb_pick = vec![CbPick { targets: vec![NodeRef::Dag(nid.clone())], attr: "translateX".into(), int: false, min: None, max: None }];
         anim_layer_attrs_from_picks(&mut app, false);
         assert!(!app.s.anim_layers[0].attrs.contains(&key));
-        assert!(!app.s.anim_layers[0].curves.contains_key(&key), "curve survived attribute removal");
+        assert!(app.s.anim_layer_curve(&lid, &key).is_none(), "curve survived attribute removal");
         app.s.set_time(1.0);
         assert!(app.s.get_attr_f(&nid, "translateX").abs() < 1e-9, "attribute removal left the old pose");
     }
@@ -8917,14 +9041,84 @@ mod tests {
         assert_eq!(app.s.anim_layers.len(), 2);
         let copy = app.s.anim_layer_current.clone().expect("copy");
         let copy_layer = app.s.anim_layers.iter().find(|l| l.id == copy).expect("copy layer");
-        assert!(copy_layer.curves.contains_key(&inca_core::anim::Anim::key(&nid, "translateX")));
+        let _ = copy_layer;
+        assert!(app.s.anim_layer_curve(&copy, &inca_core::anim::Anim::key(&nid, "translateX")).is_some_and(|c| !c.keys.is_empty()));
         assert!((app.s.anim_layer_weight(&copy) - 0.3).abs() < 1e-9, "duplicate did not copy the layer weight");
         assert!(app.s.anim_layer_rotation_by_layer(&copy), "duplicate did not copy the layer mode");
         assert_ne!(copy, source);
         anim_layer_duplicate(&mut app, true);
         assert_eq!(app.s.anim_layers.len(), 3);
         let empty = app.s.anim_layer_current.clone().expect("empty copy");
-        assert!(app.s.anim_layers.iter().find(|l| l.id == empty).is_some_and(|l| l.curves.is_empty()));
+        assert!(app.s.anim_layer_curve(&empty, &inca_core::anim::Anim::key(&nid, "translateX")).is_none_or(|c| c.keys.is_empty()));
+    }
+
+    #[test]
+    fn dependency_node_selection_drives_the_channel_box_and_attribute_editor() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        anim_layer_new(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        app.dep_sel = Some(lid.clone());
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, t: f64| {
+            let mut raw = egui::RawInput::default();
+            raw.time = Some(t);
+            let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..3 {
+            run(&mut app, i as f64 * 0.1);
+        }
+        assert_eq!(app.dep_sel.as_deref(), Some(lid.as_str()), "the dependency selection was cleared");
+        anim_layer_rename_commit(&mut app, &lid, "Renamed Layer");
+        assert_eq!(app.s.deps.node(&lid).map(|n| n.name.as_str()), Some("Renamed Layer"), "the layer node did not follow the rename");
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.select_names(&[nid], SelMode::Replace);
+        assert!(app.dep_sel.is_none(), "selecting an object kept the dependency node selected");
+    }
+
+    #[test]
+    fn dependency_node_attribute_edits_reapply_the_pose() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        app.s.set_time(0.0);
+        assert!(app.s.set_key(&nid, "translateX", Some(0.0), Some(10.0)));
+        app.s.set_time(0.0);
+        assert!((app.s.get_attr_f(&nid, "translateX") - 10.0).abs() < 1e-9);
+        dep_attr_set(&mut app, &lid, "weight", json!(0.5));
+        assert!((app.s.get_attr_f(&nid, "translateX") - 5.0).abs() < 1e-9, "weight edit did not reapply the pose");
+        dep_attr_set(&mut app, &lid, "mute", json!(true));
+        assert!(app.s.get_attr_f(&nid, "translateX").abs() < 1e-9, "mute edit did not reapply the pose");
+    }
+
+    #[test]
+    fn outliner_lists_the_layer_network_but_not_the_layer_node() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let nid = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&nid), SelMode::Replace);
+        anim_layer_new_from_selected(&mut app, false);
+        let lid = app.s.anim_layer_current.clone().expect("layer");
+        app.s.set_time(1.0);
+        app.s.set_attr_f(&nid, "translateX", 4.0);
+        assert!(app.s.set_key(&nid, "translateX", None, None));
+        app.s.set_time(1.0);
+        let rows = outliner_dep_rows(&app.s);
+        let names: Vec<&str> = rows.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(names.contains(&"pCube1_translateX_AnimLayer1"), "blend node missing: {names:?}");
+        assert!(names.contains(&"pCube1_translateX_AnimLayer1_inputB"), "curve node missing: {names:?}");
+        assert!(!rows.iter().any(|(_, _, k)| k == "animLayer"), "animLayer must stay out of the Outliner");
+        assert!(app.s.deps.node(&lid).is_some(), "the animLayer node still exists for Select Layer Node");
     }
 
     #[test]
@@ -9238,7 +9432,7 @@ mod tests {
         anim_layer_key_weight(&mut app, &lid, Some(0.5));
         anim_layer_empty_ids(&mut app, vec![lid.clone()]);
         let layer = app.s.anim_layers.iter().find(|l| l.id == lid).expect("emptied layer is kept");
-        assert!(layer.attrs.is_empty() && layer.members.is_empty() && layer.curves.is_empty());
+        assert!(layer.attrs.is_empty() && layer.members.is_empty());
         assert_eq!(layer.weight_curve.keys.len(), 1, "Empty must keep the layer weight animation");
         app.s.set_time(0.0);
         assert!(app.s.get_attr_f(&nid, "translateX").abs() < 1e-9, "removed layer animation was not restored");
@@ -9351,9 +9545,9 @@ mod tests {
         let src = app.s.anim_layers.iter().find(|l| l.id == source).expect("source survives");
         let ext = app.s.anim_layers.iter().find(|l| l.id == new).expect("extracted layer");
         assert!(ext.name.ends_with("_extract"));
-        assert!(ext.curves.contains_key(&inca_core::anim::Anim::key(&a, "translateX")));
-        assert!(!src.curves.contains_key(&inca_core::anim::Anim::key(&a, "translateX")));
-        assert!(src.curves.contains_key(&inca_core::anim::Anim::key(&b, "translateX")));
+        assert!(app.s.anim_layer_curve(&new, &inca_core::anim::Anim::key(&a, "translateX")).is_some());
+        assert!(app.s.anim_layer_curve(&source, &inca_core::anim::Anim::key(&a, "translateX")).is_none());
+        assert!(app.s.anim_layer_curve(&source, &inca_core::anim::Anim::key(&b, "translateX")).is_some());
     }
 
     #[test]

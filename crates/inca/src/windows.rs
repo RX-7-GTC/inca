@@ -826,7 +826,7 @@ pub(crate) fn delete_selected_keys(app: &mut IncaApp) {
             }
         }
     }
-    app.s.anim_curves_mut().retain(|_, c| !c.keys.is_empty());
+    app.s.retain_anim_curves(|c| !c.keys.is_empty());
     app.s.apply_anim();
     app.s.touch();
     app.windows_state.ge_drag = false;
@@ -1652,9 +1652,12 @@ fn dope_sheet(app: &mut IncaApp, ui: &mut egui::Ui) {
                     Some(n) => vec![n.clone()],
                     None => nodes.clone(),
                 };
-                for c in app.s.anim_curves_mut().values_mut().filter(|c| ids.contains(&c.node)) {
+                app.s.for_each_anim_curve_mut(|c| {
+                    if !ids.contains(&c.node) {
+                        return;
+                    }
                     if c.keys.iter().any(|k| (k.t - (grab + off)).abs() < 1e-6) {
-                        continue; // don't stack two keys on one frame
+                        return; // don't stack two keys on one frame
                     }
                     for k in c.keys.iter_mut() {
                         if (k.t - grab).abs() < 1e-6 {
@@ -1662,7 +1665,7 @@ fn dope_sheet(app: &mut IncaApp, ui: &mut egui::Ui) {
                         }
                     }
                     c.sort();
-                }
+                });
                 app.s.touch();
                 app.s.apply_anim();
             }
@@ -1843,7 +1846,7 @@ mod tests {
         let mut c = inca_core::anim::AnimCurve::new("pCube1", "translateX");
         c.set_key(1.0, 0.0, "linear");
         c.set_key(10.0, 5.0, "linear");
-        app.s.anim_curves_mut().insert(ck.clone(), c);
+        app.s.insert_anim_curve(ck.clone(), c);
         app.windows_state.ge_keys = vec![(ck.clone(), 0)];
         delete_selected_keys(&mut app);
         let c = app.s.graph_curve(&ck).expect("curve with a remaining key should stay");
@@ -2118,7 +2121,7 @@ mod tests {
         for (i, t) in [1.0, 5.0, 10.0, 15.0].iter().enumerate() {
             c.set_key(*t, i as f64, "linear");
         }
-        app.s.anim_curves_mut().insert(ck.clone(), c);
+        app.s.insert_anim_curve(ck.clone(), c);
         app.windows_state.ge_keys = vec![(ck.clone(), 1), (ck.clone(), 3)];
         delete_selected_keys(&mut app);
         let c = app.s.graph_curve(&ck).expect("curve should remain");
@@ -2136,7 +2139,7 @@ mod tests {
         for (i, t) in [1.0, 5.0, 10.0].iter().enumerate() {
             c.set_key(*t, i as f64 * 10.0, "linear");
         }
-        app.s.anim_curves_mut().insert(ck.clone(), c);
+        app.s.insert_anim_curve(ck.clone(), c);
         app.windows_state.ge_keys = vec![(ck.clone(), 0), (ck.clone(), 2)];
         copy_selected_keys(&mut app);
         app.s.time.current = 20.0;
@@ -2172,7 +2175,7 @@ mod tests {
         for (i, t) in [1.0, 5.0, 10.0].iter().enumerate() {
             c.set_key(*t, i as f64 * 10.0, "linear");
         }
-        app.s.anim_curves_mut().insert(ck.clone(), c);
+        app.s.insert_anim_curve(ck.clone(), c);
         app.s.sel = vec!["pCube1".into()];
         app.win.graph_editor = true;
         app.windows_state.ge_scale = true;
@@ -2256,7 +2259,7 @@ mod tests {
         let mut c = inca_core::anim::AnimCurve::new("pCube1", "translateX");
         c.set_key(1.0, 0.0, "linear");
         c.set_key(9.0, 10.0, "linear");
-        app.s.anim_curves_mut().insert(ck.clone(), c);
+        app.s.insert_anim_curve(ck.clone(), c);
         app.s.sel = vec!["pCube1".into()];
         app.win.graph_editor = true;
         app.windows_state.ge_scale = true;
@@ -2313,7 +2316,7 @@ mod tests {
         let mut c = inca_core::anim::AnimCurve::new("pCube1", "translateX");
         c.set_key(1.0, 0.0, "linear");
         c.set_key(9.0, 10.0, "linear");
-        app.s.anim_curves_mut().insert(ck.clone(), c);
+        app.s.insert_anim_curve(ck.clone(), c);
         app.s.sel = vec!["pCube1".into()];
         app.win.graph_editor = true;
         app.windows_state.ge_scale = true;

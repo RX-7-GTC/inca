@@ -8,6 +8,8 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::anim::AnimCurve;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AttrType {
     Float,
@@ -68,6 +70,11 @@ impl AttrSpec {
         self.keyable = on;
         self
     }
+    pub fn read_only(mut self) -> Self {
+        self.keyable = false;
+        self.writable = false;
+        self
+    }
     pub fn range(mut self, min: f64, max: f64) -> Self {
         self.min = Some(min);
         self.max = Some(max);
@@ -84,11 +91,14 @@ pub struct DepNode {
     pub attrs: IndexMap<String, Value>,
     #[serde(default)]
     pub specs: IndexMap<String, AttrSpec>,
+    /// Key data for an `animCurve` node; None for every other node kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curve: Option<AnimCurve>,
 }
 
 impl DepNode {
     pub fn new(id: &str, name: &str, kind: &str) -> Self {
-        Self { id: id.into(), name: name.into(), kind: kind.into(), attrs: IndexMap::new(), specs: IndexMap::new() }
+        Self { id: id.into(), name: name.into(), kind: kind.into(), attrs: IndexMap::new(), specs: IndexMap::new(), curve: None }
     }
     pub fn add_attr(&mut self, name: &str, spec: AttrSpec) -> &mut Self {
         self.attrs.entry(name.into()).or_insert_with(|| spec.default.clone());

@@ -364,6 +364,7 @@ pub fn rename(s: &mut Scene, id: &str, want: &str) -> String {
     s.nodes.get_mut(id).unwrap().name = nn.clone();
     s.touch();
     s.name_changes.push((old, nn.clone()));
+    s.ensure_anim_layer_nodes();
     nn
 }
 
@@ -1243,12 +1244,12 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 for k in keys {
                     match t {
                         Some(t) => {
-                            if s.anim_curves_mut().get_mut(&k).unwrap().remove_at(t) {
+                            if s.anim_curve_mut_key(&k).is_some_and(|c| c.remove_at(t)) {
                                 n += 1;
                             }
                         }
                         None => {
-                            n += s.anim_curves_mut().shift_remove(&k).map(|c| c.keys.len()).unwrap_or(0);
+                            n += s.remove_anim_curve(&k).map(|c| c.keys.len()).unwrap_or(0);
                         }
                     }
                 }
@@ -3259,8 +3260,8 @@ mod tests {
         s.anim_layer_current = Some("al1".into());
         assert_eq!(mel(&mut s, "setKeyframe -at translateX;").unwrap().num(), 1.0);
         assert_eq!(mel(&mut s, "setKeyframe -at translateY;").unwrap().num(), 0.0);
-        assert!(s.anim_layers[0].curves.contains_key(&crate::anim::Anim::key(&a, "translateX")));
-        assert!(!s.anim_layers[0].curves.contains_key(&crate::anim::Anim::key(&a, "translateY")));
+        assert!(s.anim_layer_curve("al1", &crate::anim::Anim::key(&a, "translateX")).is_some());
+        assert!(s.anim_layer_curve("al1", &crate::anim::Anim::key(&a, "translateY")).is_none());
         assert!(!s.anim.curves.contains_key(&crate::anim::Anim::key(&a, "translateY")));
     }
 
