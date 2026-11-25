@@ -184,6 +184,9 @@ pub struct IncaApp {
     pub pivot_mode: bool,
     pub gpu: Option<Gpu>,
     pub smooth_cache: HashMap<String, (u64, inca_core::mesh::PolyMesh)>,
+    /// status-line poly count with the mesh-geometry key it was computed for (edge counts need
+    /// the mesh topology, which is far too slow to rebuild every frame on dense meshes)
+    pub poly_count_cache: Option<(u64, (usize, usize, usize, usize))>,
     pub vp_state: vp_ui::VpState,
     pub panels: panels::PanelState,
     pub windows_state: windows::WinState,
@@ -341,6 +344,7 @@ impl IncaApp {
             pivot_mode: false,
             gpu,
             smooth_cache: HashMap::new(),
+            poly_count_cache: None,
             vp_state: Default::default(),
             panels: Default::default(),
             windows_state: Default::default(),

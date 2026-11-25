@@ -503,7 +503,24 @@ pub fn command_line(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 pub fn help_line(app: &mut IncaApp, ui: &mut egui::Ui) {
     ui.horizontal_centered(|ui| {
-        let (v, e, f, t) = app.s.poly_count();
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for (id, n) in &app.s.nodes {
+                if let Some(m) = n.mesh() {
+                    (id, n.rev, m.mesh.v.len(), m.mesh.f.len()).hash(&mut h);
+                }
+            }
+            h.finish()
+        };
+        let (v, e, f, t) = match app.poly_count_cache {
+            Some((k, c)) if k == key => c,
+            _ => {
+                let c = app.s.poly_count();
+                app.poly_count_cache = Some((key, c));
+                c
+            }
+        };
         let txt = if app.help.is_empty() { "Hold Alt and drag in a viewport to tumble (LMB), track (MMB) or dolly (RMB)".to_string() } else { app.help.clone() };
         ui.label(RichText::new(txt).color(theme::TEXT_DIM).size(11.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
