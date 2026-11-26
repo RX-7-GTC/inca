@@ -455,7 +455,7 @@ fn dyn_menu(app: &mut IncaApp, ui: &mut egui::Ui, label: &str) {
             }
         }
         "Assign Existing Material" => {
-            let mats: Vec<(String, String)> = app.s.mats.values().map(|m| (m.id.clone(), m.name.clone())).collect();
+            let mats: Vec<(String, String)> = app.s.materials().into_iter().map(|m| (m.id, m.name)).collect();
             for (_, name) in mats {
                 let resp = ui.button(menu_label(&name));
                 menu_row_band(ui, resp.rect);

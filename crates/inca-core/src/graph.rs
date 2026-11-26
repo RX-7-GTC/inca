@@ -19,6 +19,8 @@ pub enum AttrType {
     Vector,
     String,
     Message,
+    /// Compound shading values (colours, arrays, ramp stops); the `Value` is authoritative.
+    Any,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -66,6 +68,10 @@ impl AttrSpec {
     pub fn message() -> Self {
         Self { ty: AttrType::Message, default: Value::Null, keyable: false, readable: false, writable: false, min: None, max: None }
     }
+    /// A shading attribute whose JSON value (colour, array, string) is stored as-is.
+    pub fn any(default: Value) -> Self {
+        Self::base(AttrType::Any, default)
+    }
     pub fn keyable(mut self, on: bool) -> Self {
         self.keyable = on;
         self
@@ -109,14 +115,35 @@ impl DepNode {
         self.specs.get(attr)
     }
     pub fn get(&self, attr: &str) -> Option<Value> {
-        self.attrs.get(attr).cloned().or_else(|| self.spec(attr).map(|s| s.default.clone()))
+        if let Some(v) = self.attrs.get(attr) {
+            return Some(v.clone());
+        }
+        if let Some(v) = self.spec(attr).map(|s| s.default.clone()) {
+            return Some(v);
+        }
+        // Maya short component names: colorR / translateX / rotateY.
+        let (base, idx) = split_component(attr)?;
+        self.attrs.get(base)?.as_array()?.get(idx).cloned()
     }
     pub fn set(&mut self, attr: &str, value: Value) -> bool {
-        let Some(spec) = self.spec(attr) else { return false };
-        if !spec.writable {
+        if let Some(spec) = self.spec(attr) {
+            if !spec.writable {
+                return false;
+            }
+            self.attrs.insert(attr.into(), value);
+            return true;
+        }
+        let Some((base, idx)) = split_component(attr) else { return false };
+        if self.spec(base).is_none() {
             return false;
         }
-        self.attrs.insert(attr.into(), value);
+        let Some(Value::Array(a)) = self.attrs.get_mut(base) else { return false };
+        let Some(dst) = a.get_mut(idx) else { return false };
+        // MEL booleans arrive as 0/1.
+        *dst = match (&*dst, value) {
+            (Value::Bool(_), Value::Number(n)) => Value::Bool(n.as_f64().unwrap_or(0.0) != 0.0),
+            (_, v) => v,
+        };
         true
     }
 }
@@ -131,6 +158,18 @@ impl PlugRef {
     pub fn new(node: &str, attr: &str) -> Self {
         Self { node: node.into(), attr: attr.into() }
     }
+}
+
+/// `colorR` -> (`color`, 0), `translateY` -> (`translate`, 1).
+fn split_component(attr: &str) -> Option<(&str, usize)> {
+    let last = attr.chars().last()?;
+    let idx = match last {
+        'R' | 'X' => 0,
+        'G' | 'Y' => 1,
+        'B' | 'Z' => 2,
+        _ => return None,
+    };
+    Some((&attr[..attr.len() - 1], idx))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

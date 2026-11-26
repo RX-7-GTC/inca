@@ -461,7 +461,8 @@ fn hypershade_selection(app: &IncaApp) -> std::collections::HashSet<String> {
     }
     ids.retain(|id| {
         let base = id.strip_prefix("sg:").unwrap_or(id);
-        app.s.mats.contains_key(base) || app.s.texs.contains_key(base) || app.s.places.contains_key(base) || crate::hypershade::is_graph_dag(app, base)
+        let base = app.s.shading_group_material(base).unwrap_or_else(|| base.to_string());
+        app.s.is_shading(&base) || app.s.is_shading_engine(&base) || crate::hypershade::is_graph_dag(app, &base)
     });
     ids
 }

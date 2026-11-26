@@ -268,17 +268,17 @@ impl RenderScene {
             if let Some(&i) = mat_index.get(id) {
                 return i;
             }
-            let m = s.mats.get(id);
-            let pbr = m.map(|m| m.pbr()).unwrap_or_default();
-            let tex = m.and_then(|m| m.maps.get(m.color_attr()).and_then(|t| t.as_str()).and_then(|t| s.texs.get(t))).and_then(|t| {
+            let m = s.material(id);
+            let pbr = m.as_ref().map(|m| m.pbr()).unwrap_or_default();
+            let tex = m.as_ref().and_then(|m| m.maps.get(m.color_attr()).and_then(|t| t.as_str()).and_then(|t| s.texture(t))).and_then(|t| {
                 if t.ty == "file" {
                     let path = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let raw = t.attrs.get("colorSpace").and_then(|v| v.as_str()) == Some("Raw");
-                    let place = s.place_of(t);
+                    let place = s.place_of(&t);
                     let key = format!(
                         "{path}|{raw}|{}|{}",
                         serde_json::to_string(&t.attrs).unwrap_or_default(),
-                        place.map(|p| serde_json::to_string(&p.attrs).unwrap_or_default()).unwrap_or_default()
+                        place.as_ref().map(|p| serde_json::to_string(&p.attrs).unwrap_or_default()).unwrap_or_default()
                     );
                     if let Some(c) = image_cache.get(&key) {
                         return Some(c.clone());
@@ -305,11 +305,11 @@ impl RenderScene {
                         }
                     };
                     let px: Vec<[f32; 3]> = img.pixels().map(|p| [decode(p[0]), decode(p[1]), decode(p[2])]).collect();
-                    let ts = TexSampler::Image { w, h, px: std::sync::Arc::new(px), place: place.cloned() };
+                    let ts = TexSampler::Image { w, h, px: std::sync::Arc::new(px), place };
                     image_cache.insert(key, ts.clone());
                     Some(ts)
                 } else {
-                    Some(TexSampler::Proc { tex: t.clone(), place: s.place_of(t).cloned() })
+                    Some(TexSampler::Proc { tex: t.clone(), place: s.place_of(&t) })
                 }
             });
             mats.push(Mat { pbr, tex });
@@ -850,19 +850,18 @@ mod tests {
         let m = s.create_material("standardSurface", Some("coatMat"));
         s.assign_material(&id, &m, None);
         {
-            let a = &mut s.mats.get_mut(&m).unwrap().attrs;
-            a.insert("baseColor".into(), serde_json::json!([0.0, 0.0, 0.0]));
-            a.insert("specular".into(), serde_json::json!(0.0));
-            a.insert("metalness".into(), serde_json::json!(0.0));
+            s.set_dep_attr(&m, "baseColor", serde_json::json!([0.0, 0.0, 0.0]));
+            s.set_dep_attr(&m, "specular", serde_json::json!(0.0));
+            s.set_dep_attr(&m, "metalness", serde_json::json!(0.0));
         }
         let base = render_total(&s, 4, 0);
         assert!(base < 1e-6, "a black material with no coat/sheen renders black: {base}");
-        s.mats.get_mut(&m).unwrap().attrs.insert("coat".into(), serde_json::json!(1.0));
-        s.mats.get_mut(&m).unwrap().attrs.insert("coatRoughness".into(), serde_json::json!(0.4));
+        s.set_dep_attr(&m, "coat", serde_json::json!(1.0));
+        s.set_dep_attr(&m, "coatRoughness", serde_json::json!(0.4));
         let coat = render_total(&s, 4, 0);
         assert!(coat > 1e-3, "clearcoat must add its specular lobe: {coat}");
-        s.mats.get_mut(&m).unwrap().attrs.insert("coat".into(), serde_json::json!(0.0));
-        s.mats.get_mut(&m).unwrap().attrs.insert("sheen".into(), serde_json::json!(1.0));
+        s.set_dep_attr(&m, "coat", serde_json::json!(0.0));
+        s.set_dep_attr(&m, "sheen", serde_json::json!(1.0));
         let sheen = render_total(&s, 4, 0);
         assert!(sheen > 1e-3, "sheen must add its grazing lobe: {sheen}");
     }
@@ -878,13 +877,12 @@ mod tests {
         let m = s.create_material("standardSurface", Some("coatMat"));
         s.assign_material(&id, &m, None);
         {
-            let a = &mut s.mats.get_mut(&m).unwrap().attrs;
-            a.insert("baseColor".into(), serde_json::json!([0.0, 0.0, 0.0]));
-            a.insert("specular".into(), serde_json::json!(0.0));
-            a.insert("specularRoughness".into(), serde_json::json!(0.2));
+            s.set_dep_attr(&m, "baseColor", serde_json::json!([0.0, 0.0, 0.0]));
+            s.set_dep_attr(&m, "specular", serde_json::json!(0.0));
+            s.set_dep_attr(&m, "specularRoughness", serde_json::json!(0.2));
         }
         let base = render_total(&s, 32, 1);
-        s.mats.get_mut(&m).unwrap().attrs.insert("coat".into(), serde_json::json!(1.0));
+        s.set_dep_attr(&m, "coat", serde_json::json!(1.0));
         let coated = render_total(&s, 32, 1);
         // the cube's indirect coat bounce picks up the white background, which the black
         // base material cannot do on its own

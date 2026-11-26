@@ -442,13 +442,13 @@ fn nice_step(x: f64) -> f64 {
 fn image_texture(app: &mut IncaApp, ctx: &egui::Context) -> Option<egui::TextureId> {
     let id = targets(app).into_iter().next()?;
     let mid = app.s.node(&id)?.mesh()?.material.clone();
-    let m = app.s.mats.get(&mid)?;
+    let m = app.s.material(&mid)?;
     let tid = m.maps.get(m.color_attr())?.as_str()?;
-    let t = app.s.texs.get(tid)?;
-    let place = app.s.place_of(t);
+    let t = app.s.texture(tid)?;
+    let place = app.s.place_of(&t);
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (tid, serde_json::to_string(&t.attrs).unwrap_or_default(), place.map(|p| serde_json::to_string(&p.attrs).unwrap_or_default())).hash(&mut h);
+    (tid, serde_json::to_string(&t.attrs).unwrap_or_default(), place.as_ref().map(|p| serde_json::to_string(&p.attrs).unwrap_or_default())).hash(&mut h);
     let key = h.finish();
     if let Some((k, tex)) = &app.uv_editor.image_tex {
         if *k == key {
@@ -460,7 +460,7 @@ fn image_texture(app: &mut IncaApp, ctx: &egui::Context) -> Option<egui::Texture
     let size = inca_core::materials::VIEW_TEX_SIZE as usize;
     let px = if t.ty == "file" {
         // The viewport image is GPU-oriented (v=0 at the bottom); flip it for display.
-        let src = inca_core::materials::viewport_texture_pixels(t, place.map(|p| &p.attrs), app.s.project.as_deref())?;
+        let src = inca_core::materials::viewport_texture_pixels(&t, place.as_ref().map(|p| &p.attrs), app.s.project.as_deref())?;
         let row = size * 4;
         let mut flipped = vec![0u8; src.len()];
         for y in 0..size {
@@ -468,7 +468,7 @@ fn image_texture(app: &mut IncaApp, ctx: &egui::Context) -> Option<egui::Texture
         }
         flipped
     } else {
-        inca_core::materials::texture_swatch(t, place.map(|p| &p.attrs), size)?
+        inca_core::materials::texture_swatch(&t, place.as_ref().map(|p| &p.attrs), size)?
     };
     let tex = ctx.load_texture("uvImage", egui::ColorImage::from_rgba_unmultiplied([size, size], &px), egui::TextureOptions::LINEAR);
     let tid = tex.id();

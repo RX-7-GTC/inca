@@ -583,9 +583,6 @@ pub struct Scene {
     pub deps: crate::graph::DepGraph,
     pub roots: Vec<Id>,
     pub names: HashSet<String>,
-    pub mats: IndexMap<Id, Material>,
-    pub texs: IndexMap<Id, Texture>,
-    pub places: IndexMap<Id, Place2D>,
     pub default_mat: Id,
     pub layers: Vec<Layer>,
     /// The layer new objects are assigned to when `add_new_to_current` is on.
@@ -661,9 +658,6 @@ impl Scene {
             deps: crate::graph::DepGraph::default(),
             roots: vec![],
             names: HashSet::new(),
-            mats: IndexMap::new(),
-            texs: IndexMap::new(),
-            places: IndexMap::new(),
             default_mat: String::new(),
             layers: vec![],
             current_layer: None,
@@ -829,56 +823,360 @@ impl Scene {
     pub fn init_default_materials(&mut self) {
         let lam = self.create_material("lambert", Some("lambert1"));
         self.default_mat = lam;
+        if let Some(sg) = self.shading_group_of(&self.default_mat) {
+            self.rename_shading_node(&sg, "initialShadingGroup");
+        }
         self.create_material("standardSurface", Some("standardSurface1"));
     }
+
+    pub fn is_material(&self, id: &str) -> bool {
+        self.deps.node(id).is_some_and(|n| crate::materials::is_material_kind(&n.kind))
+    }
+    pub fn is_shading_engine(&self, id: &str) -> bool {
+        self.deps.node(id).is_some_and(|n| n.kind == crate::materials::SHADING_ENGINE_KIND)
+    }
+    /// The shading group connected from this material's outColor.
+    pub fn shading_group_of(&self, material_id: &str) -> Option<Id> {
+        self.deps.nodes.values().find(|n| {
+            n.kind == crate::materials::SHADING_ENGINE_KIND
+                && self.deps.source_of(&crate::graph::PlugRef::new(&n.id, "surfaceShader")).is_some_and(|p| p.node == material_id)
+        }).map(|n| n.id.clone())
+    }
+    /// The material feeding a shading group's surfaceShader input.
+    pub fn shading_group_material(&self, sg_id: &str) -> Option<Id> {
+        self.deps.source_of(&crate::graph::PlugRef::new(sg_id, "surfaceShader")).map(|p| p.node).filter(|id| self.is_material(id))
+    }
+
+    /// Maya always gives a material a shading group; create it once and connect the shader.
+    pub fn ensure_shading_engine(&mut self, material_id: &str) -> Id {
+        if let Some(sg) = self.shading_group_of(material_id) {
+            return sg;
+        }
+        let name = self.material(material_id).map(|m| format!("{}SG", m.name)).unwrap_or_else(|| "shadingEngine1".into());
+        let id = format!("g_{material_id}");
+        let name = self.unique_name(&name);
+        let mut n = crate::graph::DepNode::new(&id, &name, crate::materials::SHADING_ENGINE_KIND);
+        crate::materials::add_shading_engine_specs(&mut n);
+        self.deps.insert(n);
+        self.deps.connect(crate::graph::PlugRef::new(material_id, "outColor"), crate::graph::PlugRef::new(&id, "surfaceShader"));
+        id
+    }
+    pub fn is_texture(&self, id: &str) -> bool {
+        self.deps.node(id).is_some_and(|n| crate::materials::is_texture_kind(&n.kind))
+    }
+    pub fn is_place(&self, id: &str) -> bool {
+        self.deps.node(id).is_some_and(|n| n.kind == crate::materials::PLACE_KIND)
+    }
+    pub fn is_shading(&self, id: &str) -> bool {
+        self.is_material(id) || self.is_texture(id) || self.is_place(id)
+    }
+    pub fn material_ids(&self) -> Vec<Id> {
+        self.deps.nodes.values().filter(|n| crate::materials::is_material_kind(&n.kind)).map(|n| n.id.clone()).collect()
+    }
+    pub fn texture_ids(&self) -> Vec<Id> {
+        self.deps.nodes.values().filter(|n| crate::materials::is_texture_kind(&n.kind)).map(|n| n.id.clone()).collect()
+    }
+    pub fn place_ids(&self) -> Vec<Id> {
+        self.deps.nodes.values().filter(|n| n.kind == crate::materials::PLACE_KIND).map(|n| n.id.clone()).collect()
+    }
+    /// Texture nodes mapped into any material slot.
+    pub fn material_textures(&self, id: &str) -> Vec<Id> {
+        self.material(id).map(|m| m.maps.values().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default()
+    }
+    /// Materials that map this texture into one of their slots.
+    pub fn texture_owners(&self, id: &str) -> Vec<Id> {
+        self.materials().into_iter().filter(|m| m.maps.values().any(|v| v.as_str() == Some(id))).map(|m| m.id).collect()
+    }
+
+    /// Shading nodes are dependency nodes; this keeps `NodeRef` variants for the UI.
+    pub fn shading_ref(&self, id: &str) -> Option<NodeRef> {
+        let n = self.deps.node(id)?;
+        if crate::materials::is_material_kind(&n.kind) {
+            Some(NodeRef::Material(id.into()))
+        } else if crate::materials::is_texture_kind(&n.kind) {
+            Some(NodeRef::Texture(id.into()))
+        } else if n.kind == crate::materials::PLACE_KIND {
+            Some(NodeRef::Place2D(id.into()))
+        } else {
+            Some(NodeRef::Dependency(id.into()))
+        }
+    }
+
+    /// Material attributes and texture maps as a read-only view over its dependency node.
+    pub fn material(&self, id: &str) -> Option<Material> {
+        let n = self.deps.node(id)?;
+        if !crate::materials::is_material_kind(&n.kind) {
+            return None;
+        }
+        let mut m = Material { id: id.into(), name: n.name.clone(), ty: n.kind.clone(), attrs: Params::new(), maps: Params::new(), map_outs: Params::new() };
+        for (k, v) in &n.attrs {
+            let keep = !matches!(k.as_str(), "outTransparency" | "outColor") || m.ty == "surfaceShader";
+            if keep && n.spec(k).is_some() {
+                m.attrs.insert(k.clone(), v.clone());
+            }
+        }
+        for c in &self.deps.connections {
+            if c.destination.node == id && self.is_texture(&c.source.node) {
+                m.maps.insert(c.destination.attr.clone(), json!(c.source.node));
+                if c.source.attr == "outAlpha" {
+                    m.map_outs.insert(c.destination.attr.clone(), json!("outAlpha"));
+                }
+            }
+        }
+        Some(m)
+    }
+
+    pub fn materials(&self) -> Vec<Material> {
+        self.deps.nodes.values().filter(|n| crate::materials::is_material_kind(&n.kind)).filter_map(|n| self.material(&n.id)).collect()
+    }
+
+    pub fn material_named(&self, name: &str) -> Option<Id> {
+        self.deps.nodes.values().find(|n| n.name == name && crate::materials::is_material_kind(&n.kind)).map(|n| n.id.clone())
+    }
+
+    /// Texture attributes and its connected place2dTexture, as a read-only view.
+    pub fn texture(&self, id: &str) -> Option<Texture> {
+        let n = self.deps.node(id)?;
+        if !crate::materials::is_texture_kind(&n.kind) {
+            return None;
+        }
+        let mut t = Texture { id: id.into(), name: n.name.clone(), ty: n.kind.clone(), attrs: Params::new(), place: None };
+        for (k, v) in &n.attrs {
+            if !matches!(k.as_str(), "uvCoord" | "outColor" | "outAlpha") {
+                t.attrs.insert(k.clone(), v.clone());
+            }
+        }
+        t.place = self
+            .deps
+            .source_of(&crate::graph::PlugRef::new(id, "uvCoord"))
+            .filter(|p| p.attr == "outUV" && self.is_place(&p.node))
+            .map(|p| p.node);
+        Some(t)
+    }
+
+    pub fn textures(&self) -> Vec<Texture> {
+        self.deps.nodes.values().filter(|n| crate::materials::is_texture_kind(&n.kind)).filter_map(|n| self.texture(&n.id)).collect()
+    }
+
+    pub fn place(&self, id: &str) -> Option<Place2D> {
+        let n = self.deps.node(id)?;
+        if n.kind != crate::materials::PLACE_KIND {
+            return None;
+        }
+        let mut p = Place2D { id: id.into(), name: n.name.clone(), attrs: Params::new() };
+        for (k, v) in &n.attrs {
+            if k != "outUV" {
+                p.attrs.insert(k.clone(), v.clone());
+            }
+        }
+        Some(p)
+    }
+
+    pub fn places(&self) -> Vec<Place2D> {
+        self.deps.nodes.values().filter(|n| n.kind == crate::materials::PLACE_KIND).filter_map(|n| self.place(&n.id)).collect()
+    }
+
     pub fn create_material(&mut self, ty: &str, name: Option<&str>) -> Id {
         let id = self.new_id("m");
         let name = self.unique_name(name.unwrap_or(&format!("{ty}1")));
-        self.mats.insert(id.clone(), Material::new(id.clone(), name, ty));
+        let mut n = crate::graph::DepNode::new(&id, &name, ty);
+        crate::materials::add_material_specs(&mut n, ty);
+        self.deps.insert(n);
+        self.ensure_shading_engine(&id);
         self.touch();
         id
     }
+
+    fn create_place_node(&mut self, placement: &Params) -> Id {
+        let id = self.new_id("p");
+        let name = self.unique_name("place2dTexture1");
+        let mut n = crate::graph::DepNode::new(&id, &name, crate::materials::PLACE_KIND);
+        crate::materials::add_place_specs(&mut n, placement);
+        self.deps.insert(n);
+        id
+    }
+
     pub fn create_texture(&mut self, ty: &str, name: Option<&str>) -> Id {
         let id = self.new_id("x");
         let name = self.unique_name(name.unwrap_or(&format!("{ty}1")));
-        let place = self.new_id("p");
-        let place_name = self.unique_name("place2dTexture1");
-        self.places.insert(place.clone(), Place2D::new(place.clone(), place_name, ty));
-        self.texs.insert(id.clone(), Texture { id: id.clone(), name, ty: ty.into(), attrs: crate::materials::tex_defaults_for(ty), place: Some(place) });
+        let mut n = crate::graph::DepNode::new(&id, &name, ty);
+        crate::materials::add_texture_specs(&mut n, ty);
+        self.deps.insert(n);
+        let place = self.create_place_node(&Place2D::new(String::new(), String::new(), ty).attrs);
+        self.deps.connect(crate::graph::PlugRef::new(&place, "outUV"), crate::graph::PlugRef::new(&id, "uvCoord"));
         self.touch();
         id
     }
 
     /// Standalone place2dTexture utility (not owned by a texture yet).
     pub fn create_place(&mut self, name: Option<&str>) -> Id {
-        let id = self.new_id("p");
-        let name = self.unique_name(name.unwrap_or("place2dTexture1"));
-        self.places.insert(id.clone(), Place2D::new(id.clone(), name, ""));
+        let id = self.create_place_node(&Place2D::new(String::new(), String::new(), "").attrs);
+        if let Some(name) = name {
+            let old = self.deps.node(&id).map(|n| n.name.clone()).unwrap_or_default();
+            self.names.remove(&old);
+            let want = self.unique_name(name);
+            if let Some(n) = self.deps.node_mut(&id) {
+                n.name = want.clone();
+            }
+            self.names.insert(want);
+        }
         self.touch();
         id
     }
 
-    pub fn place_of(&self, t: &Texture) -> Option<&Place2D> {
-        t.place.as_ref().and_then(|p| self.places.get(p))
+    pub fn place_of(&self, t: &Texture) -> Option<Place2D> {
+        self.place(t.place.as_deref()?)
     }
 
-    pub fn place_attrs_of(&self, t: &Texture) -> Option<&Params> {
-        self.place_of(t).map(|p| &p.attrs)
+    /// Store a shading attribute, adding a spec for attributes that came from older files.
+    pub fn set_dep_attr(&mut self, id: &str, attr: &str, value: Value) -> bool {
+        let Some(n) = self.deps.node_mut(id) else { return false };
+        if n.spec(attr).is_none() {
+            n.add_attr(attr, crate::graph::AttrSpec::any(value.clone()));
+        }
+        let ok = n.set(attr, value);
+        if ok {
+            self.touch();
+        }
+        ok
+    }
+
+    /// Convert the pre-node `shading` block into dependency nodes, keeping ids and names.
+    fn migrate_legacy_shading(&mut self, shading: ShadingData) {
+        let mut places: HashSet<Id> = HashSet::new();
+        for mut p in shading.places {
+            crate::materials::add_placement_defaults(&mut p.attrs);
+            let mut n = crate::graph::DepNode::new(&p.id, &p.name, crate::materials::PLACE_KIND);
+            crate::materials::add_place_specs(&mut n, &p.attrs);
+            for (k, v) in &p.attrs {
+                n.set(k, v.clone());
+            }
+            self.names.insert(p.name.clone());
+            places.insert(p.id.clone());
+            self.deps.insert(n);
+        }
+        for mut t in shading.texs {
+            let legacy = crate::materials::take_placement_attrs(&mut t.attrs);
+            let pid = match t.place.clone().filter(|id| places.contains(id)) {
+                Some(id) => id,
+                None => {
+                    let id = self.new_id("p");
+                    let name = self.unique_name("place2dTexture1");
+                    let attrs = Place2D::new(id.clone(), name.clone(), &t.ty).attrs;
+                    let mut n = crate::graph::DepNode::new(&id, &name, crate::materials::PLACE_KIND);
+                    crate::materials::add_place_specs(&mut n, &attrs);
+                    self.deps.insert(n);
+                    places.insert(id.clone());
+                    id
+                }
+            };
+            if let Some(p) = self.deps.node_mut(&pid) {
+                for (k, v) in legacy {
+                    if p.spec(&k).is_none() {
+                        p.add_attr(&k, crate::graph::AttrSpec::any(v.clone()));
+                    }
+                    p.set(&k, v);
+                }
+            }
+            let mut n = crate::graph::DepNode::new(&t.id, &t.name, &t.ty);
+            crate::materials::add_texture_specs(&mut n, &t.ty);
+            for (k, v) in &t.attrs {
+                if n.spec(k).is_none() {
+                    n.add_attr(k, crate::graph::AttrSpec::any(v.clone()));
+                }
+                n.set(k, v.clone());
+            }
+            self.names.insert(t.name.clone());
+            self.deps.insert(n);
+            self.deps.connect(crate::graph::PlugRef::new(&pid, "outUV"), crate::graph::PlugRef::new(&t.id, "uvCoord"));
+        }
+        for m in shading.mats {
+            let mut n = crate::graph::DepNode::new(&m.id, &m.name, &m.ty);
+            crate::materials::add_material_specs(&mut n, &m.ty);
+            for (k, v) in &m.attrs {
+                if n.spec(k).is_none() {
+                    n.add_attr(k, crate::graph::AttrSpec::any(v.clone()));
+                }
+                n.set(k, v.clone());
+            }
+            self.names.insert(m.name.clone());
+            self.deps.insert(n);
+            for (slot, tex) in &m.maps {
+                let Some(tex) = tex.as_str() else { continue };
+                let out = m.map_out(slot);
+                self.deps.connect(crate::graph::PlugRef::new(tex, out), crate::graph::PlugRef::new(&m.id, slot));
+            }
+            self.ensure_shading_engine(&m.id);
+        }
+    }
+
+    /// Connect a texture output to a material slot (`None` output means outColor).
+    pub fn set_material_map(&mut self, mat: &str, slot: &str, tex: &str, out: &str) -> bool {
+        if !self.is_material(mat) || !self.is_texture(tex) || self.deps.node(mat).is_none_or(|n| n.spec(slot).is_none()) {
+            return false;
+        }
+        let dst = crate::graph::PlugRef::new(mat, slot);
+        let src = crate::graph::PlugRef::new(tex, if out == "outAlpha" { "outAlpha" } else { "outColor" });
+        let ok = self.deps.connect(src, dst);
+        if ok {
+            self.touch();
+        }
+        ok
+    }
+
+    pub fn clear_material_map(&mut self, mat: &str, slot: &str) -> bool {
+        let ok = self.deps.disconnect(&crate::graph::PlugRef::new(mat, slot));
+        if ok {
+            self.touch();
+        }
+        ok
+    }
+
+    /// Rename a shading node; returns the new unique name.
+    pub fn rename_shading_node(&mut self, id: &str, want: &str) -> Option<Id> {
+        let old = self.deps.node(id)?.name.clone();
+        if self.is_material(id) || self.is_texture(id) || self.is_place(id) || self.is_shading_engine(id) {
+            if old == want {
+                return Some(id.to_string());
+            }
+            self.names.remove(&old);
+            let name = self.unique_name(want);
+            self.deps.node_mut(id)?.name = name.clone();
+            self.touch();
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// Remove any shading dependency node, releasing its name.
+    pub fn delete_shading_node(&mut self, id: &str) {
+        if let Some(n) = self.deps.remove(id) {
+            self.names.remove(&n.name);
+            self.touch();
+        }
     }
 
     pub fn delete_texture(&mut self, id: &str) {
-        if let Some(t) = self.texs.shift_remove(id) {
-            self.release_name(&t.name);
-            if let Some(pid) = t.place {
-                if let Some(p) = self.places.shift_remove(&pid) {
-                    self.release_name(&p.name);
+        let place = self.deps.source_of(&crate::graph::PlugRef::new(id, "uvCoord")).map(|p| p.node);
+        if let Some(n) = self.deps.remove(id) {
+            self.names.remove(&n.name);
+        }
+        if let Some(pid) = place {
+            let used = self.deps.nodes.values().any(|n| {
+                crate::materials::is_texture_kind(&n.kind)
+                    && self.deps.source_of(&crate::graph::PlugRef::new(&n.id, "uvCoord")).is_some_and(|p| p.node == pid)
+            });
+            if !used {
+                if let Some(p) = self.deps.remove(&pid) {
+                    self.names.remove(&p.name);
                 }
             }
         }
         self.touch();
     }
+
     pub fn assign_material(&mut self, node: &str, mat: &str, faces: Option<&[usize]>) {
-        let def = self.default_mat.clone();
         if let Some(n) = self.nodes.get_mut(node) {
             if let Some(m) = n.mesh_mut() {
                 match faces {
@@ -902,15 +1200,23 @@ impl Scene {
                 n.rev += 1;
             }
         }
-        let _ = def;
         self.touch();
     }
+
     pub fn delete_material(&mut self, id: &str) {
-        if id == self.default_mat || self.mats.get(id).is_some_and(|m| m.name == "standardSurface1") {
+        if id == self.default_mat || self.deps.node(id).is_some_and(|m| m.name == "standardSurface1") {
             return;
         }
-        if let Some(m) = self.mats.shift_remove(id) {
-            self.release_name(&m.name);
+        for sg in self.deps.nodes.values().filter(|n| {
+            n.kind == crate::materials::SHADING_ENGINE_KIND
+                && self.deps.source_of(&crate::graph::PlugRef::new(&n.id, "surfaceShader")).is_some_and(|p| p.node == id)
+        }).map(|n| n.id.clone()).collect::<Vec<_>>() {
+            if let Some(n) = self.deps.remove(&sg) {
+                self.names.remove(&n.name);
+            }
+        }
+        if let Some(m) = self.deps.remove(id) {
+            self.names.remove(&m.name);
         }
         let def = self.default_mat.clone();
         for n in self.nodes.values_mut() {
@@ -1383,26 +1689,14 @@ impl Scene {
                 }
             }
         }
-        if let Some(m) = self.mats.values().find(|m| m.name == name) {
-            return Some(NodeRef::Material(m.id.clone()));
-        }
-        if let Some(t) = self.texs.values().find(|t| t.name == name) {
-            return Some(NodeRef::Texture(t.id.clone()));
-        }
-        if let Some(p) = self.places.values().find(|p| p.name == name) {
-            return Some(NodeRef::Place2D(p.id.clone()));
-        }
-        self.deps.find(name).map(|n| NodeRef::Dependency(n.id.clone()))
+        self.deps.find(name).and_then(|n| self.shading_ref(&n.id))
     }
 
     pub fn ref_name(&self, r: &NodeRef) -> String {
         match r {
             NodeRef::Dag(id) => self.nodes.get(id).map(|n| n.name.clone()).unwrap_or_default(),
             NodeRef::History(id, i) => self.nodes.get(id).and_then(|n| n.mesh()).and_then(|m| m.history.get(*i)).map(|h| h.name.clone()).unwrap_or_default(),
-            NodeRef::Material(id) => self.mats.get(id).map(|m| m.name.clone()).unwrap_or_default(),
-            NodeRef::Texture(id) => self.texs.get(id).map(|m| m.name.clone()).unwrap_or_default(),
-            NodeRef::Place2D(id) => self.places.get(id).map(|p| p.name.clone()).unwrap_or_default(),
-            NodeRef::Dependency(id) => self.deps.node(id).map(|n| n.name.clone()).unwrap_or_default(),
+            NodeRef::Material(id) | NodeRef::Texture(id) | NodeRef::Place2D(id) | NodeRef::Dependency(id) => self.deps.node(id).map(|n| n.name.clone()).unwrap_or_default(),
         }
     }
 
@@ -1971,8 +2265,8 @@ impl Scene {
                 let len = self.nodes.get(&p.node)?.mesh()?.history.len();
                 (p.index < len).then(|| NodeRef::History(p.node.clone(), p.index))
             }
-            "material" => self.mats.contains_key(&p.node).then(|| NodeRef::Material(p.node.clone())),
-            "texture" => self.texs.contains_key(&p.node).then(|| NodeRef::Texture(p.node.clone())),
+            "material" => self.is_material(&p.node).then(|| NodeRef::Material(p.node.clone())),
+            "texture" => self.is_texture(&p.node).then(|| NodeRef::Texture(p.node.clone())),
             _ => None,
         }
     }
@@ -2082,7 +2376,7 @@ impl Scene {
                     Shape::Mesh(m) => match attr {
                         "smoothLevel" => Some(json!(m.smooth_level)),
                         "softAngle" => Some(json!(m.mesh.soft_angle)),
-                        "material" => Some(json!(self.mats.get(&m.material).map(|x| x.name.clone()))),
+                        "material" => Some(json!(self.material(&m.material).map(|x| x.name.clone()))),
                         _ => None,
                     },
                     Shape::Light(l) => get_compound(&l.attrs, attr),
@@ -2099,9 +2393,7 @@ impl Scene {
                 let h = self.nodes.get(id)?.mesh()?.history.get(*i)?;
                 h.params.get(attr).cloned().or_else(|| primitives::gen_info(&h.ty).and_then(|g| g.params.iter().find(|p| p.0 == attr).map(|p| json!(p.1))))
             }
-            NodeRef::Material(id) => get_compound(&self.mats.get(id)?.attrs, attr),
-            NodeRef::Texture(id) => get_compound(&self.texs.get(id)?.attrs, attr),
-            NodeRef::Place2D(id) => get_compound(&self.places.get(id)?.attrs, attr),
+            NodeRef::Material(id) | NodeRef::Texture(id) | NodeRef::Place2D(id) => self.deps.get(&crate::graph::PlugRef::new(id, attr)),
             NodeRef::Dependency(id) => self.deps.get(&crate::graph::PlugRef::new(id, attr)),
         }
     }
@@ -2251,22 +2543,7 @@ impl Scene {
                 self.set_history_param(&id, i, attr, v);
                 true
             }
-            NodeRef::Material(id) => {
-                let ok = self.mats.get_mut(id).is_some_and(|m| set_compound(&mut m.attrs, attr, v));
-                self.touch();
-                ok
-            }
-            NodeRef::Texture(id) => {
-                let ok = self.texs.get_mut(id).is_some_and(|m| set_compound(&mut m.attrs, attr, v));
-                self.touch();
-                ok
-            }
-            NodeRef::Place2D(id) => {
-                let ok = self.places.get_mut(id).is_some_and(|p| set_compound(&mut p.attrs, attr, v));
-                self.touch();
-                ok
-            }
-            NodeRef::Dependency(id) => {
+            NodeRef::Material(id) | NodeRef::Texture(id) | NodeRef::Place2D(id) | NodeRef::Dependency(id) => {
                 let ok = self.deps.set(&crate::graph::PlugRef::new(id, attr), v);
                 self.touch();
                 ok
@@ -3828,16 +4105,7 @@ impl Scene {
             return Some(NodeRef::Dag(id.into()));
         }
         if self.deps.nodes.contains_key(id) {
-            return Some(NodeRef::Dependency(id.into()));
-        }
-        if self.mats.contains_key(id) {
-            return Some(NodeRef::Material(id.into()));
-        }
-        if self.texs.contains_key(id) {
-            return Some(NodeRef::Texture(id.into()));
-        }
-        if self.places.contains_key(id) {
-            return Some(NodeRef::Place2D(id.into()));
+            return self.shading_ref(id);
         }
         self.history_ref_by_id(id)
     }
@@ -4213,7 +4481,7 @@ impl Scene {
                 if let Some(l) = history.last_mut() {
                     l.out = Some(mesh.clone());
                 }
-                let material = d["material"].as_str().filter(|m| self.mats.contains_key(*m)).map(String::from).unwrap_or(self.default_mat.clone());
+                let material = d["material"].as_str().filter(|m| self.is_material(m)).map(String::from).unwrap_or(self.default_mat.clone());
                 Shape::Mesh(Box::new(MeshShape { material, smooth_level: d["smoothLevel"].as_u64().unwrap_or(0) as u32, nurbs: d["nurbs"].as_bool().unwrap_or(false), history, mesh }))
             }
             "light" => {
@@ -4297,7 +4565,7 @@ impl Scene {
             "idCounter": self.id_counter,
             "nodes": nodes,
             "deps": serde_json::to_value(&self.deps).unwrap_or(Value::Null),
-            "shading": ShadingData { mats: self.mats.values().cloned().collect(), texs: self.texs.values().cloned().collect(), places: self.places.values().cloned().collect(), default_mat_id: Some(self.default_mat.clone()) },
+            "shading": ShadingData { mats: self.materials(), texs: self.textures(), places: self.places(), default_mat_id: Some(self.default_mat.clone()) },
             "layers": self.layers,
             "anim": self.anim.serialize(),
             "animLayers": self.anim_layers,
@@ -4322,9 +4590,6 @@ impl Scene {
         self.deps = Default::default();
         self.roots.clear();
         self.names.clear();
-        self.mats.clear();
-        self.texs.clear();
-        self.places.clear();
         self.layers.clear();
         self.current_layer = None;
         self.anim = Anim::default();
@@ -4352,44 +4617,30 @@ impl Scene {
         }
         self.clear();
         self.id_counter = self.id_counter.max(data["idCounter"].as_u64().unwrap_or(1));
+        self.deps = serde_json::from_value(data.get("deps").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         let shading: ShadingData = serde_json::from_value(data["shading"].clone()).unwrap_or_default();
-        for mut p in shading.places {
-            crate::materials::add_placement_defaults(&mut p.attrs);
-            self.names.insert(p.name.clone());
-            self.places.insert(p.id.clone(), p);
+        let migrated_shading = !self.deps.nodes.values().any(|n| crate::materials::is_material_kind(&n.kind));
+        if migrated_shading {
+            self.migrate_legacy_shading(shading.clone());
         }
-        for mut t in shading.texs {
-            let legacy = crate::materials::take_placement_attrs(&mut t.attrs);
-            let pid = t.place.clone().filter(|id| self.places.contains_key(id)).unwrap_or_else(|| {
-                let id = self.new_id("p");
-                let name = self.unique_name("place2dTexture1");
-                self.places.insert(id.clone(), Place2D::new(id.clone(), name, &t.ty));
-                id
-            });
-            if let Some(p) = self.places.get_mut(&pid) {
-                for (k, v) in legacy {
-                    p.attrs.insert(k, v);
-                }
-            }
-            t.place = Some(pid);
-            self.names.insert(t.name.clone());
-            self.texs.insert(t.id.clone(), t);
-        }
-        for m in shading.mats {
-            self.names.insert(m.name.clone());
-            self.mats.insert(m.id.clone(), m);
-        }
-        self.default_mat = shading.default_mat_id.filter(|d| self.mats.contains_key(d)).or_else(|| self.mats.keys().next().cloned()).unwrap_or_default();
+        self.default_mat = shading.default_mat_id.filter(|d| self.is_material(d)).or_else(|| self.materials().first().map(|m| m.id.clone())).unwrap_or_default();
         if self.default_mat.is_empty() {
             self.init_default_materials();
+        }
+        if migrated_shading {
+            if let Some(sg) = self.shading_group_of(&self.default_mat) {
+                self.rename_shading_node(&sg, "initialShadingGroup");
+            }
         }
         self.layers = serde_json::from_value(data["layers"].clone()).unwrap_or_default();
         for l in &self.layers {
             self.names.insert(l.name.clone());
         }
-        self.deps = serde_json::from_value(data.get("deps").cloned().unwrap_or(Value::Null)).unwrap_or_default();
         for n in self.deps.nodes.values() {
             self.names.insert(n.name.clone());
+        }
+        for id in self.material_ids() {
+            self.ensure_shading_engine(&id);
         }
         let mut by_id: HashMap<String, Id> = HashMap::new();
         for d in data["nodes"].as_array().unwrap() {
@@ -6345,6 +6596,71 @@ mod tests {
             Some(json!(custom.clone())),
             "current layer was not mirrored on layerManager"
         );
+    }
+
+    #[test]
+    fn shading_nodes_own_attributes_and_connections() {
+        let mut s = Scene::new();
+        let m = s.material_named("lambert1").expect("startup lambert");
+        assert!(s.is_material(&m));
+        let sg = s.shading_group_of(&m).expect("startup material has a shading group");
+        assert_eq!(s.deps.node(&sg).unwrap().name, "initialShadingGroup");
+        assert_eq!(s.shading_group_material(&sg).as_deref(), Some(m.as_str()));
+        let t = s.create_texture("checker", Some("checker1"));
+        let place = s.texture(&t).and_then(|x| x.place).expect("texture has a place2dTexture");
+        assert!(s.is_place(&place));
+        assert_eq!(s.get_attr(&NodeRef::Material(m.clone()), "color"), Some(json!([0.5, 0.5, 0.5])));
+        assert!(s.set_attr(&NodeRef::Material(m.clone()), "colorR", json!(0.25)));
+        assert_eq!(s.material(&m).unwrap().attrs["color"][0], json!(0.25));
+        assert!(s.set_material_map(&m, "color", &t, "outColor"));
+        assert_eq!(s.material(&m).unwrap().maps["color"], json!(t));
+        assert_eq!(s.deps.source_of(&crate::graph::PlugRef::new(&m, "color")), Some(crate::graph::PlugRef::new(&t, "outColor")));
+        assert_eq!(s.texture(&t).unwrap().name, "checker1");
+        assert_eq!(s.place(&place).unwrap().name, "place2dTexture1");
+        assert!(s.clear_material_map(&m, "color"));
+        assert!(s.material(&m).unwrap().maps.is_empty());
+    }
+
+    #[test]
+    fn shading_nodes_round_trip_and_legacy_shading_migrates() {
+        let mut s = Scene::new();
+        let m = s.create_material("blinn", Some("blue"));
+        let t = s.create_texture("file", Some("image"));
+        assert!(s.shading_group_of(&m).is_some());
+        s.set_attr(&NodeRef::Material(m.clone()), "color", json!([0.1, 0.2, 0.9]));
+        s.set_attr(&NodeRef::Texture(t.clone()), "fileTextureName", json!("C:/tex.png"));
+        s.set_material_map(&m, "color", &t, "outColor");
+        let v = s.serialize();
+        let mut back = Scene::new();
+        back.load(&v).unwrap();
+        assert_eq!(back.material(&m).unwrap().attrs["color"], json!([0.1, 0.2, 0.9]));
+        assert_eq!(back.texture(&t).unwrap().attrs["fileTextureName"], json!("C:/tex.png"));
+        assert_eq!(back.material(&m).unwrap().maps["color"], json!(t));
+        assert_eq!(back.material(&m).unwrap().map_out("color"), "outColor");
+        assert!(back.shading_group_of(&m).is_some());
+        let sg = back.shading_group_of(&m).unwrap();
+        assert_eq!(back.deps.node(&sg).unwrap().name, "blueSG");
+        back.delete_material(&m);
+        assert!(!back.deps.nodes.contains_key(&sg), "deleting a material must remove its shading group");
+
+        // A pre-node file has only the shading block; loading it builds the same nodes.
+        let legacy = json!({
+            "nodes": [],
+            "idCounter": 20,
+            "shading": {
+                "mats": [{"id": "m1", "name": "lambert1", "type": "lambert", "attrs": {"color": [0.2, 0.3, 0.4]}, "maps": {"color": "x2"}}],
+                "texs": [{"id": "x2", "name": "file1", "type": "file", "attrs": {"fileTextureName": "legacy.png"}, "place": "p3"}],
+                "places": [{"id": "p3", "name": "place2dTexture1", "attrs": {"repeatU": 2.0}}],
+                "defaultMatId": "m1"
+            }
+        });
+        let mut old = Scene::new();
+        old.load(&legacy).unwrap();
+        assert_eq!(old.default_mat, "m1");
+        assert_eq!(old.material("m1").unwrap().attrs["color"], json!([0.2, 0.3, 0.4]));
+        assert_eq!(old.texture("x2").unwrap().place.as_deref(), Some("p3"));
+        assert_eq!(old.place("p3").unwrap().attrs["repeatU"], json!(2.0));
+        assert_eq!(old.deps.source_of(&crate::graph::PlugRef::new("m1", "color")), Some(crate::graph::PlugRef::new("x2", "outColor")));
     }
 
     #[test]

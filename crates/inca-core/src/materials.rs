@@ -47,6 +47,58 @@ pub fn tex_type(ty: &str) -> Option<&'static TexType> {
     TEX_TYPES.iter().find(|m| m.ty == ty)
 }
 
+pub fn is_material_kind(kind: &str) -> bool {
+    MAT_TYPES.iter().any(|m| m.ty == kind)
+}
+pub fn is_texture_kind(kind: &str) -> bool {
+    TEX_TYPES.iter().any(|m| m.ty == kind)
+}
+pub const PLACE_KIND: &str = "place2dTexture";
+pub const SHADING_ENGINE_KIND: &str = "shadingEngine";
+
+/// Give a new material node its input attributes and Maya output plugs.
+pub fn add_material_specs(n: &mut crate::graph::DepNode, ty: &str) {
+    if let Value::Object(m) = (mat_type(ty).defaults)() {
+        for (k, v) in m {
+            n.add_attr(&k, crate::graph::AttrSpec::any(v));
+        }
+    }
+    if n.spec("outColor").is_none() {
+        n.add_attr("outColor", crate::graph::AttrSpec::any(json!([0.0, 0.0, 0.0])).read_only());
+    }
+    if n.spec("outTransparency").is_none() {
+        n.add_attr("outTransparency", crate::graph::AttrSpec::any(json!([0.0, 0.0, 0.0])).read_only());
+    }
+}
+
+/// Give a new texture node its own attributes, the UV input and its output plugs.
+pub fn add_texture_specs(n: &mut crate::graph::DepNode, ty: &str) {
+    if let Some(t) = tex_type(ty) {
+        if let Value::Object(m) = (t.defaults)() {
+            for (k, v) in m {
+                n.add_attr(&k, crate::graph::AttrSpec::any(v));
+            }
+        }
+    }
+    n.add_attr("uvCoord", crate::graph::AttrSpec::vector([0.0, 0.0, 0.0]).keyable(false));
+    n.add_attr("outColor", crate::graph::AttrSpec::any(json!([0.0, 0.0, 0.0])).read_only());
+    n.add_attr("outAlpha", crate::graph::AttrSpec::float(1.0).read_only());
+}
+
+/// Give a place2dTexture node the shared placement attributes and its outUV output.
+pub fn add_place_specs(n: &mut crate::graph::DepNode, placement: &Params) {
+    for (k, v) in placement {
+        n.add_attr(k, crate::graph::AttrSpec::any(v.clone()));
+    }
+    n.add_attr("outUV", crate::graph::AttrSpec::vector([0.0, 0.0, 0.0]).read_only());
+}
+
+/// Maya's shading group inputs: the surface shader and the objects (or face sets) it shades.
+pub fn add_shading_engine_specs(n: &mut crate::graph::DepNode) {
+    n.add_attr("surfaceShader", crate::graph::AttrSpec::message());
+    n.add_attr("dagSetMembers", crate::graph::AttrSpec::message());
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Material {
     pub id: String,

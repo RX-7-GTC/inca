@@ -793,7 +793,7 @@ pub fn icon_lines(s: &Scene, id: &str, col: [f32; 4]) -> Vec<LineVertex> {
 }
 
 pub fn mat_color(s: &Scene, mid: &str) -> [f32; 3] {
-    match s.mats.get(mid) {
+    match s.material(mid) {
         // the flat colour (JS `matsU`); Hardware Texturing samples the map in the shader.
         // Emission is a separate additive vertex attribute, like three.js `emissive`.
         Some(m) => m.pbr().base,
@@ -803,7 +803,7 @@ pub fn mat_color(s: &Scene, mid: &str) -> [f32; 3] {
 
 /// Additive emission of a material (JS `emissive` / `incandescence`).
 pub fn mat_emission(s: &Scene, mid: &str) -> [f32; 3] {
-    match s.mats.get(mid) {
+    match s.material(mid) {
         // surfaceShader is unlit: its outColor is the vertex base, not an added emission
         Some(m) => {
             let p = m.pbr();
@@ -906,10 +906,10 @@ fn ensure_bump(g: &mut crate::viewport::gpu::Gpu, s: &Scene, t: &inca_core::mate
     g.bump_texture_layer(&t.id, layer, h.finish(), || inca_core::materials::viewport_bump_pixels(t, place.as_ref(), project.as_deref()));
 }
 
-fn texture_slot<'a>(g: &mut crate::viewport::gpu::Gpu, s: &'a Scene, mat: &inca_core::materials::Material, slot: &str) -> Option<(&'a inca_core::materials::Texture, u32, bool)> {
+fn texture_slot(g: &mut crate::viewport::gpu::Gpu, s: &Scene, mat: &inca_core::materials::Material, slot: &str) -> Option<(inca_core::materials::Texture, u32, bool)> {
     let tid = mat.maps.get(slot)?.as_str()?;
-    let t = s.texs.get(tid)?;
-    let layer = ensure_texture(g, s, t)?;
+    let t = s.texture(tid)?;
+    let layer = ensure_texture(g, s, &t)?;
     Some((t, layer, mat.map_out(slot) == "outAlpha"))
 }
 
@@ -924,53 +924,54 @@ fn mesh_textures(g: &mut crate::viewport::gpu::Gpu, s: &Scene, m: &inca_core::sc
         if out.contains_key(mid) {
             continue;
         }
-        let Some(mat) = s.mats.get(mid) else { continue };
-        let color = texture_slot(g, s, mat, mat.color_attr());
+        let Some(mat) = s.material(mid) else { continue };
+        let color = texture_slot(g, s, &mat, mat.color_attr());
         let (rough, metal, emission_slot, alpha, spec, bump) = match mat.ty.as_str() {
             "standardSurface" => (
-                texture_slot(g, s, mat, "specularRoughness"),
-                texture_slot(g, s, mat, "metalness"),
-                texture_slot(g, s, mat, "emissionColor"),
-                texture_slot(g, s, mat, "opacity"),
+                texture_slot(g, s, &mat, "specularRoughness"),
+                texture_slot(g, s, &mat, "metalness"),
+                texture_slot(g, s, &mat, "emissionColor"),
+                texture_slot(g, s, &mat, "opacity"),
                 None,
-                texture_slot(g, s, mat, "bump"),
+                texture_slot(g, s, &mat, "bump"),
             ),
             "surfaceShader" => (None, None, None, None, None, None),
             ty => (
                 None,
                 None,
-                texture_slot(g, s, mat, "incandescence"),
-                texture_slot(g, s, mat, "transparency"),
-                if ty == "lambert" { None } else { texture_slot(g, s, mat, "specularColor") },
-                texture_slot(g, s, mat, "bump"),
+                texture_slot(g, s, &mat, "incandescence"),
+                texture_slot(g, s, &mat, "transparency"),
+                if ty == "lambert" { None } else { texture_slot(g, s, &mat, "specularColor") },
+                texture_slot(g, s, &mat, "bump"),
             ),
         };
         // Maya: bump 0 means no bump, not three.js' "bumpScale defaults to 1".
         let bump_amount = mat.attrs.get("bump").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
         if bump_amount > 0.0 {
-            if let Some((t, layer, _)) = bump {
-                ensure_bump(g, s, t, layer);
+            if let Some((t, layer, _)) = &bump {
+                ensure_bump(g, s, t, *layer);
             }
         }
         let mut alpha_src = 0u8;
-        let mut take = |bit: u8, s: Option<(&inca_core::materials::Texture, u32, bool)>| -> Option<u32> {
+        let mut take = |bit: u8, s: Option<&(inca_core::materials::Texture, u32, bool)>| -> Option<u32> {
             let (_, layer, alpha) = s?;
-            if alpha {
+            if *alpha {
                 alpha_src |= 1 << bit;
             }
-            Some(layer)
+            Some(*layer)
         };
         let mut mt = MatTex::default();
-        mt.color = take(0, color);
-        mt.roughness = take(1, rough);
-        mt.metalness = take(2, metal);
-        mt.emission = take(3, emission_slot);
-        mt.alpha = take(4, alpha);
-        mt.specular = take(5, spec);
-        mt.bump = if bump_amount > 0.0 { take(6, bump) } else { None };
+        mt.color = take(0, color.as_ref());
+        mt.roughness = take(1, rough.as_ref());
+        mt.metalness = take(2, metal.as_ref());
+        mt.emission = take(3, emission_slot.as_ref());
+        mt.alpha = take(4, alpha.as_ref());
+        mt.specular = take(5, spec.as_ref());
+        mt.bump = if bump_amount > 0.0 { take(6, bump.as_ref()) } else { None };
         mt.alpha_src = alpha_src;
-        mt.uv_xf = [color, rough, metal, emission_slot, alpha, spec, bump].map(|s| UvXf::from_texture(s.map(|(t, _, _)| t)));
-        mt.tint = tex_tint(mat);
+        let uv_src = [color.as_ref(), rough.as_ref(), metal.as_ref(), emission_slot.as_ref(), alpha.as_ref(), spec.as_ref(), bump.as_ref()];
+        mt.uv_xf = uv_src.map(|s| UvXf::from_texture(s.map(|(t, _, _)| t)));
+        mt.tint = tex_tint(&mat);
         if mat.ty == "standardSurface" {
             mt.emission_scale = mat.attrs.get("emission").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0001) as f32;
         }
@@ -998,7 +999,7 @@ fn mesh_has_alpha_map(s: &Scene, m: &inca_core::scene::MeshShape) -> bool {
     if let Some(fm) = &m.mesh.fm {
         ids.extend(fm.iter().flatten());
     }
-    ids.into_iter().any(|mid| s.mats.get(mid).is_some_and(mat_has_alpha_map))
+    ids.into_iter().any(|mid| s.material(mid).is_some_and(|m| mat_has_alpha_map(&m)))
 }
 
 /// Key for the GPU cache of a mesh node: geometry revision, smoothing and material colours.
@@ -1025,15 +1026,15 @@ pub fn mesh_key(s: &Scene, id: &str, divisions: u32) -> u64 {
             }
             // UV transforms and map layers are baked into the vertex buffer, so texture edits
             // (and the bump strength) rebuild it.
-            if let Some(mat) = s.mats.get(mid.as_str()) {
+            if let Some(mat) = s.material(mid.as_str()) {
                 mat.attrs.get("bump").and_then(|v| v.as_f64()).map(|v| v.to_bits()).hash(&mut h);
                 for slot in inca_core::materials::mat_type(&mat.ty).mappable {
-                    if let Some(t) = mat.maps.get(*slot).and_then(|v| v.as_str()).and_then(|tid| s.texs.get(tid)) {
+                    if let Some(t) = mat.maps.get(*slot).and_then(|v| v.as_str()).and_then(|tid| s.texture(tid)) {
                         t.id.hash(&mut h);
                         t.ty.hash(&mut h);
                         mat.map_out(slot).hash(&mut h);
                         serde_json::to_string(&t.attrs).unwrap_or_default().hash(&mut h);
-                        if let Some(p) = s.place_of(t) {
+                        if let Some(p) = s.place_of(&t) {
                             serde_json::to_string(&p.attrs).unwrap_or_default().hash(&mut h);
                         }
                     }
@@ -1420,7 +1421,7 @@ pub fn build_draws(
                         g.upload_mesh(&id, if live.contains(&id) { 0 } else { key }, &t, &w);
                     }
                 }
-                let pbr = s.mats.get(&m.material).map(|x| x.pbr()).unwrap_or_default();
+                let pbr = s.material(&m.material).map(|x| x.pbr()).unwrap_or_default();
                 let in_comp = hilite.contains(&id) && !vp.beauty;
                 // Render Stats flags (JS defaults mesh.castShadow/receiveShadow to true)
                 let cast_shadows = n.extra.get("castShadows").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -2793,16 +2794,15 @@ mod tests {
         // standardSurface: base and emission travel separately so the shader can add the
         // emission after lighting, like three.js `totalEmissiveRadiance`
         let mid = s.create_material("standardSurface", Some("emissiveMat"));
-        let m = s.mats.get_mut(&mid).unwrap();
-        m.attrs.insert("base".into(), serde_json::json!(1.0));
-        m.attrs.insert("baseColor".into(), serde_json::json!([0.0, 0.0, 1.0]));
-        m.attrs.insert("emission".into(), serde_json::json!(2.0));
-        m.attrs.insert("emissionColor".into(), serde_json::json!([1.0, 0.0, 0.0]));
+        s.set_dep_attr(&mid, "base", serde_json::json!(1.0));
+        s.set_dep_attr(&mid, "baseColor", serde_json::json!([0.0, 0.0, 1.0]));
+        s.set_dep_attr(&mid, "emission", serde_json::json!(2.0));
+        s.set_dep_attr(&mid, "emissionColor", serde_json::json!([1.0, 0.0, 0.0]));
         assert_eq!(mat_color(&s, &mid), [0.0, 0.0, 1.0]);
         assert_eq!(mat_emission(&s, &mid), [2.0, 0.0, 0.0]);
         // surfaceShader outColor is the unlit base itself, not an added emission
         let sid = s.create_material("surfaceShader", Some("flatMat"));
-        s.mats.get_mut(&sid).unwrap().attrs.insert("outColor".into(), serde_json::json!([0.25, 0.5, 0.75]));
+        s.set_dep_attr(&sid, "outColor", serde_json::json!([0.25, 0.5, 0.75]));
         assert_eq!(mat_color(&s, &sid), [0.25, 0.5, 0.75]);
         assert_eq!(mat_emission(&s, &sid), [0.0; 3]);
     }
@@ -2847,12 +2847,12 @@ mod tests {
         let mesh = s.node(&id).unwrap().mesh().unwrap().clone();
         assert!(!mesh_has_alpha_map(&s, &mesh), "no alpha map yet");
         let before = mesh_key(&s, &id, 1);
-        s.mats.get_mut(&mid).unwrap().maps.insert("opacity".into(), serde_json::json!(tid));
+        s.set_material_map(&mid, "opacity", &tid, "outColor");
         assert!(mesh_has_alpha_map(&s, &mesh));
         assert_ne!(mesh_key(&s, &id, 1), before, "map edits must rebuild the vertex buffer");
         // Surface Shader ignores an opacity map (applyAttrs leaves alphaMap null).
         let sid = s.create_material("surfaceShader", Some("flatMat"));
-        s.mats.get_mut(&sid).unwrap().maps.insert("opacity".into(), serde_json::json!(tid));
+        s.set_material_map(&sid, "opacity", &tid, "outColor");
         let mut flat = mesh;
         flat.material = sid;
         assert!(!mesh_has_alpha_map(&s, &flat));

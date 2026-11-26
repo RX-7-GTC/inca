@@ -494,9 +494,9 @@ pub fn import_ma(s: &mut Scene, src: &str) -> Result<Vec<Id>, String> {
                 "checker" | "ramp" | "noise" | "grid" => Some(s.create_texture(&t.ty, Some(&t.name))),
                 _ => None,
             };
-            if let (Some(tid), Some(m)) = (tex, s.mats.get_mut(&id)) {
+            if let Some(tid) = tex {
                 let slot = if n.ty == "standardSurface" { "baseColor" } else { "color" };
-                m.maps.insert(slot.into(), json!(tid));
+                s.set_material_map(&id, slot, &tid, "outColor");
             }
         }
         mats.insert(n.name.clone(), id);
@@ -505,6 +505,11 @@ pub fn import_ma(s: &mut Scene, src: &str) -> Result<Vec<Id>, String> {
     let mut sg_mat: HashMap<String, Id> = HashMap::new();
     for n in f.nodes.iter().filter(|n| n.ty == "shadingEngine") {
         if let Some(m) = src_of(&n.name, &["ss", "surfaceShader"]).map(plug_node).and_then(|m| mats.get(m)) {
+            if let Some(sg) = s.shading_group_of(m) {
+                if s.deps.node(&sg).is_some_and(|node| node.name != n.name) {
+                    s.rename_shading_node(&sg, &n.name);
+                }
+            }
             sg_mat.insert(n.name.clone(), m.clone());
         }
     }
@@ -865,8 +870,13 @@ pub fn export_ma(s: &Scene, sel_only: bool) -> String {
     // materials, shading groups and assignments
     let mut conns: Vec<String> = vec![];
     for (mid, shapes) in &mat_users {
-        let Some(m) = s.mats.get(mid) else { continue };
-        let (mname, sg) = if *mid == s.default_mat { ("lambert1".to_string(), "initialShadingGroup".to_string()) } else { (m.name.clone(), format!("{}SG", m.name)) };
+        let Some(m) = s.material(mid) else { continue };
+        let (mname, sg) = if *mid == s.default_mat {
+            ("lambert1".to_string(), "initialShadingGroup".to_string())
+        } else {
+            let sg = s.shading_group_of(mid).and_then(|id| s.deps.node(&id).map(|n| n.name.clone())).unwrap_or_else(|| format!("{}SG", m.name));
+            (m.name.clone(), sg)
+        };
         if *mid != s.default_mat {
             let _ = writeln!(o, "createNode {} -n {};", m.ty, q(&mname));
             let a = &m.attrs;
@@ -908,7 +918,7 @@ pub fn export_ma(s: &Scene, sel_only: bool) -> String {
             conns.push(format!("connectAttr {} {} -na;", q(&format!("{sg}.pa")), q(":renderPartition.st")));
             conns.push(format!("connectAttr {} {};", q(&format!("{sg}.msg")), q(&format!("{}MaterialInfo.sg", m.name))));
             // a file texture on the colour slot
-            if let Some(t) = m.maps.get(m.color_attr()).and_then(|v| v.as_str()).and_then(|t| s.texs.get(t)) {
+            if let Some(t) = m.maps.get(m.color_attr()).and_then(|v| v.as_str()).and_then(|t| s.texture(t)) {
                 let _ = writeln!(o, "createNode {} -n {};", if t.ty == "file" { "file" } else { t.ty.as_str() }, q(&t.name));
                 if let Some(p) = t.attrs.get("fileTextureName").and_then(|v| v.as_str()) {
                     let _ = writeln!(o, "\tsetAttr \".ftn\" -type \"string\" {};", q(p));
@@ -1078,7 +1088,7 @@ connectAttr "pCube1_translateX.o" "pCube1.tx";
         let q = &s.node(&quad).unwrap().mesh().unwrap();
         assert_eq!(q.mesh.f, vec![vec![0, 1, 2, 3]]);
         assert!(q.mesh.uv.is_some());
-        assert_eq!(s.mats[&q.material].name, "red");
+        assert_eq!(s.material(&q.material).unwrap().name, "red");
         s.set_time(24.0);
         assert!((s.node(&cube).unwrap().xf.t[0] - 10.0).abs() < 1e-9);
         assert_eq!(s.node(&cube).unwrap().xf.r, [0.0, 45.0, 0.0]);

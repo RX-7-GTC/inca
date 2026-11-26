@@ -791,7 +791,7 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
         if o.materials {
-            let mats: Vec<String> = app.s.mats.values().map(|m| m.name.clone()).collect();
+            let mats: Vec<String> = app.s.materials().into_iter().map(|m| m.name).collect();
             for m in mats {
                 if !filter.is_empty() && !m.to_lowercase().contains(&filter) {
                     continue;
@@ -805,20 +805,34 @@ pub fn outliner(app: &mut IncaApp, ui: &mut egui::Ui) {
         // The animLayer node itself is hidden; its per-channel blend/curve network is shown.
         if !o.dag_only {
             for (id, name, kind) in outliner_dep_rows(&app.s) {
+                if o.materials && app.s.is_material(&id) {
+                    continue;
+                }
                 if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
                     continue;
                 }
                 let icon = match kind.as_str() {
                     "animCurve" => "olCurve",
                     "displayLayer" => "olDisplayLayer",
+                    "shadingEngine" => "olMaterial",
                     _ => "olDependency",
                 };
                 let selected = app.dep_sel.as_deref() == Some(id.as_str());
                 if plain_row(ui, 1, icon, &name, theme::TEXT, selected).clicked() {
                     app.s.checkpoint_selection("select");
                     app.s.select(&[], SelMode::Replace);
-                    app.snode_sel = None;
-                    app.dep_sel = Some(id.clone());
+                    if app.s.is_shading(&id) {
+                        app.snode_sel = Some(id.clone());
+                        app.dep_sel = None;
+                        app.windows_state.hs_selected = Some(id.clone());
+                    } else if let Some(mid) = app.s.shading_group_material(&id) {
+                        app.snode_sel = Some(mid.clone());
+                        app.dep_sel = None;
+                        app.windows_state.hs_selected = Some(mid);
+                    } else {
+                        app.snode_sel = None;
+                        app.dep_sel = Some(id.clone());
+                    }
                     app.echo(format!("select -r {name};"));
                 }
             }
@@ -7383,7 +7397,7 @@ pub fn material_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, t
 
 pub fn texture_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, ty: &str) {
     let r = NodeRef::Texture(id.to_string());
-    let Some(t) = app.s.texs.get(id).cloned() else { return };
+    let Some(t) = app.s.texture(id) else { return };
     let place = t.place.clone();
     let mut specs = vec![];
     for k in t.attrs.keys() {
@@ -7480,7 +7494,7 @@ pub fn place_fields_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
         fspec("noiseV", "Noise V", 0.0, 1.0),
     ];
     theme::section_header(ui, "2D Texture Placement");
-    if let Some(p) = app.s.places.get(id) {
+    if let Some(p) = app.s.place(id) {
         ui.label(RichText::new(&p.name).color(theme::TEXT_DIM));
     }
     field_grid(app, ui, &NodeRef::Place2D(id.to_string()), &placement);
@@ -7522,8 +7536,10 @@ fn ae_tabs(app: &IncaApp, id: &str) -> Vec<(String, NodeRef)> {
                 tabs.push((h.name.clone(), NodeRef::History(id.to_string(), i)));
             }
         }
-        if app.s.mats.contains_key(&m.material) {
-            tabs.push((app.s.mats[&m.material].name.clone(), NodeRef::Material(m.material.clone())));
+        if app.s.is_material(&m.material) {
+            if let Some(mat) = app.s.material(&m.material) {
+                tabs.push((mat.name, NodeRef::Material(m.material.clone())));
+            }
         }
     }
     tabs
@@ -7549,18 +7565,18 @@ fn ae_target(app: &mut IncaApp) -> Option<String> {
 fn shading_attribute_editor(app: &mut IncaApp, ui: &mut egui::Ui) {
     let Some(id) = app.snode_sel.clone() else { return };
     let mut tabs: Vec<(String, NodeRef)> = vec![];
-    if let Some(m) = app.s.mats.get(&id) {
+    if let Some(m) = app.s.material(&id) {
         tabs.push((m.name.clone(), NodeRef::Material(id.clone())));
         let mut seen: Vec<String> = vec![];
         for tid in m.maps.values().filter_map(|v| v.as_str()).map(String::from) {
             if !seen.contains(&tid) {
-                if let Some(t) = app.s.texs.get(&tid) {
+                if let Some(t) = app.s.texture(&tid) {
                     tabs.push((t.name.clone(), NodeRef::Texture(tid.clone())));
                 }
                 seen.push(tid);
             }
         }
-    } else if let Some(t) = app.s.texs.get(&id) {
+    } else if let Some(t) = app.s.texture(&id) {
         tabs.push((t.name.clone(), NodeRef::Texture(id.clone())));
     } else {
         app.snode_sel = None;
@@ -8196,6 +8212,9 @@ fn dep_attrs_editor(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
                 inca_core::graph::AttrType::Message => {
                     ui.label(RichText::new("message").color(theme::TEXT_DIM));
                 }
+                inca_core::graph::AttrType::Any => {
+                    ui.label(RichText::new(value.to_string()).color(theme::TEXT_DIM));
+                }
             }
             ui.end_row();
         }
@@ -8397,7 +8416,7 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
         NodeRef::Place2D(pid) => place_fields_editor(app, ui, pid),
         NodeRef::Material(mid) => crate::windows::material_editor(app, ui, mid, true),
         NodeRef::Texture(tid) => {
-            let ty = app.s.texs.get(tid).map(|t| t.ty.clone()).unwrap_or_default();
+            let ty = app.s.texture(tid).map(|t| t.ty).unwrap_or_default();
             texture_fields_editor(app, ui, tid, &ty);
             if ty == "file" && ui.button("Browse image...").clicked() {
                 if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "hdr"]).pick_file() {
@@ -8497,13 +8516,13 @@ fn shape_tab(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
                 return;
             }
             let mut sel = mat.clone();
-            egui::ComboBox::from_id_salt("aemat").selected_text(app.s.mats.get(&mat).map(|m| m.name.clone()).unwrap_or_default()).show_ui(ui, |ui| {
-                for m in app.s.mats.values() {
+            egui::ComboBox::from_id_salt("aemat").selected_text(app.s.material(&mat).map(|m| m.name).unwrap_or_default()).show_ui(ui, |ui| {
+                for m in app.s.materials() {
                     ui.selectable_value(&mut sel, m.id.clone(), &m.name);
                 }
             });
             if sel != mat {
-                let mn = app.s.mats[&sel].name.clone();
+                let mn = app.s.material(&sel).map(|m| m.name).unwrap_or_default();
                 let _ = app.run_mel("assign material", &format!("select -r {}; hyperShade -assign {mn};", app.s.name_of(id)));
             }
         }

@@ -742,7 +742,7 @@ fn run_script(app: &mut IncaApp) {
 // ------------------------------------------------------------------ hypershade
 
 pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_name: bool) {
-    let Some(m) = app.s.mats.get(mid).cloned() else { return };
+    let Some(m) = app.s.material(mid) else { return };
     let read_only = crate::hypershade::read_only(app, mid);
     if show_name {
     ui.horizontal(|ui| {
@@ -757,11 +757,7 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_nam
                 app.error("line 1: Cannot rename a read only node.");
             } else {
                 app.s.checkpoint("rename material");
-                let old = m.name.clone();
-                app.s.release_name(&old);
-                let nn = app.s.unique_name(name.trim());
-                app.s.mats.get_mut(mid).unwrap().name = nn;
-                app.s.touch();
+                app.s.rename_shading_node(mid, name.trim());
             }
         }
         ui.label(RichText::new(inca_core::materials::mat_type(&m.ty).label).color(theme::TEXT_DIM));
@@ -773,28 +769,25 @@ pub fn material_editor(app: &mut IncaApp, ui: &mut egui::Ui, mid: &str, show_nam
         ui.horizontal(|ui| {
             ui.add_sized([108.0, 18.0], egui::Label::new(inca_core::ops::nice_name(slot)).truncate());
             let cur = m.maps.get(*slot).and_then(|v| v.as_str()).map(String::from);
-            let cur_name = cur.as_ref().and_then(|t| app.s.texs.get(t)).map(|t| t.name.clone()).unwrap_or("None".into());
+            let cur_name = cur.as_ref().and_then(|t| app.s.texture(t)).map(|t| t.name).unwrap_or("None".into());
             egui::ComboBox::from_id_salt(("map", mid, *slot)).width(120.0).selected_text(cur_name).show_ui(ui, |ui| {
                 if ui.selectable_label(cur.is_none(), "None").clicked() {
                     app.s.checkpoint("disconnect texture");
-                    app.s.mats.get_mut(mid).unwrap().clear_map(slot);
-                    app.s.touch();
+                    app.s.clear_material_map(mid, slot);
                 }
                 for t in TEX_TYPES {
                     if ui.button(format!("New {}", t.label)).clicked() {
                         app.s.checkpoint("connect texture");
                         let tid = app.s.create_texture(t.ty, None);
                         crate::hypershade::place_new_node(app, &tid, None);
-                        app.s.mats.get_mut(mid).unwrap().set_map(slot, &tid, "outColor");
-                        app.s.touch();
+                        app.s.set_material_map(mid, slot, &tid, "outColor");
                     }
                 }
-                let texs: Vec<(String, String)> = app.s.texs.values().map(|t| (t.id.clone(), t.name.clone())).collect();
+                let texs: Vec<(String, String)> = app.s.textures().into_iter().map(|t| (t.id, t.name)).collect();
                 for (tid, tn) in texs {
                     if ui.selectable_label(cur.as_deref() == Some(tid.as_str()), &tn).clicked() {
                         app.s.checkpoint("connect texture");
-                        app.s.mats.get_mut(mid).unwrap().set_map(slot, &tid, "outColor");
-                        app.s.touch();
+                        app.s.set_material_map(mid, slot, &tid, "outColor");
                     }
                 }
             });

@@ -261,7 +261,7 @@ fn layout_connections(s: &Scene, io: &[String]) -> (Vec<Box_>, Vec<(String, Stri
     }
     let mut min_y = f32::NEG_INFINITY;
     for (mid, ys, shapes) in mat_users {
-        let Some(m) = s.mats.get(&mid) else { continue };
+        let Some(m) = s.material(&mid) else { continue };
         let y = (ys.iter().sum::<f32>() / ys.len() as f32).max(min_y);
         min_y = y + NH + 20.0;
         boxes.push(Box_ { key: mid.clone(), obj: None, label: m.name.clone(), sub: m.ty.clone(), at: pos2(shape_x + col, y), material: true, node: Some(NodeRef::Material(mid.clone())) });
@@ -1136,7 +1136,7 @@ fn history_attrs(s: &Scene, id: &str, i: usize) -> Vec<CeAttr> {
 }
 
 fn material_attrs(s: &Scene, id: &str) -> Vec<CeAttr> {
-    let Some(m) = s.mats.get(id) else { return vec![] };
+    let Some(m) = s.material(id) else { return vec![] };
     let mappable = inca_core::materials::mat_type(&m.ty).mappable;
     let mut out = bag_attrs(&m.attrs, mappable, |_| true);
     for slot in mappable {
@@ -1148,7 +1148,7 @@ fn material_attrs(s: &Scene, id: &str) -> Vec<CeAttr> {
 }
 
 fn texture_attrs(s: &Scene, id: &str) -> Vec<CeAttr> {
-    let Some(t) = s.texs.get(id) else { return vec![] };
+    let Some(t) = s.texture(id) else { return vec![] };
     let mut out = vec![
         CeAttr::new("outColor", CeType::TexColor).with_keyable(false).with_writable(false),
         CeAttr::new("outAlpha", CeType::Float).with_keyable(false).with_writable(false).with_hidden(true),
@@ -1163,7 +1163,11 @@ fn ce_attrs(s: &Scene, r: &NodeRef) -> Vec<CeAttr> {
         NodeRef::History(id, i) => history_attrs(s, id, *i),
         NodeRef::Material(id) => material_attrs(s, id),
         NodeRef::Texture(id) => texture_attrs(s, id),
-        NodeRef::Place2D(id) => s.places.get(id).map(|p| bag_attrs(&p.attrs, &[], |_| true)).unwrap_or_default(),
+        NodeRef::Place2D(id) => {
+            let mut out = vec![CeAttr::new("outUV", CeType::Vector).with_keyable(false).with_writable(false)];
+            out.extend(s.place(id).map(|p| bag_attrs(&p.attrs, &[], |_| true)).unwrap_or_default());
+            out
+        }
         NodeRef::Dependency(_) => vec![],
     }
 }
@@ -1211,33 +1215,26 @@ fn attr_connected(s: &Scene, node: &NodeRef, attr: &CeAttr, as_source: bool) -> 
         if s.conns.iter().any(|c| c.src == id && fam.contains(&c.src_attr.as_str())) {
             return true;
         }
-        if matches!(node, NodeRef::Texture(_)) && (attr.name == "outColor" || attr.name == "outAlpha") {
-            return output_wired(s, node, &attr.name);
+        if s.deps.connections.iter().any(|c| c.source.node == id && fam.contains(&c.source.attr.as_str())) {
+            return true;
         }
         return false;
     }
     if s.conns.iter().any(|c| c.dst == id && fam.contains(&c.dst_attr.as_str())) {
         return true;
     }
-    if let NodeRef::Material(mid) = node {
-        if let Some(m) = s.mats.get(mid) {
-            return m.maps.keys().any(|k| fam.contains(&k.as_str()));
-        }
-    }
-    false
+    s.deps.connections.iter().any(|c| c.destination.node == id && fam.contains(&c.destination.attr.as_str()))
 }
 
-/// Exact connection, including a texture map stored on the material.
+/// Exact connection, including texture-map and utility links stored in the dependency graph.
 fn connected(s: &Scene, src: &NodeRef, src_attr: &str, dst: &NodeRef, dst_attr: &str) -> bool {
     let (src, src_attr) = resolve_ce_plug(s, src, src_attr);
     let (dst, dst_attr) = resolve_ce_plug(s, dst, dst_attr);
-    if matches!(src, NodeRef::Texture(_)) && matches!(dst, NodeRef::Material(_)) && (src_attr == "outColor" || src_attr == "outAlpha") {
-        if let NodeRef::Material(mid) = &dst {
-            return s.mats.get(mid).and_then(|m| m.maps.get(&dst_attr)).and_then(|v| v.as_str()) == Some(s.ref_id(&src).as_str());
-        }
-    }
     let sid = s.ref_id(&src);
     let did = s.ref_id(&dst);
+    if s.deps.source_of(&inca_core::graph::PlugRef::new(&did, &dst_attr)) == Some(inca_core::graph::PlugRef::new(&sid, &src_attr)) {
+        return true;
+    }
     s.conns.iter().any(|c| c.src == sid && c.src_attr == src_attr && c.dst == did && c.dst_attr == dst_attr)
 }
 
@@ -1280,15 +1277,12 @@ fn neighbours(s: &Scene, node: &NodeRef, down: bool) -> Vec<NodeRef> {
             push(s.ref_by_id(&c.src));
         }
     }
-    for m in s.mats.values() {
-        for tid in m.maps.values() {
-            let Some(tid) = tid.as_str() else { continue };
-            if down && tid == id {
-                push(Some(NodeRef::Material(m.id.clone())));
-            }
-            if !down && m.id == id {
-                push(Some(NodeRef::Texture(tid.to_string())));
-            }
+    for c in &s.deps.connections {
+        if down && c.source.node == id {
+            push(s.shading_ref(&c.destination.node));
+        }
+        if !down && c.destination.node == id {
+            push(s.shading_ref(&c.source.node));
         }
     }
     if let NodeRef::Dag(id2) = node {
@@ -1339,10 +1333,10 @@ fn neighbours(s: &Scene, node: &NodeRef, down: bool) -> Vec<NodeRef> {
 fn selected_node(app: &IncaApp) -> Option<NodeRef> {
     if app.win.hypershade {
         if let Some(id) = &app.windows_state.hs_selected {
-            if app.s.mats.contains_key(id) {
+            if app.s.is_material(id) {
                 return Some(NodeRef::Material(id.clone()));
             }
-            if app.s.texs.contains_key(id) {
+            if app.s.is_texture(id) {
                 return Some(NodeRef::Texture(id.clone()));
             }
         }
@@ -1368,9 +1362,9 @@ pub fn load_connection_editor(app: &mut IncaApp) {
 /// Open the Connection Editor with the Hypershade's selected material or texture.
 pub fn open_for_hypershade(app: &mut IncaApp) {
     let Some(id) = app.windows_state.hs_selected.clone() else { return };
-    let node = if app.s.mats.contains_key(&id) {
+    let node = if app.s.is_material(&id) {
         NodeRef::Material(id)
-    } else if app.s.texs.contains_key(&id) {
+    } else if app.s.is_texture(&id) {
         NodeRef::Texture(id)
     } else {
         return;
@@ -1410,20 +1404,17 @@ fn resolve_ce_plug(s: &Scene, node: &NodeRef, attr: &str) -> (NodeRef, String) {
     }
 }
 
-/// The connection driving `dst.attr`, including a texture map stored on a material. Returns
+/// The connection driving `dst.attr`, including texture-map and utility links. Returns
 /// (source id, source attribute, is a texture map).
 fn input_conn(s: &Scene, dst: &NodeRef, attr: &str) -> Option<(String, String, bool)> {
     if let Some((target, target_attr)) = published_plug(s, dst, attr) {
         return input_conn(s, &target, &target_attr);
     }
-    if let NodeRef::Material(mid) = dst {
-        if let Some(m) = s.mats.get(mid) {
-            if let Some(tid) = m.maps.get(attr).and_then(|v| v.as_str()) {
-                return Some((tid.to_string(), m.map_out(attr).to_string(), true));
-            }
-        }
-    }
     let did = s.ref_id(dst);
+    if let Some(src) = s.deps.source_of(&inca_core::graph::PlugRef::new(&did, attr)) {
+        let is_map = s.is_texture(&src.node) && s.is_material(&did);
+        return Some((src.node, src.attr, is_map));
+    }
     s.conns.iter().find(|c| c.dst == did && c.dst_attr == attr).map(|c| (c.src.clone(), c.src_attr.clone(), false))
 }
 
@@ -1436,10 +1427,7 @@ fn output_wired(s: &Scene, src: &NodeRef, attr: &str) -> bool {
     if s.conns.iter().any(|c| c.src == sid && c.src_attr == attr) {
         return true;
     }
-    if matches!(src, NodeRef::Texture(_)) {
-        return s.mats.values().any(|m| m.maps.iter().any(|(slot, v)| v.as_str() == Some(sid.as_str()) && m.map_out(slot) == attr));
-    }
-    false
+    s.deps.connections.iter().any(|c| c.source.node == sid && c.source.attr == attr)
 }
 
 fn reload_side(app: &mut IncaApp, side: usize) {
@@ -1870,7 +1858,7 @@ mod tests {
         // texture maps live on the material, not in `Scene::conns`
         let m = s.create_material("standardSurface", Some("m"));
         let t = s.create_texture("checker", Some("tex"));
-        s.mats.get_mut(&m).unwrap().maps.insert("baseColor".into(), serde_json::json!(t));
+        s.set_material_map(&m, "baseColor", &t, "outColor");
         assert_eq!(input_conn(&s, &NodeRef::Material(m.clone()), "baseColor"), Some((t.clone(), "outColor".into(), true)));
         assert!(output_wired(&s, &NodeRef::Texture(t.clone()), "outColor"));
         assert!(!output_wired(&s, &NodeRef::Texture(t), "outAlpha"), "maps are recorded as outColor");
@@ -1930,7 +1918,7 @@ mod tests {
         let other = s.create_mesh("polyCube", &Params::new(), Some("b"));
         let container = s.create_container("asset1", None);
         s.conns.push(inca_core::scene::Conn { src: cube.clone(), src_attr: "translateX".into(), dst: other, dst_attr: "translateY".into() });
-        s.mats.get_mut(&mat).unwrap().maps.insert("baseColor".into(), serde_json::json!(tex.clone()));
+        s.set_material_map(&mat, "baseColor", &tex, "outColor");
         let published = |kind: &str, node: &str, attr: &str| inca_core::scene::PublishedAttr { kind: kind.into(), node: node.into(), index: 0, attr: attr.into() };
         {
             let n = s.nodes.get_mut(&container).unwrap();
@@ -2031,7 +2019,7 @@ mod tests {
 
         let mat = s.create_material("standardSurface", Some("m"));
         let tex = s.create_texture("checker", Some("t"));
-        s.mats.get_mut(&mat).unwrap().maps.insert("baseColor".into(), serde_json::json!(tex.clone()));
+        s.set_material_map(&mat, "baseColor", &tex, "outColor");
         let ma = ce_attrs(&s, &NodeRef::Material(mat.clone()));
         assert!(attr_connected(&s, &NodeRef::Material(mat.clone()), ma.iter().find(|x| x.name == "baseColor").unwrap(), false));
         let ta = ce_attrs(&s, &NodeRef::Texture(tex.clone()));

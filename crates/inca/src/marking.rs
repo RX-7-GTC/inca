@@ -189,7 +189,7 @@ fn object_menu_list(app: &IncaApp, t: &str) -> Vec<Option<Item>> {
         Some(cmd("Invert Selection", "invertSelection")),
         None,
         Some(sub("Assign New Material...", new_mats())),
-        Some(sub("Assign Existing Material", app.s.mats.values().map(|m| it(&m.name, Act::AssignExisting(m.name.clone()))).collect())),
+        Some(sub("Assign Existing Material", app.s.materials().into_iter().map(|m| it(&m.name, Act::AssignExisting(m.name.clone()))).collect())),
         Some(it("Material Attributes...", Act::Action("hypershade".into()))),
         None,
         Some(sub("Actions", ["hideSelection", "showLastHidden", "templateSel", "centerPivot", "freezeTransformations", "deleteHistory"].iter().map(|a| acmd(a)).collect())),
@@ -364,7 +364,7 @@ fn run(app: &mut IncaApp, act: Act) {
         }
         Act::SetTool(t) => app.set_tool(t),
         Act::HypershadeAssign(id) => {
-            if let Some(m) = app.s.mats.get(&id) {
+            if let Some(m) = app.s.material(&id) {
                 let _ = app.run_mel("assign material", &format!("hyperShade -assign {};", m.name));
             }
         }
@@ -374,7 +374,7 @@ fn run(app: &mut IncaApp, act: Act) {
         }
         Act::HypershadeDuplicate(id) => crate::hypershade::duplicate_shading_network(app, &id),
         Act::HypershadeRename(id) => {
-            if let Some(name) = app.s.mats.get(&id).map(|m| m.name.clone()).or_else(|| app.s.texs.get(&id).map(|t| t.name.clone())).or_else(|| app.s.node(&id).map(|n| n.name.clone())) {
+            if let Some(name) = app.s.material(&id).map(|m| m.name).or_else(|| app.s.texture(&id).map(|t| t.name)).or_else(|| app.s.node(&id).map(|n| n.name.clone())) {
                 app.windows_state.hs.rename = Some((id, name));
             }
         }
@@ -385,7 +385,7 @@ fn run(app: &mut IncaApp, act: Act) {
             }
         }
         Act::HypershadeAttributeEditor(id) => {
-            if app.s.mats.contains_key(&id) || app.s.texs.contains_key(&id) {
+            if app.s.is_material(&id) || app.s.is_texture(&id) {
                 crate::hypershade::select_shading_node(app, &id);
             } else {
                 app.select_names(std::slice::from_ref(&id), SelMode::Replace);
@@ -396,7 +396,7 @@ fn run(app: &mut IncaApp, act: Act) {
             app.right_tab = crate::app::RightTab::AttributeEditor;
         }
         Act::HypershadeShowNode(id) => {
-            if app.s.mats.contains_key(&id) || app.s.texs.contains_key(&id) {
+            if app.s.is_material(&id) || app.s.is_texture(&id) {
                 crate::hypershade::select_shading_node(app, &id);
             } else {
                 app.select_names(std::slice::from_ref(&id), SelMode::Replace);
@@ -417,7 +417,7 @@ fn run(app: &mut IncaApp, act: Act) {
         }
         Act::HypershadeCreateMaterial(ty) => {
             let _ = app.run_mel("create material", &format!("shadingNode -asShader {ty};"));
-            if let Some(id) = app.s.mats.keys().last().cloned() {
+            if let Some(id) = app.s.material_ids().last().cloned() {
                 let at = app.windows_state.hs.create_pos.take();
                 crate::hypershade::place_new_node(app, &id, at);
                 app.windows_state.hs_selected = Some(id);
@@ -425,7 +425,7 @@ fn run(app: &mut IncaApp, act: Act) {
         }
         Act::HypershadeCreateTexture(ty) => {
             let _ = app.run_mel("create texture", &format!("shadingNode -asTexture {ty};"));
-            if let Some(id) = app.s.texs.keys().last().cloned() {
+            if let Some(id) = app.s.texture_ids().last().cloned() {
                 let at = app.windows_state.hs.create_pos.take();
                 crate::hypershade::place_new_node(app, &id, at);
                 app.windows_state.hs_selected = Some(id);

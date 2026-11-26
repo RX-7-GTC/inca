@@ -895,15 +895,15 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let nm = a.s(&["n", "name"]);
             if ty == "place2dTexture" {
                 let id = s.create_place(nm.as_deref());
-                return Ok(Val::Str(s.places[&id].name.clone()));
+                return Ok(Val::Str(s.place(&id).map(|p| p.name).unwrap_or_default()));
             }
-            if crate::materials::MAT_TYPES.iter().any(|m| m.ty == ty) {
+            if crate::materials::is_material_kind(&ty) {
                 let id = s.create_material(&ty, nm.as_deref());
-                return Ok(Val::Str(s.mats[&id].name.clone()));
+                return Ok(Val::Str(s.material(&id).map(|m| m.name).unwrap_or_default()));
             }
             if crate::materials::tex_type(&ty).is_some() {
                 let id = s.create_texture(&ty, nm.as_deref());
-                return Ok(Val::Str(s.texs[&id].name.clone()));
+                return Ok(Val::Str(s.texture(&id).map(|t| t.name).unwrap_or_default()));
             }
             match ty.as_str() {
                 "transform" => {
@@ -920,14 +920,14 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "hyperShade" | "assignMaterial" => {
             let m = a.s(&["assign"]).or_else(|| a.strings().first().cloned()).ok_or("hyperShade: -assign material")?;
             let m = m.trim_end_matches("SG").to_string();
-            let mid = s.mats.values().find(|x| x.name == m).map(|x| x.id.clone()).ok_or(format!("No material named {m}"))?;
+            let mid = s.material_named(&m).ok_or(format!("No material named {m}"))?;
             assign_to_selection(s, &mid);
             Ok(Val::None)
         }
         "sets" => {
             if let Some(m) = a.s(&["fe", "forceElement"]) {
                 let m = m.trim_end_matches("SG").to_string();
-                let mid = s.mats.values().find(|x| x.name == m).map(|x| x.id.clone()).ok_or(format!("No material named {m}"))?;
+                let mid = s.material_named(&m).ok_or(format!("No material named {m}"))?;
                 let objs = a.strings();
                 if !objs.is_empty() {
                     let save = s.sel.clone();
@@ -1039,8 +1039,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                     }
                 }
                 Some(NodeRef::History(id, i)) => s.node(&id).unwrap().mesh().unwrap().history[i].ty.clone(),
-                Some(NodeRef::Material(id)) => s.mats[&id].ty.clone(),
-                Some(NodeRef::Texture(id)) => s.texs[&id].ty.clone(),
+                Some(NodeRef::Material(id)) | Some(NodeRef::Texture(id)) => s.deps.node(&id).map(|n| n.kind.clone()).unwrap_or_default(),
                 Some(NodeRef::Place2D(_)) => "place2dTexture".into(),
                 Some(NodeRef::Dependency(id)) => s.deps.node(&id).map(|n| n.kind.clone()).unwrap_or_default(),
                 None => return Err(format!("No object matches name: {n}")),
@@ -1076,12 +1075,18 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         }
         "rename" => {
             let st = a.strings();
-            let (obj, new) = match st.len() {
-                0 => return Err("rename: new name required".into()),
-                1 => (s.lead().cloned().ok_or("rename: nothing selected")?, st[0].clone()),
-                _ => (s.find(&st[0]).ok_or(format!("No object matches name: {}", st[0]))?, st[1].clone()),
-            };
-            Ok(Val::Str(rename(s, &obj, &new)))
+            if st.len() >= 2 {
+                if let Some(id) = s.find(&st[0]) {
+                    return Ok(Val::Str(rename(s, &id, &st[1])));
+                }
+                if let Some(n) = s.deps.find(&st[0]).map(|n| n.id.clone()) {
+                    return Ok(Val::Str(s.rename_shading_node(&n, &st[1]).unwrap_or_default()));
+                }
+                return Err(format!("No object matches name: {}", st[0]));
+            }
+            let obj = s.lead().cloned().ok_or("rename: nothing selected")?;
+            let new = st.first().ok_or("rename: new name required")?;
+            Ok(Val::Str(rename(s, &obj, new)))
         }
         "parent" => {
             let mut objs = targets(s, &a);
@@ -1858,8 +1863,15 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let (o, at) = t.split_once('.').ok_or(format!("{t}: expected node.attribute"))?;
             let r = s.resolve(o).ok_or(format!("No object matches name: {o}"))?;
             let (id, at) = s.resolve_plug(&r, at);
-            let input = s.conns.iter().find(|c| c.dst == id && c.dst_attr == at).cloned();
-            let outs: Vec<Conn> = s.conns.iter().filter(|c| c.src == id && c.src_attr == at).cloned().collect();
+            let plug_ref = crate::graph::PlugRef::new(&id, &at);
+            let input = s
+                .conns
+                .iter()
+                .find(|c| c.dst == id && c.dst_attr == at)
+                .cloned()
+                .or_else(|| s.deps.source_of(&plug_ref).map(|p| Conn { src: p.node, src_attr: p.attr, dst: id.clone(), dst_attr: at.clone() }));
+            let mut outs: Vec<Conn> = s.conns.iter().filter(|c| c.src == id && c.src_attr == at).cloned().collect();
+            outs.extend(s.deps.destinations_of(&plug_ref).into_iter().map(|p| Conn { src: id.clone(), src_attr: at.clone(), dst: p.node, dst_attr: p.attr }));
             let plug = |s: &Scene, node: &str, attr: &str| s.ref_by_id(node).map(|r| format!("{}.{attr}", s.ref_name(&r))).unwrap_or_default();
             if a.has(&["sfd", "sourceFromDestination"]) {
                 return Ok(Val::Str(input.map(|c| plug(s, &c.src, &c.src_attr)).unwrap_or_default()));
@@ -2347,21 +2359,27 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             };
             let (src, sa) = parse(&st[0])?;
             let (dst, da) = parse(&st[1])?;
-            // a texture's output into a material attribute is a texture map (what the shaders read)
-            if s.texs.contains_key(&src) && s.mats.contains_key(&dst) && matches!(sa.as_str(), "outColor" | "oc" | "outAlpha" | "oa") {
-                let out = if matches!(sa.as_str(), "outAlpha" | "oa") { "outAlpha" } else { "outColor" };
-                let m = s.mats.get_mut(&dst).unwrap();
+            let short = |a: &str| match a {
+                "oc" => "outColor".to_string(),
+                "oa" => "outAlpha".to_string(),
+                _ => a.to_string(),
+            };
+            if s.deps.node(&src).is_some() && s.deps.node(&dst).is_some() {
+                let src_plug = crate::graph::PlugRef::new(&src, &short(&sa));
+                let dst_plug = crate::graph::PlugRef::new(&dst, &da);
                 match name {
                     "connectAttr" => {
-                        if m.maps.contains_key(&da) && !a.has(&["f", "force"]) {
+                        if s.deps.source_of(&dst_plug).is_some() && !a.has(&["f", "force"]) {
                             return Err(format!("'{}' is already connected.", st[1]));
                         }
-                        m.set_map(&da, &src, out);
+                        if !s.deps.connect(src_plug, dst_plug) {
+                            return Err(format!("connectAttr: cannot connect '{}' to '{}'", st[0], st[1]));
+                        }
                     }
                     "disconnectAttr" => {
-                        m.clear_map(&da);
+                        s.deps.disconnect(&dst_plug);
                     }
-                    _ => return Ok(Val::Int((m.maps.get(&da).and_then(|v| v.as_str()) == Some(src.as_str()) && m.map_out(&da) == out) as i64)),
+                    _ => return Ok(Val::Int((s.deps.source_of(&dst_plug).as_ref() == Some(&src_plug)) as i64)),
                 }
                 s.touch();
                 return Ok(Val::None);
@@ -2401,6 +2419,18 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                     }
                     if c.src == id && at.as_ref().is_none_or(|x| *x == c.src_attr) {
                         if let Some(r) = s.ref_by_id(&c.dst) {
+                            out.push(s.ref_name(&r));
+                        }
+                    }
+                }
+                for c in &s.deps.connections {
+                    if c.destination.node == id && at.as_ref().is_none_or(|x| *x == c.destination.attr) {
+                        if let Some(r) = s.ref_by_id(&c.source.node) {
+                            out.push(s.ref_name(&r));
+                        }
+                    }
+                    if c.source.node == id && at.as_ref().is_none_or(|x| *x == c.source.attr) {
+                        if let Some(r) = s.ref_by_id(&c.destination.node) {
                             out.push(s.ref_name(&r));
                         }
                     }
@@ -2783,7 +2813,7 @@ fn ls(s: &Scene, a: &Args) -> Result<Val, String> {
     let long = a.has(&["l", "long"]);
     let nm = |id: &Id| if long { s.full_path(id) } else { s.name_of(id) };
     if a.has(&["mat", "materials"]) {
-        return Ok(strs(s.mats.values().map(|m| m.name.clone()).collect()));
+        return Ok(strs(s.materials().into_iter().map(|m| m.name).collect()));
     }
     if a.has(&["sl", "selection"]) {
         let mut out = vec![];
@@ -2828,7 +2858,7 @@ fn ls(s: &Scene, a: &Args) -> Result<Val, String> {
         }
     }
     if ty.is_none() && !a.has(&["dag", "tr", "transforms", "s", "shapes", "lt", "ca", "geometry", "v"]) && filter_names.is_empty() {
-        out.extend(s.mats.values().map(|m| m.name.clone()));
+        out.extend(s.materials().into_iter().map(|m| m.name));
     }
     Ok(strs(out))
 }
@@ -3177,7 +3207,7 @@ mod tests {
         assert!((v - 8.0).abs() < 1e-6, "{v}");
         mel(&mut s, "string $m = `shadingNode -asShader blinn`; select pCube1; hyperShade -assign $m;").unwrap();
         let c = s.find("pCube1").unwrap();
-        assert_eq!(s.mats[&s.node(&c).unwrap().mesh().unwrap().material].name, "blinn1");
+        assert_eq!(s.material(&s.node(&c).unwrap().mesh().unwrap().material).unwrap().name, "blinn1");
     }
 
     #[test]

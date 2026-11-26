@@ -86,14 +86,16 @@ fn import_inca(s: &mut Scene, path: &Path) -> Result<Vec<Id>, String> {
         for m in mats {
             let name = m["name"].as_str().unwrap_or("material1");
             if name == "lambert1" || name == "standardSurface1" {
-                if let Some(id) = s.mats.values().find(|x| x.name == name).map(|x| x.id.clone()) {
+                if let Some(id) = s.material_named(name) {
                     mat_map.insert(m["id"].as_str().unwrap_or("").to_string(), id);
                 }
                 continue;
             }
             let id = s.create_material(m["type"].as_str().unwrap_or("lambert"), Some(name));
             if let Some(a) = m["attrs"].as_object() {
-                s.mats.get_mut(&id).unwrap().attrs.extend(a.clone());
+                for (k, v) in a {
+                    s.set_dep_attr(&id, k, v.clone());
+                }
             }
             mat_map.insert(m["id"].as_str().unwrap_or("").to_string(), id);
         }
@@ -130,14 +132,14 @@ fn import_obj(s: &mut Scene, path: &Path) -> Result<Vec<Id>, String> {
         .map(|m| {
             let id = s.create_material(if m.shininess.unwrap_or(0.0) > 1.0 { "blinn" } else { "lambert" }, Some(&m.name));
             if let Some(d) = m.diffuse {
-                s.mats.get_mut(&id).unwrap().attrs.insert("color".into(), json!([d[0], d[1], d[2]]));
-                s.mats.get_mut(&id).unwrap().attrs.insert("diffuse".into(), json!(1.0));
+                s.set_dep_attr(&id, "color", json!([d[0], d[1], d[2]]));
+                s.set_dep_attr(&id, "diffuse", json!(1.0));
             }
             if let Some(tex) = &m.diffuse_texture {
                 let t = s.create_texture("file", None);
                 let full = path.parent().map(|p| p.join(tex)).unwrap_or_else(|| tex.into());
-                s.texs.get_mut(&t).unwrap().attrs.insert("fileTextureName".into(), json!(full.to_string_lossy()));
-                s.mats.get_mut(&id).unwrap().maps.insert("color".into(), json!(t));
+                s.set_dep_attr(&t, "fileTextureName", json!(full.to_string_lossy()));
+                s.set_material_map(&id, "color", &t, "outColor");
             }
             id
         })
@@ -183,15 +185,14 @@ fn import_gltf(s: &mut Scene, path: &Path) -> Result<Vec<Id>, String> {
             let id = s.create_material("standardSurface", Some(m.name().unwrap_or("gltfMaterial1")));
             let pbr = m.pbr_metallic_roughness();
             let c = pbr.base_color_factor();
-            let a = &mut s.mats.get_mut(&id).unwrap().attrs;
-            a.insert("baseColor".into(), json!([c[0], c[1], c[2]]));
-            a.insert("base".into(), json!(1.0));
-            a.insert("metalness".into(), json!(pbr.metallic_factor()));
-            a.insert("specularRoughness".into(), json!(pbr.roughness_factor()));
+            s.set_dep_attr(&id, "baseColor", json!([c[0], c[1], c[2]]));
+            s.set_dep_attr(&id, "base", json!(1.0));
+            s.set_dep_attr(&id, "metalness", json!(pbr.metallic_factor()));
+            s.set_dep_attr(&id, "specularRoughness", json!(pbr.roughness_factor()));
             let e = m.emissive_factor();
             if e.iter().any(|x| *x > 0.0) {
-                a.insert("emission".into(), json!(1.0));
-                a.insert("emissionColor".into(), json!(e));
+                s.set_dep_attr(&id, "emission", json!(1.0));
+                s.set_dep_attr(&id, "emissionColor", json!(e));
             }
             id
         })
@@ -322,7 +323,7 @@ fn export_obj(s: &Scene, path: &Path, sel_only: bool) -> Result<(), String> {
         for fi in 0..pm.f.len() {
             let mat = pm.face_mat(fi).cloned().unwrap_or(ms.material.clone());
             if mat != cur_mat {
-                let name = s.mats.get(&mat).map(|m| m.name.clone()).unwrap_or("default".into());
+                let name = s.material(&mat).map(|m| m.name.clone()).unwrap_or("default".into());
                 o += &format!("usemtl {name}\n");
                 if !used_mats.contains(&mat) {
                     used_mats.push(mat.clone());
@@ -347,7 +348,7 @@ fn export_obj(s: &Scene, path: &Path, sel_only: bool) -> Result<(), String> {
     std::fs::write(path, o).map_err(|e| e.to_string())?;
     let mut m = String::new();
     for id in used_mats {
-        let Some(mat) = s.mats.get(&id) else { continue };
+        let Some(mat) = s.material(&id) else { continue };
         let p = mat.pbr();
         m += &format!("newmtl {}\nKd {} {} {}\nKs {s} {s} {s}\nNs {}\nd {}\n\n", mat.name, p.base[0], p.base[1], p.base[2], (1.0 - p.roughness) * 200.0, p.opacity, s = p.specular * 0.5);
     }
@@ -444,10 +445,10 @@ fn export_glb(s: &Scene, path: &Path, sel_only: bool) -> Result<(), String> {
             attr.insert(name.into(), json!(accessors.len() - 1));
         }
         let mi = *mat_index.entry(ms.material.clone()).or_insert_with(|| {
-            let m = s.mats.get(&ms.material);
-            let p = m.map(|m| m.pbr()).unwrap_or_default();
+            let m = s.material(&ms.material);
+            let p = m.as_ref().map(|m| m.pbr()).unwrap_or_default();
             materials.push(json!({
-                "name": m.map(|m| m.name.clone()).unwrap_or_default(),
+                "name": m.as_ref().map(|m| m.name.clone()).unwrap_or_default(),
                 "pbrMetallicRoughness": { "baseColorFactor": [p.base[0], p.base[1], p.base[2], p.opacity], "metallicFactor": p.metalness, "roughnessFactor": p.roughness },
                 "emissiveFactor": [p.emission[0].min(1.0), p.emission[1].min(1.0), p.emission[2].min(1.0)],
             }));
