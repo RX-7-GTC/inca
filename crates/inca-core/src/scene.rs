@@ -246,12 +246,25 @@ pub struct HistoryNode {
     pub error: Option<String>,
 }
 
+fn history_params(n: &crate::graph::DepNode) -> Params {
+    n.attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Lightweight construction-history entry for lists and tabs (no attribute maps).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryMeta {
+    pub id: Id,
+    pub name: String,
+    pub ty: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MeshShape {
     pub material: Id,
     pub smooth_level: u32,
     pub nurbs: bool,
-    pub history: Vec<HistoryNode>,
+    /// Dependency-node ids of the construction-history chain, first input to last output.
+    pub history: Vec<Id>,
     pub mesh: PolyMesh,
 }
 
@@ -1684,7 +1697,7 @@ impl Scene {
         }
         for n in self.nodes.values() {
             if let Some(m) = n.mesh() {
-                if let Some(i) = m.history.iter().position(|h| h.name == name) {
+                if let Some(i) = m.history.iter().position(|hid| self.deps.node(hid).is_some_and(|h| h.name == name)) {
                     return Some(NodeRef::History(n.id.clone(), i));
                 }
             }
@@ -1695,7 +1708,7 @@ impl Scene {
     pub fn ref_name(&self, r: &NodeRef) -> String {
         match r {
             NodeRef::Dag(id) => self.nodes.get(id).map(|n| n.name.clone()).unwrap_or_default(),
-            NodeRef::History(id, i) => self.nodes.get(id).and_then(|n| n.mesh()).and_then(|m| m.history.get(*i)).map(|h| h.name.clone()).unwrap_or_default(),
+            NodeRef::History(id, i) => self.history_node(id, *i).map(|h| h.name).unwrap_or_default(),
             NodeRef::Material(id) | NodeRef::Texture(id) | NodeRef::Place2D(id) | NodeRef::Dependency(id) => self.deps.node(id).map(|n| n.name.clone()).unwrap_or_default(),
         }
     }
@@ -1970,8 +1983,10 @@ impl Scene {
                     self.release_name(s);
                 }
                 if let Shape::Mesh(m) = &n.shape {
-                    for h in &m.history {
-                        self.release_name(&h.name);
+                    for hid in &m.history {
+                        if let Some(h) = self.deps.remove(hid) {
+                            self.names.remove(&h.name);
+                        }
                     }
                 }
             }
@@ -1989,7 +2004,7 @@ impl Scene {
         let users: Vec<Id> = self
             .nodes
             .values()
-            .filter(|n| n.mesh().is_some_and(|m| m.history.iter().any(|h| h.params.values().any(|v| v.as_str().is_some_and(|s| ids.iter().any(|d| d == s))))))
+            .filter(|n| n.mesh().is_some_and(|m| m.history.iter().any(|hid| self.deps.node(hid).is_some_and(|h| h.attrs.values().any(|v| v.as_str().is_some_and(|s| ids.iter().any(|d| d == s)) || v.as_array().is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(|s| ids.iter().any(|d| d == s)))))))))
             .map(|n| n.id.clone())
             .collect();
         for u in users {
@@ -2018,28 +2033,100 @@ impl Scene {
     }
 
     // ------------------------------------------------------------ history
+    /// Dependency node at one position in a mesh's construction history.
+    pub fn history_node(&self, mesh_id: &str, idx: usize) -> Option<HistoryNode> {
+        let hid = self.nodes.get(mesh_id)?.mesh()?.history.get(idx)?;
+        let n = self.deps.node(hid)?;
+        Some(HistoryNode { id: n.id.clone(), name: n.name.clone(), ty: n.kind.clone(), params: history_params(n), out: None, error: n.error.clone() })
+    }
+
+    pub fn history_view(&self, mesh_id: &str) -> Vec<HistoryNode> {
+        let len = self.nodes.get(mesh_id).and_then(|n| n.mesh()).map(|m| m.history.len()).unwrap_or(0);
+        (0..len).filter_map(|i| self.history_node(mesh_id, i)).collect()
+    }
+
+    pub fn history_meta(&self, mesh_id: &str, idx: usize) -> Option<HistoryMeta> {
+        let hid = self.nodes.get(mesh_id)?.mesh()?.history.get(idx)?;
+        let n = self.deps.node(hid)?;
+        Some(HistoryMeta { id: n.id.clone(), name: n.name.clone(), ty: n.kind.clone() })
+    }
+
+    pub fn history_metas(&self, mesh_id: &str) -> Vec<HistoryMeta> {
+        let len = self.nodes.get(mesh_id).and_then(|n| n.mesh()).map(|m| m.history.len()).unwrap_or(0);
+        (0..len).filter_map(|i| self.history_meta(mesh_id, i)).collect()
+    }
+
+    /// Cached output of one history node (not saved with the scene).
+    pub fn history_out(&self, mesh_id: &str, idx: usize) -> Option<PolyMesh> {
+        let hid = self.nodes.get(mesh_id)?.mesh()?.history.get(idx)?;
+        self.deps.node(hid)?.mesh_out.clone()
+    }
+
+    pub fn history_error(&self, mesh_id: &str, idx: usize) -> Option<String> {
+        let hid = self.nodes.get(mesh_id)?.mesh()?.history.get(idx)?;
+        self.deps.node(hid)?.error.clone()
+    }
+
+    pub fn history_id(&self, mesh_id: &str, idx: usize) -> Option<Id> {
+        self.nodes.get(mesh_id)?.mesh()?.history.get(idx).cloned()
+    }
+
+    pub fn history_find(&self, mesh_id: &str, ty: &str) -> Option<usize> {
+        let m = self.nodes.get(mesh_id)?.mesh()?;
+        m.history.iter().position(|id| self.deps.node(id).is_some_and(|n| n.kind == ty))
+    }
+
+    pub fn clear_history(&mut self, mesh_id: &str) {
+        let ids = self.nodes.get(mesh_id).and_then(|n| n.mesh()).map(|m| m.history.clone()).unwrap_or_default();
+        for hid in ids {
+            if let Some(n) = self.deps.remove(&hid) {
+                self.names.remove(&n.name);
+            }
+        }
+        if let Some(m) = self.nodes.get_mut(mesh_id).and_then(|n| n.mesh_mut()) {
+            m.history.clear();
+        }
+    }
+
+    pub fn remove_history_node(&mut self, mesh_id: &str, hid: &str) {
+        if let Some(m) = self.nodes.get_mut(mesh_id).and_then(|n| n.mesh_mut()) {
+            m.history.retain(|id| id != hid);
+        }
+        if let Some(n) = self.deps.remove(hid) {
+            self.names.remove(&n.name);
+        }
+        self.touch();
+    }
+
     pub fn add_history(&mut self, id: &str, ty: &str, params: Params) -> OpOut {
+        if self.nodes.get(id).and_then(|n| n.mesh()).is_none() {
+            return OpOut::default();
+        }
         let (base, hidden, _) = ops::info(ty).unwrap_or((ty, false, &[]));
         let hid = self.new_id("h");
         let name = if hidden { format!("{base}#{hid}") } else { self.unique_name(&format!("{base}1")) };
-        if let Some(m) = self.nodes.get_mut(id).and_then(|n| n.mesh_mut()) {
-            // a generator replaces everything below it
-            m.history.push(HistoryNode { id: hid, name, ty: ty.into(), params, out: None, error: None });
-            let last = m.history.len() - 1;
-            return self.evaluate(id, last);
+        let mut node = crate::graph::DepNode::new(&hid, &name, ty);
+        for (k, v) in &params {
+            node.add_attr(k, crate::graph::AttrSpec::any(v.clone()));
         }
-        OpOut::default()
+        self.deps.insert(node);
+        let last = if let Some(m) = self.nodes.get_mut(id).and_then(|n| n.mesh_mut()) {
+            m.history.push(hid);
+            m.history.len() - 1
+        } else {
+            return OpOut::default();
+        };
+        self.evaluate(id, last)
     }
 
     /// Re-run history from entry `from` (falls back to the start when caches are missing).
     pub fn evaluate(&mut self, id: &str, from: usize) -> OpOut {
-        let Some(node) = self.nodes.get(id) else { return OpOut::default() };
-        let Some(ms) = node.mesh() else { return OpOut::default() };
-        let mut history = ms.history.clone();
+        let Some(ms) = self.nodes.get(id).and_then(|n| n.mesh()) else { return OpOut::default() };
+        let history = ms.history.clone();
         let mut start = from.min(history.len());
         let mut pm = if start > 0 {
-            match &history[start - 1].out {
-                Some(m) => m.clone(),
+            match self.deps.node(&history[start - 1]).and_then(|n| n.mesh_out.clone()) {
+                Some(m) => m,
                 None => {
                     start = 0;
                     PolyMesh::default()
@@ -2049,19 +2136,24 @@ impl Scene {
             PolyMesh::default()
         };
         let mut last = OpOut::default();
-        for h in history.iter_mut().skip(start) {
-            match ops::apply(&h.ty, &pm, &h.params, self) {
+        for hid in history.iter().skip(start) {
+            let Some(node) = self.deps.node(hid) else { continue };
+            let ty = node.kind.clone();
+            let params = history_params(node);
+            let result = ops::apply(&ty, &pm, &params, self);
+            let Some(node) = self.deps.node_mut(hid) else { continue };
+            match result {
                 Ok(out) => {
                     pm = out.mesh.clone();
-                    h.error = None;
+                    node.error = None;
                     last = out;
                 }
                 Err(e) => {
-                    h.error = Some(e);
+                    node.error = Some(e);
                     last = OpOut { mesh: pm.clone(), ..Default::default() };
                 }
             }
-            h.out = Some(pm.clone());
+            node.mesh_out = Some(pm.clone());
         }
         let n = self.nodes.get_mut(id).unwrap();
         let ms = n.mesh_mut().unwrap();
@@ -2069,15 +2161,24 @@ impl Scene {
             ms.mesh = pm;
         }
         bake_fm(ms);
-        ms.history = history;
         n.rev += 1;
         self.touch();
         last
     }
 
     pub fn set_history_param(&mut self, id: &str, idx: usize, key: &str, v: Value) {
-        if let Some(h) = self.nodes.get_mut(id).and_then(|n| n.mesh_mut()).and_then(|m| m.history.get_mut(idx)) {
-            h.params.insert(key.into(), v);
+        self.set_history_params(id, idx, &[(key.to_string(), v)]);
+    }
+
+    pub fn set_history_params(&mut self, id: &str, idx: usize, values: &[(String, Value)]) {
+        let Some(hid) = self.history_id(id, idx) else { return };
+        if let Some(h) = self.deps.node_mut(&hid) {
+            for (key, v) in values {
+                if h.spec(key).is_none() {
+                    h.add_attr(key, crate::graph::AttrSpec::any(v.clone()));
+                }
+                h.set(key, v.clone());
+            }
         }
         self.evaluate(id, idx);
         // meshes whose history reads this node (booleans, curve surfaces) follow
@@ -2093,7 +2194,7 @@ impl Scene {
     /// (curve surfaces, booleans, deformer handles, skin joints).
     pub fn refresh_many(&mut self, srcs: &[Id]) {
         let ids: HashSet<String> = srcs.iter().flat_map(|s| self.subtree(s)).collect();
-        if ids.is_empty() || !self.nodes.values().any(|n| n.mesh().is_some_and(|m| m.history.len() > 1 || m.history.first().is_some_and(|h| h.ty != "meshData"))) {
+        if ids.is_empty() {
             return;
         }
         let refs = |v: &Value| v.as_str().is_some_and(|s| ids.contains(s)) || v.as_array().is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(|s| ids.contains(s))));
@@ -2102,7 +2203,7 @@ impl Scene {
             .values()
             .filter_map(|n| {
                 let m = n.mesh()?;
-                let i = m.history.iter().position(|h| h.params.values().any(&refs))?;
+                let i = m.history.iter().position(|hid| self.deps.node(hid).is_some_and(|h| h.attrs.values().any(&refs)))?;
                 Some((n.id.clone(), i))
             })
             .collect();
@@ -2112,17 +2213,21 @@ impl Scene {
     }
 
     pub fn bake_mesh(&mut self, id: &str, pm: PolyMesh) {
-        let names: Vec<String> = self.nodes.get(id).and_then(|n| n.mesh()).map(|m| m.history.iter().map(|h| h.name.clone()).collect()).unwrap_or_default();
-        for n in names {
-            self.release_name(&n);
+        let ids = self.nodes.get(id).and_then(|n| n.mesh()).map(|m| m.history.clone()).unwrap_or_default();
+        for hid in ids {
+            if let Some(n) = self.deps.remove(&hid) {
+                self.names.remove(&n.name);
+            }
         }
         let hid = self.new_id("h");
+        let mut node = crate::graph::DepNode::new(&hid, &format!("meshData#{hid}"), "meshData");
+        let data = serde_json::to_value(&pm).unwrap_or(Value::Null);
+        node.add_attr("data", crate::graph::AttrSpec::any(data));
+        node.mesh_out = Some(pm.clone());
+        self.deps.insert(node);
         if let Some(n) = self.nodes.get_mut(id) {
             if let Some(m) = n.mesh_mut() {
-                let data = serde_json::to_value(&pm).unwrap_or(Value::Null);
-                let mut params = Params::new();
-                params.insert("data".into(), data);
-                m.history = vec![HistoryNode { id: hid.clone(), name: format!("meshData#{hid}"), ty: "meshData".into(), params, out: Some(pm.clone()), error: None }];
+                m.history = vec![hid];
                 m.mesh = pm;
                 bake_fm(m);
             }
@@ -2170,6 +2275,9 @@ impl Scene {
             let parent = self.nodes.get(id).and_then(|n| n.parent.clone());
             let mut root = None;
             for mut d in datas {
+                if let Some(o) = d.as_object_mut() {
+                    o.remove("historyIds");
+                }
                 let old = d["id"].as_str().unwrap_or("").to_string();
                 let par = if old == *id { parent.clone() } else { d["parent"].as_str().and_then(|p| map.get(p).cloned()) };
                 if !keep_history && d["kind"] == "mesh" {
@@ -2390,8 +2498,9 @@ impl Scene {
                 }
             }
             NodeRef::History(id, i) => {
-                let h = self.nodes.get(id)?.mesh()?.history.get(*i)?;
-                h.params.get(attr).cloned().or_else(|| primitives::gen_info(&h.ty).and_then(|g| g.params.iter().find(|p| p.0 == attr).map(|p| json!(p.1))))
+                let hid = self.nodes.get(id)?.mesh()?.history.get(*i)?;
+                let n = self.deps.node(hid)?;
+                n.get(attr).or_else(|| primitives::gen_info(&n.kind).and_then(|g| g.params.iter().find(|p| p.0 == attr).map(|p| json!(p.1))))
             }
             NodeRef::Material(id) | NodeRef::Texture(id) | NodeRef::Place2D(id) => self.deps.get(&crate::graph::PlugRef::new(id, attr)),
             NodeRef::Dependency(id) => self.deps.get(&crate::graph::PlugRef::new(id, attr)),
@@ -4105,13 +4214,16 @@ impl Scene {
             return Some(NodeRef::Dag(id.into()));
         }
         if self.deps.nodes.contains_key(id) {
+            if let Some(r) = self.history_ref_by_id(id) {
+                return Some(r);
+            }
             return self.shading_ref(id);
         }
         self.history_ref_by_id(id)
     }
     fn history_ref_by_id(&self, hid: &str) -> Option<NodeRef> {
         for n in self.nodes.values() {
-            if let Some(i) = n.mesh().and_then(|m| m.history.iter().position(|h| h.id == hid)) {
+            if let Some(i) = n.mesh().and_then(|m| m.history.iter().position(|h| h == hid)) {
                 return Some(NodeRef::History(n.id.clone(), i));
             }
         }
@@ -4120,7 +4232,7 @@ impl Scene {
     pub fn ref_id(&self, r: &NodeRef) -> Id {
         match r {
             NodeRef::Dag(i) | NodeRef::Material(i) | NodeRef::Texture(i) | NodeRef::Place2D(i) | NodeRef::Dependency(i) => i.clone(),
-            NodeRef::History(n, i) => self.nodes.get(n).and_then(|n| n.mesh()).and_then(|m| m.history.get(*i)).map(|h| h.id.clone()).unwrap_or_default(),
+            NodeRef::History(n, i) => self.nodes.get(n).and_then(|n| n.mesh()).and_then(|m| m.history.get(*i)).cloned().unwrap_or_default(),
         }
     }
 
@@ -4383,7 +4495,12 @@ impl Scene {
         let redo = std::mem::take(&mut self.redo_stack);
         let comp_mode = self.comp_mode;
         let hilite = self.hilite.clone();
+        let next_rev = self.nodes.values().map(|n| n.rev).max().unwrap_or(0).wrapping_add(1);
         let _ = self.load(d);
+        // Keep the viewport and mesh caches invalidating across repeated undo/redo restores.
+        for n in self.nodes.values_mut() {
+            n.rev = next_rev;
+        }
         // JS `Undo.restore`: component mode, the hilite and the component selections come back
         self.comp_mode = d.get("compMode").and_then(|v| serde_json::from_value(v.clone()).ok()).flatten().or(comp_mode);
         if let Some(h) = d.get("hilite").and_then(|v| v.as_array()) {
@@ -4418,7 +4535,8 @@ impl Scene {
                 o.insert("material".into(), json!(m.material));
                 o.insert("smoothLevel".into(), json!(m.smooth_level));
                 o.insert("nurbs".into(), json!(m.nurbs));
-                o.insert("history".into(), serde_json::to_value(&m.history).unwrap());
+                o.insert("history".into(), serde_json::to_value(self.history_view(id)).unwrap());
+                o.insert("historyIds".into(), json!(m.history));
                 o.insert("mesh".into(), serde_json::to_value(&m.mesh).unwrap());
             }
             Shape::Light(l) => {
@@ -4469,17 +4587,28 @@ impl Scene {
         let shape = match kind.as_str() {
             "mesh" => {
                 let mesh: PolyMesh = serde_json::from_value(d["mesh"].clone()).unwrap_or_default();
-                let mut history: Vec<HistoryNode> = serde_json::from_value(d["history"].clone()).unwrap_or_default();
-                for h in &mut history {
-                    if fresh {
-                        h.id = self.new_id("h");
+                let stored: Vec<Id> = d["historyIds"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).filter(|id| self.deps.node(id).is_some()).collect()).unwrap_or_default();
+                let history = if stored.is_empty() {
+                    let legacy: Vec<HistoryNode> = serde_json::from_value(d["history"].clone()).unwrap_or_default();
+                    let mut ids = Vec::with_capacity(legacy.len());
+                    for h in legacy {
+                        let hid = if fresh || h.id.is_empty() { self.new_id("h") } else { h.id.clone() };
+                        let name = if h.name.contains('#') { h.name } else if fresh { self.unique_name(&h.name) } else { self.claim(&h.name) };
+                        let mut n = crate::graph::DepNode::new(&hid, &name, &h.ty);
+                        for (k, v) in h.params {
+                            n.add_attr(&k, crate::graph::AttrSpec::any(v));
+                        }
+                        self.deps.insert(n);
+                        ids.push(hid);
                     }
-                    if !h.name.contains('#') {
-                        h.name = if fresh { self.unique_name(&h.name) } else { self.claim(&h.name) };
+                    ids
+                } else {
+                    stored
+                };
+                if let Some(hid) = history.last() {
+                    if let Some(n) = self.deps.node_mut(hid) {
+                        n.mesh_out = Some(mesh.clone());
                     }
-                }
-                if let Some(l) = history.last_mut() {
-                    l.out = Some(mesh.clone());
                 }
                 let material = d["material"].as_str().filter(|m| self.is_material(m)).map(String::from).unwrap_or(self.default_mat.clone());
                 Shape::Mesh(Box::new(MeshShape { material, smooth_level: d["smoothLevel"].as_u64().unwrap_or(0) as u32, nurbs: d["nurbs"].as_bool().unwrap_or(false), history, mesh }))
@@ -4675,6 +4804,11 @@ impl Scene {
         self.sync_display_layer_order();
         self.ensure_anim_layer_nodes();
         self.ensure_display_layer_nodes();
+        // Restored/serialized nodes have no revision, but the viewport caches by it: a second
+        // undo (or a load followed by undo) can otherwise keep showing the previous mesh.
+        for n in self.nodes.values_mut() {
+            n.rev = n.rev.wrapping_add(1);
+        }
         self.touch();
         Ok(())
     }
@@ -5204,7 +5338,7 @@ mod tests {
         assert_eq!(s.name_of(&a), "pCube1");
         assert_eq!(s.name_of(&b), "pCube2");
         assert_eq!(s.nodes[&a].shape_name.as_deref(), Some("pCubeShape1"));
-        assert_eq!(s.nodes[&a].mesh().unwrap().history[0].name, "polyCube1");
+        assert_eq!(s.history_node(&a, 0).unwrap().name, "polyCube1");
     }
 
     #[test]
@@ -6661,6 +6795,66 @@ mod tests {
         assert_eq!(old.texture("x2").unwrap().place.as_deref(), Some("p3"));
         assert_eq!(old.place("p3").unwrap().attrs["repeatU"], json!(2.0));
         assert_eq!(old.deps.source_of(&crate::graph::PlugRef::new("m1", "color")), Some(crate::graph::PlugRef::new("x2", "outColor")));
+    }
+
+    #[test]
+    fn history_ops_are_dependency_nodes_and_round_trip() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let gen = s.history_id(&id, 0).expect("primitive history node");
+        assert_eq!(s.deps.node(&gen).unwrap().kind, "polyCube");
+        assert_eq!(s.history_node(&id, 0).unwrap().name, "polyCube1");
+        assert_eq!(s.get_attr(&NodeRef::History(id.clone(), 0), "width"), Some(json!(1.0)));
+
+        let mut p = Params::new();
+        p.insert("faces".into(), json!([0]));
+        p.insert("localTranslateZ".into(), json!(0.5));
+        s.add_history(&id, "polyExtrudeFace", p);
+        assert_eq!(s.node(&id).unwrap().mesh().unwrap().history.len(), 2);
+        assert_eq!(s.history_node(&id, 1).unwrap().name, "polyExtrudeFace1");
+        let extrude = s.history_id(&id, 1).unwrap();
+        assert_eq!(s.deps.node(&extrude).unwrap().kind, "polyExtrudeFace");
+
+        let v = s.serialize();
+        let mut back = Scene::new();
+        back.load(&v).unwrap();
+        assert_eq!(back.history_id(&id, 1).as_deref(), Some(extrude.as_str()));
+        assert_eq!(back.deps.node(&extrude).unwrap().kind, "polyExtrudeFace");
+        assert_eq!(back.get_attr(&NodeRef::History(id.clone(), 1), "localTranslateZ"), Some(json!(0.5)));
+
+        // editing the node changes the evaluated mesh after a round trip
+        let before = back.node(&id).unwrap().mesh().unwrap().mesh.v.clone();
+        back.set_history_param(&id, 1, "localTranslateZ", json!(1.5));
+        assert_ne!(before, back.node(&id).unwrap().mesh().unwrap().mesh.v);
+
+        // duplicates get their own history nodes
+        let dup = back.duplicate(&[id.clone()], true).into_iter().next().unwrap();
+        assert_ne!(back.history_id(&dup, 1), Some(extrude));
+    }
+
+    #[test]
+    fn history_parameter_edits_undo_by_checkpoint() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let base = s.node(&id).unwrap().mesh().unwrap().mesh.v.clone();
+        s.checkpoint("before extrude");
+        let mut p = Params::new();
+        p.insert("faces".into(), json!([0]));
+        p.insert("localTranslateZ".into(), json!(0.25));
+        s.add_history(&id, "polyExtrudeFace", p);
+        let before = s.node(&id).unwrap().mesh().unwrap().mesh.v.clone();
+        s.checkpoint("before edit");
+        s.set_history_param(&id, 1, "localTranslateZ", json!(2.0));
+        assert_ne!(before, s.node(&id).unwrap().mesh().unwrap().mesh.v);
+        assert_eq!(s.history_node(&id, 1).unwrap().params["localTranslateZ"], json!(2.0));
+
+        assert_eq!(s.undo().as_deref(), Some("before edit"));
+        assert_eq!(s.history_node(&id, 1).unwrap().params["localTranslateZ"], json!(0.25));
+        assert_eq!(s.node(&id).unwrap().mesh().unwrap().mesh.v, before, "undo did not restore the evaluated mesh");
+
+        assert_eq!(s.undo().as_deref(), Some("before extrude"));
+        assert_eq!(s.node(&id).unwrap().mesh().unwrap().history.len(), 1, "undo did not remove the extrude node");
+        assert_eq!(s.node(&id).unwrap().mesh().unwrap().mesh.v, base, "extrude edits stayed in the mesh after the node was removed");
     }
 
     #[test]

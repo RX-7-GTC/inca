@@ -111,6 +111,9 @@ fn import_inca(s: &mut Scene, path: &Path) -> Result<Vec<Id>, String> {
             continue;
         }
         let mut d = d.clone();
+        if let Some(o) = d.as_object_mut() {
+            o.remove("historyIds");
+        }
         if let Some(m) = d["material"].as_str().and_then(|m| mat_map.get(m)) {
             d["material"] = json!(m);
         }
@@ -550,7 +553,7 @@ mod compat_tests {
         s.load(&v).unwrap();
         let c = s.find("pCube1").unwrap();
         assert_eq!(s.node(&c).unwrap().parent.as_deref(), Some("d10"));
-        assert_eq!(s.node(&c).unwrap().mesh().unwrap().history[0].name, "polyCube1");
+        assert_eq!(s.history_node(&c, 0).unwrap().name, "polyCube1");
         assert_eq!(s.sel, vec!["d11".to_string()]);
         // history is live after loading
         let r = s.resolve("polyCube1").unwrap();

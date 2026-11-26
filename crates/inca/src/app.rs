@@ -817,7 +817,7 @@ impl IncaApp {
         for (id, n0) in watched {
             let n1 = hist_len(&self.s, &id);
             if n1 > n0 {
-                let ty = self.s.node(&id).and_then(|n| n.mesh()).map(|m| m.history[n1 - 1].ty.clone()).unwrap_or_default();
+                let ty = self.s.history_meta(&id, n1 - 1).map(|h| h.ty).unwrap_or_default();
                 if inca_core::ops::info(&ty).is_some_and(|i| !i.2.is_empty()) {
                     self.inview = Some((id, n1 - 1));
                 }

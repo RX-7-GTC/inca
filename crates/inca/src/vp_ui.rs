@@ -2566,8 +2566,8 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                 // the extrude just made (still shown in the In-View Editor) takes the move, as in Maya/JS:
                 // its divisions then spread along the moved distance
                 let extrude = app.inview.clone().filter(|_| app.tool == Tool::Move && !pivot_mode).and_then(|(id, i)| {
-                    let m = app.s.node(&id)?.mesh()?;
-                    let h = m.history.get(i).filter(|h| h.ty == "polyExtrudeFace" && i + 1 == m.history.len())?;
+                    let len = app.s.node(&id).and_then(|n| n.mesh()).map(|m| m.history.len()).unwrap_or(0);
+                    let h = app.s.history_node(&id, i).filter(|h| h.ty == "polyExtrudeFace" && i + 1 == len)?;
                     let g = |k: &str| h.params.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
                     Some((id.clone(), i, DVec3::new(g("translateX"), g("translateY"), g("translateZ"))))
                 });
@@ -2660,11 +2660,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                 let world = DVec3::from(d.cur.translation) - DVec3::from(d.start.translation);
                 let local = app.s.world_matrix(&id).inverse().transform_vector3(world);
                 let t = t0 + local;
-                if let Some(h) = app.s.nodes.get_mut(&id).and_then(|n| n.mesh_mut()).and_then(|m| m.history.get_mut(i)) {
-                    h.params.insert("translateX".into(), serde_json::json!(t.x));
-                    h.params.insert("translateY".into(), serde_json::json!(t.y));
-                }
-                app.s.set_history_param(&id, i, "translateZ", serde_json::json!(t.z));
+                app.s.set_history_params(&id, i, &[
+                    ("translateX".into(), serde_json::json!(t.x)),
+                    ("translateY".into(), serde_json::json!(t.y)),
+                    ("translateZ".into(), serde_json::json!(t.z)),
+                ]);
                 let final_tf = app.vp_state.drag.as_ref().map(|d| d.cur).unwrap_or(tf);
                 if !interaction.dragging {
                     if let Some(d) = app.vp_state.drag.take() {
@@ -3167,7 +3167,7 @@ fn finish_drag(app: &mut IncaApp, d: GizmoDrag) {
     // JS skips them in `endDrag`, their CVs are the curve)
     for (id, verts, orig) in &d.comps {
         let DragGeom::Mesh(orig) = orig else { continue };
-        let cur = app.s.node(id).unwrap().mesh().unwrap().mesh.clone();
+        let Some(cur) = app.s.node(id).and_then(|n| n.mesh()).map(|m| m.mesh.clone()) else { continue };
         let deltas: Vec<[f64; 3]> = verts.iter().map(|&v| (cur.v[v as usize] - orig.v[v as usize]).to_array()).collect();
         if let Some(m) = app.s.nodes.get_mut(id).and_then(|n| n.mesh_mut()) {
             m.mesh = orig.clone();
@@ -3282,7 +3282,7 @@ fn hud(app: &mut IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
 /// In-View Editor: the channels of the history node an op just made, in the viewport (JS showHistoryEditor).
 fn inview_editor(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect) {
     let Some((id, i)) = app.inview.clone() else { return };
-    let valid = app.s.node(&id).and_then(|n| n.mesh()).and_then(|m| m.history.get(i)).map(|h| h.name.clone());
+    let valid = app.s.history_meta(&id, i).map(|h| h.name);
     let lead_ok = app.s.sel.contains(&id) || app.s.hilite().contains(&id);
     let Some(name) = valid.filter(|_| lead_ok) else {
         app.inview = None;

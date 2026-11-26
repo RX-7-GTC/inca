@@ -831,10 +831,12 @@ pub fn export_ma(s: &Scene, sel_only: bool) -> String {
         let shape = nd.shape_name.clone().unwrap_or(format!("{}Shape", nd.name));
         match &nd.shape {
             Shape::Mesh(m) => {
-                write_mesh(&mut o, &shape, &nd.name, crate::skin::bind_mesh(m));
+                write_mesh(&mut o, &shape, &nd.name, &crate::skin::bind_mesh(s, m));
                 mat_users.entry(m.material.clone()).or_default().push(shape.clone());
-                if let Some(h) = m.history.iter().find(|h| h.ty == "skinCluster") {
-                    skins.push((nd.name.clone(), shape.clone(), h.params.clone()));
+                if let Some(i) = s.history_find(&nd.id, "skinCluster") {
+                    if let Some(h) = s.history_node(&nd.id, i) {
+                        skins.push((nd.name.clone(), shape.clone(), h.params));
+                    }
                 }
             }
             Shape::Camera(c) => {
@@ -1080,10 +1082,9 @@ connectAttr "pCube1_translateX.o" "pCube1.tx";
         let made = import_ma(&mut s, CUBE).unwrap();
         assert_eq!(made.len(), 2);
         let cube = s.find("pCube1").unwrap();
-        let m = s.node(&cube).unwrap().mesh().unwrap();
-        assert_eq!(m.history[0].ty, "polyCube");
-        assert_eq!(m.history[0].params["width"], json!(2.0));
-        assert_eq!(m.mesh.f.len(), 14, "3x1x1 subdivided cube");
+        assert_eq!(s.history_node(&cube, 0).unwrap().ty, "polyCube");
+        assert_eq!(s.history_node(&cube, 0).unwrap().params["width"], json!(2.0));
+        assert_eq!(s.node(&cube).unwrap().mesh().unwrap().mesh.f.len(), 14, "3x1x1 subdivided cube");
         let quad = s.find("quad").unwrap();
         let q = &s.node(&quad).unwrap().mesh().unwrap();
         assert_eq!(q.mesh.f, vec![vec![0, 1, 2, 3]]);
@@ -1150,8 +1151,9 @@ connectAttr "pCube1_translateX.o" "pCube1.tx";
         let mut t = Scene::new();
         import_ma(&mut t, &txt).unwrap();
         let arm = t.find("arm").unwrap();
-        let h = t.node(&arm).unwrap().mesh().unwrap().history.iter().find(|h| h.ty == "skinCluster").cloned().expect("skin");
-        let a0 = s.node(&s.find("arm").unwrap()).unwrap().mesh().unwrap().history.iter().find(|h| h.ty == "skinCluster").unwrap().params["weights"].clone();
+        let hi = t.history_find(&arm, "skinCluster").expect("skin");
+        let h = t.history_node(&arm, hi).expect("skin");
+        let a0 = s.history_node(&s.find("arm").unwrap(), s.history_find(&s.find("arm").unwrap(), "skinCluster").unwrap()).unwrap().params["weights"].clone();
         let w = &h.params["weights"];
         assert_eq!(w.as_array().unwrap().len(), a0.as_array().unwrap().len());
         // vertex 0's weights match
@@ -1205,8 +1207,7 @@ connectAttr "pSphereShape1.iog" ":initialShadingGroup.dsm" -na;
         let made = import_ma(&mut s, src).unwrap();
         assert_eq!(made.len(), 1);
         let ball = s.find("pSphere1").unwrap();
-        let m = s.node(&ball).unwrap().mesh().unwrap();
-        assert_eq!(m.history[0].ty, "polySphere");
-        assert_eq!(m.history[0].params["radius"], json!(3.0));
+        assert_eq!(s.history_node(&ball, 0).unwrap().ty, "polySphere");
+        assert_eq!(s.history_node(&ball, 0).unwrap().params["radius"], json!(3.0));
     }
 }

@@ -229,14 +229,14 @@ fn lattice_tool(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Re
 /// The selected skinned mesh and the index of its skinCluster.
 pub fn skinned(app: &IncaApp) -> Option<(String, usize)> {
     app.s.sel.iter().flat_map(|i| app.s.subtree(i)).find_map(|i| {
-        let h = app.s.node(&i)?.mesh()?.history.iter().position(|h| h.ty == "skinCluster")?;
+        let h = app.s.history_find(&i, "skinCluster")?;
         Some((i, h))
     })
 }
 
 pub fn influences(app: &IncaApp) -> Vec<String> {
     let Some((m, h)) = skinned(app) else { return vec![] };
-    app.s.node(&m).and_then(|n| n.mesh()).and_then(|x| x.history[h].params.get("joints")).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|j| j.as_str().map(String::from)).collect()).unwrap_or_default()
+    app.s.history_node(&m, h).and_then(|x| x.params.get("joints").cloned()).and_then(|v| v.as_array().cloned()).map(|a| a.iter().filter_map(|j| j.as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
 pub fn weight_of(w: &Value, j: usize) -> f64 {
@@ -273,7 +273,7 @@ fn paint_tool(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Rect
     let wm = app.s.world_matrix(&m);
     let verts: Vec<DVec3> = app.s.node(&m).and_then(|n| n.mesh()).map(|x| x.mesh.v.iter().map(|p| wm.transform_point3(*p)).collect()).unwrap_or_default();
     let j = app.rig_tool.influence;
-    let weights = app.s.node(&m).and_then(|n| n.mesh()).and_then(|x| x.history[h].params.get("weights")).cloned().unwrap_or(json!([]));
+    let weights = app.s.history_node(&m, h).and_then(|x| x.params.get("weights").cloned()).unwrap_or(json!([]));
     // weight display: black (0) to white (1) dots
     for (i, p) in verts.iter().enumerate() {
         if let Some(q) = cv.project(*p, rect) {

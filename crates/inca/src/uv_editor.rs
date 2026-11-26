@@ -74,7 +74,7 @@ fn mesh(app: &IncaApp, id: &str) -> Option<PolyMesh> {
 fn commit(app: &mut IncaApp, id: &str, pm: &PolyMesh) {
     let Some(uvs) = &pm.uv else { return };
     let v = serde_json::to_value(uvs).unwrap_or_default();
-    let last = app.s.node(id).and_then(|n| n.mesh()).map(|m| (m.history.len(), m.history.last().map(|h| h.ty.clone())));
+    let last = app.s.node(id).and_then(|n| n.mesh()).map(|m| (m.history.len(), app.s.history_meta(id, m.history.len().saturating_sub(1)).map(|h| h.ty)));
     match last {
         Some((n, Some(t))) if t == "polyUVSet" => app.s.set_history_param(id, n - 1, "uv", v),
         _ => {

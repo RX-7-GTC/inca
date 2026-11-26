@@ -226,11 +226,11 @@ fn edge_loop(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Rect,
             }
         }
         if let Some(ring) = &app.mesh_tool.loop_ring {
-            let t = app.s.node(&id).and_then(|n| n.mesh()).and_then(|m| m.history.get(hi)).and_then(|h| h.params.get("t")).and_then(|v| v.as_f64()).unwrap_or(0.5);
+            let t = app.s.history_node(&id, hi).and_then(|h| h.params.get("t").and_then(|v| v.as_f64())).unwrap_or(0.5);
             draw_loops(painter, cv, rect, ring, &loop_ts(n, t));
         }
         if resp.drag_stopped() || resp.clicked() || !resp.is_pointer_button_down_on() {
-            let t = app.s.node(&id).and_then(|n| n.mesh()).and_then(|m| m.history.get(hi)).and_then(|h| h.params.get("t")).and_then(|v| v.as_f64()).unwrap_or(0.5);
+            let t = app.s.history_node(&id, hi).and_then(|h| h.params.get("t").and_then(|v| v.as_f64())).unwrap_or(0.5);
             app.echo(format!("polySplitRing -ch on -splitType 1 -weight {t:.4} -smoothingAngle 30 -fixQuads 1 -insertWithEdgeFlow 0;"));
             app.mesh_tool.loop_drag = None;
             app.mesh_tool.loop_ring = None;

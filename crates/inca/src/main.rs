@@ -40,6 +40,14 @@ fn icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result {
+    // Keep a crash report on disk so a window-only panic can still be diagnosed.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = std::env::temp_dir().join("inca-crash.log");
+        let text = format!("{info}\n\n{}", std::backtrace::Backtrace::force_capture());
+        let _ = std::fs::write(&path, text);
+        default_hook(info);
+    }));
     prefs::apply_backend_env();
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([1600.0, 1000.0]).with_min_inner_size([900.0, 600.0]).with_title("Inca");
     if let Some(i) = icon() {

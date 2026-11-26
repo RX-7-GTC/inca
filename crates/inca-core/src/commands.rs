@@ -323,7 +323,7 @@ fn history_on(a: &Args) -> bool {
 fn result_names(s: &Scene, id: &Id) -> Val {
     let n = s.node(id).unwrap();
     let mut v = vec![Val::Str(n.name.clone())];
-    if let Some(h) = n.mesh().and_then(|m| m.history.last()) {
+    if let Some(h) = s.history_view(id).last() {
         if !h.name.contains('#') {
             v.push(Val::Str(h.name.clone()));
         }
@@ -1038,7 +1038,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                         "transform".into()
                     }
                 }
-                Some(NodeRef::History(id, i)) => s.node(&id).unwrap().mesh().unwrap().history[i].ty.clone(),
+                Some(NodeRef::History(id, i)) => s.history_node(&id, i).map(|h| h.ty).unwrap_or_default(),
                 Some(NodeRef::Material(id)) | Some(NodeRef::Texture(id)) => s.deps.node(&id).map(|n| n.kind.clone()).unwrap_or_default(),
                 Some(NodeRef::Place2D(_)) => "place2dTexture".into(),
                 Some(NodeRef::Dependency(id)) => s.deps.node(&id).map(|n| n.kind.clone()).unwrap_or_default(),
@@ -1067,9 +1067,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "listHistory" => {
             let mut out = vec![];
             for id in targets(s, &a) {
-                if let Some(m) = s.node(&id).and_then(|n| n.mesh()) {
-                    out.extend(m.history.iter().rev().filter(|h| !h.name.contains('#')).map(|h| h.name.clone()));
-                }
+                out.extend(s.history_metas(&id).iter().rev().filter(|h| !h.name.contains('#')).map(|h| h.name.clone()));
             }
             Ok(strs(out))
         }
@@ -1381,15 +1379,13 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let (am, bm) = (ts[0].clone(), ts[1].clone());
             let mat = s.node(&am).unwrap().mesh().unwrap().material.clone();
             let o = s.create_mesh_from(Default::default(), "polySurface1", Some(&mat), None);
-            if let Some(m) = s.nodes.get_mut(&o).and_then(|n| n.mesh_mut()) {
-                m.history.clear();
-            }
+            s.clear_history(&o);
             let mut p = Params::new();
             p.insert("a".into(), json!(am));
             p.insert("b".into(), json!(bm));
             p.insert("operation".into(), json!(op.clamp(0, 2)));
             s.add_history(&o, "polyCBoolOp", p);
-            if let Some(e) = s.node(&o).and_then(|n| n.mesh()).and_then(|m| m.history[0].error.clone()) {
+            if let Some(e) = s.history_node(&o, 0).and_then(|h| h.error) {
                 s.delete_node(&o);
                 return Err(e);
             }
@@ -1574,10 +1570,10 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 tlist.push(json!({ "name": nm, "id": t, "d": d }));
             }
             // add to an existing blend shape node on the base, or make one
-            let existing = s.node(&base).and_then(|n| n.mesh()).and_then(|m| m.history.iter().position(|h| h.ty == "blendShape"));
+            let existing = s.history_find(&base, "blendShape");
             match existing {
                 Some(i) => {
-                    let mut all = s.node(&base).unwrap().mesh().unwrap().history[i].params.get("targets").cloned().unwrap_or(json!([]));
+                    let mut all = s.get_attr(&NodeRef::History(base.clone(), i), "targets").unwrap_or(json!([]));
                     all.as_array_mut().unwrap().extend(tlist);
                     s.set_history_param(&base, i, "targets", all);
                 }
@@ -1710,9 +1706,10 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 }
             }
             for h in ts.iter().filter(|t| s.node(t).is_some_and(|n| matches!(n.kind.as_str(), "deformer" | "clusterHandle" | "lattice"))).cloned().collect::<Vec<_>>() {
-                for m in s.nodes.values().filter(|n| n.mesh().is_some_and(|m| m.history.iter().any(|x| x.params.get("handle").and_then(|v| v.as_str()) == Some(h.as_str())))).map(|n| n.id.clone()).collect::<Vec<_>>() {
-                    if let Some(mm) = s.nodes.get_mut(&m).and_then(|n| n.mesh_mut()) {
-                        mm.history.retain(|x| x.params.get("handle").and_then(|v| v.as_str()) != Some(h.as_str()));
+                for m in s.nodes.values().filter(|n| n.mesh().is_some_and(|mesh| mesh.history.iter().any(|hid| s.deps.node(hid).is_some_and(|x| x.attrs.get("handle").and_then(|v| v.as_str()) == Some(h.as_str()))))).map(|n| n.id.clone()).collect::<Vec<_>>() {
+                    let dead: Vec<Id> = s.node(&m).and_then(|n| n.mesh()).map(|mesh| mesh.history.iter().filter(|hid| s.deps.node(hid).is_some_and(|x| x.attrs.get("handle").and_then(|v| v.as_str()) == Some(h.as_str()))).cloned().collect()).unwrap_or_default();
+                    for hid in dead {
+                        s.remove_history_node(&m, &hid);
                     }
                     s.evaluate(&m, 0);
                     n += 1;
@@ -2526,7 +2523,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
 }
 
 fn last_history_name(s: &Scene, id: &str) -> String {
-    s.node(id).and_then(|n| n.mesh()).and_then(|m| m.history.last()).filter(|h| !h.name.contains('#')).map(|h| h.name.clone()).unwrap_or_else(|| s.name_of(id))
+    s.history_metas(id).last().filter(|h| !h.name.contains('#')).map(|h| h.name.clone()).unwrap_or_else(|| s.name_of(id))
 }
 
 fn apply_op_selection(s: &mut Scene, id: &str, r: &crate::mesh::OpOut) {
@@ -2677,8 +2674,8 @@ fn curve_surface(s: &mut Scene, a: &Args, ty: &str) -> Result<Val, String> {
         }
     };
     let id = s.create_mesh_from(Default::default(), base, None, None);
+    s.clear_history(&id);
     if let Some(m) = s.nodes.get_mut(&id).and_then(|n| n.mesh_mut()) {
-        m.history.clear();
         m.nurbs = true;
     }
     s.add_history(&id, ty, p);
@@ -3013,7 +3010,7 @@ mod tests {
         let m = &s.node(&id).unwrap().mesh().unwrap();
         assert_eq!(m.mesh.f.len(), 10);
         assert_eq!(m.history.len(), 2);
-        assert_eq!(m.history[1].name, "polyExtrudeFace1");
+        assert_eq!(s.history_node(&id, 1).unwrap().name, "polyExtrudeFace1");
         let r = mel(&mut s, "ls -sl;").unwrap();
         assert_eq!(r.list().len(), 1);
         assert!(r.str().starts_with("pCube1.f["));
@@ -3128,7 +3125,7 @@ mod tests {
         mel(&mut s, "move -r 0 1 0 cluster1Handle;").unwrap();
         let v1 = s.node(&bx).unwrap().mesh().unwrap().mesh.v[0];
         assert!((v1 - v0 - DVec3::Y).length() < 1e-9, "{v0} {v1}");
-        assert_eq!(s.node(&bx).unwrap().mesh().unwrap().mesh.v[1], s.node(&bx).unwrap().mesh().unwrap().history[0].out.as_ref().unwrap().v[1]);
+        assert_eq!(s.node(&bx).unwrap().mesh().unwrap().mesh.v[1], s.history_out(&bx, 0).unwrap().v[1]);
         // blend shape weight on the base
         mel(&mut s, "polyCube -n tgt; move -r 0 0 0 tgt; polyCube -n base;").unwrap();
         let t = s.find("tgt").unwrap();
@@ -3137,12 +3134,12 @@ mod tests {
         s.bake_mesh(&t, pm);
         mel(&mut s, "select -r tgt base; blendShape; setAttr base.tgt 0.5;").unwrap();
         let b = s.find("base").unwrap();
-        let base0 = s.node(&b).unwrap().mesh().unwrap().history[0].out.as_ref().unwrap().v[0];
+        let base0 = s.history_out(&b, 0).unwrap().v[0];
         assert!((s.node(&b).unwrap().mesh().unwrap().mesh.v[0].y - base0.y - 1.0).abs() < 1e-9);
         // lattice: identity until points move
         mel(&mut s, "polySphere -n ball; select -r ball; lattice -dv 2 3 2;").unwrap();
         let ball = s.find("ball").unwrap();
-        let before = s.node(&ball).unwrap().mesh().unwrap().history[0].out.as_ref().unwrap().v.clone();
+        let before = s.history_out(&ball, 0).unwrap().v.clone();
         let after = &s.node(&ball).unwrap().mesh().unwrap().mesh.v;
         assert!(before.iter().zip(after).all(|(a, b)| (*a - *b).length() < 1e-9));
         // delete deformers removes the history and the handle
@@ -3226,7 +3223,7 @@ mod tests {
         let mut s = Scene::new();
         mel(&mut s, "polyCylinder -h 4 -sh 8; nonLinear -type twist -endAngle 90;").unwrap();
         let c = s.find("pCylinder1").unwrap();
-        assert_eq!(s.node(&c).unwrap().mesh().unwrap().history.last().unwrap().name, "twist1");
+        assert_eq!(s.history_view(&c).last().unwrap().name, "twist1");
         let ti = s.node(&c).unwrap().mesh().unwrap().mesh.v.iter().position(|v| v.y > 1.99).unwrap();
         let top = |s: &Scene| s.node(&c).unwrap().mesh().unwrap().mesh.v[ti];
         let before = top(&s);

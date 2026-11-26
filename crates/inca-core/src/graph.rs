@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::anim::AnimCurve;
+use crate::mesh::PolyMesh;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AttrType {
@@ -100,11 +101,17 @@ pub struct DepNode {
     /// Key data for an `animCurve` node; None for every other node kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curve: Option<AnimCurve>,
+    /// Evaluation cache for a construction-history op; never saved.
+    #[serde(skip)]
+    pub mesh_out: Option<PolyMesh>,
+    /// Last evaluation error for a history op; never saved.
+    #[serde(skip)]
+    pub error: Option<String>,
 }
 
 impl DepNode {
     pub fn new(id: &str, name: &str, kind: &str) -> Self {
-        Self { id: id.into(), name: name.into(), kind: kind.into(), attrs: IndexMap::new(), specs: IndexMap::new(), curve: None }
+        Self { id: id.into(), name: name.into(), kind: kind.into(), attrs: IndexMap::new(), specs: IndexMap::new(), curve: None, mesh_out: None, error: None }
     }
     pub fn add_attr(&mut self, name: &str, spec: AttrSpec) -> &mut Self {
         self.attrs.entry(name.into()).or_insert_with(|| spec.default.clone());

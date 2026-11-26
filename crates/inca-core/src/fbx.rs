@@ -1262,8 +1262,9 @@ pub fn export_fbx(s: &Scene, sel_only: bool) -> Vec<u8> {
         };
         match &nd.shape {
             Shape::Mesh(m) => {
-                let skin = m.history.iter().find(|h| h.ty == "skinCluster");
-                let pm = if skin.is_some() { crate::skin::bind_mesh(m) } else { &m.mesh };
+                let skin = s.history_find(&id, "skinCluster").and_then(|i| s.history_node(&id, i));
+                let pm = if skin.is_some() { crate::skin::bind_mesh(s, m) } else { m.mesh.clone() };
+                let pm = &pm;
                 let mut slots = vec![m.material.clone()];
                 for f in pm.fm.iter().flatten().flatten() {
                     if !slots.contains(f) {
@@ -1544,7 +1545,7 @@ mod tests {
         let jo2 = t.node(&j1).unwrap().xf.jo;
         assert!(jo.iter().zip(jo2).all(|(a, b)| (a - b).abs() < 1e-6), "{jo:?} {jo2:?}");
         let arm = t.find("arm").unwrap();
-        let w = |sc: &Scene, id: &str| sc.node(id).unwrap().mesh().unwrap().history.iter().find(|h| h.ty == "skinCluster").expect("skin").params["weights"].clone();
+        let w = |sc: &Scene, id: &str| sc.history_node(id, sc.history_find(id, "skinCluster").expect("skin")).expect("skin").params["weights"].clone();
         let (wa, wb) = (w(&s, &s.find("arm").unwrap()), w(&t, &arm));
         let wa = wa.as_array().unwrap();
         let wb = wb.as_array().unwrap();

@@ -500,6 +500,10 @@ pub struct PanelState {
     pub quit_confirm: bool,
     /// a channel drag is in progress (one undo step per drag)
     pub editing: bool,
+    /// the channel row that owns the active edit gesture
+    editing_key: Option<String>,
+    #[cfg(test)]
+    pub history_field_rects: Vec<(String, Rect)>,
     /// Outliner Color picker drag: one undo step from press to release.
     outliner_color_editing: bool,
     /// Channel Box channel names picked for the MMB virtual slider (and whether it is armed)
@@ -895,7 +899,7 @@ const ROW_H: f32 = 19.0;
 /// Dependency nodes shown in the Outliner when DAG Objects Only is off. The animLayer node is
 /// hidden, like Maya; its per-channel blend and curve nodes are listed instead.
 fn outliner_dep_rows(s: &inca_core::scene::Scene) -> Vec<(String, String, String)> {
-    let mut deps: Vec<(String, String, String)> = s.deps.nodes.values().filter(|n| n.kind != "animLayer").map(|n| (n.id.clone(), n.name.clone(), n.kind.clone())).collect();
+    let mut deps: Vec<(String, String, String)> = s.deps.nodes.values().filter(|n| n.kind != "animLayer" && inca_core::ops::info(&n.kind).is_none()).map(|n| (n.id.clone(), n.name.clone(), n.kind.clone())).collect();
     let rank = |k: &str| match k {
         "animBlendNode" => 0,
         "animCurve" => 1,
@@ -1528,9 +1532,23 @@ pub fn virtual_slider(app: &mut IncaApp, resp: &egui::Response) -> bool {
 }
 
 fn edit_channel(app: &mut IncaApp, targets: &[NodeRef], attr: &str, v: Value, resp: &egui::Response) {
-    if (resp.drag_started() || (resp.changed() && !resp.dragged())) && !app.panels.editing {
+    let key = targets.first().map(|r| format!("{}:{attr}", app.s.ref_id(r))).unwrap_or_default();
+    if app.panels.editing && app.panels.editing_key.as_deref() != Some(key.as_str()) {
+        app.panels.editing = false;
+    }
+    if app.panels.editing && !resp.ctx.input(|i| i.pointer.primary_down()) && !resp.has_focus() {
+        app.panels.editing = false;
+    }
+    if resp.drag_started() {
+        // A new drag is always its own undo step, even if a previous gesture left the shared
+        // editing flag set (for example when its release event was missed).
         app.s.checkpoint(&format!("setAttr {attr}"));
         app.panels.editing = true;
+        app.panels.editing_key = Some(key);
+    } else if resp.changed() && !resp.dragged() && !app.panels.editing {
+        app.s.checkpoint(&format!("setAttr {attr}"));
+        app.panels.editing = true;
+        app.panels.editing_key = Some(key);
     }
     for r in targets {
         app.s.set_attr(r, attr, v.clone());
@@ -1546,7 +1564,12 @@ fn edit_channel(app: &mut IncaApp, targets: &[NodeRef], attr: &str, v: Value, re
 }
 
 fn finish_edit(app: &mut IncaApp, targets: &[NodeRef], attr: &str, resp: &egui::Response) {
-    if (resp.drag_stopped() || resp.lost_focus() || (resp.changed() && !resp.dragged())) && app.panels.editing {
+    let key = targets.first().map(|r| format!("{}:{attr}", app.s.ref_id(r))).unwrap_or_default();
+    let stale = !resp.ctx.input(|i| i.pointer.primary_down()) && !resp.has_focus();
+    let mine = app.panels.editing_key.as_deref() == Some(key.as_str());
+    if (resp.drag_stopped() || resp.lost_focus() || (resp.changed() && !resp.dragged()) || stale) && app.panels.editing && mine {
+        app.panels.editing = false;
+        app.panels.editing_key = None;
         app.panels.editing = false;
         for r in targets {
             let name = app.s.ref_name(r);
@@ -1834,6 +1857,10 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
                     locked,
                 });
             }
+        }
+        #[cfg(test)]
+        if matches!(first, NodeRef::History(..)) {
+            app.panels.history_field_rects.push((attr.to_string(), frame.response.rect));
         }
         if selectable && !matches!(kind, ChanKind::Float | ChanKind::Int) {
             if let Some(c) = cb_state_color(app, first, attr) {
@@ -2136,14 +2163,16 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     }
     // INPUTS (construction history, newest first); a deformer handle shows its deformer
-    let mut hist: Vec<(String, usize, String, String)> = app.s.node(&lead).and_then(|n| n.mesh()).map(|m| m.history.iter().enumerate().filter(|(_, h)| !h.name.contains('#')).map(|(i, h)| (lead.clone(), i, h.name.clone(), h.ty.clone())).collect()).unwrap_or_default();
+    let mut hist: Vec<(String, usize, String, String)> = app.s.history_metas(&lead).into_iter().enumerate().filter(|(_, h)| !h.name.contains('#')).map(|(i, h)| (lead.clone(), i, h.name, h.ty)).collect();
     hist.reverse();
     if app.s.node(&lead).is_some_and(|n| n.kind == "deformer") {
         for n in app.s.nodes.values() {
             if let Some(m) = n.mesh() {
-                for (i, h) in m.history.iter().enumerate() {
-                    if h.params.get("handle").and_then(|v| v.as_str()) == Some(lead.as_str()) {
-                        hist.push((n.id.clone(), i, h.name.clone(), h.ty.clone()));
+                for (i, hid) in m.history.iter().enumerate() {
+                    if app.s.deps.node(hid).and_then(|h| h.attrs.get("handle")).and_then(|v| v.as_str()) == Some(lead.as_str()) {
+                        if let Some(h) = app.s.history_meta(&n.id, i) {
+                            hist.push((n.id.clone(), i, h.name, h.ty));
+                        }
                     }
                 }
             }
@@ -2156,7 +2185,7 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
             let lead = owner;
             let open_id = format!("{lead}:{hname}");
             let open = app.panels.expanded.contains(&open_id);
-            let err = app.s.node(&lead).and_then(|n| n.mesh()).and_then(|m| m.history[i].error.clone());
+            let err = app.s.history_error(&lead, i);
             let t = RichText::new(format!("{} {hname}", if open { "-" } else { "+" })).color(if err.is_some() { Color32::from_rgb(240, 120, 120) } else { theme::TEXT });
             let r = ui.add(egui::Button::new(t).frame(false));
             if let Some(e) = err {
@@ -7531,7 +7560,7 @@ fn ae_tabs(app: &IncaApp, id: &str) -> Vec<(String, NodeRef)> {
         }
     }
     if let Some(m) = n.mesh() {
-        for (i, h) in m.history.iter().enumerate().rev() {
+        for (i, h) in app.s.history_metas(id).iter().enumerate().rev() {
             if !h.name.contains('#') {
                 tabs.push((h.name.clone(), NodeRef::History(id.to_string(), i)));
             }
@@ -8063,8 +8092,10 @@ pub fn ae_copies(app: &mut IncaApp, ctx: &egui::Context) {
 
 /// The channels of one history node (Attribute Editor tab, In-View Editor).
 pub fn history_channels(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, i: usize) {
+    #[cfg(test)]
+    app.panels.history_field_rects.clear();
     let r = NodeRef::History(id.to_string(), i);
-    let ty = app.s.node(id).and_then(|n| n.mesh()).and_then(|m| m.history.get(i)).map(|h| h.ty.clone()).unwrap_or_default();
+    let ty = app.s.history_node(id, i).map(|h| h.ty).unwrap_or_default();
     if let Some((_, _, chans)) = ops::info(&ty) {
         for c in chans {
             let label = c.label.map(String::from).unwrap_or_else(|| ops::nice_name(c.key));
@@ -8403,7 +8434,7 @@ fn ae_body(app: &mut IncaApp, ui: &mut egui::Ui, tabs: &[(String, NodeRef)], tab
         }
         NodeRef::Dag(id) => shape_tab(app, ui, id),
         NodeRef::History(id, i) => {
-            let ty = app.s.node(id).and_then(|n| n.mesh()).and_then(|m| m.history.get(*i)).map(|h| h.ty.clone()).unwrap_or_default();
+            let ty = app.s.history_node(id, *i).map(|h| h.ty).unwrap_or_default();
             if theme::fold(ui, &format!("{ty} History")) {
                 if let Some((_, _, chans)) = ops::info(&ty) {
                     for c in chans {
@@ -10626,5 +10657,191 @@ mod tests {
             out.textures_delta.clear();
         }
         assert!(!app.panels.cb_row_rects.iter().any(|(_, a, _, _)| a == "translateX"), "hidden channel still has a row");
+    }
+
+    #[test]
+    fn inview_history_typed_edits_undo_one_parameter_at_a_time() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.checkpoint("before extrude");
+        let mut p = Params::new();
+        for (k, v) in [("faces", json!([0])), ("localTranslateZ", json!(0.0)), ("translateX", json!(0.0)), ("translateY", json!(0.0)), ("translateZ", json!(0.0)), ("offset", json!(0.0)), ("divisions", json!(1)), ("keepFacesTogether", json!(true))] {
+            p.insert(k.into(), v);
+        }
+        app.s.add_history(&id, "polyExtrudeFace", p);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.inview = Some((id.clone(), 1));
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..6 {
+            run(&mut app, vec![], 1.0 + i as f64 * 0.1);
+        }
+        let field = |app: &IncaApp, name: &str| app.panels.history_field_rects.iter().find(|(a, _)| a == name).map(|(_, r)| *r).expect("field");
+        let local = field(&app, "localTranslateZ");
+        let div = field(&app, "divisions");
+        let type_into = |app: &mut IncaApp, run: &mut dyn FnMut(&mut IncaApp, Vec<egui::Event>, f64), r: egui::Rect, t: f64, text: &str| {
+            let c = r.center();
+            run(app, vec![egui::Event::PointerMoved(c)], t);
+            run(app, vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], t + 0.1);
+            run(app, vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], t + 0.2);
+            run(app, vec![], t + 0.25);
+            run(app, vec![egui::Event::Text(text.into())], t + 0.3);
+            run(app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], t + 0.4);
+            run(app, vec![], t + 0.5);
+        };
+        type_into(&mut app, &mut run, local, 2.0, "1");
+        let after_local = app.s.get_attr(&NodeRef::History(id.clone(), 1), "localTranslateZ").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        assert_eq!(after_local, 1.0, "typing local translate failed");
+        type_into(&mut app, &mut run, div, 3.0, "3");
+        assert_eq!(app.s.get_attr(&NodeRef::History(id.clone(), 1), "divisions").and_then(|v| v.as_f64()), Some(3.0));
+        app.s.undo();
+        assert_eq!(app.s.get_attr(&NodeRef::History(id.clone(), 1), "divisions").and_then(|v| v.as_f64()), Some(1.0), "undo did not restore divisions");
+        assert_eq!(app.s.get_attr(&NodeRef::History(id.clone(), 1), "localTranslateZ").and_then(|v| v.as_f64()), Some(1.0), "undoing divisions also reverted local translate");
+    }
+
+    #[test]
+    fn inview_history_drags_take_separate_undo_steps() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.checkpoint("before extrude");
+        app.inview = Some((id.clone(), 1));
+        let mut p = Params::new();
+        p.insert("faces".into(), json!([0]));
+        p.insert("localTranslateZ".into(), json!(0.0));
+        p.insert("translateX".into(), json!(0.0));
+        p.insert("translateY".into(), json!(0.0));
+        p.insert("translateZ".into(), json!(0.0));
+        p.insert("offset".into(), json!(0.0));
+        p.insert("divisions".into(), json!(1));
+        p.insert("keepFacesTogether".into(), json!(true));
+        app.s.add_history(&id, "polyExtrudeFace", p);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..6 {
+            run(&mut app, vec![], 1.0 + i as f64 * 0.1);
+        }
+        let local = app.panels.history_field_rects.iter().find(|(a, _)| a == "localTranslateZ").map(|(_, r)| *r).expect("local translate row");
+        eprintln!("history fields: {:?}", app.panels.history_field_rects.iter().map(|(a, r)| (a.clone(), r.center())).collect::<Vec<_>>());
+        let div = app.panels.history_field_rects.iter().find(|(a, _)| a == "divisions").map(|(_, r)| *r).expect("divisions row");
+        let drag = |app: &mut IncaApp, run: &mut dyn FnMut(&mut IncaApp, Vec<egui::Event>, f64), r: egui::Rect, t: f64, dx: f32| {
+            let c = r.center();
+            run(app, vec![egui::Event::PointerMoved(c)], t);
+            run(app, vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], t + 0.1);
+            run(app, vec![egui::Event::PointerMoved(c + vec2(dx, 0.0))], t + 0.2);
+            run(app, vec![egui::Event::PointerButton { pos: c + vec2(dx, 0.0), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], t + 0.3);
+            run(app, vec![], t + 0.4);
+        };
+        drag(&mut app, &mut run, local, 2.0, 24.0);
+        let after_local = app.s.get_attr(&NodeRef::History(id.clone(), 1), "localTranslateZ").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        assert_ne!(after_local, 0.0, "dragging local translate did not change it");
+        drag(&mut app, &mut run, div, 3.0, 24.0);
+        let after_div = app.s.get_attr(&NodeRef::History(id.clone(), 1), "divisions").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        assert_ne!(after_div, 1.0, "dragging divisions did not change it");
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers { ctrl: true, ..Default::default() } }], 3.9);
+        run(&mut app, vec![], 4.0);
+        assert_eq!(app.s.get_attr(&NodeRef::History(id.clone(), 1), "divisions").and_then(|v| v.as_f64()), Some(1.0), "undo did not restore divisions");
+        assert_eq!(app.s.get_attr(&NodeRef::History(id.clone(), 1), "localTranslateZ").and_then(|v| v.as_f64()), Some(after_local), "undoing divisions also reverted local translate");
+        run(&mut app, vec![], 4.05);
+        app.s.undo();
+        run(&mut app, vec![], 4.1);
+        app.s.redo();
+        run(&mut app, vec![], 4.2);
+    }
+
+    #[test]
+    fn channel_box_history_edit_undoes_to_previous_value() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        app.right_tab = crate::app::RightTab::ChannelBox;
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        let mut p = Params::new();
+        p.insert("faces".into(), json!([0]));
+        p.insert("localTranslateZ".into(), json!(0.0));
+        p.insert("translateX".into(), json!(0.0));
+        p.insert("translateY".into(), json!(0.0));
+        p.insert("translateZ".into(), json!(0.0));
+        p.insert("offset".into(), json!(0.0));
+        p.insert("divisions".into(), json!(1));
+        p.insert("keepFacesTogether".into(), json!(true));
+        app.s.add_history(&id, "polyExtrudeFace", p);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let h = app.s.history_meta(&id, 1).expect("extrude node");
+        app.panels.expanded.insert(format!("{id}:{}", h.name));
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
+            let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
+            out.textures_delta.clear();
+        };
+        for i in 0..4 {
+            run(&mut app, vec![], 1.0 + i as f64 * 0.1);
+        }
+        let field = app
+            .panels
+            .cb_row_rects
+            .iter()
+            .find(|(_, a, _, _)| a == "localTranslateZ")
+            .map(|(_, _, _, f)| *f)
+            .expect("extrude parameter row");
+        run(&mut app, vec![egui::Event::PointerMoved(field.center())], 1.6);
+        run(&mut app, vec![egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 1.7);
+        run(&mut app, vec![egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 1.8);
+        assert!(app.panels.cb_editing.is_some(), "clicking the value did not open the inline editor");
+        run(&mut app, vec![], 1.85);
+        run(&mut app, vec![egui::Event::Text("2".into())], 1.9);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 2.0);
+        run(&mut app, vec![], 2.1);
+        let r = NodeRef::History(id.clone(), 1);
+        assert_eq!(app.s.get_attr(&r, "localTranslateZ"), Some(json!(2.0)));
+        // a second edit is its own undo step
+        run(&mut app, vec![egui::Event::PointerMoved(field.center())], 2.2);
+        run(&mut app, vec![egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 2.3);
+        run(&mut app, vec![egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 2.4);
+        run(&mut app, vec![], 2.45);
+        run(&mut app, vec![egui::Event::Text("3".into())], 2.5);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 2.6);
+        run(&mut app, vec![], 2.7);
+        assert_eq!(app.s.get_attr(&r, "localTranslateZ"), Some(json!(3.0)));
+        app.s.undo();
+        assert_eq!(app.s.get_attr(&r, "localTranslateZ"), Some(json!(2.0)), "undo did not step back one edit");
+        run(&mut app, vec![], 2.75);
+        // a different parameter must get its own undo step too
+        let dfield = app
+            .panels
+            .cb_row_rects
+            .iter()
+            .find(|(_, a, _, _)| a == "divisions")
+            .map(|(_, _, _, f)| *f)
+            .expect("divisions row");
+        run(&mut app, vec![egui::Event::PointerMoved(dfield.center())], 2.8);
+        run(&mut app, vec![egui::Event::PointerButton { pos: dfield.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 2.9);
+        run(&mut app, vec![egui::Event::PointerButton { pos: dfield.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 3.0);
+        run(&mut app, vec![], 3.05);
+        run(&mut app, vec![egui::Event::Text("3".into())], 3.1);
+        run(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }], 3.2);
+        run(&mut app, vec![], 3.3);
+        assert_eq!(app.s.get_attr(&r, "divisions").and_then(|v| v.as_f64()), Some(3.0));
+        app.s.undo();
+        assert_eq!(app.s.get_attr(&r, "divisions").and_then(|v| v.as_f64()), Some(1.0), "undo did not restore divisions");
+        assert_eq!(app.s.get_attr(&r, "localTranslateZ"), Some(json!(2.0)), "undoing divisions also reverted local translate Z");
+        app.s.undo();
+        assert_eq!(app.s.get_attr(&r, "localTranslateZ"), Some(json!(0.0)), "undo did not restore the extrude parameter");
+        assert_eq!(app.s.node(&id).unwrap().mesh().unwrap().history.len(), 2, "undo removed the extrude node");
     }
 }

@@ -56,11 +56,25 @@ pub fn bind(s: &Scene, mesh: &str, joints: &[Id], max_influences: usize) -> Para
 }
 
 /// The mesh a skinCluster deforms (the history output before it), or the shape's mesh.
-pub fn bind_mesh(m: &crate::scene::MeshShape) -> &PolyMesh {
-    match m.history.iter().position(|h| h.ty == "skinCluster") {
-        Some(k) if k > 0 => m.history[k - 1].out.as_ref().unwrap_or(&m.mesh),
-        _ => &m.mesh,
+pub fn bind_mesh(s: &crate::scene::Scene, m: &crate::scene::MeshShape) -> PolyMesh {
+    let Some(k) = m.history.iter().position(|hid| s.deps.node(hid).is_some_and(|h| h.kind == "skinCluster")) else { return m.mesh.clone() };
+    if k == 0 {
+        return m.mesh.clone();
     }
+    if let Some(out) = m.history.get(k - 1).and_then(|hid| s.deps.node(hid)).and_then(|n| n.mesh_out.clone()) {
+        return out;
+    }
+    // Caches are not saved: rebuild the pre-skin input from the stored history.
+    let mut pm = PolyMesh::default();
+    for hid in &m.history[..k] {
+        let Some(node) = s.deps.node(hid) else { return m.mesh.clone() };
+        let params = node.attrs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        match crate::ops::apply(&node.kind, &pm, &params, s) {
+            Ok(out) => pm = out.mesh,
+            Err(_) => return m.mesh.clone(),
+        }
+    }
+    pm
 }
 
 fn mat(v: &Value) -> Option<DMat4> {

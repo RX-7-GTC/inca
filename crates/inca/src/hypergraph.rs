@@ -236,8 +236,9 @@ fn layout_connections(s: &Scene, io: &[String]) -> (Vec<Box_>, Vec<(String, Stri
         boxes.push(Box_ { key: format!("xf:{o}"), obj: Some(o.clone()), label: n.name.clone(), sub: "transform".into(), at: pos2(0.0, y), material: false, node: Some(NodeRef::Dag(o.clone())) });
         let hist = n.mesh().map(|m| m.history.clone()).unwrap_or_default();
         let mut prev: Option<String> = None;
-        for (i, h) in hist.iter().enumerate() {
-            let k = h.id.clone();
+        for (i, h) in s.history_metas(o).iter().enumerate() {
+            let Some(hid) = hist.get(i) else { continue };
+            let k = hid.clone();
             boxes.push(Box_ { key: k.clone(), obj: Some(o.clone()), label: h.name.clone(), sub: h.ty.clone(), at: pos2((max_hist - hist.len() + i + 1) as f32 * col, y), material: false, node: Some(NodeRef::History(o.clone(), i)) });
             if let Some(p) = prev {
                 links.push((p, k.clone()));
@@ -1106,7 +1107,7 @@ fn dag_attrs(s: &Scene, id: &str) -> Vec<CeAttr> {
 }
 
 fn history_attrs(s: &Scene, id: &str, i: usize) -> Vec<CeAttr> {
-    let Some(h) = s.node(id).and_then(|n| n.mesh()).and_then(|m| m.history.get(i)) else { return vec![] };
+    let Some(h) = s.history_node(id, i) else { return vec![] };
     let mut out = Vec::new();
     if let Some((_, _, channels)) = inca_core::ops::info(&h.ty) {
         for ch in channels {

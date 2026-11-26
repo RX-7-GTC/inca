@@ -179,7 +179,7 @@ pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: eg
 
 /// The list half of the object marking menu (Select All, materials, inputs...).
 fn object_menu_list(app: &IncaApp, t: &str) -> Vec<Option<Item>> {
-    let inputs: Vec<Item> = app.s.node(t).and_then(|n| n.mesh()).map(|m| m.history.iter().enumerate().rev().filter(|(_, h)| !h.name.contains('#') && inca_core::ops::info(&h.ty).is_some_and(|i| !i.1)).map(|(i, h)| it(&h.name, Act::History(t.to_string(), i))).collect()).unwrap_or_default();
+    let inputs: Vec<Item> = app.s.history_metas(t).iter().enumerate().rev().filter(|(_, h)| !h.name.contains('#') && inca_core::ops::info(&h.ty).is_some_and(|i| !i.1)).map(|(i, h)| it(&h.name, Act::History(t.to_string(), i))).collect();
     let shape = app.s.node(t).and_then(|n| n.shape_name.clone()).unwrap_or("(none)".into());
     vec![
         Some(it("Select", Act::Select(t.to_string()))),

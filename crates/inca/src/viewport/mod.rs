@@ -2839,6 +2839,23 @@ mod tests {
     }
 
     #[test]
+    fn history_undo_restores_refresh_the_mesh_cache_key() {
+        let (mut s, _, _, id) = setup();
+        s.checkpoint("before extrude");
+        let mut p = Params::new();
+        p.insert("faces".into(), serde_json::json!([0]));
+        s.add_history(&id, "polyExtrudeFace", p);
+        s.checkpoint("before edit");
+        s.set_history_param(&id, 1, "localTranslateZ", serde_json::json!(2.0));
+        s.undo();
+        let k1 = mesh_key(&s, &id, 1);
+        s.undo();
+        let k2 = mesh_key(&s, &id, 1);
+        assert_ne!(k1, k2, "two undo restores reused the previous viewport mesh cache key");
+        assert_eq!(s.node(&id).unwrap().mesh().unwrap().history.len(), 1);
+    }
+
+    #[test]
     fn alpha_maps_use_the_transparent_pass_and_invalidate_mesh_buffers() {
         let (mut s, _, _, id) = setup();
         let mid = s.create_material("standardSurface", Some("alphaMat"));
