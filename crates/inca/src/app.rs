@@ -1115,7 +1115,7 @@ impl IncaApp {
             Tool::Polygon => "Create Polygon Tool: click to place vertices, Enter to create the face",
             Tool::Joint => "Joint Tool: click to place joints (each new joint is parented to the last), Enter to finish the chain",
             Tool::EdgeLoop => "Insert Edge Loop Tool: click and drag on an edge to insert an edge loop and slide it. Set multiple loops in Tool Settings",
-            Tool::MultiCut => "Multi-Cut Tool: click on edges/vertices to cut. Shift snaps to 10% steps, Ctrl+click inserts an edge loop. Enter or right-click completes, Backspace undoes the last point",
+            Tool::MultiCut => "Multi-Cut Tool: click on edges/vertices to cut. Shift snaps to 10% steps, middle-click cuts an edge at its midpoint, Ctrl+click inserts an edge loop (Ctrl+middle-click: through the midpoint). Enter or right-click completes, Backspace undoes the last point",
             Tool::TargetWeld => "Target Weld Tool: drag from a vertex onto another vertex to weld them together",
             Tool::Sculpt => "Sculpt: drag on a mesh to sculpt. Ctrl inverts, Shift smooths. Brush and size in Tool Settings",
             Tool::Pencil => "Pencil Curve Tool: drag to draw a curve freehand",

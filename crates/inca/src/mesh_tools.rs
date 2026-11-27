@@ -271,11 +271,19 @@ fn edge_loop(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Rect,
 
 // ---------------------------------------------------------------- multi-cut
 
-fn cut_pick(app: &IncaApp, cv: &CamView, rect: Rect, p: Pos2, shift: bool) -> Option<(String, CutPt)> {
+/// The cut point under `p`. Shift snaps the edge position to 10% steps. `mid` (the middle mouse
+/// button, as in Maya) puts the point exactly halfway along the edge under the cursor, even next
+/// to one of its vertices.
+fn cut_pick(app: &IncaApp, cv: &CamView, rect: Rect, p: Pos2, shift: bool, mid: bool) -> Option<(String, CutPt)> {
     let objs = match &app.mesh_tool.cut_obj {
         Some(o) => vec![o.clone()],
         None => meshes(app),
     };
+    if mid {
+        if let Some(e) = pick_edge(app, cv, rect, p, &objs) {
+            return Some((e.id, CutPt { vertex: None, edge: Some((e.a, e.b, 0.5)), w: e.w[e.a as usize].lerp(e.w[e.b as usize], 0.5) }));
+        }
+    }
     let r = if app.snap_point { 40.0 } else { 8.0 };
     // the cut's own points snap like vertices (click the first one again to close a loop)
     let own = app.mesh_tool.cut.iter().filter(|c| c.vertex.is_none()).filter_map(|c| cv.project(c.w, rect).map(|s| (c, s.distance(p)))).filter(|x| x.1 < r).min_by(|a, b| a.1.total_cmp(&b.1));
@@ -319,13 +327,17 @@ pub fn multi_cut_complete(app: &mut IncaApp) {
 
 fn multi_cut(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Rect, painter: &egui::Painter) {
     let mods = resp.ctx.input(|i| i.modifiers);
-    let hover = resp.hover_pos().and_then(|p| cut_pick(app, cv, rect, p, mods.shift));
+    // while the middle button is down, preview where a middle click will cut: the edge's midpoint
+    let mid_down = resp.ctx.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+    let mid_click = resp.clicked_by(egui::PointerButton::Middle);
+    let hover = resp.hover_pos().and_then(|p| cut_pick(app, cv, rect, p, mods.shift, mid_down || mid_click));
     let ctrl = mods.ctrl || mods.command;
-    // Ctrl: the edge loop a click would insert
+    // Ctrl: the edge loop a click would insert (Ctrl+middle-click: through the edge's midpoint)
     if ctrl {
         let objs = meshes(app);
         if let Some(h) = resp.hover_pos().and_then(|p| pick_edge(app, cv, rect, p, &objs)) {
-            draw_loops(painter, cv, rect, &ring_of(app, &h), &[h.t.clamp(0.001, 0.999)]);
+            let t = if mid_down || mid_click { 0.5 } else { h.t.clamp(0.001, 0.999) };
+            draw_loops(painter, cv, rect, &ring_of(app, &h), &[t]);
         }
     }
     let mut pts: Vec<DVec3> = app.mesh_tool.cut.iter().map(|c| c.w).collect();
@@ -343,15 +355,19 @@ fn multi_cut(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Rect,
         multi_cut_complete(app);
         return;
     }
-    if !resp.clicked_by(egui::PointerButton::Primary) {
+    if !resp.clicked_by(egui::PointerButton::Primary) && !mid_click {
         return;
     }
     let Some((id, c)) = hover else {
-        multi_cut_complete(app);
+        // a middle click off the mesh does nothing; a left click there completes the cut
+        if !mid_click {
+            multi_cut_complete(app);
+        }
         return;
     };
     if mods.ctrl || mods.command {
-        // Ctrl+click on an edge inserts an edge loop
+        // Ctrl+click on an edge inserts an edge loop (through the midpoint with the middle button,
+        // as cut_pick returns t = 0.5 then)
         if let Some((a, b, t)) = c.edge {
             app.s.checkpoint("insert edge loop");
             let mut p = Params::new();
@@ -876,7 +892,7 @@ pub fn settings(app: &mut IncaApp, ui: &mut egui::Ui) {
             ui.label(egui::RichText::new("Ctrl inverts, Shift smooths").color(crate::theme::TEXT_DIM));
         }
         Tool::MultiCut => {
-            ui.label("Click edges / vertices to cut, Enter or RMB completes, Backspace removes the last point. Shift snaps to 10% steps, Ctrl+click inserts an edge loop.");
+            ui.label("Click edges / vertices to cut, Enter or RMB completes, Backspace removes the last point. Shift snaps to 10% steps, middle-click cuts an edge at its midpoint, Ctrl+click inserts an edge loop (Ctrl+middle-click: through the midpoint).");
         }
         Tool::QuadDraw => {
             ui.label("Click to place dots on the live surface, Shift+click fills the quad around the cursor, drag a dot or vertex to slide it, Ctrl+Shift+click deletes a dot. Enter selects the result.");
@@ -891,4 +907,144 @@ pub fn settings(app: &mut IncaApp, ui: &mut egui::Ui) {
 fn cap(s: &str) -> String {
     let mut c = s.chars();
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(ctx: &egui::Context) -> IncaApp {
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        IncaApp::new(&cc)
+    }
+
+    /// An app with one cube under the Multi-Cut tool, the persp view and its rect.
+    fn cube_scene(ctx: &egui::Context) -> (IncaApp, String, CamView, Rect) {
+        let mut app = test_app(ctx);
+        let cube = app.s.create_mesh("polyCube", &Params::new(), None);
+        for a in ["sx", "sy", "sz"] {
+            app.s.set_attr_f(&cube, a, 12.0);
+        }
+        app.s.select(std::slice::from_ref(&cube), SelMode::Replace);
+        app.tool = Tool::MultiCut;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let persp = app.s.find("persp").unwrap();
+        let cv = viewport::cam_view(&app.s, &persp, [rect.width(), rect.height()]);
+        (app, cube, cv, rect)
+    }
+
+    /// A screen point `frac` of the way along the edge `pick_edge` finds there, with that edge.
+    fn point_on_edge(app: &IncaApp, cube: &str, cv: &CamView, rect: Rect, frac: f32) -> (Pos2, u32, u32) {
+        let pm = app.s.node(cube).unwrap().mesh().unwrap().mesh.clone();
+        let w = world_verts(app, cube);
+        for (a, b) in pm.topo().edges {
+            let (Some(sa), Some(sb)) = (cv.project(w[a as usize], rect), cv.project(w[b as usize], rect)) else { continue };
+            if !rect.contains(sa) || !rect.contains(sb) || sa.distance(sb) < 80.0 {
+                continue;
+            }
+            let p = sa + (sb - sa) * frac;
+            // use an edge whose point under the cursor isn't nearer to another edge
+            if let Some(e) = pick_edge(app, cv, rect, p, &[cube.to_string()]) {
+                if (e.a, e.b) == (a, b) {
+                    return (p, a, b);
+                }
+            }
+        }
+        panic!("no clearly visible edge");
+    }
+
+    fn midpoint(app: &IncaApp, cube: &str, a: u32, b: u32) -> DVec3 {
+        let w = world_verts(app, cube);
+        (w[a as usize] + w[b as usize]) * 0.5
+    }
+
+    #[test]
+    fn middle_pick_cuts_the_edge_at_its_midpoint() {
+        let ctx = egui::Context::default();
+        let (app, cube, cv, rect) = cube_scene(&ctx);
+        let (p, a, b) = point_on_edge(&app, &cube, &cv, rect, 0.2);
+        // a plain pick stays where the cursor is
+        let (_, c) = cut_pick(&app, &cv, rect, p, false, false).unwrap();
+        let (_, _, t) = c.edge.unwrap();
+        assert!((t - 0.2).abs() < 0.05, "plain pick t = {t}");
+        // the middle button puts it exactly halfway, also in world space
+        let (id, c) = cut_pick(&app, &cv, rect, p, false, true).unwrap();
+        assert_eq!(id, cube);
+        assert_eq!(c.edge, Some((a, b, 0.5)));
+        assert!(c.w.distance(midpoint(&app, &cube, a, b)) < 1e-12);
+        // Shift's 10% steps don't move it off the midpoint
+        let (_, c) = cut_pick(&app, &cv, rect, p, true, true).unwrap();
+        assert_eq!(c.edge, Some((a, b, 0.5)));
+    }
+
+    #[test]
+    fn middle_pick_next_to_a_vertex_still_takes_the_edge_midpoint() {
+        let ctx = egui::Context::default();
+        let (app, cube, cv, rect) = cube_scene(&ctx);
+        let (p, a, _) = point_on_edge(&app, &cube, &cv, rect, 0.5);
+        let w = world_verts(&app, &cube);
+        let sa = cv.project(w[a as usize], rect).unwrap();
+        // 3 px from vertex a, along the edge: a plain pick snaps to the vertex
+        let near = sa + (p - sa).normalized() * 3.0;
+        let (_, c) = cut_pick(&app, &cv, rect, near, false, false).unwrap();
+        assert!(c.vertex.is_some(), "plain pick should snap to the vertex");
+        let (_, c) = cut_pick(&app, &cv, rect, near, false, true).unwrap();
+        let (ea, eb, t) = c.edge.expect("middle pick should take the edge");
+        assert_eq!(t, 0.5);
+        assert!(c.w.distance(midpoint(&app, &cube, ea, eb)) < 1e-12);
+    }
+
+    /// Drive the tool with real egui frames: move, then press and release a button.
+    fn click(ctx: &egui::Context, app: &mut IncaApp, cv: &CamView, rect: Rect, p: Pos2, button: egui::PointerButton, modifiers: egui::Modifiers, t0: f64) {
+        let frames = [
+            vec![egui::Event::ModifiersChanged(modifiers), egui::Event::PointerMoved(p)],
+            vec![egui::Event::PointerButton { pos: p, button, pressed: true, modifiers }],
+            vec![egui::Event::PointerButton { pos: p, button, pressed: false, modifiers }],
+            vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+        ];
+        for (i, events) in frames.into_iter().enumerate() {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(rect);
+            raw.time = Some(t0 + i as f64 * 0.05);
+            raw.events = events;
+            let mut out = ctx.run_ui(raw, |ui| {
+                let resp = ui.interact(rect, egui::Id::new("multi-cut test"), egui::Sense::click_and_drag());
+                let painter = ui.painter().clone();
+                multi_cut(app, &resp, cv, rect, &painter);
+            });
+            out.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn middle_click_adds_a_midpoint_cut_and_left_click_does_not() {
+        let ctx = egui::Context::default();
+        let (mut app, cube, cv, rect) = cube_scene(&ctx);
+        let (p, a, b) = point_on_edge(&app, &cube, &cv, rect, 0.2);
+        click(&ctx, &mut app, &cv, rect, p, egui::PointerButton::Middle, egui::Modifiers::NONE, 0.0);
+        assert_eq!(app.mesh_tool.cut.len(), 1);
+        assert_eq!(app.mesh_tool.cut[0].edge, Some((a, b, 0.5)));
+        click(&ctx, &mut app, &cv, rect, p, egui::PointerButton::Primary, egui::Modifiers::NONE, 1.0);
+        assert_eq!(app.mesh_tool.cut.len(), 2);
+        let (_, _, t) = app.mesh_tool.cut[1].edge.unwrap();
+        assert!((t - 0.2).abs() < 0.05, "left click t = {t}");
+        // a middle click on empty space neither adds a point nor completes the cut
+        click(&ctx, &mut app, &cv, rect, Pos2::new(5.0, 5.0), egui::PointerButton::Middle, egui::Modifiers::NONE, 2.0);
+        assert_eq!(app.mesh_tool.cut.len(), 2);
+    }
+
+    #[test]
+    fn ctrl_middle_click_inserts_an_edge_loop_through_the_midpoint() {
+        let ctx = egui::Context::default();
+        let (mut app, cube, cv, rect) = cube_scene(&ctx);
+        let (p, a, b) = point_on_edge(&app, &cube, &cv, rect, 0.2);
+        let mid = midpoint(&app, &cube, a, b);
+        let faces = app.s.node(&cube).unwrap().mesh().unwrap().mesh.f.len();
+        click(&ctx, &mut app, &cv, rect, p, egui::PointerButton::Middle, egui::Modifiers::CTRL, 0.0);
+        let pm = app.s.node(&cube).unwrap().mesh().unwrap().mesh.clone();
+        assert_eq!(pm.f.len(), faces + 4, "a loop around the cube splits 4 faces");
+        let w = world_verts(&app, &cube);
+        assert!(w.iter().any(|v| v.distance(mid) < 1e-9), "no new vertex at the edge midpoint {mid}");
+        assert!(app.mesh_tool.cut.is_empty());
+    }
 }
