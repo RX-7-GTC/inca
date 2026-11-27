@@ -387,6 +387,16 @@ fn cb_numeric_cell(
             }
             // Clicking a text box drops the channel-name selection (and the MMB slider arm).
             cb_clear_names(app);
+            // ...but it also selects that channel, like Maya. Object transform channels get the
+            // mini axis gizmo; history inputs hide their Show Manipulator until T.
+            app.panels.cb_pick_from_inview = false;
+            app.panels.cb_sel = vec![attr.to_string()];
+            app.panels.cb_pick = vec![me.clone()];
+            app.panels.cb_last = Some(attr.to_string());
+            if let NodeRef::History(hid, hi) = first {
+                app.manip_node = Some((hid.clone(), *hi));
+            }
+            cb_arm(app);
             let m = ui.input(|i| i.modifiers);
             if m.shift {
                 app.panels.cb_field_click = Some((key.clone(), true));
@@ -511,6 +521,8 @@ pub struct PanelState {
     /// the picked channels themselves: rows' targets, attribute, whole-number?, range
     pub cb_pick: Vec<CbPick>,
     pub cb_armed: bool,
+    /// the current armed channel pick came from the floating In-View Editor (keep the gizmo)
+    pub cb_pick_from_inview: bool,
     cb_last: Option<String>,
     /// virtual slider drag: (target, attribute, start value, int?)
     pub cb_drag: Option<Vec<(NodeRef, String, f64, bool, Option<f64>, Option<f64>)>>,
@@ -1673,6 +1685,12 @@ fn channel_row_impl(app: &mut IncaApp, ui: &mut egui::Ui, targets: &[NodeRef], a
         }
         ui.painter().text(rect.right_center() - egui::vec2(4.0, 0.0), egui::Align2::RIGHT_CENTER, label, egui::FontId::proportional(12.0), label_color);
         if lresp.clicked() {
+            // Clicking a history node's channel makes it T's current node (the channel manip
+            // takes over until T recalls that node's gizmo/panel).
+            if let Some(NodeRef::History(hid, hi)) = targets.first() {
+                app.manip_node = Some((hid.clone(), *hi));
+            }
+            app.panels.cb_pick_from_inview = !selectable;
             // pick channels for the MMB virtual slider: click, Ctrl toggles, Shift adds a range
             let m = ui.input(|i| i.modifiers);
             let p = &mut app.panels;
@@ -2035,18 +2053,26 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
     let full_name = n.name.clone();
     let name = shown_node_name(app, &full_name);
     let shape = n.shape_name.clone();
+    let component = app.s.comp_mode.is_some();
     let mut cb_rows: Vec<CbRow> = Vec::new();
-    // object name (editable; keep the edit buffer between frames so typing is not reset)
-    if app.panels.cb_name.0 != name {
-        app.panels.cb_name = (name.clone(), name.clone());
-    }
-    let r = ui.add(egui::TextEdit::singleline(&mut app.panels.cb_name.1).font(egui::TextStyle::Heading).desired_width(f32::INFINITY));
-    app.panels.cb_name_rect = Some(r.rect);
-    if r.lost_focus() {
-        let new = app.panels.cb_name.1.trim().to_string();
-        if !new.is_empty() && new != name {
-            let _ = app.run_mel("rename", &format!("rename {full_name} \"{new}\";"));
-            return;
+    if component {
+        // Maya's component-mode Channel Box shows the shape node and its construction inputs,
+        // not the object transform channels.
+        ui.label(RichText::new(shape.clone().unwrap_or_else(|| name.clone())).heading());
+        app.panels.cb_name_rect = None;
+    } else {
+        // object name (editable; keep the edit buffer between frames so typing is not reset)
+        if app.panels.cb_name.0 != name {
+            app.panels.cb_name = (name.clone(), name.clone());
+        }
+        let r = ui.add(egui::TextEdit::singleline(&mut app.panels.cb_name.1).font(egui::TextStyle::Heading).desired_width(f32::INFINITY));
+        app.panels.cb_name_rect = Some(r.rect);
+        if r.lost_focus() {
+            let new = app.panels.cb_name.1.trim().to_string();
+            if !new.is_empty() && new != name {
+                let _ = app.run_mel("rename", &format!("rename {full_name} \"{new}\";"));
+                return;
+            }
         }
     }
     // the lead object comes first: its values are the ones shown
@@ -2067,7 +2093,7 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
             })
             .collect()
     })).unwrap_or_default();
-    if app.panels.cb_asset_top {
+    if !component && app.panels.cb_asset_top {
         if let (Some(aid), false) = (&asset, asset_rows.is_empty()) {
             ui.add_space(4.0);
             theme::section_header(ui, "ASSET");
@@ -2079,57 +2105,61 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
     }
-    for c in CHANNELS {
-        if !cb_shown(filter, c) || !cb_custom_shown(app, c) || app.s.node(&lead).is_some_and(|n| n.channel_hidden(c)) {
-            continue;
+    if !component {
+        for c in CHANNELS {
+            if !cb_shown(filter, c) || !cb_custom_shown(app, c) || app.s.node(&lead).is_some_and(|n| n.channel_hidden(c)) {
+                continue;
+            }
+            let kind = if c == "visibility" { ChanKind::Bool } else { ChanKind::Float };
+            let label = cb_label(app, c);
+            channel_row_cb(app, ui, &mut cb_rows, &targets, c, &label, kind, None, None);
         }
-        let kind = if c == "visibility" { ChanKind::Bool } else { ChanKind::Float };
-        let label = cb_label(app, c);
-        channel_row_cb(app, ui, &mut cb_rows, &targets, c, &label, kind, None, None);
     }
     // added (dynamic) attributes, unless the SHAPES section lists them
     let sh_channels = app.s.shape_channels(&lead);
-    let extra: Vec<(String, ChanKind)> = app.s.node(&lead).and_then(|n| n.extra.as_object()).map(|e| {
-        e.iter()
-            .filter(|(k, _)| !sh_channels.contains(k))
-            .filter_map(|(k, v)| match v {
-                Value::Bool(_) => Some((k.clone(), ChanKind::Bool)),
-                Value::Number(n) if n.is_f64() => Some((k.clone(), ChanKind::Float)),
-                Value::Number(_) => Some((k.clone(), ChanKind::Int)),
-                _ => None,
-            })
-            .collect()
-    }).unwrap_or_default();
-    for (k, kind) in extra {
-        if app.s.node(&lead).is_some_and(|n| n.channel_hidden(&k)) || !cb_custom_shown(app, &k) {
-            continue;
-        }
-        let label = cb_label(app, &k);
-        channel_row_cb(app, ui, &mut cb_rows, &targets, &k, &label, kind, None, None);
-    }
-    // PUBLISHED (container interface attributes)
-    let published: Vec<(String, ChanKind)> = app.s.node(&lead).map(|n| {
-        n.published
-            .keys()
-            .filter_map(|name| match app.s.get_attr(&NodeRef::Dag(lead.clone()), name) {
-                Some(Value::Bool(_)) => Some((name.clone(), ChanKind::Bool)),
-                Some(Value::Number(x)) if x.is_f64() => Some((name.clone(), ChanKind::Float)),
-                Some(Value::Number(_)) => Some((name.clone(), ChanKind::Int)),
-                _ => None,
-            })
-            .collect()
-    }).unwrap_or_default();
-    if !published.is_empty() {
-        ui.add_space(4.0);
-        theme::section_header(ui, "PUBLISHED");
-        for (k, kind) in published {
+    if !component {
+        let extra: Vec<(String, ChanKind)> = app.s.node(&lead).and_then(|n| n.extra.as_object()).map(|e| {
+            e.iter()
+                .filter(|(k, _)| !sh_channels.contains(k))
+                .filter_map(|(k, v)| match v {
+                    Value::Bool(_) => Some((k.clone(), ChanKind::Bool)),
+                    Value::Number(n) if n.is_f64() => Some((k.clone(), ChanKind::Float)),
+                    Value::Number(_) => Some((k.clone(), ChanKind::Int)),
+                    _ => None,
+                })
+                .collect()
+        }).unwrap_or_default();
+        for (k, kind) in extra {
             if app.s.node(&lead).is_some_and(|n| n.channel_hidden(&k)) || !cb_custom_shown(app, &k) {
                 continue;
             }
-            channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(lead.clone())], &k, &k, kind, None, None);
+            let label = cb_label(app, &k);
+            channel_row_cb(app, ui, &mut cb_rows, &targets, &k, &label, kind, None, None);
+        }
+        // PUBLISHED (container interface attributes)
+        let published: Vec<(String, ChanKind)> = app.s.node(&lead).map(|n| {
+            n.published
+                .keys()
+                .filter_map(|name| match app.s.get_attr(&NodeRef::Dag(lead.clone()), name) {
+                    Some(Value::Bool(_)) => Some((name.clone(), ChanKind::Bool)),
+                    Some(Value::Number(x)) if x.is_f64() => Some((name.clone(), ChanKind::Float)),
+                    Some(Value::Number(_)) => Some((name.clone(), ChanKind::Int)),
+                    _ => None,
+                })
+                .collect()
+        }).unwrap_or_default();
+        if !published.is_empty() {
+            ui.add_space(4.0);
+            theme::section_header(ui, "PUBLISHED");
+            for (k, kind) in published {
+                if app.s.node(&lead).is_some_and(|n| n.channel_hidden(&k)) || !cb_custom_shown(app, &k) {
+                    continue;
+                }
+                channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(lead.clone())], &k, &k, kind, None, None);
+            }
         }
     }
-    if !app.panels.cb_asset_top {
+    if !component && !app.panels.cb_asset_top {
         if let (Some(aid), false) = (&asset, asset_rows.is_empty()) {
             ui.add_space(4.0);
             theme::section_header(ui, "ASSET");
@@ -2141,25 +2171,27 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
     }
-    // SHAPES
-    let shape = shape.or_else(|| (!sh_channels.is_empty()).then(|| app.s.node(&lead).map(|n| n.kind.clone()).unwrap_or_default()));
-    if let Some(sn) = shape {
-        ui.add_space(4.0);
-        theme::section_header(ui, "SHAPES");
-        ui.label(RichText::new(sn).color(theme::TEXT));
-        for c in sh_channels {
-            if app.s.node(&lead).is_some_and(|n| n.channel_hidden(&c)) || !cb_custom_shown(app, &c) {
-                continue;
+    if !component {
+        // SHAPES
+        let shape = shape.or_else(|| (!sh_channels.is_empty()).then(|| app.s.node(&lead).map(|n| n.kind.clone()).unwrap_or_default()));
+        if let Some(sn) = shape {
+            ui.add_space(4.0);
+            theme::section_header(ui, "SHAPES");
+            ui.label(RichText::new(sn).color(theme::TEXT));
+            for c in sh_channels {
+                if app.s.node(&lead).is_some_and(|n| n.channel_hidden(&c)) || !cb_custom_shown(app, &c) {
+                    continue;
+                }
+                let v = app.s.get_attr(&NodeRef::Dag(lead.clone()), &c);
+                let kind = match v {
+                    Some(Value::Bool(_)) => ChanKind::Bool,
+                    _ if c == "smoothLevel" => ChanKind::Int,
+                    _ => ChanKind::Float,
+                };
+                let (mn, mx) = if c == "smoothLevel" { (Some(0.0), Some(3.0)) } else { (None, None) };
+                let label = cb_label(app, &c);
+                channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(lead.clone())], &c, &label, kind, mn, mx);
             }
-            let v = app.s.get_attr(&NodeRef::Dag(lead.clone()), &c);
-            let kind = match v {
-                Some(Value::Bool(_)) => ChanKind::Bool,
-                _ if c == "smoothLevel" => ChanKind::Int,
-                _ => ChanKind::Float,
-            };
-            let (mn, mx) = if c == "smoothLevel" { (Some(0.0), Some(3.0)) } else { (None, None) };
-            let label = cb_label(app, &c);
-            channel_row_cb(app, ui, &mut cb_rows, &[NodeRef::Dag(lead.clone())], &c, &label, kind, mn, mx);
         }
     }
     // INPUTS (construction history, newest first); a deformer handle shows its deformer
@@ -2196,6 +2228,23 @@ pub fn channel_box(app: &mut IncaApp, ui: &mut egui::Ui) {
                     app.panels.expanded.remove(&open_id);
                 } else {
                     app.panels.expanded.insert(open_id);
+                }
+                let editable = ops::info(&ty).is_some_and(|x| !x.2.is_empty());
+                if editable {
+                    // Clicking any history entry recalls that operation's tool, whether the
+                    // entry was expanded or collapsed. The In-View Editor covers every op;
+                    // Extrude also gets its viewport gizmo.
+                    app.panels.cb_armed = false;
+                    app.inview = Some((lead.clone(), i));
+                    app.show_manips_tool = true;
+                    if ty == "polyExtrudeFace" {
+                        app.extrude_manip = Some((lead.clone(), i));
+                        app.extrude_forced = true;
+                    } else {
+                        app.extrude_manip = None;
+                        app.extrude_forced = false;
+                    }
+                    app.manip_node = Some((lead.clone(), i));
                 }
             }
             if open {
@@ -8097,7 +8146,12 @@ pub fn history_channels(app: &mut IncaApp, ui: &mut egui::Ui, id: &str, i: usize
     let r = NodeRef::History(id.to_string(), i);
     let ty = app.s.history_node(id, i).map(|h| h.ty).unwrap_or_default();
     if let Some((_, _, chans)) = ops::info(&ty) {
-        for c in chans {
+        let ordered: Vec<_> = if ty == "polyExtrudeFace" {
+            ["thickness", "localTranslateZ", "offset", "divisions", "keepFacesTogether"].iter().filter_map(|k| chans.iter().find(|c| c.key == *k)).cloned().collect()
+        } else {
+            chans.to_vec()
+        };
+        for c in ordered {
             let label = c.label.map(String::from).unwrap_or_else(|| ops::nice_name(c.key));
             channel_row(app, ui, std::slice::from_ref(&r), c.key, &label, c.kind, c.min, c.max);
         }
@@ -8856,7 +8910,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_box_click_away_clears_field_selection() {
+    fn channel_box_name_and_value_clicks_update_selection() {
         let ctx = egui::Context::default();
         crate::theme::apply(&ctx);
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
@@ -8888,7 +8942,9 @@ mod tests {
         run(&mut app, vec![egui::Event::PointerMoved(field.center()), egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }], 0.9);
         run(&mut app, vec![egui::Event::PointerButton { pos: field.center(), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }], 1.0);
         run(&mut app, vec![], 1.1);
-        assert!(app.panels.cb_pick.is_empty(), "clicking the value field left the channel name selected");
+        // Clicking the value field also selects its channel so the mini axis manipulator appears.
+        assert!(app.panels.cb_pick.iter().any(|p| p.attr == "translateX"), "clicking the value field did not select its channel");
+        assert!(app.panels.cb_armed, "clicking the value field did not arm the channel manipulator");
         assert!(app.panels.cb_fields.iter().any(|p| p.attr == "translateX"), "clicking the value field did not select it");
     }
 
@@ -10669,11 +10725,15 @@ mod tests {
         app.s.select(std::slice::from_ref(&id), SelMode::Replace);
         app.s.checkpoint("before extrude");
         let mut p = Params::new();
-        for (k, v) in [("faces", json!([0])), ("localTranslateZ", json!(0.0)), ("translateX", json!(0.0)), ("translateY", json!(0.0)), ("translateZ", json!(0.0)), ("offset", json!(0.0)), ("divisions", json!(1)), ("keepFacesTogether", json!(true))] {
+        for (k, v) in [("faces", json!([0])), ("thickness", json!(0.0)), ("localTranslateZ", json!(0.0)), ("translateX", json!(0.0)), ("translateY", json!(0.0)), ("translateZ", json!(0.0)), ("offset", json!(0.0)), ("divisions", json!(1)), ("keepFacesTogether", json!(true))] {
             p.insert(k.into(), v);
         }
         app.s.add_history(&id, "polyExtrudeFace", p);
         app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.comp_mode = Some(inca_core::scene::CompMode::Face);
+        app.s.comp.entry(id.clone()).or_default().f.insert(0);
+        app.s.set_hilite(std::slice::from_ref(&id));
+        app.show_manips_tool = true;
         app.inview = Some((id.clone(), 1));
         let mut frame = eframe::Frame::_new_kittest();
         let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
@@ -10718,6 +10778,7 @@ mod tests {
         app.inview = Some((id.clone(), 1));
         let mut p = Params::new();
         p.insert("faces".into(), json!([0]));
+        p.insert("thickness".into(), json!(0.0));
         p.insert("localTranslateZ".into(), json!(0.0));
         p.insert("translateX".into(), json!(0.0));
         p.insert("translateY".into(), json!(0.0));
@@ -10727,6 +10788,10 @@ mod tests {
         p.insert("keepFacesTogether".into(), json!(true));
         app.s.add_history(&id, "polyExtrudeFace", p);
         app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.comp_mode = Some(inca_core::scene::CompMode::Face);
+        app.s.comp.entry(id.clone()).or_default().f.insert(0);
+        app.s.set_hilite(std::slice::from_ref(&id));
+        app.show_manips_tool = true;
         let mut frame = eframe::Frame::_new_kittest();
         let mut run = |app: &mut IncaApp, events: Vec<egui::Event>, t: f64| {
             let mut out = ctx.run_ui(raw(events, t), |ui| eframe::App::ui(app, ui, &mut frame));
@@ -10773,6 +10838,7 @@ mod tests {
         let id = app.s.create_mesh("polyCube", &Params::new(), None);
         let mut p = Params::new();
         p.insert("faces".into(), json!([0]));
+        p.insert("thickness".into(), json!(0.0));
         p.insert("localTranslateZ".into(), json!(0.0));
         p.insert("translateX".into(), json!(0.0));
         p.insert("translateY".into(), json!(0.0));

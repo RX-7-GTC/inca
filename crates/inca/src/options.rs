@@ -28,7 +28,7 @@ pub const SPECS: &[(&str, &[Opt])] = &[
     ("smooth", &[o("divisions", "Division levels", Kind::Int, 1.0)]),
     ("mirror", &[o("axis", "Mirror axis", Kind::Radio(XYZ), 0.0), o("merge", "Merge border vertices", Kind::Bool, 1.0), o("threshold", "Merge threshold", Kind::Float, 0.001)]),
     ("addDivisions", &[o("divisions", "Subdivision levels", Kind::Int, 1.0)]),
-    ("extrude", &[o("thickness", "Thickness", Kind::Float, 0.5), o("offset", "Offset", Kind::Float, 0.0), o("divisions", "Divisions", Kind::Int, 1.0), o("keepFacesTogether", "Keep faces together", Kind::Bool, 1.0)]),
+    ("extrude", &[o("thickness", "Thickness", Kind::Float, 0.0), o("offset", "Offset", Kind::Float, 0.0), o("divisions", "Divisions", Kind::Int, 1.0), o("keepFacesTogether", "Keep faces together", Kind::Bool, 1.0)]),
     ("bridge", &[o("divisions", "Divisions", Kind::Int, 0.0)]),
     ("bevel", &[o("fraction", "Fraction", Kind::Float, 0.5)]),
     ("merge", &[o("threshold", "Threshold", Kind::Float, 0.001)]),

@@ -59,7 +59,7 @@ pub static OPS: &[OpInfo] = &[
         ty: "polyExtrudeFace",
         base: "polyExtrudeFace",
         hidden: false,
-        channels: &[ch("translateX", F, None, None), ch("translateY", F, None, None), ch("translateZ", F, None, None), ch("localTranslateZ", F, None, None), ch("offset", F, Some(-1.0), Some(1.0)), ch("divisions", I, Some(1.0), Some(50.0)), ch("keepFacesTogether", B, None, None)],
+        channels: &[ch("thickness", F, None, None), ch("translateX", F, None, None), ch("translateY", F, None, None), ch("translateZ", F, None, None), ch("localTranslateZ", F, None, None), ch("offset", F, Some(-1.0), Some(1.0)), ch("divisions", I, Some(1.0), Some(50.0)), ch("keepFacesTogether", B, None, None)],
     },
     OpInfo { ty: "polyExtrudeEdge", base: "polyExtrudeEdge", hidden: false, channels: &[ch("offset", F, None, None), ch("translateY", F, None, None)] },
     OpInfo { ty: "polyBevel", base: "polyBevel", hidden: false, channels: &[ch("fraction", F, Some(0.001), Some(1.0))] },

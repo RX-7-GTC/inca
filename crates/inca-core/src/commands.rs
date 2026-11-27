@@ -1298,7 +1298,8 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 }
                 let mut p = Params::new();
                 p.insert("faces".into(), json!(faces));
-                p.insert("localTranslateZ".into(), json!(a.f(&["ltz", "localTranslateZ"]).or(a.f(&["thk", "thickness"])).unwrap_or(0.0)));
+                p.insert("thickness".into(), json!(a.f(&["thickness", "th", "thk"]).unwrap_or(0.0)));
+                p.insert("localTranslateZ".into(), json!(a.f(&["ltz", "localTranslateZ"]).unwrap_or(0.0)));
                 let t = a.v3(&["t", "translate"]).unwrap_or([a.f(&["tx"]).unwrap_or(0.0), a.f(&["ty"]).unwrap_or(0.0), a.f(&["tz"]).unwrap_or(0.0)]);
                 p.insert("translateX".into(), json!(t[0]));
                 p.insert("translateY".into(), json!(t[1]));
@@ -3000,6 +3001,26 @@ mod tests {
 
     fn mel(s: &mut Scene, src: &str) -> Result<Val, String> {
         Interp::new().run(s, &mut NoHost, src)
+    }
+
+    #[test]
+    fn extrude_command_defaults_to_zero_movement() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube; select -r pCube1.f[1]; polyExtrudeFacet;").unwrap();
+        let id = s.find("pCube1").unwrap();
+        let h = s.history_node(&id, 1).unwrap();
+        assert_eq!(h.params["thickness"], json!(0.0));
+        assert_eq!(h.params["localTranslateZ"], json!(0.0));
+    }
+
+    #[test]
+    fn extrude_thickness_and_local_translate_are_separate_channels() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube; select -r pCube1.f[1]; polyExtrudeFacet -thickness 1 -ltz 2;").unwrap();
+        let id = s.find("pCube1").unwrap();
+        let h = s.history_node(&id, 1).unwrap();
+        assert_eq!(h.params["thickness"], json!(1.0));
+        assert_eq!(h.params["localTranslateZ"], json!(2.0));
     }
 
     #[test]

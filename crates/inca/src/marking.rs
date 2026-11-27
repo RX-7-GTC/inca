@@ -360,7 +360,16 @@ fn run(app: &mut IncaApp, act: Act) {
         }
         Act::History(id, i) => {
             app.select_names(std::slice::from_ref(&id), SelMode::Replace);
-            app.inview = Some((id, i));
+            app.inview = Some((id.clone(), i));
+            app.manip_node = Some((id.clone(), i));
+            app.show_manips_tool = true;
+            if app.s.history_meta(&id, i).is_some_and(|h| h.ty == "polyExtrudeFace") {
+                app.extrude_manip = Some((id, i));
+                app.extrude_forced = true;
+            } else {
+                app.extrude_manip = None;
+                app.extrude_forced = false;
+            }
         }
         Act::SetTool(t) => app.set_tool(t),
         Act::HypershadeAssign(id) => {

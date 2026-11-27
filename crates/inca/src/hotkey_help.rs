@@ -79,6 +79,7 @@ pub fn describe(id: &str) -> Option<&'static str> {
         "rotateTool" => "Activates the rotate tool.",
         "scaleTool" => "Activates the scale tool.",
         "lastToolUsed" => "Switches back to the previous tool.",
+    "manipulatorTool" => "Shows the manipulator for the selected object's current construction-history node.",
         "makeLive" => "Makes the selected mesh a live surface for snapping and drawing.",
         "symmetryObjectX" | "symmetryWorldX" | "symmetryWorldY" | "symmetryWorldZ" => "Mirrors edits across the chosen symmetry axis.",
         "symmetryOff" => "Turns modeling symmetry off.",

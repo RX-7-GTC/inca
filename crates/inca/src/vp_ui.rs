@@ -7,7 +7,7 @@ use egui::{pos2, vec2, Color32, Pos2, Rect, RichText, Sense, Stroke};
 use glam::{DMat4, DQuat, DVec3};
 use inca_core::math::quat_from_euler_deg;
 use inca_core::mesh::epair;
-use inca_core::scene::{CompMode, SelMode, Shape};
+use inca_core::scene::{CompMode, NodeRef, SelMode, Shape};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use transform_gizmo_egui::math::Transform;
@@ -155,8 +155,9 @@ pub struct GizmoDrag {
     /// per comps entry: soft selection weights (empty = all 1) and symmetry partner map
     pub weights: Vec<Vec<f64>>,
     pub mirror: Vec<Option<Vec<i64>>>,
-    /// right after an Extrude: the Move drag drives that node's translate (mesh, history index, start translate)
-    pub extrude: Option<(String, usize, DVec3)>,
+    /// Extrude manipulator drag: the node's translate X/Y/Z and Local Translate Z
+    /// (mesh, history index, start translate, start local translate Z, mesh-space face normal)
+    pub extrude: Option<(String, usize, DVec3, f64, DVec3)>,
     /// the handle being dragged
     pub handle: Option<GizmoMode>,
     /// press position of a JS-style drag (MMB / Shift auto-axis), where rotate and scale use
@@ -729,6 +730,25 @@ fn sel_mode(m: egui::Modifiers) -> SelMode {
 
 fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter) {
     let (mods, pointer, scroll) = ui.input(|i| (i.modifiers, i.pointer.clone(), i.smooth_scroll_delta.y));
+    // Clicks/drags that start on the floating In-View Editor belong to its widgets. Guard only
+    // the press (and its release), not hover: the viewport gizmo must keep drawing underneath.
+    if app.active_vp == idx {
+        let primary_down = pointer.button_down(egui::PointerButton::Primary);
+        if app.inview_rect.is_some_and(|r| pointer.button_pressed(egui::PointerButton::Primary) && pointer.press_origin().is_some_and(|p| r.contains(p))) {
+            app.inview_press = true;
+        }
+        if app.inview_press {
+            if !primary_down {
+                app.inview_press = false;
+            }
+            // Keep drawing the viewport gizmo while the pointer is on the panel.
+            gizmo(app, ui, idx, resp, cv, painter, false);
+            return;
+        }
+        if app.inview_rect.is_none() {
+            app.inview_press = false;
+        }
+    }
     // ---- marking menus: RMB (Shift / Ctrl variants), W / E / R + LMB
     if app.marking.is_some() {
         return;
@@ -822,6 +842,8 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
     }
     // ---- Channel Box virtual slider (MMB with channels picked); an LMB click disarms it
     if crate::panels::virtual_slider(app, resp) {
+        // The slider owns the MMB gesture, but the manipulator must stay visible while it drags.
+        gizmo(app, ui, idx, resp, cv, painter, false);
         return;
     }
     if resp.clicked_by(egui::PointerButton::Primary) {
@@ -852,6 +874,9 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
     }
     if resp.drag_started_by(egui::PointerButton::Primary) && tab_down && !app.lock_selection {
         app.s.checkpoint_selection("select");
+        if app.s.comp_mode.is_some() {
+            app.disarm_manip();
+        }
         app.vp_state.tab_drag = Some((HashSet::new(), resp.interact_pointer_pos().map(|p| p - resp.drag_delta())));
     }
     if let Some((mut seen, last)) = app.vp_state.tab_drag.clone() {
@@ -891,6 +916,9 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
         if let Some(p) = resp.interact_pointer_pos() {
             if let Some(n) = pick_name(app, idx, cv, p) {
                 app.s.checkpoint_selection("select");
+                if app.s.comp_mode.is_some() {
+                    app.disarm_manip();
+                }
                 let verb = if item_selected(app, &n) { "-d" } else { "-add" };
                 let _ = app.exec_mel(&format!("select {verb} {n};"), false);
             }
@@ -949,6 +977,10 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
                             }
                         }
                     }
+                    // A marquee keeps the Extrude show armed but collapses its Channel Box
+                    // entry and forgets the previously selected manipulator axis.
+                    app.collapse_extrude_entry();
+                    app.vp_state.reset_active_handle(Tool::Move);
                 }
             }
         }
@@ -968,6 +1000,9 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
     // Shift+double-click a face beside a selected one takes the face loop through both and
     // skips the normal edge-ring behaviour.
     if resp.double_clicked() {
+        if app.s.comp_mode.is_some() {
+            app.disarm_manip();
+        }
         if let Some(p) = resp.interact_pointer_pos() {
             let mut handled = false;
             if mods.shift && app.s.comp_mode == Some(inca_core::scene::CompMode::Face) && !app.lock_selection {
@@ -1044,6 +1079,12 @@ fn hover_pick(app: &mut IncaApp, ctx: &egui::Context, idx: usize, cv: &CamView, 
 }
 
 fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelMode) {
+    // In component mode any viewport click drops the Extrude tool: gizmo, panel and Channel Box
+    // entry. T cannot recall it afterwards. In Object mode the show stays armed (it is only
+    // hidden by the component-only rule), so T/Channel Box can recall it.
+    if app.s.comp_mode.is_some() {
+        app.disarm_manip();
+    }
     if app.lock_selection {
         return;
     }
@@ -1117,6 +1158,11 @@ fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelM
     let hit = pick_masked(app, &vp, cv, p).and_then(|h| filter_picks(app, vec![h]).pop());
     match hit {
         Some(id) => {
+            // Object-mode selection change closes the Extrude Channel Box entry but keeps the
+            // show armed so reselecting the object (or T) can bring the gizmo back.
+            if app.s.lead() != Some(&id) {
+                app.collapse_extrude_entry();
+            }
             app.s.checkpoint_selection("select");
             app.select_names(&[id], mode);
         }
@@ -1446,8 +1492,27 @@ fn region_select(app: &mut IncaApp, idx: usize, cv: &CamView, region: &dyn Fn(Po
 /// Move / rotate / scale manipulator. Returns true while it owns the mouse.
 /// Transform channels picked in the Channel Box (all translate, all rotate or all scale): the
 /// manipulator shows just those axes, as in Maya.
+/// The Channel Box has a history-node channel armed (not an object transform). Selecting one
+/// hides that tool's Show Manipulator gizmo/panel until T.
+fn channel_manip_is_history(app: &IncaApp) -> bool {
+    if app.panels.cb_pick_from_inview {
+        return false;
+    }
+    app.panels.cb_armed
+        && !app.panels.cb_pick.is_empty()
+        && app.panels.cb_pick.iter().all(|p| p.targets.iter().all(|t| matches!(t, NodeRef::History(..))))
+}
+
 fn channel_modes(app: &IncaApp) -> Option<(Tool, EnumSet<GizmoMode>)> {
     if !app.panels.cb_armed || app.panels.cb_manips.unwrap_or(2).min(2) < 2 || app.panels.cb_sel.is_empty() || app.s.comp_mode.is_some() {
+        return None;
+    }
+    // Maya draws these single-axis manipulators only for the object's transform channels. A
+    // history node's inputs (Extrude's Translate X, etc.) keep their own Show Manipulator; the
+    // Channel Box virtual slider still works for them via MMB.
+    if app.panels.cb_pick.is_empty()
+        || !app.panels.cb_pick.iter().all(|p| p.targets.iter().all(|t| matches!(t, NodeRef::Dag(_))))
+    {
         return None;
     }
     let mut kind = None;
@@ -1990,14 +2055,114 @@ fn finite_quat(q: DQuat) -> DQuat {
     if q.to_array().iter().all(|v| v.is_finite()) { q } else { DQuat::IDENTITY }
 }
 
+/// The trailing Extrude node currently shown by the manipulator, with the extruded cap's centre
+/// (after this node's own transform, so the manipulator follows the cap) and normal.
+struct ExtrudeTarget {
+    center: DVec3,
+    normal: DVec3,
+    mesh_normal: DVec3,
+}
+
+/// The mesh is the current object-level selection target (component target or lead object).
+fn manip_object_selected(app: &IncaApp, mesh: &str) -> bool {
+    app.s.hilite().iter().any(|m| m == mesh) || app.s.lead().is_some_and(|m| m == mesh)
+}
+
+/// The Extrude node whose manipulator is visible right now. Extrude is component-only:
+/// Show Manipulator must be the tool, component mode must be on, and the node's mesh must be
+/// the current selection target. The armed node itself survives object-level selections, so
+/// clicking back on the object can restore the gizmo without T.
+fn extrude_node(app: &IncaApp) -> Option<(String, usize)> {
+    if !app.show_manips_tool {
+        return None;
+    }
+    // Automatic component shows are component-only; an explicit Channel Box/T recall works in
+    // Object mode too.
+    if !app.extrude_forced && app.s.comp_mode.is_none() {
+        return None;
+    }
+    let (mesh, idx) = app.extrude_manip.clone()?;
+    manip_object_selected(app, &mesh).then_some((mesh, idx))
+}
+
+fn extrude_target(app: &IncaApp) -> Option<ExtrudeTarget> {
+    let (mesh, idx) = extrude_node(app)?;
+    // Only the trailing Extrude can be edited; an older one in the stack has no manipulator.
+    if idx + 1 != app.s.node(&mesh)?.mesh()?.history.len() {
+        return None;
+    }
+    let h = app.s.history_node(&mesh, idx)?;
+    if h.ty != "polyExtrudeFace" {
+        return None;
+    }
+    let faces: Vec<usize> = h.params.get("faces")?.as_array()?.iter().filter_map(|v| v.as_u64().map(|x| x as usize)).collect();
+    // Read the cap from this node's output, not its input: the manipulator has to sit on the
+    // extruded polygon, wherever the previous drag/values left it.
+    let base = app.s.history_out(&mesh, idx).or_else(|| app.s.history_output(&mesh, idx + 1)).or_else(|| app.s.node(&mesh).and_then(|n| n.mesh()).map(|m| m.mesh.clone()))?;
+    let mut center = DVec3::ZERO;
+    let mut normal = DVec3::ZERO;
+    for &f in &faces {
+        if f < base.f.len() {
+            center += base.face_center(f);
+            normal += base.face_normal(f);
+        }
+    }
+    if faces.is_empty() || normal.length_squared() < 1e-12 {
+        let b = base.bbox();
+        center = b.center();
+        normal = DVec3::Y;
+    } else {
+        center /= faces.len() as f64;
+        normal = normal.normalize_or_zero();
+    }
+    let wm = app.s.world_matrix(&mesh);
+    Some(ExtrudeTarget {
+        center: wm.transform_point3(center),
+        normal: wm.transform_vector3(normal).normalize_or_zero(),
+        mesh_normal: normal.normalize_or_zero(),
+    })
+}
+
+/// Split an Extrude manipulator drag (a mesh-space delta) into Local Translate Z along the face
+/// normal and the in-plane translate vector, so the cap follows the handle on any face side.
+fn extrude_drag_offsets(t0: DVec3, ltz0: f64, normal: DVec3, local: DVec3) -> (DVec3, f64) {
+    let along = local.dot(normal);
+    (t0 + local - normal * along, ltz0 + along)
+}
+
+/// Local manipulator frame with Z along the extrude normal.
+fn face_quat(normal: DVec3) -> DQuat {
+    let z = normal.normalize_or_zero();
+    if z.length_squared() < 1e-12 {
+        return DQuat::IDENTITY;
+    }
+    let up = if z.dot(DVec3::Y).abs() < 0.99 { DVec3::Y } else { DVec3::Z };
+    let x = z.cross(up).normalize_or_zero();
+    let y = z.cross(x).normalize_or_zero();
+    DQuat::from_mat3(&glam::DMat3::from_cols(x, y, z))
+}
+
 fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response, cv: &CamView, painter: &egui::Painter, interact: bool) -> bool {
     app.vp_state.gizmo_solo[idx] = None;
-    let chan = channel_modes(app);
-    if (!app.tool.is_manip() && chan.is_none()) || !app.vps[idx].show_manips {
+    if !app.vps[idx].show_manips {
         return false;
     }
     // JS `manipActiveOnly`: other panes keep drawing the scene but hide their manipulators
     if app.prefs.manip_active_only && app.active_vp != idx {
+        return false;
+    }
+    let chan = channel_modes(app);
+    let channel_manip = chan.is_some();
+    let history_channel_armed = channel_manip_is_history(app);
+    // Selecting a history node's channel takes over from its Show Manipulator gizmo until T.
+    // An object-transform channel manip takes over the same way (and is drawn at the object).
+    let extrude_active = extrude_target(app).is_some() && !history_channel_armed && !channel_manip;
+    // Show Manipulator tool: no transform gizmo for the current selection at all, except an
+    // explicitly armed object-transform channel manipulator.
+    if app.show_manips_tool && !extrude_active && !channel_manip {
+        return false;
+    }
+    if !app.tool.is_manip() && chan.is_none() && !extrude_active {
         return false;
     }
     if let Some(d) = &app.vp_state.drag {
@@ -2008,11 +2173,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     // target frame: pivot + orientation
     let comp_targets: Vec<(String, Vec<u32>)> = if app.s.comp_mode.is_some() { app.s.hilite().into_iter().map(|id| { let v = app.s.comp_verts(&id); (id, v) }).filter(|(_, v)| !v.is_empty()).collect() } else { vec![] };
     let objects: Vec<String> = if app.s.comp_mode.is_some() { vec![] } else { app.s.sel.iter().filter(|i| app.s.node(i).is_some_and(|n| !n.startup())).cloned().collect() };
-    if comp_targets.is_empty() && objects.is_empty() && app.vp_state.drag.is_none() {
+    if comp_targets.is_empty() && objects.is_empty() && app.vp_state.drag.is_none() && !extrude_active {
         return false;
     }
     let pivot_mode = app.pivot_mode && app.s.comp_mode.is_none();
-    let tool = chan.map(|c| c.0).unwrap_or(app.tool);
+    let tool = if extrude_active { Tool::Move } else { chan.map(|c| c.0).unwrap_or(app.tool) };
     let (pivot, rot) = if let Some(d) = &app.vp_state.drag {
         (DVec3::from(d.cur.translation), DQuat::from(d.cur.rotation))
     } else if !comp_targets.is_empty() {
@@ -2040,8 +2205,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             }
         }
         (c / n.max(1) as f64, rot)
-    } else {
-        let lead = objects.last().unwrap();
+    } else if let Some(lead) = objects.last() {
         let rot = if tool == Tool::Scale {
             rotation_without_scale(app, lead)
         } else if app.space_world(tool) {
@@ -2050,7 +2214,16 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             finite_quat(app.s.world_matrix(lead).to_scale_rotation_translation().1)
         };
         (app.s.world_pivot(lead), rot)
+    } else {
+        // The Extrude manipulator can be live with no object selection (for example after a
+        // viewport click); the face frame below supplies its real pivot.
+        (DVec3::ZERO, DQuat::IDENTITY)
     };
+    // The Extrude manipulator sits on the selected face and aims local Z along its normal.
+    let extrude_axes = if extrude_active { extrude_target(app).map(|t| (t.center, face_quat(t.normal))) } else { None };
+    // Mid-drag, pivot/rot already come from the drag's current transform. Re-seeding them from
+    // the face centre every frame discards transform-gizmo's incremental delta (the drag sticks).
+    let (pivot, rot) = if app.vp_state.drag.is_some() { (pivot, rot) } else { extrude_axes.unwrap_or((pivot, rot)) };
     let mut modes = match tool {
         _ if pivot_mode => GizmoMode::all_translate(),
         _ if chan.is_some() => chan.unwrap().1,
@@ -2091,7 +2264,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     };
     let mut active = app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)).or_else(|| modes.contains(default_handle).then_some(default_handle)).or_else(|| modes.iter().next());
     let ppp = ui.ctx().pixels_per_point();
-    let space_world = app.space_world(tool);
+    let space_world = app.space_world(tool) && extrude_axes.is_none();
     let pointer = ui.input(|i| i.pointer.clone());
     let mods = ui.input(|i| i.modifiers);
     let ctrl = mods.ctrl || mods.command;
@@ -2530,11 +2703,24 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     match result {
         Some((_, new_tfs)) => {
             if app.vp_state.drag.is_none() {
+                // The Extrude manipulator takes this drag, as in Maya/JS: its divisions then
+                // spread along the moved distance.
+                let extrude = extrude_node(app).filter(|_| extrude_active && !pivot_mode).and_then(|(id, i)| {
+                    let len = app.s.node(&id).and_then(|n| n.mesh()).map(|m| m.history.len()).unwrap_or(0);
+                    let h = app.s.history_node(&id, i).filter(|h| h.ty == "polyExtrudeFace" && i + 1 == len)?;
+                    let g = |k: &str| h.params.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let n = extrude_target(app).map(|t| t.mesh_normal).unwrap_or(DVec3::Y);
+                    Some((id.clone(), i, DVec3::new(g("translateX"), g("translateY"), g("translateZ")), g("localTranslateZ"), n))
+                });
                 // drag start: snapshot what we move (one undo step per drag)
-                let label = match app.tool {
-                    Tool::Move => "move",
-                    Tool::Rotate => "rotate",
-                    _ => "scale",
+                let label = if extrude.is_some() {
+                    "extrude"
+                } else {
+                    match app.tool {
+                        Tool::Move => "move",
+                        Tool::Rotate => "rotate",
+                        _ => "scale",
+                    }
                 };
                 app.s.checkpoint(label);
                 let objs: Vec<(String, DMat4)> = objects.iter().filter(|o| !objects.iter().any(|p| p != *o && app.s.is_ancestor(p, o))).map(|o| (o.clone(), app.s.world_matrix(o))).collect();
@@ -2563,17 +2749,9 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                     mirror.push(m);
                 }
                 let pivots = pivot_mode.then(|| objs.iter().map(|(o, _)| app.s.world_pivot(o)).collect());
-                // the extrude just made (still shown in the In-View Editor) takes the move, as in Maya/JS:
-                // its divisions then spread along the moved distance
-                let extrude = app.inview.clone().filter(|_| app.tool == Tool::Move && !pivot_mode).and_then(|(id, i)| {
-                    let len = app.s.node(&id).and_then(|n| n.mesh()).map(|m| m.history.len()).unwrap_or(0);
-                    let h = app.s.history_node(&id, i).filter(|h| h.ty == "polyExtrudeFace" && i + 1 == len)?;
-                    let g = |k: &str| h.params.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    Some((id.clone(), i, DVec3::new(g("translateX"), g("translateY"), g("translateZ"))))
-                });
                 let (comps, weights, mirror) = if extrude.is_some() { (vec![], vec![], vec![]) } else { (comps, weights, mirror) };
                 let local_scales: Vec<DVec3> = objs.iter().map(|(o, _)| app.s.node(o).map(|n| DVec3::from(n.xf.s)).unwrap_or(DVec3::ONE)).collect();
-                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, local_scales, comps, tool: if pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag, press_px: auto_origin.or(mmb_press).unwrap_or(cursor), rebase });
+                app.vp_state.drag = Some(GizmoDrag { vp: idx, start: tf, cur: tf, objects: objs, local_scales, comps, tool: if extrude.is_some() || pivot_mode { Tool::Move } else { app.tool }, pivots, weights, mirror, extrude, handle: drag_handle, js_drag, press_px: auto_origin.or(mmb_press).unwrap_or(cursor), rebase });
             }
             let d = app.vp_state.drag.as_mut().unwrap();
             if let Some(n) = new_tfs.first() {
@@ -2656,14 +2834,15 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                 }
             }
             let d = app.vp_state.drag.as_mut().unwrap();
-            if let Some((id, i, t0)) = d.extrude.clone() {
+            if let Some((id, i, t0, ltz0, normal)) = d.extrude.clone() {
                 let world = DVec3::from(d.cur.translation) - DVec3::from(d.start.translation);
                 let local = app.s.world_matrix(&id).inverse().transform_vector3(world);
-                let t = t0 + local;
+                let (t, z) = extrude_drag_offsets(t0, ltz0, normal, local);
                 app.s.set_history_params(&id, i, &[
                     ("translateX".into(), serde_json::json!(t.x)),
                     ("translateY".into(), serde_json::json!(t.y)),
                     ("translateZ".into(), serde_json::json!(t.z)),
+                    ("localTranslateZ".into(), serde_json::json!(z)),
                 ]);
                 let final_tf = app.vp_state.drag.as_ref().map(|d| d.cur).unwrap_or(tf);
                 if !interaction.dragging {
@@ -3281,13 +3460,26 @@ fn hud(app: &mut IncaApp, idx: usize, cv: &CamView, p: &egui::Painter) {
 
 /// In-View Editor: the channels of the history node an op just made, in the viewport (JS showHistoryEditor).
 fn inview_editor(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect) {
+    app.inview_rect = None;
     let Some((id, i)) = app.inview.clone() else { return };
-    let valid = app.s.history_meta(&id, i).map(|h| h.name);
-    let lead_ok = app.s.sel.contains(&id) || app.s.hilite().contains(&id);
-    let Some(name) = valid.filter(|_| lead_ok) else {
+    let Some(meta) = app.s.history_meta(&id, i) else {
         app.inview = None;
         return;
     };
+    if meta.ty == "polyExtrudeFace" {
+        // Automatic Extrude shows are component-only; an explicit Channel Box/T recall also
+        // works in Object mode. A viewport click disarms it, so a random polygon cannot re-arm.
+        if !app.show_manips_tool
+            || (!app.extrude_forced && app.s.comp_mode.is_none())
+            || !manip_object_selected(app, &id)
+        {
+            return;
+        }
+    } else if !app.s.sel.contains(&id) && !app.s.hilite().contains(&id) {
+        app.inview = None;
+        return;
+    }
+    let name = meta.name;
     // dragged by its title bar; kept inside the viewport
     let off = app.inview_offset;
     let min = rect.min + vec2(8.0, 96.0) + off;
@@ -3295,7 +3487,7 @@ fn inview_editor(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect) {
     let r = Rect::from_min_size(min, vec2(250.0, 10.0));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(r.min, vec2(250.0, rect.height() - 110.0))));
     let mut close = false;
-    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(55, 55, 55, 235)).stroke(Stroke::new(1.0, Color32::from_gray(0x22))).corner_radius(3).inner_margin(egui::Margin::same(6)).show(&mut child, |ui| {
+    let frame = egui::Frame::new().fill(Color32::from_rgba_unmultiplied(55, 55, 55, 235)).stroke(Stroke::new(1.0, Color32::from_gray(0x22))).corner_radius(3).inner_margin(egui::Margin::same(6)).show(&mut child, |ui| {
         ui.set_width(238.0);
         ui.horizontal(|ui| {
             let title = ui.add(egui::Label::new(RichText::new(&name).strong()).sense(Sense::drag())).on_hover_cursor(egui::CursorIcon::Grab).on_hover_text("Drag to move the In-View Editor");
@@ -3304,12 +3496,39 @@ fn inview_editor(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect) {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 close = ui.small_button("✕").on_hover_text("Close the In-View Editor").clicked();
+                ui.menu_button("⚙", |ui| {
+                    if ui.button("Reset Extrude").clicked() {
+                        for k in ["thickness", "localTranslateZ", "offset"] {
+                            app.s.set_history_param(&id, i, k, serde_json::json!(0.0));
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Delete History").clicked() {
+                        app.s.delete_history(&id);
+                        app.inview = None;
+                        app.extrude_manip = None;
+                        app.manip_node = None;
+                        ui.close();
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text("Extrude options");
             });
         });
         crate::panels::history_channels(app, ui, &id, i);
     });
+    app.inview_rect = Some(frame.response.rect);
+    // Using the floating editor must never hide the viewport gizmo (only real Channel Box
+    // channel clicks do that). Mark any interaction with the panel as In-View-originated.
+    if ui.input(|i| i.pointer.hover_pos()).is_some_and(|p| frame.response.rect.contains(p)) {
+        app.panels.cb_pick_from_inview = true;
+    }
     if close || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        app.inview = None;
+        app.close_manip();
     }
 }
 
@@ -3371,6 +3590,169 @@ mod tests {
     use egui::vec2;
     use inca_core::params::Params;
     use inca_core::scene::Scene;
+
+    #[test]
+    fn extrude_z_drag_uses_the_face_normal() {
+        let t0 = DVec3::new(1.0, 2.0, 3.0);
+        let (t, z) = extrude_drag_offsets(t0, 0.5, DVec3::Y, DVec3::new(0.0, 2.0, 0.0));
+        assert_eq!(t, t0);
+        assert!((z - 2.5).abs() < 1e-9, "Z drag did not follow the face normal: {z}");
+        // An X drag on a side face must move the cap in the face plane, not vanish.
+        let (t, z) = extrude_drag_offsets(DVec3::ZERO, 0.0, DVec3::X, DVec3::new(0.0, 0.0, 3.0));
+        assert_eq!(t, DVec3::new(0.0, 0.0, 3.0));
+        assert_eq!(z, 0.0);
+    }
+
+    #[test]
+    fn extrude_manip_visibility_and_cap_position() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        let mut p = Params::new();
+        p.insert("faces".into(), serde_json::json!([0]));
+        p.insert("thickness".into(), serde_json::json!(0.0));
+        app.s.add_history(&id, "polyExtrudeFace", p);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.comp_mode = Some(CompMode::Face);
+        app.s.comp.entry(id.clone()).or_default().f.insert(0);
+        app.s.set_hilite(std::slice::from_ref(&id));
+        app.inview = Some((id.clone(), 1));
+        app.extrude_manip = Some((id.clone(), 1));
+        app.manip_node = Some((id.clone(), 1));
+        app.show_manips_tool = true;
+        let t = extrude_target(&app).expect("extrude target");
+        assert!((t.normal.length() - 1.0).abs() < 1e-6, "{:?}", t.normal);
+        assert!(t.center.is_finite());
+        // The manipulator sits on the extruded cap, not the original face.
+        app.s.set_history_param(&id, 1, "localTranslateZ", serde_json::json!(2.0));
+        let moved = extrude_target(&app).expect("extrude target").center - t.center;
+        assert!((moved.dot(t.normal) - 2.0).abs() < 1e-6, "manip did not follow the cap: {moved:?}");
+
+        // Selecting another object hides it but keeps the remembered node; clicking the same
+        // object back restores the gizmo without T.
+        let other = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&other), SelMode::Replace);
+        app.s.set_hilite(std::slice::from_ref(&other));
+        assert!(extrude_target(&app).is_none());
+        assert_eq!(app.extrude_manip, Some((id.clone(), 1)), "the node is remembered across selection");
+        assert_eq!(app.inview, Some((id.clone(), 1)));
+        app.s.set_hilite(std::slice::from_ref(&id));
+        assert!(extrude_target(&app).is_some(), "reselecting the object must restore the gizmo");
+
+        // Extrude is component-only: Object mode hides gizmo and editor, Face mode returns them.
+        app.set_comp_mode(None);
+        assert!(extrude_target(&app).is_none());
+        assert_eq!(app.extrude_manip, Some((id.clone(), 1)), "component state survives Object mode");
+        assert_eq!(app.inview, Some((id.clone(), 1)));
+        app.set_comp_mode(Some(CompMode::Face));
+        assert!(extrude_target(&app).is_some(), "Face mode must restore the gizmo");
+
+        // Choosing another tool ends Show Manipulator; T can recall it later.
+        app.set_tool(Tool::Rotate);
+        assert!(!app.show_manips_tool);
+        assert!(app.extrude_manip.is_none());
+        assert!(app.inview.is_none());
+    }
+
+    #[test]
+    fn extrude_manip_survives_cleared_selection() {
+        // Regression: clicking empty space during Extrude cleared the object selection and the
+        // manipulator pivot code unwrapped a missing lead object.
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        let mut p = Params::new();
+        p.insert("faces".into(), serde_json::json!([0]));
+        app.s.add_history(&id, "polyExtrudeFace", p);
+        app.inview = Some((id.clone(), 1));
+        app.extrude_manip = Some((id, 1));
+        app.show_manips_tool = true;
+        app.s.select(&[], SelMode::Replace);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
+        raw.time = Some(0.0);
+        let mut out = ctx.run_ui(raw, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn extrude_manip_recalls_without_components_and_polygon_selection_does_not_rearm() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        let mut p = Params::new();
+        p.insert("faces".into(), serde_json::json!([0]));
+        app.s.add_history(&id, "polyExtrudeFace", p);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.comp_mode = Some(CompMode::Face);
+        app.s.set_hilite(std::slice::from_ref(&id));
+        // Channel Box recall: the history node shows its manipulator without a component selection.
+        app.show_manips_tool = true;
+        app.extrude_manip = Some((id.clone(), 1));
+        app.inview = Some((id.clone(), 1));
+        app.manip_node = Some((id.clone(), 1));
+        assert!(extrude_target(&app).is_some(), "the history entry must recall without selected components");
+        // A marquee collapses the Channel Box INPUTS entry but keeps the show armed.
+        let hname = app.s.history_meta(&id, 1).expect("history node").name;
+        app.panels.expanded.insert(format!("{id}:{hname}"));
+        app.collapse_extrude_entry();
+        assert!(!app.panels.expanded.iter().any(|k| k.starts_with(&format!("{id}:"))), "Channel Box entry must collapse");
+        assert!(extrude_target(&app).is_some(), "collapsing the entry must keep the gizmo armed");
+        // A single component click drops the show; a later polygon selection must not re-arm it.
+        app.disarm_manip();
+        app.s.comp.entry(id.clone()).or_default().f.insert(0);
+        assert!(extrude_target(&app).is_none(), "a polygon selection must not re-arm Extrude");
+    }
+
+    #[test]
+    fn extrude_channel_box_recall_works_in_object_mode() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        let mut p = Params::new();
+        p.insert("faces".into(), serde_json::json!([0]));
+        app.s.add_history(&id, "polyExtrudeFace", p);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.show_manips_tool = true;
+        app.extrude_manip = Some((id.clone(), 1));
+        app.inview = Some((id.clone(), 1));
+        app.manip_node = Some((id, 1));
+        app.extrude_forced = false;
+        assert!(extrude_target(&app).is_none(), "automatic Extrude shows are component-only");
+        app.extrude_forced = true;
+        assert!(extrude_target(&app).is_some(), "the Channel Box entry must recall Extrude in Object mode");
+    }
+
+    #[test]
+    fn extrude_action_starts_show_manips_not_move() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.comp_mode = Some(CompMode::Face);
+        app.s.comp.entry(id.clone()).or_default().f.insert(0);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.set_hilite(std::slice::from_ref(&id));
+        app.action("extrude");
+        assert_eq!(app.tool, Tool::Select, "Extrude leaves the Show Manipulator selection tool active");
+        assert!(app.show_manips_tool, "Extrude must suppress the transform gizmo");
+        assert!(app.extrude_manip.is_some(), "the new Extrude node takes the manipulator");
+        assert!(!app.extrude_forced, "the new Extrude show is automatic, not an explicit recall");
+        assert!(app.inview.is_some());
+        assert!(extrude_target(&app).is_some());
+        let hname = app.s.history_meta(&id, 1).expect("history node").name;
+        assert!(app.panels.expanded.contains(&format!("{id}:{hname}")), "Ctrl+E must open the Channel Box INPUTS entry");
+    }
 
     #[test]
     fn active_plane_is_redrawn_yellow() {

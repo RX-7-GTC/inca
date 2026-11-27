@@ -178,6 +178,15 @@ pub struct IncaApp {
     pub mel: Interp,
     pub tool: Tool,
     pub last_tool: Tool,
+    /// Extrude's Show Manipulator target: the history node whose manipulator is shown.
+    pub extrude_manip: Option<(String, usize)>,
+    /// True when the Extrude show was explicitly recalled (Channel Box/T), which allows it in
+    /// Object mode. Automatic component-mode shows have this off.
+    pub extrude_forced: bool,
+    /// The history node T recalls. Tool changes keep it; a new selection forgets it.
+    pub manip_node: Option<(String, usize)>,
+    /// Maya's Show Manipulator tool: no transform gizmo for the selection until W/E/R/Q.
+    pub show_manips_tool: bool,
     pub layout: Layout,
     /// Multi-pane layout to restore when the maximized view is toggled back.
     pub(crate) layout_before: Layout,
@@ -331,6 +340,10 @@ pub struct IncaApp {
     pub marking_target: Option<String>,
     /// In-View Editor: a history node shown in the viewport after an op
     pub inview: Option<(String, usize)>,
+    /// Screen rect of the floating In-View Editor, so viewport input can ignore clicks on it.
+    pub inview_rect: Option<egui::Rect>,
+    /// A primary press started on the In-View Editor; ignore the viewport until it is released.
+    pub inview_press: bool,
     pub options: crate::options::Values,
     pub option_dialog: Option<String>,
     /// seconds left to show the manipulator size readout
@@ -454,6 +467,10 @@ impl IncaApp {
             mel: Interp::new(),
             tool: Tool::Select,
             last_tool: Tool::Move,
+            extrude_manip: None,
+            extrude_forced: false,
+            manip_node: None,
+            show_manips_tool: false,
             layout: Layout::Single,
             layout_before: Layout::Four,
             active_vp: 0,
@@ -566,6 +583,8 @@ impl IncaApp {
             marking: None,
             marking_target: None,
             inview: None,
+            inview_rect: None,
+            inview_press: false,
             options: cc.storage.and_then(|s| eframe::get_value(s, "options")).unwrap_or_default(),
             option_dialog: None,
             soft: cc.storage.and_then(|s| eframe::get_value(s, "softSelect")).unwrap_or_default(),
@@ -817,9 +836,16 @@ impl IncaApp {
         for (id, n0) in watched {
             let n1 = hist_len(&self.s, &id);
             if n1 > n0 {
-                let ty = self.s.history_meta(&id, n1 - 1).map(|h| h.ty).unwrap_or_default();
-                if inca_core::ops::info(&ty).is_some_and(|i| !i.2.is_empty()) {
-                    self.inview = Some((id, n1 - 1));
+                if let Some(h) = self.s.history_meta(&id, n1 - 1) {
+                    if inca_core::ops::info(&h.ty).is_some_and(|i| !i.2.is_empty()) {
+                        self.inview = Some((id.clone(), n1 - 1));
+                        // T recalls the manipulator of the operation just run, until a new selection.
+                        self.manip_node = Some((id.clone(), n1 - 1));
+                        // The new operation's gizmo takes over from any Channel Box channel manip.
+                        self.panels.cb_armed = false;
+                        // Maya opens the new node's Channel Box INPUTS entry.
+                        self.panels.expanded.insert(format!("{id}:{}", h.name));
+                    }
                 }
             }
         }
@@ -960,7 +986,109 @@ impl IncaApp {
         }
     }
 
+    /// Close the Extrude Show Manipulator and the In-View Editor belonging to it.
+    pub fn end_extrude(&mut self) {
+        self.extrude_forced = false;
+        if let Some(t) = self.extrude_manip.take() {
+            self.collapse_history_entry(&t.0, t.1);
+            if self.inview.as_ref() == Some(&t) {
+                self.inview = None;
+            }
+        }
+    }
+
+    /// T: Maya's Show Manipulator Tool. It only recalls the remembered node; any viewport click
+    /// has already dropped that, so T cannot revive the Extrude after a selection.
+    pub fn show_manipulator(&mut self) {
+        let node = self.manip_node.clone();
+        // Show Manipulator supersedes the Channel Box virtual-slider manipulator; clicking a
+        // channel name re-arms that, and T disarms it again.
+        self.panels.cb_armed = false;
+        // Leave a creation/transform tool if Show Manipulator is not already the tool. Staying
+        // in Show Manipulator must not end the current show (that would collapse its entry).
+        if !self.show_manips_tool {
+            self.set_tool(Tool::Select);
+            self.show_manips_tool = true;
+        }
+        let Some((mesh, idx)) = node else {
+            self.extrude_manip = None;
+            self.extrude_forced = false;
+            self.inview = None;
+            return;
+        };
+        let Some(ty) = self.s.history_meta(&mesh, idx).map(|h| h.ty) else {
+            self.manip_node = None;
+            self.extrude_manip = None;
+            self.extrude_forced = false;
+            self.inview = None;
+            return;
+        };
+        let editable = ty == "polyExtrudeFace" || inca_core::ops::info(&ty).is_some_and(|i| !i.2.is_empty());
+        if !editable {
+            self.manip_node = None;
+            self.extrude_manip = None;
+            self.extrude_forced = false;
+            self.inview = None;
+            return;
+        }
+        self.extrude_manip = (ty == "polyExtrudeFace").then(|| (mesh.clone(), idx));
+        self.extrude_forced = self.extrude_manip.is_some();
+        self.manip_node = Some((mesh.clone(), idx));
+        self.inview = Some((mesh.clone(), idx));
+        // T re-expands the node's Channel Box INPUTS entry along with its editor/gizmo.
+        if let Some(name) = self.s.history_meta(&mesh, idx).map(|h| h.name) {
+            self.panels.expanded.insert(format!("{mesh}:{name}"));
+        }
+    }
+
+    /// Explicitly close the current In-View Editor/Show Manipulator (its own close button).
+    pub fn close_manip(&mut self) {
+        self.extrude_forced = false;
+        if let Some(t) = self.inview.take() {
+            self.collapse_history_entry(&t.0, t.1);
+            if self.extrude_manip.as_ref() == Some(&t) {
+                self.extrude_manip = None;
+            }
+            if self.manip_node.as_ref() == Some(&t) {
+                self.manip_node = None;
+            }
+        }
+    }
+
+    /// A component-mode selection (or a deselect) drops the current In-View Editor/Show
+    /// Manipulator; only the Channel Box history entry or T can re-arm it.
+    pub fn disarm_manip(&mut self) {
+        self.extrude_forced = false;
+        if let Some((mesh, idx)) = self.extrude_manip.take() {
+            self.collapse_history_entry(&mesh, idx);
+        }
+        if let Some((mesh, idx)) = self.inview.take() {
+            self.collapse_history_entry(&mesh, idx);
+        }
+        self.manip_node = None;
+    }
+
+    /// Collapse the Channel Box INPUTS entry for the armed Extrude node without dropping the show.
+    pub fn collapse_extrude_entry(&mut self) {
+        if let Some((mesh, idx)) = self.extrude_manip.clone() {
+            self.collapse_history_entry(&mesh, idx);
+        }
+    }
+
+    /// Collapse the Channel Box INPUTS entry for a history node.
+    fn collapse_history_entry(&mut self, mesh: &str, idx: usize) {
+        if let Some(name) = self.s.history_meta(mesh, idx).map(|h| h.name) {
+            self.panels.expanded.remove(&format!("{mesh}:{name}"));
+        }
+    }
+
     pub fn set_tool(&mut self, t: Tool) {
+        // Choosing any tool leaves Show Manipulator: close its editor and extrude session.
+        if self.show_manips_tool {
+            self.inview = None;
+        }
+        self.end_extrude();
+        self.show_manips_tool = false;
         if t.is_manip() {
             self.last_tool = t;
         }
@@ -1001,6 +1129,20 @@ impl IncaApp {
     }
 
     pub fn set_comp_mode(&mut self, m: Option<CompMode>) {
+        // Entering Object mode hides an automatic Extrude show but does not drop it: the node
+        // stays armed and the Channel Box INPUTS entry stays open. Switching back to component
+        // mode shows it again.
+        if m.is_none() {
+            self.extrude_forced = false;
+        }
+        if self.show_manips_tool
+            && self
+                .inview
+                .as_ref()
+                .is_some_and(|(id, i)| self.s.history_meta(id, *i).is_none_or(|h| h.ty != "polyExtrudeFace"))
+        {
+            self.inview = None;
+        }
         self.uv_mode = false;
         if self.s.comp_mode == m {
             return;
@@ -1111,7 +1253,22 @@ impl IncaApp {
         }
         if let Some(mel) = crate::actions::mel_for(self, id) {
             let label = crate::actions::label(id);
-            let _ = self.run_mel(&label, &mel);
+            let ok = self.run_mel(&label, &mel).is_ok();
+            if id == "extrude" && ok {
+                // Maya's performPolyExtrude ends with `setToolTo ShowManips`: the new node's
+                // manipulator stays live until another tool or mode is chosen.
+                let target = self.inview.clone().filter(|(m, i)| {
+                    self.s.history_meta(m, *i).is_some_and(|h| h.ty == "polyExtrudeFace")
+                });
+                // Maya switches to the Show Manipulator tool here; it selects like the Select
+                // tool and shows no transform gizmo for the selection.
+                self.set_tool(Tool::Select);
+                self.show_manips_tool = true;
+                self.inview = target.clone();
+                self.extrude_manip = target.clone();
+                self.manip_node = target;
+                self.extrude_forced = false;
+            }
             return;
         }
         crate::actions::builtin(self, id);
@@ -1598,6 +1755,80 @@ mod tests {
         raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 1000.0)));
         raw.events = events;
         raw
+    }
+
+    #[test]
+    fn t_recalls_the_extrude_manipulator_after_a_tool_change() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.comp_mode = Some(CompMode::Face);
+        app.s.comp.entry(id.clone()).or_default().f.insert(0);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.s.set_hilite(std::slice::from_ref(&id));
+        app.action("extrude");
+        let extrude = app.extrude_manip.clone().expect("extrude manipulator");
+        assert_eq!(app.manip_node, Some(extrude.clone()));
+        // W leaves Show Manipulator; T recalls the current node.
+        app.set_tool(Tool::Move);
+        assert!(app.extrude_manip.is_none());
+        assert_eq!(app.manip_node, Some(extrude.clone()));
+        assert_eq!(
+            crate::hotkey_editor::resolve(&app, egui::Key::T, egui::Modifiers::default(), crate::hotkey_editor::Scope::Application),
+            Some("manipulatorTool".to_string())
+        );
+        app.show_manipulator();
+        assert_eq!(app.extrude_manip, Some(extrude));
+        assert!(app.inview.is_some());
+        assert!(app.show_manips_tool);
+        // Object mode: the show stays armed and T recalls it.
+        app.set_comp_mode(None);
+        app.show_manipulator();
+        assert!(app.extrude_manip.is_some(), "T must recall Extrude in Object mode");
+        assert!(app.extrude_forced);
+        // After a component-mode click the tool is dropped; T must not revive it.
+        app.disarm_manip();
+        app.show_manipulator();
+        assert!(app.extrude_manip.is_none(), "T must not recall Extrude after a click");
+        assert!(app.inview.is_none());
+    }
+
+    #[test]
+    fn t_recalls_other_history_nodes_and_expands_their_entry() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        let mut p = inca_core::params::Params::new();
+        p.insert("fraction".into(), serde_json::json!(0.2));
+        app.s.add_history(&id, "polyBevel", p);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.manip_node = Some((id.clone(), 1));
+        app.show_manips_tool = false;
+        app.panels.expanded.clear();
+        app.show_manipulator();
+        assert_eq!(app.inview, Some((id.clone(), 1)), "T must open the node's In-View Editor");
+        assert!(app.extrude_manip.is_none(), "a non-Extrude node has no viewport gizmo");
+        assert!(app.show_manips_tool);
+        let hname = app.s.history_meta(&id, 1).expect("history node").name;
+        assert!(app.panels.expanded.contains(&format!("{id}:{hname}")), "T must re-expand the Channel Box entry");
+    }
+
+    #[test]
+    fn object_mode_remembers_the_previous_component_mode() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        app.set_comp_mode(Some(CompMode::Face));
+        assert_eq!(app.s.comp_mode, Some(CompMode::Face));
+        app.action("objectMode");
+        assert_eq!(app.s.comp_mode, None);
+        app.action("objectMode");
+        assert_eq!(app.s.comp_mode, Some(CompMode::Face), "F8 must restore Face, not Vertex");
     }
 
     #[test]

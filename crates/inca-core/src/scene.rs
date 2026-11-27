@@ -2062,6 +2062,21 @@ impl Scene {
         self.deps.node(hid)?.mesh_out.clone()
     }
 
+    /// Recompute the mesh output before history entry `upto` without changing caches.
+    pub fn history_output(&self, mesh_id: &str, upto: usize) -> Option<PolyMesh> {
+        let m = self.nodes.get(mesh_id)?.mesh()?;
+        if upto > m.history.len() {
+            return None;
+        }
+        let mut pm = PolyMesh::default();
+        for hid in &m.history[..upto] {
+            let n = self.deps.node(hid)?;
+            let params = history_params(n);
+            pm = ops::apply(&n.kind, &pm, &params, self).ok()?.mesh;
+        }
+        Some(pm)
+    }
+
     pub fn history_error(&self, mesh_id: &str, idx: usize) -> Option<String> {
         let hid = self.nodes.get(mesh_id)?.mesh()?.history.get(idx)?;
         self.deps.node(hid)?.error.clone()
@@ -2500,7 +2515,9 @@ impl Scene {
             NodeRef::History(id, i) => {
                 let hid = self.nodes.get(id)?.mesh()?.history.get(*i)?;
                 let n = self.deps.node(hid)?;
-                n.get(attr).or_else(|| primitives::gen_info(&n.kind).and_then(|g| g.params.iter().find(|p| p.0 == attr).map(|p| json!(p.1))))
+                n.get(attr)
+                    .or_else(|| primitives::gen_info(&n.kind).and_then(|g| g.params.iter().find(|p| p.0 == attr).map(|p| json!(p.1))))
+                    .or_else(|| (n.kind == "polyExtrudeFace" && attr == "thickness").then_some(json!(0.0)))
             }
             NodeRef::Material(id) | NodeRef::Texture(id) | NodeRef::Place2D(id) => self.deps.get(&crate::graph::PlugRef::new(id, attr)),
             NodeRef::Dependency(id) => self.deps.get(&crate::graph::PlugRef::new(id, attr)),

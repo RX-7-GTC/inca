@@ -155,6 +155,7 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("rotateTool", "Rotate Tool", "E"),
     ("scaleTool", "Scale Tool", "R"),
     ("lastToolUsed", "Last Tool", "Y"),
+    ("manipulatorTool", "Show Manipulator Tool", "T"),
     ("resetTransformations", "Reset Transformations", ""),
     ("freezeTransformations", "Freeze Transformations", ""),
     ("centerPivot", "Center Pivot", ""),
@@ -525,7 +526,7 @@ pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
             "addDivisions" => format!("polySubdivideFacet -dv {};", opt("addDivisions", "divisions") as i64),
             "extrude" => match app.s.comp_mode {
                 Some(CompMode::Edge) => "polyExtrudeEdge -off 0.5;".into(),
-                _ => format!("polyExtrudeFacet -ltz {} -off {} -d {} -kft {} -ch {ch};", f(opt("extrude", "thickness")), f(opt("extrude", "offset")), opt("extrude", "divisions").max(1.0) as i64, opt("extrude", "keepFacesTogether") as i64),
+                _ => format!("polyExtrudeFacet -thickness {} -ltz 0 -off {} -d {} -kft {} -ch {ch};", f(opt("extrude", "thickness")), f(opt("extrude", "offset")), opt("extrude", "divisions").max(1.0) as i64, opt("extrude", "keepFacesTogether") as i64),
             },
             "bridge" => format!("polyBridgeEdge -dv {};", opt("bridge", "divisions") as i64),
             "bevel" => format!("polyBevel -f {} -ch {ch};", f(opt("bevel", "fraction"))),
@@ -972,7 +973,14 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             }
         }
         "objectMode" => {
-            let m = if app.s.comp_mode.is_some() { None } else { Some(CompMode::Vertex) };
+            let m = match app.s.comp_mode {
+                Some(c) => {
+                    // F8 remembers the component mode it is leaving (even if set by MEL).
+                    app.last_comp_mode = c;
+                    None
+                }
+                None => Some(app.last_comp_mode),
+            };
             app.set_comp_mode(m);
         }
         "vertexMode" => app.set_comp_mode(Some(CompMode::Vertex)),
@@ -1045,6 +1053,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "rotateTool" => app.set_tool(Tool::Rotate),
         "scaleTool" => app.set_tool(Tool::Scale),
         "lastToolUsed" => app.set_tool(app.last_tool),
+        "manipulatorTool" => app.show_manipulator(),
         "cvCurveTool" => app.set_tool(Tool::CvCurve),
         "epCurveTool" => app.set_tool(Tool::EpCurve),
         "arcTool" => app.set_tool(Tool::Arc),
@@ -1470,6 +1479,7 @@ pub fn hotkey(key: Key, m: Modifiers, app: &IncaApp) -> Option<&'static str> {
         (Key::E, false, false, false) => "rotateTool",
         (Key::R, false, false, false) => "scaleTool",
         (Key::Y, false, false, false) => "lastToolUsed",
+        (Key::T, false, false, false) => "manipulatorTool",
         (Key::W, false, true, _) => "keyTranslate",
         (Key::E, false, true, _) => "keyRotate",
         (Key::R, false, true, _) => "keyScale",
