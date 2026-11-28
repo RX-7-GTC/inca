@@ -101,7 +101,7 @@ fn strs(v: Vec<String>) -> Val {
 
 pub const CORE_COMMANDS: &[&str] = &[
     "sphere", "cylinder", "cone", "torus", "circle", "nurbsSquare", "curve", "spaceLocator", "group", "camera", "ambientLight", "directionalLight", "pointLight", "spotLight",
-    "areaLight", "skyDomeLight", "shadingNode", "createNode", "move", "rotate", "scale", "xform", "makeIdentity", "CenterPivot", "centerPivot", "setAttr", "getAttr", "select", "ls",
+    "areaLight", "skyDomeLight", "shadingNode", "createNode", "container", "move", "rotate", "scale", "xform", "makeIdentity", "CenterPivot", "centerPivot", "setAttr", "getAttr", "select", "ls",
     "objExists", "nodeType", "listRelatives", "listHistory", "rename", "parent", "delete", "duplicate", "hide", "showHidden", "currentTime", "playbackOptions", "setKeyframe",
     "cutKey", "keyframe", "hyperShade", "sets", "polyEvaluate", "polyExtrudeFacet", "polyExtrudeFace", "polyExtrudeEdge", "polySmooth", "polySubdivideFacet", "polyTriangulate",
     "polyQuad", "polyNormal", "polyPoke", "polyCloseBorder", "polyMirrorFace", "polyMergeVertex", "polyDelFacet", "polyDelEdge", "polyDelVertex", "polyUnite", "polySeparate",
@@ -111,6 +111,7 @@ pub const CORE_COMMANDS: &[&str] = &[
     "matchTransform", "addAttr", "deleteAttr", "polyChamferVtx", "polyConnectComponents", "polyCollapseEdge", "polyCollapseFacet", "polyToCurve", "polyCleanup", "closeCurve", "openCurve",
     "distanceDimension", "instance", "connectionInfo", "python", "echo", "particle", "connectDynamic", "deleteRigidBody", "ikHandle", "insertJoint", "mirrorJoint", "cluster", "softMod", "lattice", "blendShape", "poleVectorConstraint", "setDrivenKeyframe", "pathAnimation", "removeConstraints", "deleteDeformers",
     "hikCreateSkeleton", "hikCreateCharacter", "hikCreateControlRig", "hikDeleteControlRig", "hikDeleteCharacter", "hikSetSource", "hikSetSlot", "hikBake", "hikListCharacters",
+"ConvertSelectionToVertices", "ConvertSelectionToEdges", "ConvertSelectionToFaces",
 ];
 
 pub fn exists(name: &str) -> bool {
@@ -118,6 +119,16 @@ pub fn exists(name: &str) -> bool {
 }
 
 /// Objects named in the args, or the selection.
+fn parse_plug(s: &Scene, t: &str) -> Result<(NodeRef, String), String> {
+    let (o, at) = t.split_once('.').ok_or(format!("{t}: expected node.attribute"))?;
+    let r = s.resolve(o).ok_or(format!("No object matches name: {o}"))?;
+    Ok((r, alias(at).to_string()))
+}
+
+fn valid_published_name(n: &str) -> bool {
+    !n.is_empty() && n != "note" && !n.contains('.')
+}
+
 fn targets(s: &Scene, a: &Args) -> Vec<Id> {
     let named: Vec<Id> = a.strings().iter().filter_map(|n| s.find(n.split('.').next().unwrap_or(n))).collect();
     if named.is_empty() {
@@ -139,17 +150,28 @@ pub fn parse_component(s: &Scene, txt: &str) -> Option<(Id, CompMode, Vec<usize>
     let (kind, range) = rest.split_once('[')?;
     let range = range.trim_end_matches(']');
     let mode = match kind {
-        "vtx" | "v" => CompMode::Vertex,
+        // curve CVs use `.cv[...]` in the JS MEL parser, meshes `.vtx[...]`
+        "vtx" | "v" | "cv" => CompMode::Vertex,
         "e" => CompMode::Edge,
         "f" => CompMode::Face,
         _ => return None,
     };
     let id = s.find(obj)?;
-    let n = s.node(&id)?.mesh()?;
-    let count = match mode {
-        CompMode::Vertex => n.mesh.v.len(),
-        CompMode::Edge => n.mesh.topo().edges.len(),
-        CompMode::Face => n.mesh.f.len(),
+    let n = s.node(&id)?;
+    let count = match n.curve() {
+        // curve CVs are vertices (the JS `Sel.vertsOf`)
+        Some(c) => match mode {
+            CompMode::Vertex => c.cvs.len(),
+            _ => return None,
+        },
+        None => {
+            let m = n.mesh()?;
+            match mode {
+                CompMode::Vertex => m.mesh.v.len(),
+                CompMode::Edge => m.mesh.topo().edges.len(),
+                CompMode::Face => m.mesh.f.len(),
+            }
+        }
     };
     let idx: Vec<usize> = if range == "*" {
         (0..count).collect()
@@ -161,10 +183,24 @@ pub fn parse_component(s: &Scene, txt: &str) -> Option<(Id, CompMode, Vec<usize>
     Some((id, mode, idx.into_iter().filter(|&i| i < count).collect()))
 }
 
+/// Parse a component argument for `select`, which looks edge indices up in the topology and
+/// ignores out-of-range ones. Avoids building the topology just to bound-check a single
+/// `.e[i]`: a marquee emits one argument per selected edge.
+fn parse_select_component(s: &Scene, txt: &str) -> Option<(Id, CompMode, Vec<usize>)> {
+    let (obj, rest) = txt.split_once('.')?;
+    let (kind, range) = rest.split_once('[')?;
+    let range = range.trim_end_matches(']');
+    if kind != "e" || range == "*" || range.contains(':') {
+        return parse_component(s, txt);
+    }
+    let id = s.find(obj)?;
+    s.node(&id)?.mesh()?;
+    Some((id, CompMode::Edge, vec![range.parse().ok()?]))
+}
+
 /// Component selection as strings (for `ls -sl`).
 pub fn component_names(s: &Scene, id: &str) -> Vec<String> {
     let Some(n) = s.node(id) else { return vec![] };
-    let Some(m) = n.mesh() else { return vec![] };
     let c = s.comp_sel(id);
     let mut out = vec![];
     let ranges = |v: Vec<usize>| -> Vec<String> {
@@ -180,19 +216,33 @@ pub fn component_names(s: &Scene, id: &str) -> Vec<String> {
         }
         r
     };
-    for r in ranges(c.v.iter().map(|&x| x as usize).collect()) {
-        out.push(format!("{}.vtx[{r}]", n.name));
-    }
-    if !c.e.is_empty() {
-        let topo = m.mesh.topo();
-        let mut es: Vec<usize> = c.e.iter().filter_map(|&(a, b)| topo.edge(a, b)).collect();
-        es.sort();
-        for r in ranges(es) {
-            out.push(format!("{}.e[{r}]", n.name));
+    if n.curve().is_some() {
+        for r in ranges(c.v.iter().map(|&x| x as usize).collect()) {
+            out.push(format!("{}.cv[{r}]", n.name));
         }
+        return out;
     }
-    for r in ranges(c.f.iter().copied().collect()) {
-        out.push(format!("{}.f[{r}]", n.name));
+    let Some(m) = n.mesh() else { return vec![] };
+    match s.comp_mode {
+        Some(CompMode::Vertex) => {
+            for r in ranges(c.v.iter().map(|&x| x as usize).collect()) {
+                out.push(format!("{}.vtx[{r}]", n.name));
+            }
+        }
+        Some(CompMode::Edge) => {
+            let topo = m.mesh.topo();
+            let mut es: Vec<usize> = c.e.iter().filter_map(|&(a, b)| topo.edge(a, b)).collect();
+            es.sort();
+            for r in ranges(es) {
+                out.push(format!("{}.e[{r}]", n.name));
+            }
+        }
+        Some(CompMode::Face) => {
+            for r in ranges(c.f.iter().copied().collect()) {
+                out.push(format!("{}.f[{r}]", n.name));
+            }
+        }
+        None => {}
     }
     out
 }
@@ -207,7 +257,7 @@ fn op_faces(s: &Scene, a: &Args, id: &str, all_if_none: bool) -> Vec<usize> {
             }
         }
     }
-    if v.is_empty() {
+    if v.is_empty() && s.comp_mode == Some(CompMode::Face) {
         v = s.comp_sel(id).f.iter().copied().collect();
     }
     if v.is_empty() && all_if_none {
@@ -225,7 +275,7 @@ fn op_edges(s: &Scene, a: &Args, id: &str) -> Vec<(u32, u32)> {
             }
         }
     }
-    if v.is_empty() {
+    if v.is_empty() && s.comp_mode == Some(CompMode::Edge) {
         v = s.comp_sel(id).e.iter().copied().collect();
     }
     v
@@ -249,8 +299,9 @@ fn op_verts(s: &Scene, a: &Args, id: &str) -> Vec<u32> {
 fn mesh_targets(s: &Scene, a: &Args) -> Vec<Id> {
     let mut out: Vec<Id> = vec![];
     for t in a.strings() {
+        // mesh ops skip curves (the JS `kind !== 'mesh'` guards)
         if let Some((id, _, _)) = parse_component(s, &t) {
-            if !out.contains(&id) {
+            if s.node(&id).is_some_and(|n| n.mesh().is_some()) && !out.contains(&id) {
                 out.push(id);
             }
         } else if let Some(id) = s.find(&t) {
@@ -272,7 +323,7 @@ fn history_on(a: &Args) -> bool {
 fn result_names(s: &Scene, id: &Id) -> Val {
     let n = s.node(id).unwrap();
     let mut v = vec![Val::Str(n.name.clone())];
-    if let Some(h) = n.mesh().and_then(|m| m.history.last()) {
+    if let Some(h) = s.history_view(id).last() {
         if !h.name.contains('#') {
             v.push(Val::Str(h.name.clone()));
         }
@@ -312,6 +363,8 @@ pub fn rename(s: &mut Scene, id: &str, want: &str) -> String {
     }
     s.nodes.get_mut(id).unwrap().name = nn.clone();
     s.touch();
+    s.name_changes.push((old, nn.clone()));
+    s.ensure_anim_layer_nodes();
     nn
 }
 
@@ -378,17 +431,26 @@ fn transform_cmd(s: &mut Scene, name: &str, a: &Args) -> Result<Val, String> {
     let comp_targets: Vec<(Id, Vec<u32>)> = if !comps.is_empty() {
         comps
             .iter()
-            .map(|(id, m, idx)| {
-                let pm = &s.node(id).unwrap().mesh().unwrap().mesh;
+            .filter_map(|(id, m, idx)| {
+                let n = s.node(id)?;
+                // a curve has CVs only; `.cv[...]` parses as vertex mode
+                if let Some(c) = n.curve() {
+                    if *m != CompMode::Vertex {
+                        return None;
+                    }
+                    let verts: BTreeSet<u32> = idx.iter().filter(|&&i| i < c.cvs.len()).map(|&i| i as u32).collect();
+                    return Some((id.clone(), verts.into_iter().collect()));
+                }
+                let pm = &n.mesh()?.mesh;
                 let verts: BTreeSet<u32> = match m {
                     CompMode::Vertex => idx.iter().map(|&i| i as u32).collect(),
-                    CompMode::Face => idx.iter().flat_map(|&f| pm.f[f].iter().copied()).collect(),
+                    CompMode::Face => idx.iter().flat_map(|&f| pm.f.get(f).into_iter().flatten().copied()).collect(),
                     CompMode::Edge => {
                         let t = pm.topo();
-                        idx.iter().flat_map(|&e| [t.edges[e].0, t.edges[e].1]).collect()
+                        idx.iter().filter_map(|&e| t.edges.get(e).copied()).flat_map(|(a, b)| [a, b]).collect()
                     }
                 };
-                (id.clone(), verts.into_iter().collect())
+                Some((id.clone(), verts.into_iter().collect()))
             })
             .collect()
     } else if s.comp_mode.is_some() && a.strings().is_empty() {
@@ -400,8 +462,17 @@ fn transform_cmd(s: &mut Scene, name: &str, a: &Args) -> Result<Val, String> {
         for (id, verts) in comp_targets {
             let wm = s.world_matrix(&id);
             let inv = wm.inverse();
-            let pm = s.node(&id).unwrap().mesh().unwrap().mesh.clone();
-            let pts: Vec<DVec3> = verts.iter().map(|&i| wm.transform_point3(pm.v[i as usize])).collect();
+            let Some(node) = s.node(&id) else { continue };
+            let pts: Vec<DVec3> = match node.curve() {
+                Some(c) => verts.iter().filter_map(|&i| c.cvs.get(i as usize).map(|p| wm.transform_point3(*p))).collect(),
+                None => {
+                    let Some(pm) = node.mesh().map(|m| &m.mesh) else { continue };
+                    verts.iter().filter_map(|&i| pm.v.get(i as usize).map(|p| wm.transform_point3(*p))).collect()
+                }
+            };
+            if pts.len() != verts.len() {
+                continue;
+            }
             let c = pts.iter().copied().sum::<DVec3>() / pts.len().max(1) as f64;
             let deltas: Vec<DVec3> = pts
                 .iter()
@@ -420,6 +491,21 @@ fn transform_cmd(s: &mut Scene, name: &str, a: &Args) -> Result<Val, String> {
                     inv.transform_point3(np) - inv.transform_point3(p)
                 })
                 .collect();
+            // a curve stores its shape as CVs; there is no polyTweak history to feed
+            if s.node(&id).is_some_and(|n| n.curve().is_some()) {
+                if let Some(curve) = s.nodes.get_mut(&id).and_then(|n| n.curve_mut()) {
+                    for (&i, d) in verts.iter().zip(&deltas) {
+                        if let Some(p) = curve.cvs.get_mut(i as usize) {
+                            *p += *d;
+                        }
+                    }
+                }
+                if let Some(n) = s.nodes.get_mut(&id) {
+                    n.rev += 1;
+                }
+                s.refresh_dependents(&id);
+                continue;
+            }
             let mut p = Params::new();
             p.insert("verts".into(), json!(verts));
             p.insert("deltas".into(), json!(deltas.iter().map(|d| [d.x, d.y, d.z]).collect::<Vec<_>>()));
@@ -503,6 +589,12 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "addAttr" => &[("ln|longName", 1), ("sn|shortName", 1), ("at|attributeType", 1), ("dt|dataType", 1), ("dv|defaultValue", 1), ("min|minValue", 1), ("max|maxValue", 1), ("k|keyable", 1)],
         "deleteAttr" => &[("at|attribute", 1)],
         "group" => &[("em|empty", 0), ("w|world", 0), ("n|name", 1), ("p|parent", 1), ("a|absolute", 0), ("r|relative", 0)],
+        "container" => &[
+            ("q|query", 0), ("e|edit", 0), ("n|name", 1), ("p|parent", 1),
+            ("ba|bindAttr", 3), ("pn|publishName", 0), ("publishAttr", 1),
+            ("unpublishName", 1), ("unbindAndUnpublish", 2), ("fc|findContainer", 1),
+            ("addNode|an", 1),
+        ],
         "shadingNode" => &[("asShader", 0), ("asTexture", 0), ("asUtility", 0), ("n|name", 1)],
         "hyperShade" => &[("assign", 1), ("objects", 1)],
         "sets" => &[("e|edit", 0), ("fe|forceElement", 1), ("n|name", 1), ("r|renderable", 1), ("nss|noSurfaceShader", 1), ("em|empty", 0)],
@@ -637,9 +729,152 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             s.select(std::slice::from_ref(&g), SelMode::Replace);
             Ok(Val::Str(s.name_of(&g)))
         }
+        "container" => {
+            if a.has(&["q", "query"]) {
+                if let Some(node) = a.s(&["fc", "findContainer"]) {
+                    let r = s.resolve(&node).ok_or(format!("No object matches name: {node}"))?;
+                    let c = s.container_of(&s.ref_id(&r)).ok_or(format!("{node} is not in a container"))?;
+                    return Ok(strs(vec![s.name_of(&c)]));
+                }
+                let container = a
+                    .strings()
+                    .last()
+                    .cloned()
+                    .or_else(|| a.get(&["ba", "bindAttr"]).and_then(|v| v.last()).map(|v| v.str()))
+                    .ok_or("container: no container name")?;
+                let cid = s.find(&container).ok_or(format!("No object matches name: {container}"))?;
+                let c = s.node(&cid).ok_or(format!("No object matches name: {container}"))?;
+                if c.kind != "container" {
+                    return Err(format!("'{container}' is not a container"));
+                }
+                if a.has(&["ba", "bindAttr"]) {
+                    let mut out = vec![];
+                    for p in c.published.values() {
+                        if let Some(r) = s.published_ref(p) {
+                            out.push(format!("{}.{}", s.ref_name(&r), p.attr));
+                        }
+                    }
+                    return Ok(strs(out));
+                }
+                if let Some(plug) = a.s(&["publishAttr"]) {
+                    let (r, at) = parse_plug(s, &plug)?;
+                    let mut out = vec![];
+                    for (name, p) in &c.published {
+                        if p.attr == at && s.published_ref(p).as_ref() == Some(&r) {
+                            out.push(name.clone());
+                        }
+                    }
+                    return Ok(strs(out));
+                }
+                return Ok(strs(c.published.keys().cloned().collect()));
+            }
+            if a.has(&["e", "edit"]) {
+                let container = a
+                    .strings()
+                    .last()
+                    .cloned()
+                    .or_else(|| a.get(&["ba", "bindAttr", "unbindAndUnpublish"]).and_then(|v| v.last()).map(|v| v.str()))
+                    .ok_or("container: no container name")?;
+                let cid = s.find(&container).ok_or(format!("No object matches name: {container}"))?;
+                if s.node(&cid).is_none_or(|n| n.kind != "container") {
+                    return Err(format!("'{container}' is not a container"));
+                }
+                if let Some(vals) = a.get(&["ba", "bindAttr"]) {
+                    let plug = vals.first().map(|v| v.str()).ok_or("container -ba: missing plug")?;
+                    let name = vals.get(1).map(|v| v.str()).ok_or("container -ba: missing published name")?;
+                    if !valid_published_name(&name) {
+                        return Err(format!("'{name}' is not a valid published attribute name"));
+                    }
+                    let (r, at) = parse_plug(s, &plug)?;
+                    let exists = if matches!(&r, NodeRef::Texture(_)) {
+                        at == "outColor" || at == "outAlpha" || s.get_attr(&r, &at).is_some()
+                    } else {
+                        s.get_attr(&r, &at).is_some()
+                    };
+                    if !exists {
+                        return Err(format!("No attribute matches name: {plug}"));
+                    }
+                    let (kind, node) = match &r {
+                        NodeRef::Dag(id) => ("dag", id.clone()),
+                        NodeRef::Material(id) => ("material", id.clone()),
+                        NodeRef::Texture(id) => ("texture", id.clone()),
+                        NodeRef::History(..) => return Err("container: publishing history attributes is not supported".into()),
+                        NodeRef::Place2D(..) => return Err("container: publishing place2dTexture attributes is not supported".into()),
+                        NodeRef::Dependency(..) => return Err("container: publishing dependency-node attributes is not supported".into()),
+                    };
+                    if node == cid {
+                        return Err("container: cannot publish a container's own attribute".into());
+                    }
+                    if matches!(&r, NodeRef::Dag(id) if s.node(id).is_some_and(|n| n.kind == "container")) {
+                        return Err("container: cannot publish another container's interface".into());
+                    }
+                    let p = crate::scene::PublishedAttr { kind: kind.into(), node, index: 0, attr: at };
+                    s.node_mut(&cid).unwrap().published.insert(name.clone(), p);
+                    return Ok(Val::Str(name));
+                }
+                if a.has(&["pn", "publishName"]) {
+                    let strings = a.strings();
+                    let name = strings.first().cloned().ok_or("container -publishName: missing name")?;
+                    if !valid_published_name(&name) {
+                        return Err(format!("'{name}' is not a valid published attribute name"));
+                    }
+                    s.node_mut(&cid).unwrap().published.entry(name.clone()).or_insert(crate::scene::PublishedAttr {
+                        kind: "unbound".into(),
+                        node: String::new(),
+                        index: 0,
+                        attr: String::new(),
+                    });
+                    return Ok(Val::Str(name));
+                }
+                if let Some(vals) = a.get(&["unpublishName"]) {
+                    let name = vals.first().map(|v| v.str()).ok_or("container -unpublishName: missing name")?;
+                    s.node_mut(&cid).unwrap().published.shift_remove(&name);
+                    return Ok(Val::Str(name));
+                }
+                if let Some(vals) = a.get(&["unbindAndUnpublish"]) {
+                    let plug = vals.first().map(|v| v.str()).ok_or("container -unbindAndUnpublish: missing plug")?;
+                    let (r, at) = parse_plug(s, &plug)?;
+                    let names: Vec<String> = s
+                        .node(&cid)
+                        .unwrap()
+                        .published
+                        .iter()
+                        .filter(|(_, p)| p.attr == at && s.published_ref(p).as_ref() == Some(&r))
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    for n in &names {
+                        s.node_mut(&cid).unwrap().published.shift_remove(n);
+                    }
+                    return Ok(strs(names));
+                }
+                return Err("container: no edit operation given".into());
+            }
+            let name = a.s(&["n", "name"]).unwrap_or("container1".into());
+            let parent = a.s(&["p", "parent"]);
+            let selected = s.sel.clone();
+            let cid = s.create_container(&name, parent.as_deref());
+            let mut members = selected;
+            if let Some(v) = a.get(&["addNode", "an"]) {
+                members = v.iter().map(|x| x.str()).collect();
+            }
+            for m in members {
+                if m != cid {
+                    let id = s.nodes.contains_key(&m).then(|| m.clone()).or_else(|| s.find(&m));
+                    if let Some(id) = id {
+                        s.reparent(&id, Some(&cid), None);
+                    }
+                }
+            }
+            s.select(std::slice::from_ref(&cid), SelMode::Replace);
+            Ok(Val::Str(s.name_of(&cid)))
+        }
         "camera" => {
             let cam = CamShape { focal_length: a.f(&["fl", "focalLength"]).unwrap_or(35.0), ortho: a.b(&["o", "orthographic"], false), ortho_width: a.f(&["ow"]).unwrap_or(30.0), ..Default::default() };
             let id = s.create_camera("camera1", cam, false);
+            // JS `createCamera` drops a new camera at (0, 2, 10) looking down -Z
+            if let Some(n) = s.nodes.get_mut(&id) {
+                n.xf.t = [0.0, 2.0, 10.0];
+            }
             place_new(s, &id, &a);
             let n = s.node(&id).unwrap();
             Ok(Val::Array(vec![Val::Str(n.name.clone()), Val::Str(n.shape_name.clone().unwrap_or_default())]))
@@ -658,13 +893,17 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "shadingNode" | "createNode" => {
             let ty = a.strings().first().cloned().ok_or("shadingNode: missing type")?;
             let nm = a.s(&["n", "name"]);
-            if crate::materials::MAT_TYPES.iter().any(|m| m.ty == ty) {
+            if ty == "place2dTexture" {
+                let id = s.create_place(nm.as_deref());
+                return Ok(Val::Str(s.place(&id).map(|p| p.name).unwrap_or_default()));
+            }
+            if crate::materials::is_material_kind(&ty) {
                 let id = s.create_material(&ty, nm.as_deref());
-                return Ok(Val::Str(s.mats[&id].name.clone()));
+                return Ok(Val::Str(s.material(&id).map(|m| m.name).unwrap_or_default()));
             }
             if crate::materials::tex_type(&ty).is_some() {
                 let id = s.create_texture(&ty, nm.as_deref());
-                return Ok(Val::Str(s.texs[&id].name.clone()));
+                return Ok(Val::Str(s.texture(&id).map(|t| t.name).unwrap_or_default()));
             }
             match ty.as_str() {
                 "transform" => {
@@ -681,14 +920,14 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "hyperShade" | "assignMaterial" => {
             let m = a.s(&["assign"]).or_else(|| a.strings().first().cloned()).ok_or("hyperShade: -assign material")?;
             let m = m.trim_end_matches("SG").to_string();
-            let mid = s.mats.values().find(|x| x.name == m).map(|x| x.id.clone()).ok_or(format!("No material named {m}"))?;
+            let mid = s.material_named(&m).ok_or(format!("No material named {m}"))?;
             assign_to_selection(s, &mid);
             Ok(Val::None)
         }
         "sets" => {
             if let Some(m) = a.s(&["fe", "forceElement"]) {
                 let m = m.trim_end_matches("SG").to_string();
-                let mid = s.mats.values().find(|x| x.name == m).map(|x| x.id.clone()).ok_or(format!("No material named {m}"))?;
+                let mid = s.material_named(&m).ok_or(format!("No material named {m}"))?;
                 let objs = a.strings();
                 if !objs.is_empty() {
                     let save = s.sel.clone();
@@ -726,11 +965,28 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let (obj, attr) = target.split_once('.').ok_or("setAttr: expected node.attribute")?;
             let vals: Vec<&Val> = a.pos.iter().skip(1).collect();
             if matches!(obj, "defaultResolution" | "defaultRenderGlobals") {
-                // render settings (Render Settings window)
-                let v = match vals.first() {
-                    Some(Val::Str(st)) if st.parse::<f64>().is_err() => json!(st),
-                    Some(v) => v.to_json(),
-                    None => return Err("setAttr: no value".into()),
+                // render settings (Render Settings window); vector attributes such as
+                // `background 0.1 0.2 0.3` arrive as several positional values
+                let v = if a.has(&["type"]) && a.s(&["type"]).as_deref() == Some("string") {
+                    json!(vals.first().map(|v| v.str()).unwrap_or_default())
+                } else if vals.len() >= 3 {
+                    json!([vals[0].num(), vals[1].num(), vals[2].num()])
+                } else {
+                    match vals.first() {
+                        Some(Val::Str(st)) if st.parse::<f64>().is_err() => json!(st),
+                        Some(v) => v.to_json(),
+                        None => return Err("setAttr: no value".into()),
+                    }
+                };
+                // MEL booleans arrive as 1/0; the Render Settings UI and `from_scene`
+                // expect real booleans for the checkbox attributes
+                let v = if matches!(attr, "transparentBg" | "hwAllShadows" | "caustics" | "animation" | "keepRatio" | "autoResize") {
+                    match v.as_f64() {
+                        Some(n) => json!(n != 0.0),
+                        None => v,
+                    }
+                } else {
+                    v
                 };
                 s.render.insert(attr.to_string(), v);
                 return Ok(Val::None);
@@ -782,9 +1038,10 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                         "transform".into()
                     }
                 }
-                Some(NodeRef::History(id, i)) => s.node(&id).unwrap().mesh().unwrap().history[i].ty.clone(),
-                Some(NodeRef::Material(id)) => s.mats[&id].ty.clone(),
-                Some(NodeRef::Texture(id)) => s.texs[&id].ty.clone(),
+                Some(NodeRef::History(id, i)) => s.history_node(&id, i).map(|h| h.ty).unwrap_or_default(),
+                Some(NodeRef::Material(id)) | Some(NodeRef::Texture(id)) => s.deps.node(&id).map(|n| n.kind.clone()).unwrap_or_default(),
+                Some(NodeRef::Place2D(_)) => "place2dTexture".into(),
+                Some(NodeRef::Dependency(id)) => s.deps.node(&id).map(|n| n.kind.clone()).unwrap_or_default(),
                 None => return Err(format!("No object matches name: {n}")),
             }))
         }
@@ -810,20 +1067,24 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "listHistory" => {
             let mut out = vec![];
             for id in targets(s, &a) {
-                if let Some(m) = s.node(&id).and_then(|n| n.mesh()) {
-                    out.extend(m.history.iter().rev().filter(|h| !h.name.contains('#')).map(|h| h.name.clone()));
-                }
+                out.extend(s.history_metas(&id).iter().rev().filter(|h| !h.name.contains('#')).map(|h| h.name.clone()));
             }
             Ok(strs(out))
         }
         "rename" => {
             let st = a.strings();
-            let (obj, new) = match st.len() {
-                0 => return Err("rename: new name required".into()),
-                1 => (s.lead().cloned().ok_or("rename: nothing selected")?, st[0].clone()),
-                _ => (s.find(&st[0]).ok_or(format!("No object matches name: {}", st[0]))?, st[1].clone()),
-            };
-            Ok(Val::Str(rename(s, &obj, &new)))
+            if st.len() >= 2 {
+                if let Some(id) = s.find(&st[0]) {
+                    return Ok(Val::Str(rename(s, &id, &st[1])));
+                }
+                if let Some(n) = s.deps.find(&st[0]).map(|n| n.id.clone()) {
+                    return Ok(Val::Str(s.rename_shading_node(&n, &st[1]).unwrap_or_default()));
+                }
+                return Err(format!("No object matches name: {}", st[0]));
+            }
+            let obj = s.lead().cloned().ok_or("rename: nothing selected")?;
+            let new = st.first().ok_or("rename: new name required")?;
+            Ok(Val::Str(rename(s, &obj, new)))
         }
         "parent" => {
             let mut objs = targets(s, &a);
@@ -854,7 +1115,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             }
             if a.has(&["c", "channels"]) {
                 for id in targets(s, &a) {
-                    s.anim.remove_node(&id);
+                    s.remove_anim_node(&id);
                 }
                 return Ok(Val::None);
             }
@@ -942,25 +1203,38 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "setKeyframe" => {
             let t = a.f(&["t", "time"]);
             let v = a.f(&["v", "value"]);
+            let bd = a.flags.iter().any(|(f, _)| f == "bd" || f == "breakdown");
             let attrs: Vec<String> = a.flags.iter().filter(|(f, _)| f == "at" || f == "attribute").filter_map(|(_, v)| v.first().map(|x| x.str())).collect();
             let mut n = 0;
+            let mut attempted = false;
             for tgt in a.strings() {
                 if let Some((obj, attr)) = tgt.split_once('.') {
                     if let Some(id) = s.find(obj) {
-                        s.set_key(&id, attr, t, v);
-                        n += 1;
+                        attempted = true;
+                        if s.set_key_ex(&id, attr, t, v, bd) {
+                            n += 1;
+                        }
                     }
                 }
             }
             if n == 0 {
                 let ts: Vec<Id> = if a.strings().is_empty() { s.sel.clone() } else { a.strings().iter().filter_map(|x| s.find(x)).collect() };
                 for id in ts {
-                    let list: Vec<String> = if attrs.is_empty() { CHANNELS.iter().map(|c| c.to_string()).collect() } else { attrs.clone() };
+                    attempted = true;
+                    let list = if attrs.is_empty() { s.keyable_attrs(&id) } else { attrs.clone() };
                     for at in list {
-                        s.set_key(&id, &at, t, v);
-                        n += 1;
+                        if s.set_key_ex(&id, &at, t, v, bd) {
+                            n += 1;
+                        }
                     }
                 }
+            }
+            if n == 0 && attempted && s.anim_layer_current.is_some() {
+                s.warn("No keys were set: the layer is locked or the attributes are not on it.");
+            }
+            if n > 0 {
+                // Layered values (scale especially) can differ from the raw pose just keyed.
+                s.apply_anim();
             }
             Ok(Val::Int(n))
         }
@@ -969,16 +1243,16 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let t = a.s(&["t", "time"]).and_then(|x| x.split(':').next().and_then(|v| v.parse::<f64>().ok()));
             let mut n = 0;
             for id in targets(s, &a) {
-                let keys: Vec<String> = s.anim.curves.iter().filter(|(_, c)| c.node == id && (attrs.is_empty() || attrs.contains(&c.attr))).map(|(k, _)| k.clone()).collect();
+                let keys: Vec<String> = s.anim_curves().iter().filter(|(_, c)| c.node == id && (attrs.is_empty() || attrs.contains(&c.attr))).map(|(k, _)| k.clone()).collect();
                 for k in keys {
                     match t {
                         Some(t) => {
-                            if s.anim.curves.get_mut(&k).unwrap().remove_at(t) {
+                            if s.anim_curve_mut_key(&k).is_some_and(|c| c.remove_at(t)) {
                                 n += 1;
                             }
                         }
                         None => {
-                            n += s.anim.curves.shift_remove(&k).map(|c| c.keys.len()).unwrap_or(0);
+                            n += s.remove_anim_curve(&k).map(|c| c.keys.len()).unwrap_or(0);
                         }
                     }
                 }
@@ -989,7 +1263,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "keyframe" => {
             let attrs: Vec<String> = a.flags.iter().filter(|(f, _)| f == "at" || f == "attribute").filter_map(|(_, v)| v.first().map(|x| alias(&x.str()).to_string())).collect();
             let ts = targets(s, &a);
-            let curves: Vec<crate::anim::AnimCurve> = s.anim.curves.values().filter(|c| ts.contains(&c.node) && (attrs.is_empty() || attrs.contains(&c.attr))).cloned().collect();
+            let curves: Vec<crate::anim::AnimCurve> = s.anim_curves().values().filter(|c| ts.contains(&c.node) && (attrs.is_empty() || attrs.contains(&c.attr))).cloned().collect();
             if a.has(&["kc", "keyframeCount"]) {
                 return Ok(Val::Int(curves.iter().map(|c| c.keys.len()).sum::<usize>() as i64));
             }
@@ -1024,7 +1298,8 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 }
                 let mut p = Params::new();
                 p.insert("faces".into(), json!(faces));
-                p.insert("localTranslateZ".into(), json!(a.f(&["ltz", "localTranslateZ"]).or(a.f(&["thk", "thickness"])).unwrap_or(0.0)));
+                p.insert("thickness".into(), json!(a.f(&["thickness", "th", "thk"]).unwrap_or(0.0)));
+                p.insert("localTranslateZ".into(), json!(a.f(&["ltz", "localTranslateZ"]).unwrap_or(0.0)));
                 let t = a.v3(&["t", "translate"]).unwrap_or([a.f(&["tx"]).unwrap_or(0.0), a.f(&["ty"]).unwrap_or(0.0), a.f(&["tz"]).unwrap_or(0.0)]);
                 p.insert("translateX".into(), json!(t[0]));
                 p.insert("translateY".into(), json!(t[1]));
@@ -1105,15 +1380,13 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let (am, bm) = (ts[0].clone(), ts[1].clone());
             let mat = s.node(&am).unwrap().mesh().unwrap().material.clone();
             let o = s.create_mesh_from(Default::default(), "polySurface1", Some(&mat), None);
-            if let Some(m) = s.nodes.get_mut(&o).and_then(|n| n.mesh_mut()) {
-                m.history.clear();
-            }
+            s.clear_history(&o);
             let mut p = Params::new();
             p.insert("a".into(), json!(am));
             p.insert("b".into(), json!(bm));
             p.insert("operation".into(), json!(op.clamp(0, 2)));
             s.add_history(&o, "polyCBoolOp", p);
-            if let Some(e) = s.node(&o).and_then(|n| n.mesh()).and_then(|m| m.history[0].error.clone()) {
+            if let Some(e) = s.history_node(&o, 0).and_then(|h| h.error) {
                 s.delete_node(&o);
                 return Err(e);
             }
@@ -1235,7 +1508,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 s.comp.remove(&m);
                 out.push(last_history_name(s, &m));
             }
-            s.comp_mode = None;
+            s.set_comp_mode(None);
             s.select(std::slice::from_ref(&h), SelMode::Replace);
             out.push(s.name_of(&h));
             Ok(strs(out))
@@ -1298,10 +1571,10 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 tlist.push(json!({ "name": nm, "id": t, "d": d }));
             }
             // add to an existing blend shape node on the base, or make one
-            let existing = s.node(&base).and_then(|n| n.mesh()).and_then(|m| m.history.iter().position(|h| h.ty == "blendShape"));
+            let existing = s.history_find(&base, "blendShape");
             match existing {
                 Some(i) => {
-                    let mut all = s.node(&base).unwrap().mesh().unwrap().history[i].params.get("targets").cloned().unwrap_or(json!([]));
+                    let mut all = s.get_attr(&NodeRef::History(base.clone(), i), "targets").unwrap_or(json!([]));
                     all.as_array_mut().unwrap().extend(tlist);
                     s.set_history_param(&base, i, "targets", all);
                 }
@@ -1434,9 +1707,10 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                 }
             }
             for h in ts.iter().filter(|t| s.node(t).is_some_and(|n| matches!(n.kind.as_str(), "deformer" | "clusterHandle" | "lattice"))).cloned().collect::<Vec<_>>() {
-                for m in s.nodes.values().filter(|n| n.mesh().is_some_and(|m| m.history.iter().any(|x| x.params.get("handle").and_then(|v| v.as_str()) == Some(h.as_str())))).map(|n| n.id.clone()).collect::<Vec<_>>() {
-                    if let Some(mm) = s.nodes.get_mut(&m).and_then(|n| n.mesh_mut()) {
-                        mm.history.retain(|x| x.params.get("handle").and_then(|v| v.as_str()) != Some(h.as_str()));
+                for m in s.nodes.values().filter(|n| n.mesh().is_some_and(|mesh| mesh.history.iter().any(|hid| s.deps.node(hid).is_some_and(|x| x.attrs.get("handle").and_then(|v| v.as_str()) == Some(h.as_str()))))).map(|n| n.id.clone()).collect::<Vec<_>>() {
+                    let dead: Vec<Id> = s.node(&m).and_then(|n| n.mesh()).map(|mesh| mesh.history.iter().filter(|hid| s.deps.node(hid).is_some_and(|x| x.attrs.get("handle").and_then(|v| v.as_str()) == Some(h.as_str()))).cloned().collect()).unwrap_or_default();
+                    for hid in dead {
+                        s.remove_history_node(&m, &hid);
                     }
                     s.evaluate(&m, 0);
                     n += 1;
@@ -1586,10 +1860,16 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let t = a.strings().first().cloned().ok_or("connectionInfo: node.attribute required")?;
             let (o, at) = t.split_once('.').ok_or(format!("{t}: expected node.attribute"))?;
             let r = s.resolve(o).ok_or(format!("No object matches name: {o}"))?;
-            let id = s.ref_id(&r);
-            let at = alias(at).to_string();
-            let input = s.conns.iter().find(|c| c.dst == id && c.dst_attr == at).cloned();
-            let outs: Vec<Conn> = s.conns.iter().filter(|c| c.src == id && c.src_attr == at).cloned().collect();
+            let (id, at) = s.resolve_plug(&r, at);
+            let plug_ref = crate::graph::PlugRef::new(&id, &at);
+            let input = s
+                .conns
+                .iter()
+                .find(|c| c.dst == id && c.dst_attr == at)
+                .cloned()
+                .or_else(|| s.deps.source_of(&plug_ref).map(|p| Conn { src: p.node, src_attr: p.attr, dst: id.clone(), dst_attr: at.clone() }));
+            let mut outs: Vec<Conn> = s.conns.iter().filter(|c| c.src == id && c.src_attr == at).cloned().collect();
+            outs.extend(s.deps.destinations_of(&plug_ref).into_iter().map(|p| Conn { src: id.clone(), src_attr: at.clone(), dst: p.node, dst_attr: p.attr }));
             let plug = |s: &Scene, node: &str, attr: &str| s.ref_by_id(node).map(|r| format!("{}.{attr}", s.ref_name(&r))).unwrap_or_default();
             if a.has(&["sfd", "sourceFromDestination"]) {
                 return Ok(Val::Str(input.map(|c| plug(s, &c.src, &c.src_attr)).unwrap_or_default()));
@@ -1971,7 +2251,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let c = crate::curves::Curve::new(pts, 1, if closed { "periodic" } else { "open" }, "cv");
             let nm = a.s(&["n", "name"]).unwrap_or_else(|| "polyToCurve1".into());
             let cid = s.create_curve(c, &nm);
-            s.comp_mode = None;
+            s.set_comp_mode(None);
             s.select(std::slice::from_ref(&cid), SelMode::Replace);
             Ok(Val::Array(vec![Val::Str(s.name_of(&cid))]))
         }
@@ -2073,24 +2353,31 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             let parse = |t: &str| -> Result<(Id, String), String> {
                 let (o, at) = t.split_once('.').ok_or(format!("{t}: expected node.attribute"))?;
                 let r = s.resolve(o).ok_or(format!("No object matches name: {o}"))?;
-                Ok((s.ref_id(&r), alias(at).to_string()))
+                Ok(s.resolve_plug(&r, at))
             };
             let (src, sa) = parse(&st[0])?;
             let (dst, da) = parse(&st[1])?;
-            // a texture's output into a material attribute is a texture map (what the shaders read)
-            if s.texs.contains_key(&src) && s.mats.contains_key(&dst) && (sa == "outColor" || sa == "outAlpha") {
-                let m = s.mats.get_mut(&dst).unwrap();
+            let short = |a: &str| match a {
+                "oc" => "outColor".to_string(),
+                "oa" => "outAlpha".to_string(),
+                _ => a.to_string(),
+            };
+            if s.deps.node(&src).is_some() && s.deps.node(&dst).is_some() {
+                let src_plug = crate::graph::PlugRef::new(&src, &short(&sa));
+                let dst_plug = crate::graph::PlugRef::new(&dst, &da);
                 match name {
                     "connectAttr" => {
-                        if m.maps.contains_key(&da) && !a.has(&["f", "force"]) {
+                        if s.deps.source_of(&dst_plug).is_some() && !a.has(&["f", "force"]) {
                             return Err(format!("'{}' is already connected.", st[1]));
                         }
-                        m.maps.insert(da.clone(), json!(src));
+                        if !s.deps.connect(src_plug, dst_plug) {
+                            return Err(format!("connectAttr: cannot connect '{}' to '{}'", st[0], st[1]));
+                        }
                     }
                     "disconnectAttr" => {
-                        m.maps.remove(&da);
+                        s.deps.disconnect(&dst_plug);
                     }
-                    _ => return Ok(Val::Int((m.maps.get(&da).and_then(|v| v.as_str()) == Some(src.as_str())) as i64)),
+                    _ => return Ok(Val::Int((s.deps.source_of(&dst_plug).as_ref() == Some(&src_plug)) as i64)),
                 }
                 s.touch();
                 return Ok(Val::None);
@@ -2116,9 +2403,12 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
         "listConnections" => {
             let mut out = vec![];
             for t in a.strings() {
-                let (o, at) = t.split_once('.').map(|(a, b)| (a.to_string(), Some(alias(b).to_string()))).unwrap_or((t.clone(), None));
-                let Some(r) = s.resolve(&o) else { continue };
-                let id = s.ref_id(&r);
+                let parsed = match t.split_once('.') {
+                    Some((o, at)) => s.resolve(o).map(|r| s.resolve_plug(&r, at)),
+                    None => s.resolve(&t).map(|r| (s.ref_id(&r), String::new())),
+                };
+                let Some((id, at)) = parsed else { continue };
+                let at = (!at.is_empty()).then_some(at);
                 for c in &s.conns {
                     if c.dst == id && at.as_ref().is_none_or(|x| *x == c.dst_attr) {
                         if let Some(r) = s.ref_by_id(&c.src) {
@@ -2127,6 +2417,18 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
                     }
                     if c.src == id && at.as_ref().is_none_or(|x| *x == c.src_attr) {
                         if let Some(r) = s.ref_by_id(&c.dst) {
+                            out.push(s.ref_name(&r));
+                        }
+                    }
+                }
+                for c in &s.deps.connections {
+                    if c.destination.node == id && at.as_ref().is_none_or(|x| *x == c.destination.attr) {
+                        if let Some(r) = s.ref_by_id(&c.source.node) {
+                            out.push(s.ref_name(&r));
+                        }
+                    }
+                    if c.source.node == id && at.as_ref().is_none_or(|x| *x == c.source.attr) {
+                        if let Some(r) = s.ref_by_id(&c.destination.node) {
                             out.push(s.ref_name(&r));
                         }
                     }
@@ -2163,11 +2465,36 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
             }
             Ok(Val::None)
         }
+        "ConvertSelectionToVertices" | "ConvertSelectionToEdges" | "ConvertSelectionToFaces" => {
+            let to = match name {
+                "ConvertSelectionToVertices" => CompMode::Vertex,
+                "ConvertSelectionToEdges" => CompMode::Edge,
+                _ => CompMode::Face,
+            };
+            crate::selection::convert(s, to);
+            Ok(Val::None)
+        }
         "createDisplayLayer" => {
             let nm = a.s(&["n", "name"]).unwrap_or("layer1".into());
             let id = s.new_id("l");
             let nm = s.unique_name(&nm);
-            s.layers.push(Layer { id: id.clone(), name: nm.clone(), visible: true, mode: "normal".into(), color: None, extra: Default::default() });
+            let created = s.id_counter;
+            s.layers.push(Layer {
+                id: id.clone(),
+                name: nm.clone(),
+                visible: true,
+                mode: "normal".into(),
+                color: None,
+                playback: true,
+                enabled: true,
+                shading: true,
+                texturing: true,
+                lod: "full".into(),
+                anim_playback: true,
+                created,
+                extra: Default::default(),
+            });
+            s.ensure_display_layer_nodes();
             if !a.has(&["e", "empty"]) {
                 for o in targets(s, &a) {
                     if let Some(n) = s.nodes.get_mut(&o) {
@@ -2197,7 +2524,7 @@ pub fn run(s: &mut Scene, h: &mut dyn Host, name: &str, raw: &[Val]) -> Result<V
 }
 
 fn last_history_name(s: &Scene, id: &str) -> String {
-    s.node(id).and_then(|n| n.mesh()).and_then(|m| m.history.last()).filter(|h| !h.name.contains('#')).map(|h| h.name.clone()).unwrap_or_else(|| s.name_of(id))
+    s.history_metas(id).last().filter(|h| !h.name.contains('#')).map(|h| h.name.clone()).unwrap_or_else(|| s.name_of(id))
 }
 
 fn apply_op_selection(s: &mut Scene, id: &str, r: &crate::mesh::OpOut) {
@@ -2348,8 +2675,8 @@ fn curve_surface(s: &mut Scene, a: &Args, ty: &str) -> Result<Val, String> {
         }
     };
     let id = s.create_mesh_from(Default::default(), base, None, None);
+    s.clear_history(&id);
     if let Some(m) = s.nodes.get_mut(&id).and_then(|n| n.mesh_mut()) {
-        m.history.clear();
         m.nurbs = true;
     }
     s.add_history(&id, ty, p);
@@ -2362,8 +2689,8 @@ fn curve_surface(s: &mut Scene, a: &Args, ty: &str) -> Result<Val, String> {
 
 fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
     if a.has(&["cl", "clear"]) {
+        // JS `select -cl` clears the object selection but keeps component mode and its selection
         s.select(&[], SelMode::Replace);
-        s.comp.clear();
         return Ok(Val::None);
     }
     let mode = if a.has(&["add", "af", "addFirst"]) {
@@ -2376,6 +2703,11 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
         SelMode::Replace
     };
     if a.has(&["all"]) {
+        // JS `selectAll` selects every component of the hilited objects in component mode
+        if s.comp_mode.is_some() {
+            crate::selection::all_components(s, false);
+            return Ok(Val::None);
+        }
         let all: Vec<Id> = s.roots.iter().filter(|i| !s.node(i).unwrap().startup()).cloned().collect();
         s.select(&all, SelMode::Replace);
         return Ok(Val::None);
@@ -2383,7 +2715,7 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
     let mut objs = vec![];
     let mut comps: Vec<(Id, CompMode, Vec<usize>)> = vec![];
     for t in a.strings() {
-        if let Some(c) = parse_component(s, &t) {
+        if let Some(c) = parse_select_component(s, &t) {
             comps.push(c);
             continue;
         }
@@ -2398,12 +2730,44 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
         }
     }
     if !comps.is_empty() {
-        if mode == SelMode::Replace {
-            s.comp.clear();
+        let kind = comps.last().map(|c| c.1).unwrap();
+        let owners: Vec<Id> = comps.iter().map(|c| c.0.clone()).collect();
+        let old_hilite = s.hilite();
+        let same = s.comp_mode == Some(kind);
+        if !same {
+            // JS mel `select`: a different component type re-hilites the owners
+            s.set_hilite(&owners);
+            s.set_comp_mode(Some(kind));
+        } else {
+            s.rev += 1;
         }
-        let mut owners = vec![];
+        if mode == SelMode::Replace {
+            // JS `Sel.selectComponents`: replace clears only the component sets of the objects
+            // that were hilited before the new owners were appended
+            let clear: &[Id] = if same { &old_hilite } else { &owners };
+            for id in clear {
+                if let Some(c) = s.comp.get_mut(id) {
+                    match kind {
+                        CompMode::Vertex => c.v.clear(),
+                        CompMode::Edge => c.e.clear(),
+                        CompMode::Face => c.f.clear(),
+                    }
+                }
+            }
+        }
+        // Edge indices need the topology, but building it once per component turned a
+        // marquee over a 400k-vertex mesh into hundreds of thousands of rebuilds (the
+        // subdivision hang). Cache it per object, and skip it entirely for vertices/faces.
+        let mut topo_cache: std::collections::HashMap<Id, Option<crate::mesh::Topo>> = std::collections::HashMap::new();
         for (id, m, idx) in comps {
-            let topo = s.node(&id).unwrap().mesh().unwrap().mesh.topo();
+            // JS `Sel.selectComponents` hilites every object whose components are selected
+            s.add_hilite(&id);
+            // curves have no edges/faces; `parse_component` already restricts them to CVs
+            let topo = if m == CompMode::Edge {
+                topo_cache.entry(id.clone()).or_insert_with(|| s.node(&id).and_then(|n| n.mesh()).map(|m| m.mesh.topo())).as_ref()
+            } else {
+                None
+            };
             let c = s.comp.entry(id.clone()).or_default();
             for i in idx {
                 match (m, mode) {
@@ -2420,15 +2784,17 @@ fn select(s: &mut Scene, a: &Args) -> Result<Val, String> {
                         c.f.insert(i);
                     }
                     (CompMode::Edge, SelMode::Remove) => {
-                        c.e.remove(&topo.edges[i]);
+                        if let Some(e) = topo.as_ref().and_then(|t| t.edges.get(i)) {
+                            c.e.remove(e);
+                        }
                     }
                     (CompMode::Edge, _) => {
-                        c.e.insert(topo.edges[i]);
+                        if let Some(e) = topo.as_ref().and_then(|t| t.edges.get(i)) {
+                            c.e.insert(*e);
+                        }
                     }
                 }
             }
-            s.comp_mode = Some(m);
-            owners.push(id);
         }
         if !owners.iter().all(|o| s.sel.contains(o)) {
             s.select(&owners, SelMode::Add);
@@ -2445,12 +2811,12 @@ fn ls(s: &Scene, a: &Args) -> Result<Val, String> {
     let long = a.has(&["l", "long"]);
     let nm = |id: &Id| if long { s.full_path(id) } else { s.name_of(id) };
     if a.has(&["mat", "materials"]) {
-        return Ok(strs(s.mats.values().map(|m| m.name.clone()).collect()));
+        return Ok(strs(s.materials().into_iter().map(|m| m.name).collect()));
     }
     if a.has(&["sl", "selection"]) {
         let mut out = vec![];
         for id in &s.sel {
-            if s.comp_mode.is_some() && !s.comp_sel(id).is_empty() {
+            if s.comp_mode.is_some() && !s.comp_sel_active(id).is_empty() {
                 out.extend(component_names(s, id));
             } else {
                 out.push(nm(id));
@@ -2490,7 +2856,7 @@ fn ls(s: &Scene, a: &Args) -> Result<Val, String> {
         }
     }
     if ty.is_none() && !a.has(&["dag", "tr", "transforms", "s", "shapes", "lt", "ca", "geometry", "v"]) && filter_names.is_empty() {
-        out.extend(s.mats.values().map(|m| m.name.clone()));
+        out.extend(s.materials().into_iter().map(|m| m.name));
     }
     Ok(strs(out))
 }
@@ -2598,6 +2964,13 @@ fn file_cmd(s: &mut Scene, a: &Args) -> Result<Val, String> {
     }
     if a.has(&["i", "import"]) {
         let p = path.ok_or("file -i: path required")?;
+        if p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(crate::layer_io::LAYER_FILE_EXT)) {
+            let report = crate::layer_io::import_file(s, &p)?;
+            if !report.missing_objects.is_empty() || !report.missing_attrs.is_empty() {
+                s.warn(format!("Imported layers skipped {} missing object(s) and {} missing attribute(s)", report.missing_objects.len(), report.missing_attrs.len()));
+            }
+            return Ok(strs(report.layers));
+        }
         let made = crate::io::import(s, &p)?;
         s.select(&made, SelMode::Replace);
         return Ok(strs(made.iter().map(|i| s.name_of(i)).collect()));
@@ -2631,6 +3004,26 @@ mod tests {
     }
 
     #[test]
+    fn extrude_command_defaults_to_zero_movement() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube; select -r pCube1.f[1]; polyExtrudeFacet;").unwrap();
+        let id = s.find("pCube1").unwrap();
+        let h = s.history_node(&id, 1).unwrap();
+        assert_eq!(h.params["thickness"], json!(0.0));
+        assert_eq!(h.params["localTranslateZ"], json!(0.0));
+    }
+
+    #[test]
+    fn extrude_thickness_and_local_translate_are_separate_channels() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube; select -r pCube1.f[1]; polyExtrudeFacet -thickness 1 -ltz 2;").unwrap();
+        let id = s.find("pCube1").unwrap();
+        let h = s.history_node(&id, 1).unwrap();
+        assert_eq!(h.params["thickness"], json!(1.0));
+        assert_eq!(h.params["localTranslateZ"], json!(2.0));
+    }
+
+    #[test]
     fn components_extrude_and_ls() {
         let mut s = Scene::new();
         mel(&mut s, "polyCube; select -r pCube1.f[1]; polyExtrudeFacet -ltz 2;").unwrap();
@@ -2638,7 +3031,7 @@ mod tests {
         let m = &s.node(&id).unwrap().mesh().unwrap();
         assert_eq!(m.mesh.f.len(), 10);
         assert_eq!(m.history.len(), 2);
-        assert_eq!(m.history[1].name, "polyExtrudeFace1");
+        assert_eq!(s.history_node(&id, 1).unwrap().name, "polyExtrudeFace1");
         let r = mel(&mut s, "ls -sl;").unwrap();
         assert_eq!(r.list().len(), 1);
         assert!(r.str().starts_with("pCube1.f["));
@@ -2646,6 +3039,76 @@ mod tests {
         mel(&mut s, "setAttr polyExtrudeFace1.localTranslateZ 4;").unwrap();
         let b = s.world_bbox(&id);
         assert!((b.max.y - 4.5).abs() < 1e-9, "{:?}", b);
+    }
+
+    #[test]
+    fn selecting_many_components_does_not_rebuild_topology() {
+        // A marquee on a subdivided cube used to spend one full `topo()` build per component
+        // argument because `select` and `parse_component` computed the edge topology for
+        // every name. At 400k vertices that turned a selection into an apparent hang.
+        use std::fmt::Write;
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n c; polySmooth -dv 6 -ch 0; selectMode -component;").unwrap();
+        let id = s.find("c").unwrap();
+        let (n, edges) = {
+            let pm = &s.node(&id).unwrap().mesh().unwrap().mesh;
+            (pm.v.len(), pm.topo().edges.len())
+        };
+        let mut src = String::from("select -r ");
+        for i in 0..n {
+            let _ = write!(src, "c.vtx[{i}] ");
+        }
+        src.push(';');
+        let t = std::time::Instant::now();
+        mel(&mut s, &src).unwrap();
+        let dt = t.elapsed();
+        assert_eq!(s.comp_sel(&id).v.len(), n);
+        assert!(dt < std::time::Duration::from_secs(10), "selecting {n} vertices took {dt:?}; topology may be rebuilt per component");
+
+        let mut src = String::from("select -r ");
+        for i in 0..edges {
+            let _ = write!(src, "c.e[{i}] ");
+        }
+        src.push(';');
+        let t = std::time::Instant::now();
+        mel(&mut s, &src).unwrap();
+        let dt = t.elapsed();
+        assert_eq!(s.comp_sel(&id).e.len(), edges);
+        assert!(dt < std::time::Duration::from_secs(10), "selecting {edges} edges took {dt:?}; topology may be rebuilt per component");
+    }
+
+    #[test]
+    fn set_attr_boolean_literals_match_mel() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n c; setAttr c.visibility false; setAttr c.template true;").unwrap();
+        let id = s.find("c").unwrap();
+        let n = s.node(&id).unwrap();
+        assert!(!n.visible);
+        assert!(n.template);
+        // light flags must be stored as real booleans for the viewport shadow path
+        let l = s.create_light("directionalLight");
+        mel(&mut s, "setAttr directionalLight1.shadows true;").unwrap();
+        assert_eq!(s.get_attr(&NodeRef::Dag(l), "shadows"), Some(json!(true)));
+    }
+
+    #[test]
+    fn render_global_set_attr_accepts_vectors() {
+        let mut s = Scene::new();
+        mel(&mut s, "setAttr defaultRenderGlobals.background 0.1 0.2 0.3;").unwrap();
+        assert_eq!(s.render.get("background"), Some(&json!([0.1, 0.2, 0.3])));
+        // scalars and booleans keep their type
+        mel(&mut s, "setAttr defaultRenderGlobals.width 640; setAttr defaultRenderGlobals.transparentBg true;").unwrap();
+        assert_eq!(s.render.get("width"), Some(&json!(640)));
+        assert_eq!(s.render.get("transparentBg"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn camera_command_matches_the_js_default_placement() {
+        let mut s = Scene::new();
+        mel(&mut s, "select -cl; camera -n camA;").unwrap();
+        let id = s.find("camA").unwrap();
+        assert_eq!(s.node(&id).unwrap().xf.t, [0.0, 2.0, 10.0]);
+        assert_eq!(s.sel, vec![id]);
     }
 
     #[test]
@@ -2683,7 +3146,7 @@ mod tests {
         mel(&mut s, "move -r 0 1 0 cluster1Handle;").unwrap();
         let v1 = s.node(&bx).unwrap().mesh().unwrap().mesh.v[0];
         assert!((v1 - v0 - DVec3::Y).length() < 1e-9, "{v0} {v1}");
-        assert_eq!(s.node(&bx).unwrap().mesh().unwrap().mesh.v[1], s.node(&bx).unwrap().mesh().unwrap().history[0].out.as_ref().unwrap().v[1]);
+        assert_eq!(s.node(&bx).unwrap().mesh().unwrap().mesh.v[1], s.history_out(&bx, 0).unwrap().v[1]);
         // blend shape weight on the base
         mel(&mut s, "polyCube -n tgt; move -r 0 0 0 tgt; polyCube -n base;").unwrap();
         let t = s.find("tgt").unwrap();
@@ -2692,12 +3155,12 @@ mod tests {
         s.bake_mesh(&t, pm);
         mel(&mut s, "select -r tgt base; blendShape; setAttr base.tgt 0.5;").unwrap();
         let b = s.find("base").unwrap();
-        let base0 = s.node(&b).unwrap().mesh().unwrap().history[0].out.as_ref().unwrap().v[0];
+        let base0 = s.history_out(&b, 0).unwrap().v[0];
         assert!((s.node(&b).unwrap().mesh().unwrap().mesh.v[0].y - base0.y - 1.0).abs() < 1e-9);
         // lattice: identity until points move
         mel(&mut s, "polySphere -n ball; select -r ball; lattice -dv 2 3 2;").unwrap();
         let ball = s.find("ball").unwrap();
-        let before = s.node(&ball).unwrap().mesh().unwrap().history[0].out.as_ref().unwrap().v.clone();
+        let before = s.history_out(&ball, 0).unwrap().v.clone();
         let after = &s.node(&ball).unwrap().mesh().unwrap().mesh.v;
         assert!(before.iter().zip(after).all(|(a, b)| (*a - *b).length() < 1e-9));
         // delete deformers removes the history and the handle
@@ -2762,7 +3225,7 @@ mod tests {
         assert!((v - 8.0).abs() < 1e-6, "{v}");
         mel(&mut s, "string $m = `shadingNode -asShader blinn`; select pCube1; hyperShade -assign $m;").unwrap();
         let c = s.find("pCube1").unwrap();
-        assert_eq!(s.mats[&s.node(&c).unwrap().mesh().unwrap().material].name, "blinn1");
+        assert_eq!(s.material(&s.node(&c).unwrap().mesh().unwrap().material).unwrap().name, "blinn1");
     }
 
     #[test]
@@ -2781,7 +3244,7 @@ mod tests {
         let mut s = Scene::new();
         mel(&mut s, "polyCylinder -h 4 -sh 8; nonLinear -type twist -endAngle 90;").unwrap();
         let c = s.find("pCylinder1").unwrap();
-        assert_eq!(s.node(&c).unwrap().mesh().unwrap().history.last().unwrap().name, "twist1");
+        assert_eq!(s.history_view(&c).last().unwrap().name, "twist1");
         let ti = s.node(&c).unwrap().mesh().unwrap().mesh.v.iter().position(|v| v.y > 1.99).unwrap();
         let top = |s: &Scene| s.node(&c).unwrap().mesh().unwrap().mesh.v[ti];
         let before = top(&s);
@@ -2828,6 +3291,82 @@ mod tests {
         let r = mel(&mut s, "keyframe -q -tc -at tx pCube1;").unwrap();
         assert_eq!(r.list().len(), 2);
     }
+
+    #[test]
+    fn set_keyframe_obeys_layer_attribute_membership() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n pCube1; select -r pCube1;").unwrap();
+        let a = s.find("pCube1").unwrap();
+        s.anim_layers.push(crate::anim::AnimLayer {
+            id: "al1".into(),
+            name: "Layer 1".into(),
+            weight_curve: Default::default(),
+            members: vec![a.clone()],
+            attrs: vec![crate::anim::Anim::key(&a, "translateX")],
+            parent: None,
+            curves: Default::default(),
+        });
+        s.anim_layer_current = Some("al1".into());
+        assert_eq!(mel(&mut s, "setKeyframe -at translateX;").unwrap().num(), 1.0);
+        assert_eq!(mel(&mut s, "setKeyframe -at translateY;").unwrap().num(), 0.0);
+        assert!(s.anim_layer_curve("al1", &crate::anim::Anim::key(&a, "translateX")).is_some());
+        assert!(s.anim_layer_curve("al1", &crate::anim::Anim::key(&a, "translateY")).is_none());
+        assert!(!s.anim.curves.contains_key(&crate::anim::Anim::key(&a, "translateY")));
+    }
+
+    #[test]
+    fn container_published_attributes() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n pCube1; select -r pCube1; container -n asset1;").unwrap();
+        assert_eq!(s.node(&s.find("asset1").unwrap()).unwrap().kind, "container");
+        assert_eq!(s.node(&s.find("pCube1").unwrap()).unwrap().parent.as_deref(), Some(s.find("asset1").unwrap().as_str()));
+        mel(&mut s, "select -r pCube1; container -e -publishName pubTx asset1; container -e -ba pCube1.translateX pubTx asset1;").unwrap();
+        assert_eq!(mel(&mut s, "container -q -publishName -publishAttr pCube1.translateX asset1;").unwrap().list(), vec![Val::Str("pubTx".into())]);
+        assert_eq!(mel(&mut s, "container -q -ba asset1;").unwrap().list(), vec![Val::Str("pCube1.translateX".into())]);
+        assert_eq!(mel(&mut s, "container -q -fc pCube1;").unwrap().list(), vec![Val::Str("asset1".into())]);
+
+        let cube1 = s.find("pCube1").unwrap();
+        mel(&mut s, "setAttr asset1.pubTx 2.5;").unwrap();
+        assert!((s.get_attr_f(&cube1, "tx") - 2.5).abs() < 1e-9);
+        assert!((mel(&mut s, "getAttr asset1.pubTx;").unwrap().num() - 2.5).abs() < 1e-9);
+
+        mel(&mut s, "polyCube -n pCube2; connectAttr asset1.pubTx pCube2.translateY;").unwrap();
+        assert_eq!(mel(&mut s, "isConnected asset1.pubTx pCube2.translateY;").unwrap().num(), 1.0);
+        mel(&mut s, "setAttr asset1.pubTx 4;").unwrap();
+        s.apply_anim();
+        let cube2 = s.find("pCube2").unwrap();
+        assert!((s.get_attr_f(&cube2, "ty") - 4.0).abs() < 1e-9);
+
+        let data = s.serialize();
+        let mut s2 = Scene::new();
+        s2.load(&data).unwrap();
+        let a = s2.find("asset1").unwrap();
+        assert!(s2.node(&a).unwrap().published.contains_key("pubTx"));
+
+        mel(&mut s, "container -e -unpublishName pubTx asset1;").unwrap();
+        assert!(mel(&mut s, "getAttr asset1.pubTx;").is_err());
+    }
+
+    #[test]
+    fn selecting_an_edge_keeps_the_face_selection() {
+        let mut s = Scene::new();
+        mel(&mut s, "polyCube -n c; select -r c.f[0];").unwrap();
+        let id = s.find("c").unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Face));
+        assert_eq!(s.comp_sel(&id).f.len(), 1);
+        // switching to an edge keeps the face set stored
+        mel(&mut s, "select -r c.e[0];").unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Edge));
+        assert_eq!(s.comp_sel(&id).e.len(), 1);
+        assert_eq!(s.comp_sel(&id).f.len(), 1);
+        s.set_comp_mode(Some(CompMode::Face));
+        assert_eq!(component_names(&s, &id), vec!["c.f[0]".to_string()]);
+        // explicit conversion replaces the edge set, not the face set
+        mel(&mut s, "ConvertSelectionToEdges;").unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Edge));
+        assert_eq!(s.comp_sel(&id).f.len(), 1);
+        assert!(!s.comp_sel(&id).e.is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -2855,9 +3394,33 @@ mod more_tests {
         let mut s = Scene::new();
         Interp::new().run(&mut s, &mut NoHost, "camera; move -r 6 3 6; spotLight; move -r 1 2 3;").unwrap();
         let c = s.find("camera1").unwrap();
-        assert_eq!(s.node(&c).unwrap().xf.t, [6.0, 3.0, 6.0]);
+        // JS `createCamera` starts at (0, 2, 10)
+        assert_eq!(s.node(&c).unwrap().xf.t, [6.0, 5.0, 16.0]);
         let l = s.find("spotLight1").unwrap();
         assert_eq!(s.node(&l).unwrap().xf.t, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn curve_cvs_select_and_move() {
+        let mut s = Scene::new();
+        let mut i = Interp::new();
+        i.run(&mut s, &mut NoHost, "curve -d 3 -p 0 0 0 -p 1 2 0 -p 2 0 0 -p 3 2 0 -n c1;").unwrap();
+        i.run(&mut s, &mut NoHost, "select -r c1.cv[1];").unwrap();
+        let c = s.find("c1").unwrap();
+        assert_eq!(s.comp_mode, Some(CompMode::Vertex));
+        assert_eq!(s.comp_verts(&c), vec![1]);
+        assert_eq!(component_names(&s, &c), vec!["c1.cv[1]".to_string()]);
+        let before = s.node(&c).unwrap().curve().unwrap().cvs[1];
+        i.run(&mut s, &mut NoHost, "move -r 0 1 0;").unwrap();
+        let after = s.node(&c).unwrap().curve().unwrap().cvs[1];
+        assert!((after - before - DVec3::new(0.0, 1.0, 0.0)).length() < 1e-9, "{before:?} {after:?}");
+        // `cv[*]` / ranges select CVs, and all/invert understand a curve's vertex count
+        i.run(&mut s, &mut NoHost, "select -r c1.cv[0:1];").unwrap();
+        assert_eq!(s.comp_verts(&c), vec![0, 1]);
+        crate::selection::all_components(&mut s, false);
+        assert_eq!(s.comp_verts(&c), vec![0, 1, 2, 3]);
+        crate::selection::all_components(&mut s, true);
+        assert!(s.comp_verts(&c).is_empty());
     }
 }
 

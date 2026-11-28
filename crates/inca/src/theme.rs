@@ -13,9 +13,7 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(0x8f, 0x8f, 0x8f);
 pub const HI: Color32 = Color32::from_rgb(0x52, 0x85, 0xa6);
 pub const BTN: Color32 = Color32::from_rgb(0x5d, 0x5d, 0x5d);
 pub const BTN_HOVER: Color32 = Color32::from_rgb(0x6f, 0x6f, 0x6f);
-pub const KEYED: Color32 = Color32::from_rgb(0xdd, 0x72, 0x7a);
 pub const KEY: Color32 = Color32::from_rgb(0xcd, 0x5c, 0x5c);
-pub const LOCKED: Color32 = Color32::from_rgb(0x5c, 0x68, 0x74);
 pub const DRIVEN: Color32 = Color32::from_rgb(0xe6, 0xc5, 0x4a);
 pub const ACCENT: Color32 = Color32::from_rgb(0x48, 0xaa, 0xb5);
 
@@ -73,10 +71,32 @@ pub fn panel_frame() -> Frame {
     Frame::NONE.fill(BG).inner_margin(Margin::same(4)).stroke(Stroke::new(1.0, LINE))
 }
 
+/// Maya-style marquee: a dashed white outline with no fill. All box selections use this so the
+/// viewport, Hypershade, Hypergraph, UV editor and lattice tool match; the lasso uses the same
+/// dash pattern.
+pub fn marquee(painter: &egui::Painter, rect: egui::Rect) {
+    let pts = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom(), rect.left_top()];
+    painter.add(egui::Shape::dashed_line(&pts, Stroke::new(1.0, Color32::WHITE), 4.0, 3.0));
+}
+
 /// A collapsible section header (Attribute Editor frames); returns whether it is open.
 pub fn fold(ui: &mut egui::Ui, text: &str) -> bool {
-    let id = ui.make_persistent_id(("fold", text));
-    let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, true));
+    fold_key(ui, text, true, "fold")
+}
+
+/// Attribute Editor section headers use their own namespace so old expanded states do not
+/// override Maya's collapsed-by-default layout.
+pub fn fold_ae(ui: &mut egui::Ui, text: &str) -> bool {
+    fold_key(ui, text, true, "fold_ae")
+}
+
+pub fn fold_ae_closed(ui: &mut egui::Ui, text: &str) -> bool {
+    fold_key(ui, text, false, "fold_ae")
+}
+
+fn fold_key(ui: &mut egui::Ui, text: &str, default_open: bool, namespace: &'static str) -> bool {
+    let id = ui.make_persistent_id((namespace, text));
+    let mut open = ui.data_mut(|d| *d.get_persisted_mut_or(id, default_open));
     let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::click());
     ui.painter().rect_filled(r, 0.0, if resp.hovered() { Color32::from_gray(0x5a) } else { Color32::from_gray(0x52) });
     let c = egui::pos2(r.min.x + 9.0, r.center().y);

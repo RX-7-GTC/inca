@@ -15,9 +15,11 @@ ttf-parser = "0.25"
 epaint_default_fonts = "0.36"
 tobj = "4"
 stl_io = "0.8"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.21"
 gltf = { version = "1.4", features = ["import"] }
 boolmesh = { version = "0.2", default-features = false }
 rayon = "1"
 rapier3d = "0.36"
 flate2 = "1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }

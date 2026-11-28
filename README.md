@@ -10,7 +10,7 @@ Website and downloads: **https://incacad.com**
 See [FEATURES.md](FEATURES.md) for the full feature list.
 
 Inca saves `.inca` scenes, opens, imports and exports Maya ASCII (`.ma`) and FBX (with skeletons, skin
-weights and animation), imports OBJ, glTF/GLB and STL, and exports OBJ, GLB and STL. Maya Binary (`.mb`)
+weights and animation), imports OBJ, glTF/GLB, STL and 3MF, and exports OBJ, GLB, STL and 3MF. Maya Binary (`.mb`)
 is an undocumented format Inca can't read: in Maya, save the scene as Maya ASCII instead.
 
 ## Contributing
@@ -103,4 +103,13 @@ packages and publishes them on the [Releases page](https://github.com/v3ai/inca/
 The `.inca` scene format is the same JSON format the earlier Electron versions (up to 0.1.12) used,
 so old scenes open in this version.
 
-MIT licensed. Built with egui, wgpu, glam, rapier3d, boolmesh, rhai and other Rust crates.
+## License
+
+MIT. See [LICENSE](LICENSE) for the full text. Third-party notices are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Maya and Autodesk are trademarks or registered trademarks of Autodesk, Inc.
+Blender is a trademark of the Blender Foundation. Inca is not affiliated with,
+endorsed by, or sponsored by Autodesk or the Blender Foundation.
+
+Built with egui, wgpu, glam, rapier3d, boolmesh, rhai and other Rust crates.

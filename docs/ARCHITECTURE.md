@@ -33,7 +33,7 @@ crates/inca-core/          engine, no GUI (unit-tested)
   anim.rs                  anim curves, Maya tangents and infinity
   mel.rs                   MEL lexer, parser and interpreter
   commands.rs              Maya command set used by MEL and the UI
-  io.rs                    .inca, OBJ/MTL, STL, glTF/GLB
+  io.rs                    .inca, OBJ/MTL, STL, 3MF, glTF/GLB
   maya.rs                  Maya ASCII (.ma) reader and writer
   fbx.rs                   FBX reader (binary and ASCII 7.x) and binary FBX 7.4 writer
   hik.rs                   HumanIK skeleton, character definitions, control rig, retargeting
@@ -76,6 +76,7 @@ crates/inca/               the application (eframe/egui + wgpu)
 | Booleans | `boolmesh` | pure-Rust Manifold port; union/difference/intersection with live history |
 | Triangulation | `earcutr` | concave n-gons |
 | OBJ / STL / glTF | `tobj`, `stl_io`, `gltf` | import; OBJ/STL/GLB exporters are written in-house |
+| 3MF | `zip`, `roxmltree` | package and XML; the 3MF reader and writer are written in-house |
 | FBX / Maya ASCII | `flate2` | readers and writers are written in-house; `flate2` (zlib) handles FBX's compressed arrays |
 | Images | `image` | textures, screenshots, render output |
 | Parallelism | `rayon` | path tracer |
@@ -95,6 +96,7 @@ crates/inca/               the application (eframe/egui + wgpu)
 | Booleans | `boolmesh` | pure-Rust Manifold port; union/difference/intersection with live history |
 | Triangulation | `earcutr` | concave n-gons |
 | OBJ / STL / glTF | `tobj`, `stl_io`, `gltf` | import; OBJ/STL/GLB exporters are written in-house |
+| 3MF | `zip`, `roxmltree` | package and XML; the 3MF reader and writer are written in-house |
 | FBX / Maya ASCII | `flate2` | readers and writers are written in-house; `flate2` (zlib) handles FBX's compressed arrays |
 | Images | `image` | textures, screenshots, render output |
 | Parallelism | `rayon` | path tracer |

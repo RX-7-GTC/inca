@@ -49,6 +49,27 @@ pub fn near_angle(prev: f64, mut a: f64) -> f64 {
     a
 }
 
+/// Euler angles in degrees for `q`, choosing the equivalent Tait-Bryan solution closest to
+/// `prev`. This keeps Maya rotate channels winding past 360 instead of snapping back when the
+/// canonical Euler decomposition flips the other two axes by 180 degrees.
+pub fn euler_deg_from_quat_near(q: DQuat, ro: &str, prev: [f64; 3]) -> [f64; 3] {
+    let e = euler_deg_from_quat(q, ro);
+    // Tait-Bryan euler triples have a second equivalent solution:
+    // (a, b, c) and (a + 180, 180 - b, c + 180).
+    let alt = [e[0] + 180.0, 180.0 - e[1], e[2] + 180.0];
+    let mut best = e;
+    let mut best_dist = f64::INFINITY;
+    for cand in [e, alt] {
+        let c = [0, 1, 2].map(|i| near_angle(prev[i], cand[i]));
+        let dist: f64 = (0..3).map(|i| (c[i] - prev[i]).powi(2)).sum();
+        if dist < best_dist {
+            best_dist = dist;
+            best = c;
+        }
+    }
+    best
+}
+
 pub fn v3(a: [f64; 3]) -> DVec3 {
     DVec3::from_array(a)
 }
@@ -189,5 +210,24 @@ pub fn fmt_num_long(x: f64) -> String {
         "0".into()
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn near_euler_keeps_middle_axis_winding() {
+        for ro in ROTATE_ORDERS {
+            let mut prev = [0.0; 3];
+            for deg in (10..=720).step_by(10) {
+                let q = quat_from_euler_deg([0.0, deg as f64, 0.0], ro);
+                let e = euler_deg_from_quat_near(q, ro, prev);
+                assert!((e[1] - deg as f64).abs() < 1e-6, "{ro} at {deg}: {e:?}");
+                assert!(e[0].abs() < 1e-6 && e[2].abs() < 1e-6, "{ro} at {deg}: {e:?}");
+                prev = e;
+            }
+        }
     }
 }

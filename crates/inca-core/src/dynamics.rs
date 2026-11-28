@@ -388,9 +388,9 @@ impl Scene {
         let local = self.parent_world(id).inverse() * wm;
         let Some(n) = self.nodes.get_mut(id) else { return };
         let (s, q, pos) = local.to_scale_rotation_translation();
-        let e = crate::math::euler_deg_from_quat(n.xf.jo_quat().inverse() * q, &n.xf.ro);
+        let e = crate::math::euler_deg_from_quat_near(n.xf.jo_quat().inverse() * q, &n.xf.ro, n.xf.r);
         let xf = &mut n.xf;
-        xf.r = [0, 1, 2].map(|i| crate::math::near_angle(xf.r[i], e[i]));
+        xf.r = e;
         xf.s = s.to_array();
         let rs = DMat4::from_scale_rotation_translation(s, q, DVec3::ZERO);
         let rp = rs.transform_point3(DVec3::from_array(xf.p));

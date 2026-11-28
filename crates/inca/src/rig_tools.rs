@@ -87,7 +87,7 @@ fn ik_tool(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Rect, p
     let Some(j) = resp.interact_pointer_pos().and_then(|p| pick_joint(app, cv, rect, p)) else { return };
     match app.rig_tool.ik_start.take() {
         None => {
-            app.select_names(&[app.s.name_of(&j)], inca_core::scene::SelMode::Replace);
+            app.select_names(std::slice::from_ref(&j), inca_core::scene::SelMode::Replace);
             app.rig_tool.ik_start = Some(j);
             app.help = "Create IK Handle: click the end joint".into();
         }
@@ -167,7 +167,7 @@ fn lattice_tool(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Re
     }
     if let (Some(start), Some(q)) = (app.rig_tool.lat_box, resp.interact_pointer_pos()) {
         let r = Rect::from_two_pos(start, q);
-        painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Inside);
+        crate::theme::marquee(&painter, r);
         if resp.drag_stopped() {
             if !mods.shift {
                 app.rig_tool.lat_sel.clear();
@@ -229,14 +229,14 @@ fn lattice_tool(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Re
 /// The selected skinned mesh and the index of its skinCluster.
 pub fn skinned(app: &IncaApp) -> Option<(String, usize)> {
     app.s.sel.iter().flat_map(|i| app.s.subtree(i)).find_map(|i| {
-        let h = app.s.node(&i)?.mesh()?.history.iter().position(|h| h.ty == "skinCluster")?;
+        let h = app.s.history_find(&i, "skinCluster")?;
         Some((i, h))
     })
 }
 
 pub fn influences(app: &IncaApp) -> Vec<String> {
     let Some((m, h)) = skinned(app) else { return vec![] };
-    app.s.node(&m).and_then(|n| n.mesh()).and_then(|x| x.history[h].params.get("joints")).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|j| j.as_str().map(String::from)).collect()).unwrap_or_default()
+    app.s.history_node(&m, h).and_then(|x| x.params.get("joints").cloned()).and_then(|v| v.as_array().cloned()).map(|a| a.iter().filter_map(|j| j.as_str().map(String::from)).collect()).unwrap_or_default()
 }
 
 pub fn weight_of(w: &Value, j: usize) -> f64 {
@@ -273,7 +273,7 @@ fn paint_tool(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Rect
     let wm = app.s.world_matrix(&m);
     let verts: Vec<DVec3> = app.s.node(&m).and_then(|n| n.mesh()).map(|x| x.mesh.v.iter().map(|p| wm.transform_point3(*p)).collect()).unwrap_or_default();
     let j = app.rig_tool.influence;
-    let weights = app.s.node(&m).and_then(|n| n.mesh()).and_then(|x| x.history[h].params.get("weights")).cloned().unwrap_or(json!([]));
+    let weights = app.s.history_node(&m, h).and_then(|x| x.params.get("weights").cloned()).unwrap_or(json!([]));
     // weight display: black (0) to white (1) dots
     for (i, p) in verts.iter().enumerate() {
         if let Some(q) = cv.project(*p, rect) {
@@ -407,7 +407,12 @@ pub fn sdk_window(app: &mut IncaApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Set Driven Key").open(&mut open).default_size([460.0, 420.0]).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Set Driven Key"), open, |app, fix| {
+        let mut window = egui::Window::new("Set Driven Key").open(&mut open).default_size([460.0, 420.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         let mut st = std::mem::take(&mut app.rig_tool.sdk);
         st.driver = st.driver.filter(|d| app.s.node(d).is_some());
         st.driven.retain(|d| app.s.node(d).is_some());
@@ -462,17 +467,18 @@ pub fn sdk_window(app: &mut IncaApp, ctx: &egui::Context) {
                 let _ = app.run_mel("set driven key", &format!("setDrivenKeyframe -cd {drv} {};", targets.join(" ")));
             }
             if ui.button("Select Driver").clicked() {
-                if let Some(d) = &st.driver {
-                    app.select_names(&[app.s.name_of(d)], inca_core::scene::SelMode::Replace);
+                if let Some(d) = st.driver.clone() {
+                    app.select_names(std::slice::from_ref(&d), inca_core::scene::SelMode::Replace);
                 }
             }
             if ui.button("Select Driven").clicked() {
-                let n: Vec<String> = st.driven.iter().map(|d| app.s.name_of(d)).collect();
+                let n = st.driven.clone();
                 app.select_names(&n, inca_core::scene::SelMode::Replace);
             }
         });
         ui.label(dim("Pick the driver attribute and the driven attributes, pose both, then Key. Repeat for each pose."));
         app.rig_tool.sdk = st;
+    })
     });
     app.win.sdk = open;
 }

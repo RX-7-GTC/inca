@@ -6,6 +6,14 @@ use egui::{vec2, Color32, Rect, Response, Sense, TextureHandle, Ui};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Exact icon for an action id, if one exists (no fallback).
+pub fn action_icon(id: &str) -> Option<&'static str> {
+    if let Some((_, i)) = CMD_ICONS.iter().find(|(c, _)| *c == id) {
+        return Some(i);
+    }
+    ICONS.iter().find(|(n, _)| *n == id).map(|(n, _)| *n)
+}
+
 /// Icon name for an action id: the JS command's icon, an icon of the same name, or `help`.
 pub fn for_action(id: &str) -> &'static str {
     if let Some((_, i)) = CMD_ICONS.iter().find(|(c, _)| *c == id) {
@@ -76,6 +84,29 @@ pub fn paint(ui: &Ui, rect: Rect, name: &str, tint: Color32) {
     }
 }
 
+fn cursor_from_icon(name: &str, px: u32, hotspot: [u16; 2]) -> Option<egui::CustomCursorImage> {
+    let svg = ICONS.iter().find(|(n, _)| *n == name)?.1;
+    let img = rasterize(svg, px)?;
+    let mut rgba = Vec::with_capacity(img.pixels.len() * 4);
+    for p in &img.pixels {
+        rgba.extend_from_slice(&p.to_srgba_unmultiplied());
+    }
+    Some(egui::CustomCursorImage { rgba: rgba.into(), size: [px as u16, px as u16], hotspot })
+}
+
+/// Multi-Cut's knife cursor, rasterized once. Kept as straight RGBA because winit wants an
+/// unpremultiplied bitmap; the hotspot is the blade tip.
+pub fn multicut_cursor() -> Option<egui::CustomCursorImage> {
+    static CURSOR: OnceLock<Option<egui::CustomCursorImage>> = OnceLock::new();
+    CURSOR.get_or_init(|| cursor_from_icon("multiCutCursor", 32, [5, 3])).clone()
+}
+
+/// Cursor for moving an already placed cut point.
+pub fn move_point_cursor() -> Option<egui::CustomCursorImage> {
+    static CURSOR: OnceLock<Option<egui::CustomCursorImage>> = OnceLock::new();
+    CURSOR.get_or_init(|| cursor_from_icon("move", 32, [16, 16])).clone()
+}
+
 /// A square icon button like the JS `.ib` (hover grey, blue-grey when on).
 pub fn button(ui: &mut Ui, name: &str, tip: &str, on: bool, size: f32) -> Response {
     button_ex(ui, name, tip, on, size, size - 4.0, true)
@@ -122,5 +153,13 @@ mod tests {
         }
         assert_eq!(for_action("polyCube"), "polyCube");
         assert_eq!(for_action("moveTool"), "move");
+    }
+
+    #[test]
+    fn multicut_cursor_is_a_valid_bitmap() {
+        let c = multicut_cursor().expect("Multi-Cut cursor");
+        assert_eq!(c.size, [32, 32]);
+        assert_eq!(c.rgba.len(), 32 * 32 * 4);
+        assert!(c.rgba.chunks(4).any(|p| p[3] > 0), "cursor is fully transparent");
     }
 }

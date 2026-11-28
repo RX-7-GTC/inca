@@ -35,7 +35,7 @@ Legend: ✅ built · 🟡 partial / simplified · ⏭ planned
 ## 2. Projects & files
 - ✅ Project Window / Set Project (standard folder tree + workspace file), recent projects
 - ✅ New / Open / Save / Save As / Increment & Save / Revert; native `.inca` scene format (JSON); recent files; autosave
-- ✅ Import OBJ (keeps n-gons, MTL colours/textures), glTF/GLB, STL, FBX, Maya ASCII, Inca scenes (including scenes saved by the old Electron app); Export All / Selection to OBJ+MTL, glTF/GLB, STL, FBX, Maya ASCII, Inca
+- ✅ Import OBJ (keeps n-gons, MTL colours/textures), glTF/GLB, STL, 3MF (including multi-part slicer projects), FBX, Maya ASCII, Inca scenes (including scenes saved by the old Electron app); Export All / Selection to OBJ+MTL, glTF/GLB, STL, 3MF, FBX, Maya ASCII, Inca
 - ✅ Maya ASCII (`.ma`) open, import and export [#29](https://github.com/v3ai/inca/issues/29): transforms and hierarchy, joints with joint orients, meshes (primitive creation nodes stay live construction history; stored polyFaces with UVs and vertex tweaks otherwise), cameras, lights, locators, Lambert / Blinn / Phong / Standard Surface / Surface Shader materials with file textures, shading-group assignments, skinCluster weights, keyframe animation
 - ✅ FBX open, import and export [#31](https://github.com/v3ai/inca/issues/31): reads binary and ASCII FBX 7.x (2011 and later), writes binary FBX 7.4; transform hierarchy (pre-rotations become joint orients), meshes with UVs, normals and per-face materials, Lambert / Phong materials with file textures, skeletons, skin clusters with their weights and bind pose, cameras, lights, translate / rotate / scale / visibility animation; unit scale and Z-up files are converted
 - ⏭ Maya Binary (`.mb`: Autodesk's undocumented format; Inca says how to resave as `.ma`), FBX blend shapes and constraints, references / proxies, archive scene
@@ -62,7 +62,7 @@ Legend: ✅ built · 🟡 partial / simplified · ⏭ planned
 ## 5. Polygon modeling
 - ✅ Primitives with construction history: Sphere, Cube, Cylinder, Cone, Plane, Torus, Pyramid, Prism, Pipe, Helix, Disc, Platonic solids
 - ✅ Component modes (F8–F12, UV mode synced with the UV Editor), grow/shrink, edge loop/ring/border (double-click an edge; loops follow open borders), face loops (Shift+double-click a face next to a selected one), convert selection, pre-selection highlight
-- ✅ Extrude (faces/edges; the move manipulator after a face extrude drives Translate / Local Translate Z, with divisions spread along it), Bevel, Bridge, Insert Edge Loop tool (the loop previews on hover and stays highlighted while you slide it), Multi-Cut (hold Ctrl to preview and click to insert an edge loop), Target Weld, Merge / Merge to Center / Collapse, Connect, Chamfer vertex, Poke, Delete Edge/Vertex, Extract, Duplicate faces, Fill Hole, Triangulate, Quadrangulate, Add Divisions, Reverse normals
+- ✅ Extrude (faces/edges; the move manipulator after a face extrude drives Translate / Local Translate Z, with divisions spread along it), Bevel, Bridge, Insert Edge Loop tool (the loop previews on hover and stays highlighted while you slide it), Multi-Cut (middle-click cuts an edge exactly at its midpoint; hold Ctrl to preview and click to insert an edge loop, Ctrl+middle-click through the midpoint), Target Weld, Merge / Merge to Center / Collapse, Connect, Chamfer vertex, Poke, Delete Edge/Vertex, Extract, Duplicate faces, Fill Hole, Triangulate, Quadrangulate, Add Divisions, Reverse normals
 - ✅ Combine, Separate, Smooth, Mirror, Cleanup, Booleans (union/difference/intersection, with history), Create Polygon tool, Quad Draw (retopology)
 - ✅ Soften/Harden edges, Delete History, Modeling Toolkit panel
 - ✅ UV: planar/cylindrical/spherical/automatic projection; UV Editor (select/move/rotate/scale, flip, rotate 90, normalize, layout, unfold/relax, texture image or checker behind the UVs)
@@ -77,9 +77,10 @@ Legend: ✅ built · 🟡 partial / simplified · ⏭ planned
 
 ## 7. Materials, shading & textures
 - ✅ Lambert, Blinn, Phong, Standard Surface, Surface Shader
+- ✅ Standard Surface PBR: metalness/roughness, IOR & specular, clearcoat, sheen, emission, opacity, transmission/refraction (viewport and hardware renderer, including thin-walled glass)
 - ✅ Assign New / Existing material (menus & marking menus), per-face assignment
 - ✅ Hypershade: material / texture tabs with rendered swatches, create bar, node graph work area (drag a texture's output onto a material slot, a material's output onto an object; right-click a slot to disconnect), property editor
-- ✅ File (PNG / JPEG / HDR), Checker, Ramp, Noise, Grid textures; bump, roughness, metalness, emission maps
+- ✅ File (PNG / JPEG / HDR), Checker, Ramp, Noise, Grid textures; bump, roughness, metalness, emission maps; per-texture repeat / offset / UV rotation
 - ⏭ Layered shader, Paint Effects, 3D paint
 
 ## 8. Lighting
@@ -91,7 +92,7 @@ Legend: ✅ built · 🟡 partial / simplified · ⏭ planned
 - ✅ Set Key (S), Shift+W/E/R, Key Selected channels, Auto Key, delete/copy/paste/bake keys
 - ✅ Scrubbing, ranges, playback (real-time / every frame / speeds), step frames/keys, frame rates
 - ✅ Graph Editor: curves, key select/move, tangent types, tangent handles, infinity modes, framing, stats fields
-- ✅ Dope Sheet; Playblast (PNG sequence)
+- ✅ Dope Sheet; Playblast (WebM video or PNG sequence)
 - ✅ Set Driven Key, Attach to Motion Path, ghosting, motion trails
 - ⏭ Animation layers, Time Editor/Trax, character sets, sound
 
@@ -114,8 +115,9 @@ Legend: ✅ built · 🟡 partial / simplified · ⏭ planned
 - ✅ Script Editor (MEL & Rhai tabs, history, save to shelf, load/save scripts)
 - ✅ MEL-style language: variables, procs, loops, and commands (polyCube, move, rotate, scale, select, setAttr, getAttr, setKeyframe, currentTime, ls, xform, parent, group, duplicate, file, …); Rhai scripting as a second language
 - ✅ Every UI action echoes its command; MEL command reference window
-- ✅ Hypergraph (hierarchy, MMB-drag a node onto another to parent; input/output connections of every selected object with Maya's row layout, shared materials drawn once, connection lines coloured by type: green for vector attributes, blue for single values, one line per connection between the same two nodes, hover a line for its attributes)
-- ✅ Connection Editor (Windows > General Editors): outputs / inputs side by side, click an output then an input to connect, click a connected input to break it, Reload Left / Right, Swap
+- ✅ Hypergraph (hierarchy, auto-fit + Frame All / Frame Selection, Show filters for cameras / lights / curves / locators / shape names, marquee selection, MMB-drag a node onto another to parent, double-click rename; input/output connections of every selected object with Maya's row layout, shared materials drawn once, MMB-drag node→node opens the Connection Editor, connection lines coloured by type: green for vector attributes, blue for single values, one line per connection between the same two nodes, hover a line for its attributes)
+- ✅ Connection Editor (Windows > General Editors): outputs / inputs side by side with collapsible compound attributes, compatible inputs dimmed, connected attributes in italics; click an output then an input to connect, click a connected input to break it; `from -> to` direction swap, Reload Left / Right, Remove, Clear All, Close, upstream / downstream navigation arrows, Options > Channel Names (Nice / Long / Short) and Attribute Order (Default / alphabetical ascend / descend), per-side Show Readable / Outputs / Inputs / Published / Non-Keyable / Connected Only / Hidden filters, Auto-connect plus Make / Break (multiple inputs with Ctrl/Cmd); materials and textures load from the Hypershade (texture maps appear as italic connections and can be broken)
+- ✅ Containers and published attributes: Modify > Asset > Create Container / Publish Attributes, `container` command (bind, unbind, publish / unpublish, query), published values in the Channel Box and Attribute Editor, published interface attributes in the Connection Editor (Show Published Only), saved with the scene
 - ✅ Direct attribute connections: connectAttr / disconnectAttr / listConnections / isConnected / connectionInfo, live evaluation, saved with the scene, yellow in the Channel Box (Break Connections removes them), arrows in the Hypergraph, driven objects drawn purple when the driver is selected (also constraints); texture outColor → material attribute = texture map
 - ⏭ Plug-in API, custom UI from scripts
 

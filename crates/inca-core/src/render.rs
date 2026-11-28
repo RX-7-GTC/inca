@@ -6,6 +6,94 @@ use crate::scene::{Scene, Shape};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+/// JS `TM`: the tone mappings exposed by Render Settings (three.js names).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToneMap {
+    Aces,
+    AgX,
+    Neutral,
+    Linear,
+    None,
+}
+
+impl ToneMap {
+    pub fn from_name(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "agx" => ToneMap::AgX,
+            "neutral" => ToneMap::Neutral,
+            "linear" => ToneMap::Linear,
+            "none" => ToneMap::None,
+            _ => ToneMap::Aces,
+        }
+    }
+    /// three.js `ACESFilmicToneMapping`.
+    fn aces(x: f32) -> f32 {
+        (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
+    }
+    /// three.js `AgXToneMapping` (inset/log/contrast/outset).
+    fn agx(v: [f32; 3]) -> [f32; 3] {
+        // row-major form of the three.js column-major mat3 constants
+        let inset = [[0.856627153315983, 0.0951212405381588, 0.0482516061458583], [0.137318972929847, 0.761241990602591, 0.101439036467562], [0.11189821299995, 0.0767994186031903, 0.811302368396859]];
+        let outset = [[1.1271005818144368, -0.11060664309660323, -0.016493938717834573], [-0.1413297634984383, 1.157823702216272, -0.016493938717834257], [-0.14132976349843826, -0.11060664309660294, 1.2519364065950405]];
+        let mul = |m: [[f32; 3]; 3], c: [f32; 3]| [m[0][0] * c[0] + m[0][1] * c[1] + m[0][2] * c[2], m[1][0] * c[0] + m[1][1] * c[1] + m[1][2] * c[2], m[2][0] * c[0] + m[2][1] * c[1] + m[2][2] * c[2]];
+        let c = mul(inset, v);
+        let c = c.map(|x| {
+            let x = x.max(1e-10).log2();
+            let x = ((x + 12.47393) / (4.026069 + 12.47393)).clamp(0.0, 1.0);
+            // three.js `AgXDefaultContrastApprox`
+            let x2 = x * x;
+            let x4 = x2 * x2;
+            15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x - 0.00232
+        });
+        mul(outset, c).map(|x| x.max(0.0).powf(2.2))
+    }
+    /// Khronos PBR Neutral (`THREE.NeutralToneMapping`).
+    fn neutral(mut c: [f32; 3]) -> [f32; 3] {
+        let start = 0.8 - 0.04;
+        let desat = 0.15;
+        let x = c[0].min(c[1]).min(c[2]);
+        let offset = if x < 0.08 { x - 6.25 * x * x } else { 0.04 };
+        for v in &mut c {
+            *v -= offset;
+        }
+        let peak = c[0].max(c[1]).max(c[2]);
+        if peak < start {
+            return c;
+        }
+        let d = 1.0 - start;
+        let new_peak = 1.0 - d * d / (peak + d - start);
+        for v in &mut c {
+            *v *= new_peak / peak;
+        }
+        let g = 1.0 - 1.0 / (desat * (peak - new_peak) + 1.0);
+        c.map(|v| v * (1.0 - g) + new_peak * g)
+    }
+    pub fn apply(self, c: [f32; 3]) -> [f32; 3] {
+        let c = match self {
+            ToneMap::Aces => c.map(Self::aces),
+            ToneMap::AgX => Self::agx(c),
+            ToneMap::Neutral => Self::neutral(c),
+            ToneMap::Linear | ToneMap::None => c,
+        };
+        c.map(|v| v.clamp(0.0, 1.0))
+    }
+}
+
+impl Default for ToneMap {
+    fn default() -> Self {
+        ToneMap::Aces
+    }
+}
+
+fn aa_scale(name: &str) -> u32 {
+    match name {
+        "off" | "low" => 1,
+        "medium" => 2,
+        "ultra" => 4,
+        _ => 3,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderSettings {
     pub width: u32,
@@ -13,12 +101,76 @@ pub struct RenderSettings {
     pub samples: u32,
     pub bounces: u32,
     pub exposure: f32,
+    /// smooth mesh preview subdivision levels (a preference, not a render setting)
+    pub smooth_divisions: u32,
+    /// path tracer tone mapping (JS `toneMapping`)
+    pub tone: ToneMap,
+    /// hardware renderer tone mapping (JS `hwToneMapping`, falls back to `toneMapping`)
+    pub hw_tone: ToneMap,
+    pub pixel_aspect: f32,
+    pub background: [f32; 3],
+    pub transparent: bool,
+    /// hardware supersampling factor (JS `hwAA`)
+    pub hw_aa: u32,
+    /// hardware shadow map resolution in pixels (JS `hwShadowMap`, default 2048)
+    pub hw_shadow_map: u32,
+    /// hardware renderer forces every light to cast (JS `hwAllShadows`, default true)
+    pub hw_all_shadows: bool,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        RenderSettings {
+            width: 960,
+            height: 540,
+            samples: 128,
+            bounces: 5,
+            exposure: 0.0,
+            smooth_divisions: 2,
+            tone: ToneMap::Aces,
+            hw_tone: ToneMap::Aces,
+            pixel_aspect: 1.0,
+            background: [0.0; 3],
+            transparent: false,
+            hw_aa: 3,
+            hw_shadow_map: 2048,
+            hw_all_shadows: true,
+        }
+    }
 }
 
 impl RenderSettings {
     pub fn from_scene(s: &Scene) -> Self {
         let g = |k: &str, d: f64| s.render.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
-        RenderSettings { width: g("width", 640.0) as u32, height: g("height", 480.0) as u32, samples: g("samples", 64.0) as u32, bounces: g("bounces", 4.0) as u32, exposure: g("exposure", 0.0) as f32 }
+        let st = |k: &str, d: &str| s.render.get(k).and_then(|v| v.as_str()).unwrap_or(d).to_string();
+        let b = |k: &str, d: bool| {
+            s.render.get(k).and_then(|v| match v {
+                serde_json::Value::Bool(b) => Some(*b),
+                serde_json::Value::Number(n) => Some(n.as_f64().unwrap_or(0.0) != 0.0),
+                serde_json::Value::String(s) => Some(matches!(s.as_str(), "true" | "on" | "yes" | "1")),
+                _ => None,
+            }).unwrap_or(d)
+        };
+        let d = Self::default();
+        let tone = ToneMap::from_name(&st("toneMapping", "aces"));
+        let hw_tone = ToneMap::from_name(&st("hwToneMapping", &st("toneMapping", "aces")));
+        let bg = s.render.get("background").and_then(|v| v.as_array()).map(|a| [a.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32, a.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32, a.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32]).unwrap_or(d.background);
+        RenderSettings {
+            width: g("width", d.width as f64) as u32,
+            height: g("height", d.height as f64) as u32,
+            samples: g("samples", d.samples as f64) as u32,
+            bounces: g("bounces", d.bounces as f64) as u32,
+            exposure: g("exposure", d.exposure as f64) as f32,
+            smooth_divisions: 2,
+            tone,
+            hw_tone,
+            pixel_aspect: g("pixelAspect", d.pixel_aspect as f64) as f32,
+            background: bg,
+            transparent: b("transparentBg", d.transparent),
+            hw_aa: aa_scale(&st("hwAA", "high")),
+            hw_shadow_map: (g("hwShadowMap", d.hw_shadow_map as f64) as u32).clamp(512, 8192),
+            hw_all_shadows: b("hwAllShadows", d.hw_all_shadows),
+        }
     }
 }
 
@@ -38,23 +190,31 @@ struct Mat {
 
 #[derive(Clone)]
 enum TexSampler {
-    Proc(crate::materials::Texture),
-    Image { w: u32, h: u32, px: std::sync::Arc<Vec<[f32; 3]>>, repeat: (f64, f64) },
+    Proc { tex: crate::materials::Texture, place: Option<crate::materials::Place2D> },
+    Image { w: u32, h: u32, px: std::sync::Arc<Vec<[f32; 3]>>, place: Option<crate::materials::Place2D> },
 }
 
 impl TexSampler {
     fn sample(&self, uv: DVec2) -> Option<[f32; 3]> {
         match self {
-            TexSampler::Proc(t) => t.sample(uv.x, uv.y),
-            TexSampler::Image { w, h, px, repeat } => {
-                let u = (uv.x * repeat.0).rem_euclid(1.0);
-                let v = (1.0 - (uv.y * repeat.1).rem_euclid(1.0)).clamp(0.0, 0.9999);
+            TexSampler::Proc { tex, place } => tex.sample(place.as_ref().map(|p| &p.attrs), uv.x, uv.y),
+            TexSampler::Image { w, h, px, place } => {
+                let (u, v) = crate::materials::place_uv(place.as_ref().map(|p| &p.attrs), uv.x, uv.y);
+                let u = u.rem_euclid(1.0);
+                let v = (1.0 - v.rem_euclid(1.0)).clamp(0.0, 0.9999);
                 let x = ((u * *w as f64) as u32).min(w - 1);
                 let y = ((v * *h as f64) as u32).min(h - 1);
                 px.get((y * w + x) as usize).copied()
             }
         }
     }
+}
+
+/// three.js `Matrix3.setUvTransform` with its default (0, 0) centre.
+#[allow(dead_code)]
+fn uv_transform(uv: DVec2, repeat: (f64, f64), offset: (f64, f64), rot: f64) -> DVec2 {
+    let (s, c) = rot.sin_cos();
+    DVec2::new(repeat.0 * (c * uv.x + s * uv.y) + offset.0, repeat.1 * (-s * uv.x + c * uv.y) + offset.1)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -108,23 +268,48 @@ impl RenderScene {
             if let Some(&i) = mat_index.get(id) {
                 return i;
             }
-            let m = s.mats.get(id);
-            let pbr = m.map(|m| m.pbr()).unwrap_or_default();
-            let tex = m.and_then(|m| m.maps.get(m.color_attr()).and_then(|t| t.as_str()).and_then(|t| s.texs.get(t))).and_then(|t| {
+            let m = s.material(id);
+            let pbr = m.as_ref().map(|m| m.pbr()).unwrap_or_default();
+            let tex = m.as_ref().and_then(|m| m.maps.get(m.color_attr()).and_then(|t| t.as_str()).and_then(|t| s.texture(t))).and_then(|t| {
                 if t.ty == "file" {
                     let path = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if let Some(c) = image_cache.get(&path) {
+                    let raw = t.attrs.get("colorSpace").and_then(|v| v.as_str()) == Some("Raw");
+                    let place = s.place_of(&t);
+                    let key = format!(
+                        "{path}|{raw}|{}|{}",
+                        serde_json::to_string(&t.attrs).unwrap_or_default(),
+                        place.as_ref().map(|p| serde_json::to_string(&p.attrs).unwrap_or_default()).unwrap_or_default()
+                    );
+                    if let Some(c) = image_cache.get(&key) {
                         return Some(c.clone());
                     }
-                    let img = image::open(&path).ok()?.to_rgb32f();
+                    // relative texture names resolve inside the project, like the viewport
+                    let full = if std::path::Path::new(&path).is_absolute() {
+                        std::path::PathBuf::from(&path)
+                    } else if let Some(pr) = &s.project {
+                        std::path::Path::new(pr).join(&path)
+                    } else {
+                        std::path::PathBuf::from(&path)
+                    };
+                    let img = image::open(full).ok()?.to_rgb32f();
                     let (w, h) = img.dimensions();
-                    let px: Vec<[f32; 3]> = img.pixels().map(|p| [p[0].powf(2.2), p[1].powf(2.2), p[2].powf(2.2)]).collect();
-                    let r = (t.attrs.get("repeatU").and_then(|v| v.as_f64()).unwrap_or(1.0), t.attrs.get("repeatV").and_then(|v| v.as_f64()).unwrap_or(1.0));
-                    let ts = TexSampler::Image { w, h, px: std::sync::Arc::new(px), repeat: r };
-                    image_cache.insert(path, ts.clone());
+                    // file pixels are sRGB unless `colorSpace: Raw`; three.js decodes them
+                    // to linear before the path tracer shades them
+                    let decode = |v: f32| {
+                        if raw {
+                            v
+                        } else if v <= 0.04045 {
+                            v / 12.92
+                        } else {
+                            ((v + 0.055) / 1.055).powf(2.4)
+                        }
+                    };
+                    let px: Vec<[f32; 3]> = img.pixels().map(|p| [decode(p[0]), decode(p[1]), decode(p[2])]).collect();
+                    let ts = TexSampler::Image { w, h, px: std::sync::Arc::new(px), place };
+                    image_cache.insert(key, ts.clone());
                     Some(ts)
                 } else {
-                    Some(TexSampler::Proc(t.clone()))
+                    Some(TexSampler::Proc { tex: t.clone(), place: s.place_of(&t) })
                 }
             });
             mats.push(Mat { pbr, tex });
@@ -142,7 +327,7 @@ impl RenderScene {
             let wm = s.world_matrix(&id);
             match &n.shape {
                 Shape::Mesh(m) => {
-                    let pm = if m.smooth_level > 0 { crate::mesh::subdivide(&m.mesh, m.smooth_level.min(3), true) } else { m.mesh.clone() };
+                    let pm = if m.smooth_level > 0 { crate::mesh::subdivide(&m.mesh, settings.smooth_divisions.clamp(1, 4), true) } else { m.mesh.clone() };
                     let nm = DMat4::from_mat3(glam::DMat3::from_mat4(wm).inverse().transpose());
                     let normals = pm.corner_normals();
                     let flip = wm.determinant() < 0.0;
@@ -202,8 +387,17 @@ impl RenderScene {
             lights.push(Light { kind: LightKind::Ambient, pos: DVec3::ZERO, color: DVec3::splat(0.12), decay: 0.0, shadows: false });
         }
         let has_sky = lights.iter().any(|l| matches!(l.kind, LightKind::Sky));
-        let background = if has_sky { lights.iter().find(|l| matches!(l.kind, LightKind::Sky)).unwrap().color } else { DVec3::ZERO };
-        let aspect = settings.width as f64 / settings.height.max(1) as f64;
+        // JS prepareScene: a sky dome supplies the environment, otherwise Render Settings'
+        // background colour clears the frame (transparent backgrounds stay black behind objects)
+        let background = if has_sky {
+            lights.iter().find(|l| matches!(l.kind, LightKind::Sky)).unwrap().color
+        } else if settings.transparent {
+            DVec3::ZERO
+        } else {
+            DVec3::new(settings.background[0] as f64, settings.background[1] as f64, settings.background[2] as f64)
+        };
+        // pixel aspect stretches the frame horizontally, as in the JS camera film gate
+        let aspect = settings.width as f64 * settings.pixel_aspect.max(1e-3) as f64 / settings.height.max(1) as f64;
         let mut rs = RenderScene { tris, nodes: vec![], mats, lights, cam, fov_y: cshape.fov_y(aspect), ortho: cshape.ortho.then_some(cshape.ortho_width), settings, background };
         rs.build_bvh();
         rs
@@ -313,7 +507,7 @@ impl RenderScene {
         let (w, h) = (self.settings.width as f64, self.settings.height as f64);
         let nx = (x / w) * 2.0 - 1.0;
         let ny = 1.0 - (y / h) * 2.0;
-        let aspect = w / h;
+        let aspect = w * self.settings.pixel_aspect.max(1e-3) as f64 / h;
         match self.ortho {
             Some(ow) => {
                 let o = self.cam.transform_point3(DVec3::new(nx * ow / 2.0, ny * ow / 2.0 / aspect, 0.0));
@@ -376,15 +570,29 @@ impl RenderScene {
             }
             let metal = m.pbr.metalness as f64;
             let rough = (m.pbr.roughness as f64).clamp(0.03, 1.0);
-            let spec_k = (m.pbr.specular as f64 * 0.04 * (1.0 - metal) + metal).clamp(0.0, 1.0);
+            let sc = DVec3::new(m.pbr.spec_color[0] as f64, m.pbr.spec_color[1] as f64, m.pbr.spec_color[2] as f64);
+            // three.js: F0 = min(((ior - 1) / (ior + 1))² * specularColor, 1) * specularIntensity;
+            // metals blend straight to the base colour, ignoring the dielectric tint/intensity.
+            let ior = (m.pbr.ior as f64).max(1.0);
+            let f0 = ((ior - 1.0) / (ior + 1.0)).powi(2);
+            let dielectric = sc * (m.pbr.specular as f64 * f0);
             let diffuse = base * (1.0 - metal);
-            let spec_col = DVec3::splat(spec_k).lerp(base, metal);
+            let spec_col = dielectric.lerp(base, metal);
             let v_dir = -ray.dir;
+            let ndv = n.dot(v_dir).max(1e-4);
+            // Standard Surface coat/sheen, using the same three.js lobes as the viewport.
+            let coat = m.pbr.coat as f64;
+            let coat_rough = (m.pbr.coat_roughness as f64).clamp(0.0525, 1.0);
+            let fcc = fresnel_schlick(ndv, 0.04, 1.0);
+            let sheen_col = DVec3::new(m.pbr.sheen_color[0] as f64, m.pbr.sheen_color[1] as f64, m.pbr.sheen_color[2] as f64) * m.pbr.sheen as f64;
+            let sheen_albedo_v = ibl_sheen_brdf(ndv, 1.0);
             // direct light
             for l in &self.lights {
                 let (ldir, dist, li) = match l.kind {
                     LightKind::Ambient | LightKind::Sky => {
-                        col += thr * diffuse * l.color * if matches!(l.kind, LightKind::Sky) { 0.0 } else { 1.0 };
+                        let sheen_energy = 1.0 - sheen_col.max_element() * sheen_albedo_v;
+                        let k = if matches!(l.kind, LightKind::Sky) { 0.0 } else { 1.0 };
+                        col += thr * diffuse * l.color * sheen_energy * (1.0 - coat * fcc) * k;
                         continue;
                     }
                     LightKind::Directional(d) => (-d, f64::INFINITY, l.color),
@@ -420,27 +628,47 @@ impl RenderScene {
                     continue;
                 }
                 let h = (ldir + v_dir).normalize();
+                let ndh = n.dot(h).max(0.0);
                 let shin = 2.0 / (rough * rough) - 2.0;
-                let spec = spec_col * (n.dot(h).max(0.0)).powf(shin.max(1.0)) * (shin + 8.0) / (8.0 * std::f64::consts::PI);
-                col += thr * li * ndl * (diffuse / std::f64::consts::PI * std::f64::consts::PI + spec);
+                let spec = spec_col * ndh.powf(shin.max(1.0)) * (shin + 8.0) / (8.0 * std::f64::consts::PI);
+                let sheen_energy = 1.0 - sheen_col.max_element() * sheen_albedo_v.max(ibl_sheen_brdf(ndl, 1.0));
+                let sheen = sheen_col * d_charlie(1.0, ndh) * v_neubelt(ndv, ndl) * ndl * std::f64::consts::PI;
+                let base_direct = (ndl * (diffuse + spec)) * sheen_energy + sheen;
+                // clearcoat: white GGX lobe over the attenuated base (three.js BRDF_GGX_Clearcoat)
+                let cc = fresnel_schlick(v_dir.dot(h).max(0.0), 0.04, 1.0) * d_ggx(ndh, coat_rough) * v_smith(ndv, ndl, coat_rough) * std::f64::consts::PI;
+                col += thr * li * (base_direct * (1.0 - coat * fcc) + cc * coat);
             }
             if depth == self.settings.bounces {
                 break;
             }
-            // indirect bounce: choose specular or diffuse
+            // indirect bounce: clearcoat reflection, base specular, or diffuse
+            let p_cc = if coat > 0.0 { (coat * fcc).clamp(0.05, 0.9) } else { 0.0 };
             let ps = (spec_col.max_element() * (1.0 - rough * 0.5)).clamp(0.05, 0.95);
-            if rng.f() < ps {
+            let r = rng.f();
+            if r < p_cc {
                 let refl = (ray.dir - n * 2.0 * ray.dir.dot(n)).normalize();
-                let d = (refl + random_unit(rng) * rough * rough).normalize_or(refl);
+                let d = (refl + random_unit(rng) * coat_rough * coat_rough).normalize_or(refl);
                 if d.dot(n) <= 0.0 {
                     break;
                 }
-                thr *= spec_col / ps;
+                // sampling proportional to coat * F makes the reflected radiance pass through
+                thr *= DVec3::splat(coat * fcc / p_cc);
                 ray = Ray { origin: p_off, dir: d };
             } else {
-                let d = (n + random_unit(rng)).normalize_or(n);
-                thr *= diffuse / (1.0 - ps);
-                ray = Ray { origin: p_off, dir: d };
+                let r2 = (r - p_cc) / (1.0 - p_cc);
+                if r2 < ps {
+                    let refl = (ray.dir - n * 2.0 * ray.dir.dot(n)).normalize();
+                    let d = (refl + random_unit(rng) * rough * rough).normalize_or(refl);
+                    if d.dot(n) <= 0.0 {
+                        break;
+                    }
+                    thr *= spec_col * (1.0 - coat * fcc) / (ps * (1.0 - p_cc));
+                    ray = Ray { origin: p_off, dir: d };
+                } else {
+                    let d = (n + random_unit(rng)).normalize_or(n);
+                    thr *= diffuse * (1.0 - coat * fcc) / ((1.0 - ps) * (1.0 - p_cc));
+                    ray = Ray { origin: p_off, dir: d };
+                }
             }
             if depth > 2 {
                 let q = thr.max_element().min(0.95);
@@ -487,9 +715,9 @@ impl RenderScene {
         let k = 2f32.powf(self.settings.exposure) / passes.max(1) as f32;
         let mut out = Vec::with_capacity(accum.len() / 3 * 4);
         for c in accum.chunks(3) {
-            for &x in c {
-                let v = x * k;
-                let v = v / (1.0 + v * 0.15); // gentle shoulder
+            // tone map in linear space, then sRGB-encode, matching three.js output
+            let mapped = self.settings.tone.apply([c[0] * k, c[1] * k, c[2] * k]);
+            for v in mapped {
                 let s = if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
                 out.push((s.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
             }
@@ -523,6 +751,49 @@ fn random_unit(r: &mut Rng) -> DVec3 {
     DVec3::new(s * a.cos(), s * a.sin(), z)
 }
 
+fn fresnel_schlick(cos_theta: f64, f0: f64, f90: f64) -> f64 {
+    f0 + (f90 - f0) * (1.0 - cos_theta).clamp(0.0, 1.0).powi(5)
+}
+
+// GGX/Trowbridge-Reitz normal distribution (three.js `D_GGX`).
+fn d_ggx(ndh: f64, rough: f64) -> f64 {
+    let a = rough * rough;
+    let a2 = a * a;
+    let d = ndh * ndh * (a2 - 1.0) + 1.0;
+    a2 / (std::f64::consts::PI * d * d).max(1e-7)
+}
+
+// Smith height-correlated visibility; the NdotL factor stays inside `gl`.
+fn v_smith(ndv: f64, ndl: f64, rough: f64) -> f64 {
+    let a = rough * rough;
+    let k = a * 0.5;
+    let gv = ndv / (ndv * (1.0 - k) + k);
+    let gl = ndl / (ndl * (1.0 - k) + k);
+    gv * gl / (4.0 * ndv).max(1e-4)
+}
+
+// three.js `D_Charlie` (Production Friendly Microfacet Sheen BRDF).
+fn d_charlie(rough: f64, ndh: f64) -> f64 {
+    let alpha = rough * rough;
+    let inv_alpha = 1.0 / alpha.max(1e-5);
+    let sin2h = (1.0 - ndh * ndh).max(0.0078125);
+    (2.0 + inv_alpha) * sin2h.powf(inv_alpha * 0.5) / (2.0 * std::f64::consts::PI)
+}
+
+// three.js `V_Neubelt` (no NdotL factor).
+fn v_neubelt(ndv: f64, ndl: f64) -> f64 {
+    (1.0 / (4.0 * (ndl + ndv - ndl * ndv)).max(1e-5)).clamp(0.0, 1.0)
+}
+
+// three.js `IBLSheenBRDF`, the hemisphere-integrated Charlie lobe.
+fn ibl_sheen_brdf(ndv: f64, rough: f64) -> f64 {
+    let r2 = rough * rough;
+    let r_inv = 1.0 / (rough + 0.1);
+    let a = -1.9362 + 1.0678 * rough + 0.4573 * r2 - 0.8469 * r_inv;
+    let b = -0.6014 + 0.5538 * rough - 0.4670 * r2 - 0.1255 * r_inv;
+    (a * ndv + b).exp().clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,7 +805,7 @@ mod tests {
         s.create_mesh("polyCube", &Params::new(), None);
         let cam = s.find("persp").unwrap();
         s.nodes.get_mut(&cam).unwrap().xf.t = [3.0, 2.25, 3.0];
-        let rs = RenderScene::build(&s, "persp", RenderSettings { width: 32, height: 24, samples: 1, bounces: 1, exposure: 0.0 });
+        let rs = RenderScene::build(&s, "persp", RenderSettings { width: 32, height: 24, samples: 1, bounces: 1, ..Default::default() });
         assert_eq!(rs.triangle_count(), 12);
         let mut acc = vec![0.0; 32 * 24 * 3];
         rs.render_pass(&mut acc, 0);
@@ -545,5 +816,152 @@ mod tests {
         assert_eq!(acc[0], 0.0);
         let px = rs.resolve(&acc, 1);
         assert_eq!(px.len(), 32 * 24 * 4);
+    }
+
+    #[test]
+    fn texture_uv_transform_matches_three_js() {
+        let t = uv_transform(DVec2::new(0.25, 0.5), (2.0, 1.0), (0.1, 0.2), std::f64::consts::FRAC_PI_2);
+        assert!((t.x - 1.1).abs() < 1e-9, "{t:?}");
+        assert!((t.y + 0.05).abs() < 1e-9, "{t:?}");
+        assert_eq!(uv_transform(DVec2::new(0.3, 0.4), (1.0, 1.0), (0.0, 0.0), 0.0), DVec2::new(0.3, 0.4));
+    }
+
+    fn render_total(s: &Scene, samples: u32, bounces: u32) -> f64 {
+        let (w, h) = (32, 24);
+        let mut settings = RenderSettings::from_scene(s);
+        settings.width = w;
+        settings.height = h;
+        settings.samples = samples;
+        settings.bounces = bounces;
+        let rs = RenderScene::build(s, "persp", settings);
+        let mut acc = vec![0.0; (w * h * 3) as usize];
+        for pass in 0..samples {
+            rs.render_pass(&mut acc, pass);
+        }
+        acc.iter().map(|x| *x as f64).sum()
+    }
+
+    #[test]
+    fn path_tracer_includes_clearcoat_and_sheen() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let cam = s.find("persp").unwrap();
+        s.nodes.get_mut(&cam).unwrap().xf.t = [3.0, 2.25, 3.0];
+        let m = s.create_material("standardSurface", Some("coatMat"));
+        s.assign_material(&id, &m, None);
+        {
+            s.set_dep_attr(&m, "baseColor", serde_json::json!([0.0, 0.0, 0.0]));
+            s.set_dep_attr(&m, "specular", serde_json::json!(0.0));
+            s.set_dep_attr(&m, "metalness", serde_json::json!(0.0));
+        }
+        let base = render_total(&s, 4, 0);
+        assert!(base < 1e-6, "a black material with no coat/sheen renders black: {base}");
+        s.set_dep_attr(&m, "coat", serde_json::json!(1.0));
+        s.set_dep_attr(&m, "coatRoughness", serde_json::json!(0.4));
+        let coat = render_total(&s, 4, 0);
+        assert!(coat > 1e-3, "clearcoat must add its specular lobe: {coat}");
+        s.set_dep_attr(&m, "coat", serde_json::json!(0.0));
+        s.set_dep_attr(&m, "sheen", serde_json::json!(1.0));
+        let sheen = render_total(&s, 4, 0);
+        assert!(sheen > 1e-3, "sheen must add its grazing lobe: {sheen}");
+    }
+
+    #[test]
+    fn path_tracer_clearcoat_reflects_the_background() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let cam = s.find("persp").unwrap();
+        s.nodes.get_mut(&cam).unwrap().xf.t = [3.0, 2.25, 3.0];
+        s.render.insert("background".into(), serde_json::json!([1.0, 1.0, 1.0]));
+        s.render.insert("toneMapping".into(), serde_json::json!("none"));
+        let m = s.create_material("standardSurface", Some("coatMat"));
+        s.assign_material(&id, &m, None);
+        {
+            s.set_dep_attr(&m, "baseColor", serde_json::json!([0.0, 0.0, 0.0]));
+            s.set_dep_attr(&m, "specular", serde_json::json!(0.0));
+            s.set_dep_attr(&m, "specularRoughness", serde_json::json!(0.2));
+        }
+        let base = render_total(&s, 32, 1);
+        s.set_dep_attr(&m, "coat", serde_json::json!(1.0));
+        let coated = render_total(&s, 32, 1);
+        // the cube's indirect coat bounce picks up the white background, which the black
+        // base material cannot do on its own
+        assert!(coated > base + 0.05, "clearcoat must reflect the background: base {base}, coated {coated}");
+    }
+
+    #[test]
+    fn render_settings_defaults_match_the_js() {
+        let s = Scene::new();
+        let d = RenderSettings::from_scene(&s);
+        assert_eq!((d.width, d.height, d.samples, d.bounces), (960, 540, 128, 5));
+        assert_eq!(d.tone, ToneMap::Aces);
+        assert_eq!(d.hw_tone, ToneMap::Aces);
+        assert_eq!(d.pixel_aspect, 1.0);
+        assert!(!d.transparent);
+        assert_eq!(d.hw_aa, 3);
+        assert_eq!(d.hw_shadow_map, 2048);
+        assert!(d.hw_all_shadows);
+    }
+
+    #[test]
+    fn render_settings_parse_tone_mapping_and_hardware_options() {
+        let mut s = Scene::new();
+        s.render.insert("toneMapping".into(), serde_json::json!("agx"));
+        s.render.insert("hwToneMapping".into(), serde_json::json!("neutral"));
+        s.render.insert("hwAA".into(), serde_json::json!("ultra"));
+        s.render.insert("hwShadowMap".into(), serde_json::json!(4096));
+        s.render.insert("transparentBg".into(), serde_json::json!(true));
+        s.render.insert("background".into(), serde_json::json!([0.1, 0.2, 0.3]));
+        s.render.insert("pixelAspect".into(), serde_json::json!(2.0));
+        let d = RenderSettings::from_scene(&s);
+        assert_eq!(d.tone, ToneMap::AgX);
+        assert_eq!(d.hw_tone, ToneMap::Neutral);
+        assert_eq!(d.hw_aa, 4);
+        assert_eq!(d.hw_shadow_map, 4096);
+        assert!(d.transparent);
+        assert_eq!(d.pixel_aspect, 2.0);
+        assert!((d.background[2] - 0.3).abs() < 1e-6);
+        // hwToneMapping falls back to toneMapping when unset
+        s.render.remove("hwToneMapping");
+        assert_eq!(RenderSettings::from_scene(&s).hw_tone, ToneMap::AgX);
+    }
+
+    #[test]
+    fn path_tracer_uses_the_render_background_colour() {
+        let mut s = Scene::new();
+        s.render.insert("background".into(), serde_json::json!([0.1, 0.2, 0.3]));
+        s.render.insert("toneMapping".into(), serde_json::json!("none"));
+        s.render.insert("width".into(), serde_json::json!(8));
+        s.render.insert("height".into(), serde_json::json!(8));
+        s.render.insert("samples".into(), serde_json::json!(1));
+        s.render.insert("bounces".into(), serde_json::json!(0));
+        let rs = RenderScene::build(&s, "persp", RenderSettings::from_scene(&s));
+        let mut acc = vec![0.0; 8 * 8 * 3];
+        rs.render_pass(&mut acc, 0);
+        let px = rs.resolve(&acc, 1);
+        assert!(px[0] > 0 && px[1] > px[0] && px[2] > px[1], "{:?}", &px[0..4]);
+        // transparent backgrounds render black behind objects
+        s.render.insert("transparentBg".into(), serde_json::json!(true));
+        let rs = RenderScene::build(&s, "persp", RenderSettings::from_scene(&s));
+        let mut acc = vec![0.0; 8 * 8 * 3];
+        rs.render_pass(&mut acc, 0);
+        assert_eq!(rs.resolve(&acc, 1)[0], 0);
+    }
+
+    #[test]
+    fn aces_tone_mapping_matches_three_js() {
+        let high = ToneMap::Aces.apply([1.0, 1.0, 1.0]);
+        let mid = ToneMap::Aces.apply([0.5, 0.5, 0.5]);
+        assert!((high[0] - 2.54 / 3.16).abs() < 1e-6, "{high:?}");
+        assert!((mid[0] - 0.6425 / 1.0425).abs() < 1e-6, "{mid:?}");
+        // none/linear leave values unchanged (then clamp)
+        assert_eq!(ToneMap::None.apply([0.25, 0.5, 2.0]), [0.25, 0.5, 1.0]);
+        assert_eq!(ToneMap::Linear.apply([0.25, 0.5, 2.0]), [0.25, 0.5, 1.0]);
+        // AgX and Neutral stay in range and darken highlights
+        let agx = ToneMap::AgX.apply([4.0, 2.0, 1.0]);
+        assert!(agx.iter().all(|v| (0.0..=1.0).contains(v)), "{agx:?}");
+        let neu = ToneMap::Neutral.apply([4.0, 2.0, 1.0]);
+        assert!(neu.iter().all(|v| (0.0..=1.0).contains(v)), "{neu:?}");
+        assert!(neu[0] > 0.9, "{neu:?}");
     }
 }

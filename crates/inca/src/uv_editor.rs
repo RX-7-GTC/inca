@@ -74,7 +74,7 @@ fn mesh(app: &IncaApp, id: &str) -> Option<PolyMesh> {
 fn commit(app: &mut IncaApp, id: &str, pm: &PolyMesh) {
     let Some(uvs) = &pm.uv else { return };
     let v = serde_json::to_value(uvs).unwrap_or_default();
-    let last = app.s.node(id).and_then(|n| n.mesh()).map(|m| (m.history.len(), m.history.last().map(|h| h.ty.clone())));
+    let last = app.s.node(id).and_then(|n| n.mesh()).map(|m| (m.history.len(), app.s.history_meta(id, m.history.len().saturating_sub(1)).map(|h| h.ty)));
     match last {
         Some((n, Some(t))) if t == "polyUVSet" => app.s.set_history_param(id, n - 1, "uv", v),
         _ => {
@@ -250,7 +250,12 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         }
     }
     let mut open = true;
-    let shown = egui::Window::new("UV Editor").open(&mut open).default_size([760.0, 620.0]).show(ctx, |ui| {
+    let shown = crate::windows::place_window(app, ctx, egui::Id::new("UV Editor"), open, |app, fix| {
+        let mut window = egui::Window::new("UV Editor").open(&mut open).default_size([760.0, 620.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         menus(app, ui);
         toolbar(app, ui);
         let avail = ui.available_size() - vec2(0.0, 20.0);
@@ -265,6 +270,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
         let n_sel = app.uv_editor.sel_count();
         let n_all: usize = targets(app).iter().filter_map(|i| mesh(app, i)).map(|pm| uv::all_corners(&pm, &CornerIndex::new(&pm)).len()).sum();
         ui.label(egui::RichText::new(format!("{} mesh(es)   UV corners: {n_sel} / {n_all} selected   Q/W/E/R tools · Alt+MMB pan · Alt+RMB / wheel zoom · Shift constrains · F/A frame", targets(app).len())).size(11.0).color(crate::theme::TEXT_DIM));
+        })
     });
     app.uv_editor.win_rect = shown.map(|r| r.response.rect);
     if !open {
@@ -274,81 +280,85 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
 }
 
 fn menus(app: &mut IncaApp, ui: &mut egui::Ui) {
-    egui::MenuBar::new().ui(ui, |ui| {
-        let item = |ui: &mut egui::Ui, l: &str| {
-            let c = ui.button(l).clicked();
-            if c {
-                ui.close();
-            }
-            c
-        };
-        ui.menu_button("Edit", |ui| {
-            if item(ui, "Undo") {
+    use crate::menus::{menu_check, menu_item, menu_radio, panel_bar, MenuSource};
+    panel_bar(app, ui, MenuSource::UvEditor, &["Edit", "Select", "Create", "Modify", "Tool", "View", "Help"], false, |app, ui, title| match title {
+        "Edit" => {
+            if menu_item(app, ui, "Undo") {
                 app.action("undo");
             }
-            if item(ui, "Redo") {
+            if menu_item(app, ui, "Redo") {
                 app.action("redo");
             }
-        });
-        ui.menu_button("Select", |ui| {
-            if item(ui, "Select All UVs") {
+        }
+        "Select" => {
+            if menu_item(app, ui, "Select All UVs") {
                 select_all(app);
             }
-            if item(ui, "Select Shell") {
+            if menu_item(app, ui, "Select Shell") {
                 select_shell(app);
             }
-            if item(ui, "Convert Scene Selection to UVs") {
+            if menu_item(app, ui, "Convert Scene Selection to UVs") {
                 from_scene(app);
             }
-            if item(ui, "Clear Selection") {
+            if menu_item(app, ui, "Clear Selection") {
                 app.uv_editor.sel.clear();
             }
-        });
-        ui.menu_button("Create", |ui| {
+        }
+        "Create" => {
             for (l, a) in [("Planar", "planarMap"), ("Cylindrical", "cylindricalMap"), ("Spherical", "sphericalMap"), ("Automatic", "automaticMap")] {
-                if item(ui, l) {
+                if menu_item(app, ui, l) {
                     project(app, a);
                 }
             }
-        });
-        ui.menu_button("Modify", |ui| {
+        }
+        "Modify" => {
             for (l, k) in [("Flip U", "flipU"), ("Flip V", "flipV"), ("Rotate 90° CCW", "rot90"), ("Rotate 90° CW", "rot-90")] {
-                if item(ui, l) {
+                if menu_item(app, ui, l) {
                     op(app, k);
                 }
             }
             ui.separator();
             for (l, k) in [("Normalize", "normalize"), ("Layout", "layout"), ("Unfold (Relax)", "relax")] {
-                if item(ui, l) {
+                if menu_item(app, ui, l) {
                     op(app, k);
                 }
             }
-        });
-        ui.menu_button("Tool", |ui| {
+        }
+        "Tool" => {
             for (l, t) in [("Select Tool  Q", UvTool::Select), ("Move Tool  W", UvTool::Move), ("Rotate Tool  E", UvTool::Rotate), ("Scale Tool  R", UvTool::Scale)] {
-                if ui.radio(app.uv_editor.tool == t, l).clicked() {
+                if menu_radio(app, ui, app.uv_editor.tool == t, l) {
                     app.uv_editor.tool = t;
-                    ui.close();
                 }
             }
-        });
-        ui.menu_button("View", |ui| {
-            if item(ui, "Frame All  A") {
+        }
+        "View" => {
+            if menu_item(app, ui, "Frame All  A") {
                 app.uv_editor.framed = false;
             }
             ui.separator();
-            let e = &mut app.uv_editor;
-            ui.checkbox(&mut e.grid, "Grid");
-            ui.checkbox(&mut e.checker, "Checker Map");
-            ui.checkbox(&mut e.image, "Display Image");
-            ui.checkbox(&mut e.shade, "Shade UVs");
-            ui.checkbox(&mut e.points, "UV Points");
-        });
-        ui.menu_button("Help", |ui| {
-            if item(ui, "Help on UV Editor") {
+            for (on, label) in [
+                (app.uv_editor.grid, "Grid"),
+                (app.uv_editor.checker, "Checker Map"),
+                (app.uv_editor.image, "Display Image"),
+                (app.uv_editor.shade, "Shade UVs"),
+                (app.uv_editor.points, "UV Points"),
+            ] {
+                if menu_check(app, ui, on, label) {
+                    match label {
+                        "Grid" => app.uv_editor.grid = !app.uv_editor.grid,
+                        "Checker Map" => app.uv_editor.checker = !app.uv_editor.checker,
+                        "Display Image" => app.uv_editor.image = !app.uv_editor.image,
+                        "Shade UVs" => app.uv_editor.shade = !app.uv_editor.shade,
+                        _ => app.uv_editor.points = !app.uv_editor.points,
+                    }
+                }
+            }
+        }
+        _ => {
+            if menu_item(app, ui, "Help on UV Editor") {
                 app.help = "UV Editor: click/marquee UVs (Shift toggle, Ctrl deselect, Ctrl+Shift add) · W/E/R + LMB drag on the selection (or MMB anywhere) to move/rotate/scale · Shift constrains, Ctrl snaps · Alt+MMB pan · wheel zoom".into();
             }
-        });
+        }
     });
 }
 
@@ -432,26 +442,33 @@ fn nice_step(x: f64) -> f64 {
 fn image_texture(app: &mut IncaApp, ctx: &egui::Context) -> Option<egui::TextureId> {
     let id = targets(app).into_iter().next()?;
     let mid = app.s.node(&id)?.mesh()?.material.clone();
-    let m = app.s.mats.get(&mid)?;
+    let m = app.s.material(&mid)?;
     let tid = m.maps.get(m.color_attr())?.as_str()?;
-    let t = app.s.texs.get(tid)?;
+    let t = app.s.texture(tid)?;
+    let place = app.s.place_of(&t);
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (tid, serde_json::to_string(&t.attrs).unwrap_or_default()).hash(&mut h);
+    (tid, serde_json::to_string(&t.attrs).unwrap_or_default(), place.as_ref().map(|p| serde_json::to_string(&p.attrs).unwrap_or_default())).hash(&mut h);
     let key = h.finish();
     if let Some((k, tex)) = &app.uv_editor.image_tex {
         if *k == key {
             return Some(tex.id());
         }
     }
-    let size = 512usize;
-    let px = match inca_core::materials::texture_swatch(t, size) {
-        Some(p) => p,
-        None => {
-            let path = t.attrs.get("fileTextureName").and_then(|v| v.as_str()).unwrap_or("");
-            let img = image::open(path).ok()?.to_rgba8();
-            image::imageops::resize(&img, size as u32, size as u32, image::imageops::FilterType::Triangle).into_raw()
+    // Procedural previews use the viewport's texture size; 512² fractal terrain was
+    // too slow to regenerate on every slider change.
+    let size = inca_core::materials::VIEW_TEX_SIZE as usize;
+    let px = if t.ty == "file" {
+        // The viewport image is GPU-oriented (v=0 at the bottom); flip it for display.
+        let src = inca_core::materials::viewport_texture_pixels(&t, place.as_ref().map(|p| &p.attrs), app.s.project.as_deref())?;
+        let row = size * 4;
+        let mut flipped = vec![0u8; src.len()];
+        for y in 0..size {
+            flipped[y * row..(y + 1) * row].copy_from_slice(&src[(size - 1 - y) * row..(size - y) * row]);
         }
+        flipped
+    } else {
+        inca_core::materials::texture_swatch(&t, place.as_ref().map(|p| &p.attrs), size)?
     };
     let tex = ctx.load_texture("uvImage", egui::ColorImage::from_rgba_unmultiplied([size, size], &px), egui::TextureOptions::LINEAR);
     let tid = tex.id();
@@ -686,7 +703,7 @@ fn interact(app: &mut IncaApp, ui: &egui::Ui, rect: Rect, resp: &egui::Response,
             app.uv_editor.drag = Some(Drag::Zoom { start, s0, anchor });
         }
         Some(Drag::Marquee { start, mode }) => {
-            p.rect_stroke(Rect::from_two_pos(start, cur), 0.0, Stroke::new(1.0, Color32::from_gray(0xee)), egui::StrokeKind::Inside);
+            crate::theme::marquee(&p, Rect::from_two_pos(start, cur));
             app.uv_editor.drag = Some(Drag::Marquee { start, mode });
         }
         Some(Drag::Xform { tool, start, pivot, items, mut axis }) => {
@@ -799,7 +816,7 @@ fn interact(app: &mut IncaApp, ui: &egui::Ui, rect: Rect, resp: &egui::Response,
             None => {}
         }
     }
-    resp.context_menu(|ui| {
+    crate::menus::show_plain_context_menu(&resp, |ui| {
         for (l, k) in [("Select All UVs", "all"), ("Select Shell", "shell"), ("Clear Selection", "clear")] {
             if ui.button(l).clicked() {
                 match k {
@@ -867,5 +884,11 @@ fn keys(app: &mut IncaApp, ui: &egui::Ui, rect: Rect, resp: &egui::Response) {
 
 /// The UV Editor takes Q/W/E/R/F/A while the pointer is over it, so the scene hotkeys skip them.
 pub fn wants_keys(app: &IncaApp, ctx: &egui::Context) -> bool {
-    app.uv_editor.win_rect.zip(ctx.pointer_hover_pos()).is_some_and(|(r, p)| r.contains(p))
+    ctx.pointer_hover_pos().is_some_and(|p| app.uv_editor.contains_pointer(p))
+}
+
+impl UvEditor {
+    pub fn contains_pointer(&self, p: egui::Pos2) -> bool {
+        self.open && self.win_rect.is_some_and(|r| r.contains(p))
+    }
 }

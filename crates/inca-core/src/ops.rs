@@ -59,7 +59,7 @@ pub static OPS: &[OpInfo] = &[
         ty: "polyExtrudeFace",
         base: "polyExtrudeFace",
         hidden: false,
-        channels: &[ch("translateX", F, None, None), ch("translateY", F, None, None), ch("translateZ", F, None, None), ch("localTranslateZ", F, None, None), ch("offset", F, Some(-1.0), Some(1.0)), ch("divisions", I, Some(1.0), Some(50.0)), ch("keepFacesTogether", B, None, None)],
+        channels: &[ch("thickness", F, None, None), ch("translateX", F, None, None), ch("translateY", F, None, None), ch("translateZ", F, None, None), ch("localTranslateZ", F, None, None), ch("offset", F, Some(-1.0), Some(1.0)), ch("divisions", I, Some(1.0), Some(50.0)), ch("keepFacesTogether", B, None, None)],
     },
     OpInfo { ty: "polyExtrudeEdge", base: "polyExtrudeEdge", hidden: false, channels: &[ch("offset", F, None, None), ch("translateY", F, None, None)] },
     OpInfo { ty: "polyBevel", base: "polyBevel", hidden: false, channels: &[ch("fraction", F, Some(0.001), Some(1.0))] },
@@ -207,6 +207,13 @@ pub fn apply(ty: &str, pm: &PolyMesh, p: &Params, ctx: &dyn OpCtx) -> Result<OpO
                         .filter_map(|q| {
                             if let Some(v) = q.get("vertex").and_then(|v| v.as_u64()) {
                                 return Some(mesh::SplitPoint::Vertex(v as u32));
+                            }
+                            if let Some(fi) = q.get("face").and_then(|v| v.as_u64()) {
+                                let p = q.get("point")?.as_array()?;
+                                let x = p.first()?.as_f64()?;
+                                let y = p.get(1)?.as_f64()?;
+                                let z = p.get(2)?.as_f64()?;
+                                return Some(mesh::SplitPoint::Face(fi as usize, DVec3::new(x, y, z)));
                             }
                             let e = q.get("edge")?.as_array()?;
                             Some(mesh::SplitPoint::Edge(e.first()?.as_u64()? as u32, e.get(1)?.as_u64()? as u32, q.get("t").and_then(|t| t.as_f64()).unwrap_or(0.5)))

@@ -692,9 +692,7 @@ pub fn import_fbx(s: &mut Scene, bytes: &[u8], dir: Option<&Path>, file_stem: &s
                 .unwrap_or(if file.is_empty() { rel } else { file });
             let tid = s.create_texture("file", Some(&obj_name(t)));
             s.set_attr(&NodeRef::Texture(tid.clone()), "fileTextureName", json!(resolved));
-            if let Some(m) = s.mats.get_mut(&id) {
-                m.maps.insert("color".into(), json!(tid));
-            }
+            s.set_material_map(&id, "color", &tid, "outColor");
         }
         mats.insert(oid, id);
     }
@@ -1158,7 +1156,8 @@ pub fn export_fbx(s: &Scene, sel_only: bool) -> Vec<u8> {
         .filter_map(|i| s.node(i).and_then(|n| n.mesh()))
         .flat_map(|m| std::iter::once(m.material.clone()).chain(m.mesh.fm.iter().flatten().flatten().cloned()))
         .collect();
-    for (mid, m) in s.mats.iter().filter(|(k, _)| used.contains(*k)) {
+    for m in s.materials().into_iter().filter(|m| used.contains(&m.id)) {
+        let mid = m.id.clone();
         let oid = new_id();
         mat_id.insert(mid.clone(), oid);
         let a = |k: &str, d: [f64; 3]| -> DVec3 { m.attrs.get(k).and_then(|v| serde_json::from_value::<[f64; 3]>(v.clone()).ok()).map(DVec3::from_array).unwrap_or(DVec3::from_array(d)) };
@@ -1182,7 +1181,7 @@ pub fn export_fbx(s: &Scene, sel_only: bool) -> Vec<u8> {
         let node = FNode::new("Material").p(Prop::I64(oid)).p(oname(&m.name, "Material")).p(st("")).kid(n1("Version", Prop::I32(102))).kid(n1("ShadingModel", st(if phong { "phong" } else { "lambert" }))).kid(n1("MultiLayer", Prop::I32(0))).kid(props70(p));
         add(&mut objects, &mut counts, "Material", node);
         let slot = if m.ty == "standardSurface" { "baseColor" } else { "color" };
-        if let Some(t) = m.maps.get(slot).and_then(Value::as_str).and_then(|t| s.texs.get(t)).filter(|t| t.ty == "file") {
+        if let Some(t) = m.maps.get(slot).and_then(Value::as_str).and_then(|t| s.texture(t)).filter(|t| t.ty == "file") {
             let file = t.attrs.get("fileTextureName").and_then(Value::as_str).unwrap_or("").to_string();
             let rel = Path::new(&file).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
             let (tid, vid) = (new_id(), new_id());
@@ -1263,8 +1262,9 @@ pub fn export_fbx(s: &Scene, sel_only: bool) -> Vec<u8> {
         };
         match &nd.shape {
             Shape::Mesh(m) => {
-                let skin = m.history.iter().find(|h| h.ty == "skinCluster");
-                let pm = if skin.is_some() { crate::skin::bind_mesh(m) } else { &m.mesh };
+                let skin = s.history_find(&id, "skinCluster").and_then(|i| s.history_node(&id, i));
+                let pm = if skin.is_some() { crate::skin::bind_mesh(s, m) } else { m.mesh.clone() };
+                let pm = &pm;
                 let mut slots = vec![m.material.clone()];
                 for f in pm.fm.iter().flatten().flatten() {
                     if !slots.contains(f) {
@@ -1545,7 +1545,7 @@ mod tests {
         let jo2 = t.node(&j1).unwrap().xf.jo;
         assert!(jo.iter().zip(jo2).all(|(a, b)| (a - b).abs() < 1e-6), "{jo:?} {jo2:?}");
         let arm = t.find("arm").unwrap();
-        let w = |sc: &Scene, id: &str| sc.node(id).unwrap().mesh().unwrap().history.iter().find(|h| h.ty == "skinCluster").expect("skin").params["weights"].clone();
+        let w = |sc: &Scene, id: &str| sc.history_node(id, sc.history_find(id, "skinCluster").expect("skin")).expect("skin").params["weights"].clone();
         let (wa, wb) = (w(&s, &s.find("arm").unwrap()), w(&t, &arm));
         let wa = wa.as_array().unwrap();
         let wb = wb.as_array().unwrap();
@@ -1631,8 +1631,8 @@ Connections:  {
         let m = n.mesh().unwrap();
         assert_eq!(m.mesh.f, vec![vec![0, 1, 2, 3]]);
         assert_eq!(m.mesh.uv.as_ref().unwrap()[0].as_ref().unwrap()[2], DVec2::new(1.0, 1.0));
-        assert_eq!(s.mats[&m.material].name, "red");
-        assert_eq!(s.mats[&m.material].attrs["color"], json!([1.0, 0.0, 0.0]));
+        assert_eq!(s.material(&m.material).unwrap().name, "red");
+        assert_eq!(s.material(&m.material).unwrap().attrs["color"], json!([1.0, 0.0, 0.0]));
     }
 
     #[test]

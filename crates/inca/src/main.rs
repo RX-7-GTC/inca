@@ -8,6 +8,7 @@ mod component_editor;
 mod edit_cmds;
 mod hypershade;
 mod hotkey_editor;
+mod hotkey_help;
 mod hik_ui;
 mod hypergraph;
 mod icons;
@@ -39,10 +40,22 @@ fn icon() -> Option<egui::IconData> {
 }
 
 fn main() -> eframe::Result {
+    // Keep a crash report on disk so a window-only panic can still be diagnosed.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = std::env::temp_dir().join("inca-crash.log");
+        let text = format!("{info}\n\n{}", std::backtrace::Backtrace::force_capture());
+        let _ = std::fs::write(&path, text);
+        default_hook(info);
+    }));
+    prefs::apply_backend_env();
     let mut viewport = egui::ViewportBuilder::default().with_inner_size([1600.0, 1000.0]).with_min_inner_size([900.0, 600.0]).with_title("Inca");
     if let Some(i) = icon() {
         viewport = viewport.with_icon(i);
     }
-    let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, ..Default::default() };
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    // GUI/editor latency matters more than throughput here; don't queue two frames.
+    wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY;
+    let options = eframe::NativeOptions { viewport, renderer: eframe::Renderer::Wgpu, wgpu_options, ..Default::default() };
     eframe::run_native("Inca", options, Box::new(|cc| Ok(Box::new(app::IncaApp::new(cc)))))
 }

@@ -17,6 +17,14 @@ fn fmt(t: f64) -> String {
 }
 
 pub fn time_slider(app: &mut IncaApp, ui: &mut egui::Ui) {
+    if (ui.input(|i| i.modifiers.ctrl || i.modifiers.command)) && ui.rect_contains_pointer(ui.max_rect()) {
+        if ui.input(|i| i.key_pressed(egui::Key::C)) {
+            app.action("timelineCopy");
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::V)) {
+            app.action("timelinePaste");
+        }
+    }
     ui.horizontal_centered(|ui| {
         let ctl_w = 250.0;
         let w = (ui.available_width() - ctl_w).max(100.0);
@@ -89,12 +97,27 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
         }
         t += minor;
     }
-    // keys of the selection
-    for k in app.s.anim.key_times(&app.s.sel) {
-        if k >= t0 && k <= t1 {
-            let x = x_of(k).round();
-            p.rect_filled(Rect::from_min_size(pos2(x - 1.0, rect.max.y - 22.0), vec2((px_per as f32 * 0.18).max(2.0), 22.0)), 0.0, Color32::from_rgb(0xd7, 0x3b, 0x3e));
-        }
+    // keys of the selection (or only the picked Channel Box channels when sync is on)
+    let mut key_times: Vec<f64> = if app.panels.cb_sync_timeline && !app.panels.cb_sel.is_empty() {
+        let mut t: Vec<f64> = app
+            .s
+            .anim
+            .curves
+            .values()
+            .filter(|c| app.s.sel.contains(&c.node) && app.panels.cb_sel.contains(&c.attr))
+            .flat_map(|c| c.keys.iter().map(|k| k.t))
+            .collect();
+        t.sort_by(|a, b| a.total_cmp(b));
+        t.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        t
+    } else {
+        app.s.anim_key_times(&app.s.sel)
+    };
+    // The current layer's animated weight is keyed in the bottom Weight row; show its keys too.
+    if let Some(l) = app.s.anim_layer_current.as_ref().and_then(|id| app.s.anim_layers.iter().find(|l| &l.id == id)) {
+        key_times.extend(l.weight_curve.keys.iter().map(|k| k.t));
+        key_times.sort_by(|a, b| a.total_cmp(b));
+        key_times.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
     }
     // current time: grey frame band, white line, label box
     let cx = x_of(app.s.time.current);
@@ -107,13 +130,22 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
     let lx = (cx + 2.0).min(rect.max.x - tw);
     p.rect_filled(Rect::from_min_size(pos2(lx, rect.min.y + 1.0), vec2(tw, 13.0)), 0.0, Color32::from_gray(0xd9));
     p.text(pos2(lx + 3.0, rect.min.y + 1.5), egui::Align2::LEFT_TOP, lab, font, Color32::from_gray(0x11));
+    // Draw key ticks last so a key on the current frame stays visible under the playhead.
+    for k in key_times {
+        if k >= t0 && k <= t1 {
+            let x = x_of(k).round();
+            let breakdown = app.s.anim_curves().values().any(|c| c.keys.iter().any(|key| key.breakdown && (key.t - k).abs() < 1e-6));
+            let color = if breakdown { Color32::from_rgb(0x54, 0xc8, 0x60) } else { Color32::from_rgb(0xd7, 0x3b, 0x3e) };
+            p.rect_filled(Rect::from_min_size(pos2(x - 1.0, rect.max.y - 22.0), vec2((px_per as f32 * 0.18).max(2.0), 22.0)), 0.0, color);
+        }
+    }
 
     // ---- interaction
     let (mods, ptr) = ui.input(|i| (i.modifiers, i.pointer.clone()));
     let at = resp.interact_pointer_pos().map(|q| t_of(q.x));
     let primary = ptr.button_down(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary);
     let middle = ptr.button_down(egui::PointerButton::Middle) || resp.clicked_by(egui::PointerButton::Middle);
-    let state_id = egui::Id::new("ts-drag");
+    let state_id = ui.make_persistent_id("ts-drag");
     if resp.drag_started() || resp.clicked() {
         if let Some(f) = at {
             let mode = if primary && mods.shift {
@@ -173,10 +205,10 @@ fn slider_canvas(app: &mut IncaApp, ui: &mut egui::Ui, rect: Rect, resp: &egui::
         }
         ui.data_mut(|d| d.remove::<DragState>(state_id));
     }
-    resp.context_menu(|ui| time_menu(app, ui));
+    crate::menus::show_plain_context_menu(&resp, |ui| time_menu(app, ui));
 }
 
-fn key_range(app: &IncaApp) -> (f64, f64) {
+pub(crate) fn key_range(app: &IncaApp) -> (f64, f64) {
     match app.range_sel {
         Some((a, b)) => (a.min(b), a.max(b)),
         None => (app.s.time.current, app.s.time.current),
@@ -186,7 +218,10 @@ fn key_range(app: &IncaApp) -> (f64, f64) {
 fn move_keys(app: &mut IncaApp, lo: f64, hi: f64, d: f64) {
     app.s.checkpoint("move keys");
     let sel = app.s.sel.clone();
-    for c in app.s.anim.curves.values_mut().filter(|c| sel.contains(&c.node)) {
+    app.s.for_each_anim_curve_mut(|c| {
+        if !sel.contains(&c.node) {
+            return;
+        }
         let (moving, rest): (Vec<_>, Vec<_>) = c.keys.drain(..).partition(|k| k.t >= lo - 1e-4 && k.t <= hi + 1e-4);
         c.keys = rest.into_iter().filter(|k| !(k.t >= lo + d - 1e-4 && k.t <= hi + d + 1e-4)).collect();
         c.keys.extend(moving.into_iter().map(|mut k| {
@@ -194,7 +229,7 @@ fn move_keys(app: &mut IncaApp, lo: f64, hi: f64, d: f64) {
             k
         }));
         c.sort();
-    }
+    });
     app.s.apply_anim();
     app.s.rev += 1;
 }
@@ -202,10 +237,12 @@ fn move_keys(app: &mut IncaApp, lo: f64, hi: f64, d: f64) {
 fn delete_keys(app: &mut IncaApp, lo: f64, hi: f64) {
     app.s.checkpoint("delete keys");
     let sel = app.s.sel.clone();
-    for c in app.s.anim.curves.values_mut().filter(|c| sel.contains(&c.node)) {
-        c.keys.retain(|k| !(k.t >= lo - 1e-4 && k.t <= hi + 1e-4));
-    }
-    app.s.anim.curves.retain(|_, c| !c.keys.is_empty());
+    app.s.for_each_anim_curve_mut(|c| {
+        if sel.contains(&c.node) {
+            c.keys.retain(|k| !(k.t >= lo - 1e-4 && k.t <= hi + 1e-4));
+        }
+    });
+    app.s.retain_anim_curves(|c| !c.keys.is_empty());
     app.s.apply_anim();
     app.s.rev += 1;
 }
@@ -240,7 +277,7 @@ pub fn paste_keys(app: &mut IncaApp) {
             if same_nodes && cn != n {
                 continue;
             }
-            if let Some(c) = app.s.anim.curve_mut(n, attr, true) {
+            if let Some(c) = app.s.anim_curve_mut(n, attr, true) {
                 for k in keys {
                     c.keys.retain(|x| (x.t - (k.t + t)).abs() > 1e-4);
                     c.keys.push(inca_core::anim::Key { t: k.t + t, ..k.clone() });
@@ -271,12 +308,12 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.close();
     }
     if ui.button("Copy").clicked() {
-        copy_keys(app, lo, hi);
+        app.action("timelineCopy");
         ui.close();
     }
-    ui.menu_button("Paste", |ui| {
+    crate::menus::show_plain_submenu(ui, "Paste", |ui| {
         if ui.add_enabled(!app.key_clip.is_empty(), egui::Button::new("Paste")).clicked() {
-            paste_keys(app);
+            app.action("timelinePaste");
             ui.close();
         }
     });
@@ -289,19 +326,22 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         act(app, ui, l, a);
     }
     ui.separator();
-    ui.menu_button("Tangents", |ui| {
+    crate::menus::show_plain_submenu(ui, "Tangents", |ui| {
         for t in inca_core::anim::TANGENTS.iter().filter(|t| **t != "fixed") {
             let mut label = t.to_string();
             label[..1].make_ascii_uppercase();
             if ui.button(label).clicked() {
                 app.s.checkpoint("tangents");
                 let sel = app.s.sel.clone();
-                for c in app.s.anim.curves.values_mut().filter(|c| sel.contains(&c.node)) {
+                app.s.for_each_anim_curve_mut(|c| {
+                    if !sel.contains(&c.node) {
+                        return;
+                    }
                     for k in c.keys.iter_mut().filter(|k| k.t >= lo - 1e-4 && k.t <= hi + 1e-4) {
                         k.it = t.to_string();
                         k.ot = t.to_string();
                     }
-                }
+                });
                 app.s.apply_anim();
                 app.s.rev += 1;
                 ui.close();
@@ -309,7 +349,7 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
     });
     ui.separator();
-    ui.menu_button("Playback Looping", |ui| {
+    crate::menus::show_plain_submenu(ui, "Playback Looping", |ui| {
         for (l, v) in [("Once", "once"), ("Oscillate", "oscillate"), ("Continuous", "continuous")] {
             if ui.radio(app.s.time.r#loop == v, l).clicked() {
                 app.s.time.r#loop = v.into();
@@ -317,7 +357,7 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
             }
         }
     });
-    ui.menu_button("Set Range To", |ui| {
+    crate::menus::show_plain_submenu(ui, "Set Range To", |ui| {
         if ui.add_enabled(app.range_sel.is_some(), egui::Button::new("Selected")).clicked() {
             app.s.time.start = lo;
             app.s.time.end = hi.max(lo + 1.0);
@@ -325,7 +365,7 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
         }
         ui.add_enabled(false, egui::Button::new("Sound Length"));
         if ui.button("Keys of selected").clicked() {
-            let ks = app.s.anim.key_times(&app.s.sel);
+            let ks = app.s.anim_key_times(&app.s.sel);
             if let (Some(a), Some(b)) = (ks.first(), ks.last()) {
                 app.s.time.start = *a;
                 app.s.time.end = b.max(a + 1.0);
@@ -337,63 +377,81 @@ fn time_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
 }
 
 pub fn range_slider(app: &mut IncaApp, ui: &mut egui::Ui) {
-    ui.horizontal_centered(|ui| {
-        let t = &mut app.s.time;
-        let fld = |ui: &mut egui::Ui, v: &mut f64, tip: &str| ui.add(egui::DragValue::new(v).speed(0.5).max_decimals(2)).on_hover_text(tip).changed();
-        if fld(ui, &mut t.anim_start, "Animation start time") && t.start < t.anim_start {
-            t.start = t.anim_start;
+    if (ui.input(|i| i.modifiers.ctrl || i.modifiers.command)) && ui.rect_contains_pointer(ui.max_rect()) {
+        if ui.input(|i| i.key_pressed(egui::Key::C)) {
+            app.action("timelineCopy");
         }
-        if fld(ui, &mut t.start, "Playback start time") {
-            t.start = t.start.min(t.end);
-            t.anim_start = t.anim_start.min(t.start);
+        if ui.input(|i| i.key_pressed(egui::Key::V)) {
+            app.action("timelinePaste");
         }
-        let w = (ui.available_width() - 520.0).max(80.0);
+    }
+    // Measure the fixed controls so the bar gets exactly the leftover width. A constant reserve
+    // under-reserves when the numeric fields get wider, and a floating window then grows by the
+    // shortfall every frame.
+    let mut measure = ui.new_child(egui::UiBuilder::new().id_salt("range_measure").invisible());
+    measure.horizontal_centered(|ui| range_controls(app, ui, None));
+    let fixed = measure.min_rect().width();
+    let w = (ui.available_width() - fixed - ui.spacing().item_spacing.x).max(80.0);
+    ui.horizontal_centered(|ui| range_controls(app, ui, Some(w)));
+}
+
+fn range_controls(app: &mut IncaApp, ui: &mut egui::Ui, bar_w: Option<f32>) {
+    let t = &mut app.s.time;
+    let fld = |ui: &mut egui::Ui, v: &mut f64, tip: &str| ui.add(egui::DragValue::new(v).speed(0.5).max_decimals(2)).on_hover_text(tip).changed();
+    if fld(ui, &mut t.anim_start, "Animation start time") && t.start < t.anim_start {
+        t.start = t.anim_start;
+    }
+    if fld(ui, &mut t.start, "Playback start time") {
+        t.start = t.start.min(t.end);
+        t.anim_start = t.anim_start.min(t.start);
+    }
+    if let Some(w) = bar_w {
         let (bar, _) = ui.allocate_exact_size(vec2(w, 20.0), Sense::hover());
         range_bar(app, ui, bar);
-        let t = &mut app.s.time;
-        if fld(ui, &mut t.end, "Playback end time") {
-            t.end = t.end.max(t.start);
-            t.anim_end = t.anim_end.max(t.end);
-        }
-        if fld(ui, &mut t.anim_end, "Animation end time") && t.end > t.anim_end {
-            t.end = t.anim_end;
-        }
-        egui::ComboBox::from_id_salt("fps").width(118.0).selected_text(fps_label(t.fps)).show_ui(ui, |ui| {
-            for (l, f) in FPS {
-                ui.selectable_value(&mut t.fps, *f, *l);
-            }
-        });
-        let lp = t.r#loop.clone();
-        if icons::button(ui, "loop", &format!("Looping: {lp} (continuous / once / oscillate)"), false, 20.0).clicked() {
-            t.r#loop = match lp.as_str() {
-                "continuous" => "once",
-                "once" => "oscillate",
-                _ => "continuous",
-            }
-            .into();
-            app.help = format!("Playback looping: {}", app.s.time.r#loop);
-        }
-        egui::ComboBox::from_id_salt("charset").width(112.0).selected_text("No Character Set").show_ui(ui, |ui| {
-            let _ = ui.selectable_label(true, "No Character Set");
-        });
-        egui::ComboBox::from_id_salt("animlayer").width(100.0).selected_text("No Anim Layer").show_ui(ui, |ui| {
-            let _ = ui.selectable_label(true, "No Anim Layer");
-        });
-        let ak = app.s.time.auto_key;
-        let r = icons::button_ex(ui, "autoKey", "Toggle auto keyframe", ak, 20.0, 16.0, true);
-        if ak {
-            ui.painter().rect_stroke(r.rect, 3.0, Stroke::new(1.0, Color32::from_rgb(0xff, 0x55, 0x55)), egui::StrokeKind::Inside);
-        }
-        if r.clicked() {
-            app.action("toggleAutoKey");
-        }
-        if icons::button(ui, "speaker", "Sound (no audio in scene)", false, 20.0).clicked() {
-            app.help = "Import audio is not supported yet".into();
-        }
-        if icons::button(ui, "playPrefs", "Animation preferences", false, 20.0).clicked() {
-            app.action("preferences");
+    }
+    let t = &mut app.s.time;
+    if fld(ui, &mut t.end, "Playback end time") {
+        t.end = t.end.max(t.start);
+        t.anim_end = t.anim_end.max(t.end);
+    }
+    if fld(ui, &mut t.anim_end, "Animation end time") && t.end > t.anim_end {
+        t.end = t.anim_end;
+    }
+    egui::ComboBox::from_id_salt("fps").width(118.0).selected_text(fps_label(t.fps)).show_ui(ui, |ui| {
+        for (l, f) in FPS {
+            ui.selectable_value(&mut t.fps, *f, *l);
         }
     });
+    let lp = t.r#loop.clone();
+    if icons::button(ui, "loop", &format!("Looping: {lp} (continuous / once / oscillate)"), false, 20.0).clicked() {
+        t.r#loop = match lp.as_str() {
+            "continuous" => "once",
+            "once" => "oscillate",
+            _ => "continuous",
+        }
+        .into();
+        app.help = format!("Playback looping: {}", app.s.time.r#loop);
+    }
+    egui::ComboBox::from_id_salt("charset").width(112.0).selected_text("No Character Set").show_ui(ui, |ui| {
+        let _ = ui.selectable_label(true, "No Character Set");
+    });
+    egui::ComboBox::from_id_salt("animlayer").width(100.0).selected_text("No Anim Layer").show_ui(ui, |ui| {
+        let _ = ui.selectable_label(true, "No Anim Layer");
+    });
+    let ak = app.s.time.auto_key;
+    let r = icons::button_ex(ui, "autoKey", "Toggle auto keyframe", ak, 20.0, 16.0, true);
+    if ak {
+        ui.painter().rect_stroke(r.rect, 3.0, Stroke::new(1.0, Color32::from_rgb(0xff, 0x55, 0x55)), egui::StrokeKind::Inside);
+    }
+    if r.clicked() {
+        app.action("toggleAutoKey");
+    }
+    if icons::button(ui, "speaker", "Sound (no audio in scene)", false, 20.0).clicked() {
+        app.help = "Import audio is not supported yet".into();
+    }
+    if icons::button(ui, "playPrefs", "Animation preferences", false, 20.0).clicked() {
+        app.action("preferences");
+    }
 }
 
 /// The range bar: drag the handle to slide the playback range, its grips to resize, double-click for the full range.
@@ -417,7 +475,7 @@ fn range_bar(app: &mut IncaApp, ui: &mut egui::Ui, bar: Rect) {
     let small = egui::FontId::proportional(10.5);
     p.text(pos2(gl.max.x + 2.0, hnd.center().y), egui::Align2::LEFT_CENTER, fmt(t.start), small.clone(), Color32::from_gray(0x1a));
     p.text(pos2(gr.min.x - 2.0, hnd.center().y), egui::Align2::RIGHT_CENTER, fmt(t.end), small, Color32::from_gray(0x1a));
-    let id = egui::Id::new("rs-bar");
+    let id = ui.make_persistent_id("rs-bar");
     let resp = ui.interact(hnd, id, Sense::click_and_drag());
     let mode_id = id.with("mode");
     if resp.drag_started() {
@@ -492,7 +550,7 @@ pub fn command_line(app: &mut IncaApp, ui: &mut egui::Ui) {
             theme::TEXT
         };
         egui::Frame::NONE.fill(theme::FIELD).inner_margin(egui::Margin::symmetric(4, 1)).show(ui, |ui| {
-            ui.set_width(ui.available_width() - 30.0);
+            ui.set_width((ui.available_width() - 30.0).max(0.0));
             ui.label(RichText::new(&app.last_result).monospace().color(color));
         });
         if ui.small_button("{}").on_hover_text("Script Editor").clicked() {
@@ -503,11 +561,135 @@ pub fn command_line(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 pub fn help_line(app: &mut IncaApp, ui: &mut egui::Ui) {
     ui.horizontal_centered(|ui| {
-        let (v, e, f, t) = app.s.poly_count();
+        let (v, e, f, t) = app.scene_poly_count();
         let txt = if app.help.is_empty() { "Hold Alt and drag in a viewport to tumble (LMB), track (MMB) or dolly (RMB)".to_string() } else { app.help.clone() };
         ui.label(RichText::new(txt).color(theme::TEXT_DIM).size(11.0));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(RichText::new(format!("Verts {v}  Edges {e}  Faces {f}  Tris {t}")).color(theme::TEXT_DIM).size(11.0));
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(ctx: &egui::Context) -> IncaApp {
+        theme::apply(ctx);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        IncaApp::new(&cc)
+    }
+
+    fn raw_frame(events: Vec<egui::Event>, time: f64) -> egui::RawInput {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0)));
+        raw.time = Some(time);
+        raw.events = events;
+        raw
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
+    }
+
+    /// Detaching a panel with its grip draws it twice in the same frame: once in the docked
+    /// panel and once in the floating window. Widget IDs must therefore be scoped to their Ui;
+    /// a fixed ID makes egui abort with "Widget changed layer_id during the frame".
+    #[test]
+    fn range_slider_docked_and_floating_in_one_frame() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let mut out = ctx.run_ui(raw_frame(vec![], 0.0), |ui| {
+            egui::Panel::bottom("range").exact_size(26.0).resizable(false).show(ui, |ui| range_slider(&mut app, ui));
+            let ctx = ui.ctx().clone();
+            egui::Window::new("Range Slider")
+                .id(egui::Id::new("floating_range_test"))
+                .default_pos(egui::pos2(20.0, 20.0))
+                .default_size([720.0, 100.0])
+                .constrain(false)
+                .show(&ctx, |ui| range_slider(&mut app, ui));
+        });
+        out.textures_delta.clear();
+    }
+
+    /// A floating window auto-sizes to its content. The bar must take the exact leftover width,
+    /// or the window grows by the shortfall every frame. Long numeric fields are the stress case
+    /// for a constant reserve.
+    #[test]
+    fn floating_range_slider_width_stays_stable() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.s.time.anim_start = 123456.78;
+        app.s.time.start = 123456.78;
+        app.s.time.end = 1234567.89;
+        app.s.time.anim_end = 1234567.89;
+        let id = egui::Id::new("floating_range_width_test");
+        let mut widths = Vec::new();
+        for i in 0..8 {
+            let mut open = true;
+            let mut out = ctx.run_ui(raw_frame(vec![], i as f64 * 0.1), |_ui| {
+                let ctx = ctx.clone();
+                egui::Window::new("Range Slider")
+                    .id(id)
+                    .default_pos(egui::pos2(20.0, 20.0))
+                    .default_size([720.0, 100.0])
+                    .resizable(true)
+                    .constrain(false)
+                    .open(&mut open)
+                    .show(&ctx, |ui| range_slider(&mut app, ui));
+            });
+            out.textures_delta.clear();
+            widths.push(ctx.memory(|m| m.area_rect(id)).map_or(0.0, |r| r.width()));
+        }
+        assert!(widths.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5), "floating window width grew: {widths:?}");
+    }
+
+    #[test]
+    fn floating_time_slider_width_stays_stable() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let id = egui::Id::new("floating_time_width_test");
+        let mut widths = Vec::new();
+        for i in 0..8 {
+            let mut open = true;
+            let mut out = ctx.run_ui(raw_frame(vec![], i as f64 * 0.1), |_ui| {
+                let ctx = ctx.clone();
+                egui::Window::new("Time Slider")
+                    .id(id)
+                    .default_pos(egui::pos2(20.0, 20.0))
+                    .default_size([720.0, 110.0])
+                    .resizable(true)
+                    .constrain(false)
+                    .open(&mut open)
+                    .show(&ctx, |ui| time_slider(&mut app, ui));
+            });
+            out.textures_delta.clear();
+            widths.push(ctx.memory(|m| m.area_rect(id)).map_or(0.0, |r| r.width()));
+        }
+        assert!(widths.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5), "floating window width grew: {widths:?}");
+    }
+
+    /// The range bar's drag state and widget ID are scoped to its Ui; sliding the bar must still
+    /// move the playback range.
+    #[test]
+    fn range_bar_drag_slides_the_range() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.s.time.start = 10.0;
+        app.s.time.end = 50.0;
+        let bar = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 20.0));
+        let grab = egui::pos2(100.0, bar.center().y);
+        let started = grab + egui::vec2(40.0, 0.0);
+        let moved = grab + egui::vec2(80.0, 0.0);
+        let draw = |app: &mut IncaApp, raw: egui::RawInput| {
+            let mut out = ctx.run_ui(raw, |ui| range_bar(app, ui, bar));
+            out.textures_delta.clear();
+        };
+        draw(&mut app, raw_frame(vec![egui::Event::PointerMoved(grab)], 0.0));
+        draw(&mut app, raw_frame(vec![pointer_button(grab, true)], 0.1));
+        draw(&mut app, raw_frame(vec![egui::Event::PointerMoved(started)], 0.2));
+        draw(&mut app, raw_frame(vec![egui::Event::PointerMoved(moved)], 0.3));
+        draw(&mut app, raw_frame(vec![pointer_button(moved, false)], 0.4));
+        assert!(app.s.time.start > 10.0 && app.s.time.end > 50.0, "range did not slide: {}..{}", app.s.time.start, app.s.time.end);
+    }
 }

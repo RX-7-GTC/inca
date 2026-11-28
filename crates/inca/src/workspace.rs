@@ -69,13 +69,13 @@ pub fn restore_all(app: &mut IncaApp) {
 /// Windows > Workspaces and the menu bar selector share this list.
 pub fn menu(app: &mut IncaApp, ui: &mut egui::Ui) {
     for w in WORKSPACES {
-        if ui.selectable_label(app.workspace == w.name, w.name).clicked() {
+        if crate::menus::menu_selectable(app, ui, app.workspace == w.name, w.name) {
             apply(app, w.name);
             ui.close();
         }
     }
     ui.separator();
-    if ui.button("Reset Current Workspace").clicked() {
+    if crate::menus::menu_item(app, ui, "Reset Current Workspace") {
         let n = app.workspace.clone();
         apply(app, &n);
         ui.close();
@@ -85,25 +85,28 @@ pub fn menu(app: &mut IncaApp, ui: &mut egui::Ui) {
 /// Display > UI Elements.
 pub fn elements_menu(app: &mut IncaApp, ui: &mut egui::Ui) {
     for (k, l) in ELEMENTS {
-        let mut on = app.shown(k);
-        if ui.checkbox(&mut on, *l).clicked() {
-            app.set_shown(k, on);
+        let on = app.shown(k);
+        if crate::menus::menu_check(app, ui, on, l) {
+            app.set_shown(k, !on);
+            ui.close();
         }
     }
-    let mut on = app.show_right;
-    if ui.checkbox(&mut on, "Channel Box / Attribute Editor").clicked() {
-        app.show_right = on;
+    let on = app.show_right;
+    if crate::menus::menu_check(app, ui, on, "Channel Box / Attribute Editor") {
+        app.show_right = !on;
+        ui.close();
     }
-    let mut on = app.show_outliner;
-    if ui.checkbox(&mut on, "Outliner").clicked() {
-        app.show_outliner = on;
+    let on = app.show_outliner;
+    if crate::menus::menu_check(app, ui, on, "Outliner") {
+        app.show_outliner = !on;
+        ui.close();
     }
     ui.separator();
-    if ui.add(egui::Button::new("Hide UI Elements").shortcut_text("Ctrl+Space")).clicked() {
+    if crate::menus::menu_item_ext(app, ui, true, "Hide UI Elements", "Ctrl+Space") {
         toggle_all(app);
         ui.close();
     }
-    if ui.button("Restore UI Elements").clicked() {
+    if crate::menus::menu_item(app, ui, "Restore UI Elements") {
         restore_all(app);
         ui.close();
     }

@@ -74,7 +74,12 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     if let Some(c) = current(app) {
         app.hik_ui.current = c;
     }
-    egui::Window::new("Character Controls").open(&mut open).default_size([360.0, 600.0]).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Character Controls"), open, |app, fix| {
+        let mut window = egui::Window::new("Character Controls").open(&mut open).default_size([360.0, 600.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         let names: Vec<String> = app.s.characters.iter().map(|c| c.name.clone()).collect();
         let cur = app.hik_ui.current.clone();
         let ch = app.s.hik_character(&cur).cloned();
@@ -137,6 +142,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
             1 => skeleton(app, ui),
             _ => controls(app, ui, ch.as_ref()),
         }
+    })
     });
     app.win.hik = open;
 }

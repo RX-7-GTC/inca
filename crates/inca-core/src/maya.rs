@@ -441,6 +441,7 @@ pub fn import_ma(s: &mut Scene, src: &str) -> Result<Vec<Id>, String> {
     let f = parse(src);
     let unit = f.linear_scale;
     let ang = |a: [f64; 3]| if f.angle_rad { a.map(f64::to_degrees) } else { a };
+    let ang1 = |v: f64| if f.angle_rad { v.to_degrees() } else { v };
     let mut dag: HashMap<String, Id> = HashMap::new();
     let mut made: Vec<Id> = vec![];
     let shape_of: HashMap<&str, &MaNode> = f.nodes.iter().filter(|n| n.parent.is_some() && matches!(n.ty.as_str(), "mesh" | "camera" | "nurbsCurve" | "locator") || LIGHTS.contains(&n.ty.as_str())).map(|n| (n.parent.as_deref().unwrap_or(""), n)).collect();
@@ -493,9 +494,9 @@ pub fn import_ma(s: &mut Scene, src: &str) -> Result<Vec<Id>, String> {
                 "checker" | "ramp" | "noise" | "grid" => Some(s.create_texture(&t.ty, Some(&t.name))),
                 _ => None,
             };
-            if let (Some(tid), Some(m)) = (tex, s.mats.get_mut(&id)) {
+            if let Some(tid) = tex {
                 let slot = if n.ty == "standardSurface" { "baseColor" } else { "color" };
-                m.maps.insert(slot.into(), json!(tid));
+                s.set_material_map(&id, slot, &tid, "outColor");
             }
         }
         mats.insert(n.name.clone(), id);
@@ -504,6 +505,11 @@ pub fn import_ma(s: &mut Scene, src: &str) -> Result<Vec<Id>, String> {
     let mut sg_mat: HashMap<String, Id> = HashMap::new();
     for n in f.nodes.iter().filter(|n| n.ty == "shadingEngine") {
         if let Some(m) = src_of(&n.name, &["ss", "surfaceShader"]).map(plug_node).and_then(|m| mats.get(m)) {
+            if let Some(sg) = s.shading_group_of(m) {
+                if s.deps.node(&sg).is_some_and(|node| node.name != n.name) {
+                    s.rename_shading_node(&sg, &n.name);
+                }
+            }
             sg_mat.insert(n.name.clone(), m.clone());
         }
     }
@@ -616,6 +622,49 @@ pub fn import_ma(s: &mut Scene, src: &str) -> Result<Vec<Id>, String> {
         if let Some(ro) = n.f(&["ro", "rotateOrder"]) {
             x.ro = ["xyz", "yzx", "zxy", "xzy", "yxz", "zyx"][(ro as usize).min(5)].into();
         }
+        if let Some(ra) = n.v3(&["ra", "rotateAxis"]) {
+            x.ra = ang(ra);
+        }
+        if let Some(sh) = n.v3(&["sh", "shear"]) {
+            x.sh = sh;
+        }
+        if let Some(it) = n.s(&["it", "inheritsTransform"]) {
+            x.it = !matches!(it.as_str(), "no" | "0" | "false" | "off");
+        }
+        if let Some(a) = n.get(&["opm", "offsetParentMatrix"]) {
+            let v: Vec<f64> = a.vals.iter().filter_map(|s| s.parse().ok()).collect();
+            if v.len() >= 16 {
+                let mut m = [[0.0; 4]; 4];
+                for i in 0..4 {
+                    m[i][i] = 1.0;
+                }
+                for r in 0..4 {
+                    for c in 0..4 {
+                        m[c][r] = v[r * 4 + c];
+                    }
+                }
+                for i in 0..3 {
+                    m[3][i] *= unit;
+                }
+                x.opm = m;
+            }
+        }
+        for (prefix, lim) in [("", &mut x.lim.translate), ("R", &mut x.lim.rotate), ("S", &mut x.lim.scale)] {
+            for (i, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                if let Some(v) = n.f(&[format!("limit{prefix}{axis}Min").as_str()]) {
+                    lim.min[i] = if prefix == "R" { ang1(v) } else { v * unit };
+                }
+                if let Some(v) = n.f(&[format!("limit{prefix}{axis}Max").as_str()]) {
+                    lim.max[i] = if prefix == "R" { ang1(v) } else { v * unit };
+                }
+                let en = format!("limit{prefix}{axis}Enable");
+                if let Some(v) = n.s(&[en.as_str()]) {
+                    lim.on = matches!(v.as_str(), "yes" | "1" | "true" | "on");
+                } else if let Some(v) = n.f(&[en.as_str()]) {
+                    lim.on = v != 0.0;
+                }
+            }
+        }
         if n.s(&["v", "visibility"]).is_some_and(|v| v == "no" || v == "0" || v == "off") {
             s.nodes.get_mut(&id).unwrap().visible = false;
         }
@@ -701,6 +750,20 @@ fn n(x: f64) -> String {
     if x == 0.0 { "0".into() } else { format!("{x}") }
 }
 
+fn write_limit(o: &mut String, prefix: &str, lim: &crate::scene::Limit) {
+    let (def_min, def_max) = if prefix == "R" { (-360.0, 360.0) } else { (-1.0e6, 1.0e6) };
+    if !lim.on && lim.min == [def_min; 3] && lim.max == [def_max; 3] {
+        return;
+    }
+    for (i, axis) in ["X", "Y", "Z"].iter().enumerate() {
+        let _ = writeln!(o, "\tsetAttr \".limit{prefix}{axis}Min\" {} ;", n(lim.min[i]));
+        let _ = writeln!(o, "\tsetAttr \".limit{prefix}{axis}Max\" {} ;", n(lim.max[i]));
+    }
+    for axis in ["X", "Y", "Z"] {
+        let _ = writeln!(o, "\tsetAttr \".limit{prefix}{axis}Enable\" {} ;", if lim.on { 1 } else { 0 });
+    }
+}
+
 /// Write the scene (or the selection) as Maya ASCII.
 pub fn export_ma(s: &Scene, sel_only: bool) -> String {
     let mut o = String::new();
@@ -734,10 +797,31 @@ pub fn export_ma(s: &Scene, sel_only: bool) -> String {
         if x.jo != [0.0; 3] {
             let _ = writeln!(o, "\tsetAttr \".jo\" -type \"double3\" {} {} {} ;", n(x.jo[0]), n(x.jo[1]), n(x.jo[2]));
         }
+        if x.ra != [0.0; 3] {
+            let _ = writeln!(o, "\tsetAttr \".ra\" -type \"double3\" {} {} {} ;", n(x.ra[0]), n(x.ra[1]), n(x.ra[2]));
+        }
+        if x.sh != [0.0; 3] {
+            let _ = writeln!(o, "\tsetAttr \".sh\" -type \"double3\" {} {} {} ;", n(x.sh[0]), n(x.sh[1]), n(x.sh[2]));
+        }
+        if !x.it {
+            let _ = writeln!(o, "\tsetAttr \".it\" no;");
+        }
+        if x.opm != [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]] {
+            let mut vals = Vec::with_capacity(16);
+            for r in 0..4 {
+                for c in 0..4 {
+                    vals.push(n(x.opm[c][r]));
+                }
+            }
+            let _ = writeln!(o, "\tsetAttr \".opm\" -type \"matrix\" {} ;", vals.join(" "));
+        }
         if x.p != [0.0; 3] {
             let _ = writeln!(o, "\tsetAttr \".rp\" -type \"double3\" {} {} {} ;", n(x.p[0]), n(x.p[1]), n(x.p[2]));
             let _ = writeln!(o, "\tsetAttr \".sp\" -type \"double3\" {} {} {} ;", n(x.p[0]), n(x.p[1]), n(x.p[2]));
         }
+        write_limit(&mut o, "", &x.lim.translate);
+        write_limit(&mut o, "R", &x.lim.rotate);
+        write_limit(&mut o, "S", &x.lim.scale);
         if let Some(ro) = ["xyz", "yzx", "zxy", "xzy", "yxz", "zyx"].iter().position(|r| *r == x.ro).filter(|r| *r != 0) {
             let _ = writeln!(o, "\tsetAttr \".ro\" {ro};");
         }
@@ -747,10 +831,12 @@ pub fn export_ma(s: &Scene, sel_only: bool) -> String {
         let shape = nd.shape_name.clone().unwrap_or(format!("{}Shape", nd.name));
         match &nd.shape {
             Shape::Mesh(m) => {
-                write_mesh(&mut o, &shape, &nd.name, crate::skin::bind_mesh(m));
+                write_mesh(&mut o, &shape, &nd.name, &crate::skin::bind_mesh(s, m));
                 mat_users.entry(m.material.clone()).or_default().push(shape.clone());
-                if let Some(h) = m.history.iter().find(|h| h.ty == "skinCluster") {
-                    skins.push((nd.name.clone(), shape.clone(), h.params.clone()));
+                if let Some(i) = s.history_find(&nd.id, "skinCluster") {
+                    if let Some(h) = s.history_node(&nd.id, i) {
+                        skins.push((nd.name.clone(), shape.clone(), h.params));
+                    }
                 }
             }
             Shape::Camera(c) => {
@@ -786,8 +872,13 @@ pub fn export_ma(s: &Scene, sel_only: bool) -> String {
     // materials, shading groups and assignments
     let mut conns: Vec<String> = vec![];
     for (mid, shapes) in &mat_users {
-        let Some(m) = s.mats.get(mid) else { continue };
-        let (mname, sg) = if *mid == s.default_mat { ("lambert1".to_string(), "initialShadingGroup".to_string()) } else { (m.name.clone(), format!("{}SG", m.name)) };
+        let Some(m) = s.material(mid) else { continue };
+        let (mname, sg) = if *mid == s.default_mat {
+            ("lambert1".to_string(), "initialShadingGroup".to_string())
+        } else {
+            let sg = s.shading_group_of(mid).and_then(|id| s.deps.node(&id).map(|n| n.name.clone())).unwrap_or_else(|| format!("{}SG", m.name));
+            (m.name.clone(), sg)
+        };
         if *mid != s.default_mat {
             let _ = writeln!(o, "createNode {} -n {};", m.ty, q(&mname));
             let a = &m.attrs;
@@ -829,7 +920,7 @@ pub fn export_ma(s: &Scene, sel_only: bool) -> String {
             conns.push(format!("connectAttr {} {} -na;", q(&format!("{sg}.pa")), q(":renderPartition.st")));
             conns.push(format!("connectAttr {} {};", q(&format!("{sg}.msg")), q(&format!("{}MaterialInfo.sg", m.name))));
             // a file texture on the colour slot
-            if let Some(t) = m.maps.get(m.color_attr()).and_then(|v| v.as_str()).and_then(|t| s.texs.get(t)) {
+            if let Some(t) = m.maps.get(m.color_attr()).and_then(|v| v.as_str()).and_then(|t| s.texture(t)) {
                 let _ = writeln!(o, "createNode {} -n {};", if t.ty == "file" { "file" } else { t.ty.as_str() }, q(&t.name));
                 if let Some(p) = t.attrs.get("fileTextureName").and_then(|v| v.as_str()) {
                     let _ = writeln!(o, "\tsetAttr \".ftn\" -type \"string\" {};", q(p));
@@ -991,15 +1082,14 @@ connectAttr "pCube1_translateX.o" "pCube1.tx";
         let made = import_ma(&mut s, CUBE).unwrap();
         assert_eq!(made.len(), 2);
         let cube = s.find("pCube1").unwrap();
-        let m = s.node(&cube).unwrap().mesh().unwrap();
-        assert_eq!(m.history[0].ty, "polyCube");
-        assert_eq!(m.history[0].params["width"], json!(2.0));
-        assert_eq!(m.mesh.f.len(), 14, "3x1x1 subdivided cube");
+        assert_eq!(s.history_node(&cube, 0).unwrap().ty, "polyCube");
+        assert_eq!(s.history_node(&cube, 0).unwrap().params["width"], json!(2.0));
+        assert_eq!(s.node(&cube).unwrap().mesh().unwrap().mesh.f.len(), 14, "3x1x1 subdivided cube");
         let quad = s.find("quad").unwrap();
         let q = &s.node(&quad).unwrap().mesh().unwrap();
         assert_eq!(q.mesh.f, vec![vec![0, 1, 2, 3]]);
         assert!(q.mesh.uv.is_some());
-        assert_eq!(s.mats[&q.material].name, "red");
+        assert_eq!(s.material(&q.material).unwrap().name, "red");
         s.set_time(24.0);
         assert!((s.node(&cube).unwrap().xf.t[0] - 10.0).abs() < 1e-9);
         assert_eq!(s.node(&cube).unwrap().xf.r, [0.0, 45.0, 0.0]);
@@ -1024,6 +1114,36 @@ connectAttr "pCube1_translateX.o" "pCube1.tx";
     }
 
     #[test]
+    fn transform_extras_round_trip() {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        let r = crate::scene::NodeRef::Dag(id.clone());
+        s.set_attr(&r, "shearXY", json!(0.25));
+        s.set_attr(&r, "rotateAxisZ", json!(12.0));
+        s.set_attr(&r, "inheritsTransform", json!(0));
+        s.set_attr(&r, "limitXEnable", json!(1));
+        s.set_attr(&r, "limitXMin", json!(-2.0));
+        s.set_attr(&r, "limitXMax", json!(2.0));
+        let mut opm = [[0.0; 4]; 4];
+        for i in 0..4 {
+            opm[i][i] = 1.0;
+        }
+        opm[3][0] = 5.0;
+        s.set_attr(&r, "offsetParentMatrix", json!(opm));
+        let txt = export_ma(&s, false);
+        let mut t = Scene::new();
+        import_ma(&mut t, &txt).unwrap();
+        let n = t.node(&t.find("pCube1").unwrap()).unwrap();
+        assert_eq!(n.xf.sh[0], 0.25);
+        assert_eq!(n.xf.ra[2], 12.0);
+        assert!(!n.xf.it);
+        assert!(n.xf.lim.translate.on);
+        assert_eq!(n.xf.lim.translate.min[0], -2.0);
+        assert_eq!(n.xf.lim.translate.max[0], 2.0);
+        assert!((n.xf.opm[3][0] - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn skin_weights_survive() {
         let mut s = Scene::new();
         crate::mel::Interp::new().run(&mut s, &mut crate::commands::NoHost, "polyCylinder -h 4 -sy 4 -n arm; select -cl; joint -p 0 -2 0 -n j1; joint -p 0 2 0 -n j2; select -r j1 arm; skinCluster -tsb -mi 2;").unwrap();
@@ -1031,8 +1151,9 @@ connectAttr "pCube1_translateX.o" "pCube1.tx";
         let mut t = Scene::new();
         import_ma(&mut t, &txt).unwrap();
         let arm = t.find("arm").unwrap();
-        let h = t.node(&arm).unwrap().mesh().unwrap().history.iter().find(|h| h.ty == "skinCluster").cloned().expect("skin");
-        let a0 = s.node(&s.find("arm").unwrap()).unwrap().mesh().unwrap().history.iter().find(|h| h.ty == "skinCluster").unwrap().params["weights"].clone();
+        let hi = t.history_find(&arm, "skinCluster").expect("skin");
+        let h = t.history_node(&arm, hi).expect("skin");
+        let a0 = s.history_node(&s.find("arm").unwrap(), s.history_find(&s.find("arm").unwrap(), "skinCluster").unwrap()).unwrap().params["weights"].clone();
         let w = &h.params["weights"];
         assert_eq!(w.as_array().unwrap().len(), a0.as_array().unwrap().len());
         // vertex 0's weights match
@@ -1086,8 +1207,7 @@ connectAttr "pSphereShape1.iog" ":initialShadingGroup.dsm" -na;
         let made = import_ma(&mut s, src).unwrap();
         assert_eq!(made.len(), 1);
         let ball = s.find("pSphere1").unwrap();
-        let m = s.node(&ball).unwrap().mesh().unwrap();
-        assert_eq!(m.history[0].ty, "polySphere");
-        assert_eq!(m.history[0].params["radius"], json!(3.0));
+        assert_eq!(s.history_node(&ball, 0).unwrap().ty, "polySphere");
+        assert_eq!(s.history_node(&ball, 0).unwrap().params["radius"], json!(3.0));
     }
 }

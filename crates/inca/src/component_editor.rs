@@ -17,7 +17,12 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
     if !open {
         return;
     }
-    egui::Window::new("Component Editor").open(&mut open).default_size([460.0, 380.0]).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Component Editor"), open, |app, fix| {
+        let mut window = egui::Window::new("Component Editor").open(&mut open).default_size([460.0, 380.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut app.ce.tab, 0, "Polygons");
             ui.selectable_value(&mut app.ce.tab, 1, "Smooth Skins");
@@ -33,6 +38,7 @@ pub fn window(app: &mut IncaApp, ctx: &egui::Context) {
             0 => positions(app, ui, &rows),
             _ => weights(app, ui, &rows),
         });
+    })
     });
     app.win.component_editor = open;
 }
@@ -72,11 +78,11 @@ fn positions(app: &mut IncaApp, ui: &mut egui::Ui, rows: &[(String, u32)]) {
 
 fn weights(app: &mut IncaApp, ui: &mut egui::Ui, rows: &[(String, u32)]) {
     let Some(o) = rows.first().map(|r| r.0.clone()) else { return };
-    let Some(h) = app.s.node(&o).and_then(|n| n.mesh()).and_then(|m| m.history.iter().position(|x| x.ty == "skinCluster")) else {
+    let Some(h) = app.s.history_find(&o, "skinCluster") else {
         ui.label(RichText::new("The selected vertices are not skinned.").color(theme::TEXT_DIM));
         return;
     };
-    let params = app.s.node(&o).unwrap().mesh().unwrap().history[h].params.clone();
+    let params = app.s.history_node(&o, h).map(|h| h.params).unwrap_or_default();
     let joints: Vec<String> = params.get("joints").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|j| j.as_str().map(String::from)).collect()).unwrap_or_default();
     let mut w = params.get("weights").cloned().unwrap_or(json!([]));
     let mut changed = false;

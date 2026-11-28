@@ -309,8 +309,13 @@ pub fn dup_special_window(app: &mut IncaApp, ctx: &egui::Context) {
     }
     let mut open = true;
     let mut run = false;
-    let o = &mut app.dup_opts;
-    egui::Window::new("Duplicate Special Options").open(&mut open).resizable(false).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Duplicate Special Options"), open, |app, fix| {
+        let mut window = egui::Window::new("Duplicate Special Options").open(&mut open).resizable(false).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+        let o = &mut app.dup_opts;
         egui::Grid::new("dupopts").num_columns(2).show(ui, |ui| {
             ui.label("Duplicate input graph");
             ui.checkbox(&mut o.keep_history, "");
@@ -337,6 +342,7 @@ pub fn dup_special_window(app: &mut IncaApp, ctx: &egui::Context) {
                 *o = DupOpts::default();
             }
         });
+    })
     });
     if run {
         let o = app.dup_opts.clone();
@@ -453,10 +459,18 @@ pub struct AddAttr {
 pub const ATTR_TYPES: &[(&str, &str)] = &[("Float", "double"), ("Integer", "long"), ("Boolean", "bool"), ("Vector", "double3"), ("String", "string")];
 
 pub fn add_attr_window(app: &mut IncaApp, ctx: &egui::Context) {
-    let Some(w) = app.add_attr.as_mut() else { return };
+    if app.add_attr.is_none() {
+        return;
+    }
     let mut open = true;
     let (mut add, mut close) = (false, false);
-    egui::Window::new("Add Attribute").open(&mut open).resizable(false).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Add Attribute"), open, |app, fix| {
+        let mut window = egui::Window::new("Add Attribute").open(&mut open).resizable(false).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+        let Some(w) = app.add_attr.as_mut() else { return; };
         egui::Grid::new("addattr").num_columns(2).show(ui, |ui| {
             ui.label("Long name:");
             ui.text_edit_singleline(&mut w.name);
@@ -481,16 +495,19 @@ pub fn add_attr_window(app: &mut IncaApp, ctx: &egui::Context) {
             add |= ui.button("Add").clicked();
             close |= ui.button("Cancel").clicked();
         });
+        })
     });
     if add {
-        let name: String = w.name.trim().chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
-        let (ty, dv) = (ATTR_TYPES[w.ty].1, w.default);
-        let targets: Vec<String> = app.s.sel.iter().map(|i| app.s.name_of(i)).collect();
-        if name.is_empty() || targets.is_empty() {
-            app.last_result = "// Warning: Give the attribute a name and select an object".into();
-        } else {
-            let flag = if ty == "string" { "-dt string".to_string() } else { format!("-at {ty} -dv {}", inca_core::math::fmt_num_long(dv)) };
-            let _ = app.run_mel("add attribute", &format!("addAttr -ln {name} {flag} {};", targets.join(" ")));
+        if let Some(w) = app.add_attr.as_ref() {
+            let name: String = w.name.trim().chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+            let (ty, dv) = (ATTR_TYPES[w.ty].1, w.default);
+            let targets: Vec<String> = app.s.sel.iter().map(|i| app.s.name_of(i)).collect();
+            if name.is_empty() || targets.is_empty() {
+                app.last_result = "// Warning: Give the attribute a name and select an object".into();
+            } else {
+                let flag = if ty == "string" { "-dt string".to_string() } else { format!("-at {ty} -dv {}", inca_core::math::fmt_num_long(dv)) };
+                let _ = app.run_mel("add attribute", &format!("addAttr -ln {name} {flag} {};", targets.join(" ")));
+            }
         }
     }
     if close || !open {

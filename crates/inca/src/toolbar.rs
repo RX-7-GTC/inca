@@ -68,7 +68,7 @@ pub fn status_line(app: &mut IncaApp, ui: &mut egui::Ui) {
                 app.action("uvMode");
             }
         } else {
-            for (k, i, tip) in [("curve", "olCurve", "Select curves"), ("mesh", "olMesh", "Select surfaces (polygons & NURBS)"), ("light", "olLight", "Select lights"), ("camera", "olCamera", "Select cameras"), ("locator", "olLocator", "Select locators")] {
+            for (k, i, tip) in [("curve", "olCurve", "Select curves"), ("mesh", "olMesh", "Select surfaces (polygons & NURBS)"), ("light", "olLight", "Select lights"), ("camera", "olCamera", "Select cameras"), ("locator", "olLocator", "Select locators"), ("template", "olTemplate", "Select templates")] {
                 let on = !app.sel_mask_off.contains(k);
                 if ib(ui, i, tip, on).clicked() {
                     if on {
@@ -168,7 +168,10 @@ fn do_input(app: &mut IncaApp, mode: usize, txt: &str) {
         }
         "Select" => {
             let ids: Vec<String> = app.s.all_dag(false).into_iter().filter(|i| inca_core::mel::glob_match(txt, &app.s.name_of(i))).collect();
-            app.select_names(&ids, SelMode::Replace);
+            if !ids.is_empty() || !app.s.sel.is_empty() {
+                app.s.checkpoint_selection("select");
+                app.select_names(&ids, SelMode::Replace);
+            }
         }
         m => {
             let v: Vec<f64> = txt.split([' ', ',']).filter(|s| !s.is_empty()).filter_map(|s| s.parse().ok()).collect();
@@ -349,10 +352,25 @@ pub fn shelf(app: &mut IncaApp, ui: &mut egui::Ui) {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.add_space(26.0);
+            // The button inner margin is `button_padding - bg_stroke.width`; overriding the
+            // stroke to NONE after that calculation made hovered tabs 1px narrower, shifting
+            // the adjacent tab under the pointer and causing a hover/layout oscillation. Keep
+            // the stroke width zero in every state so the tab widths never change.
+            let w = &mut ui.visuals_mut().widgets;
+            w.inactive.bg_stroke = egui::Stroke::NONE;
+            w.hovered.bg_stroke = egui::Stroke::NONE;
+            w.active.bg_stroke = egui::Stroke::NONE;
+            w.open.bg_stroke = egui::Stroke::NONE;
             ui.spacing_mut().item_spacing.x = 0.0;
             for (i, sh) in app.shelves.iter().enumerate() {
                 let on = tab == i;
-                let t = RichText::new(&sh.name).size(11.0).color(if on { Color32::WHITE } else { Color32::from_gray(0xbd) });
+                // JS `.shelf-tab:hover { color: #fff }`. The response from the previous frame
+                // gives us hover before the button is built; colour does not affect width, so
+                // this cannot feed back into the layout.
+                let id = ui.next_auto_id();
+                let hovered = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
+                let color = if on || hovered { Color32::WHITE } else { Color32::from_gray(0xbd) };
+                let t = RichText::new(&sh.name).size(11.0).color(color);
                 let b = egui::Button::new(t).fill(if on { theme::BG } else { Color32::TRANSPARENT }).stroke(egui::Stroke::NONE).corner_radius(egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 });
                 if ui.add(b).clicked() {
                     app.shelf_tab = i;
@@ -413,7 +431,7 @@ pub fn shelf(app: &mut IncaApp, ui: &mut egui::Ui) {
                             _ => {}
                         }
                     }
-                    r.context_menu(|ui| {
+                    crate::menus::show_plain_context_menu(&r, |ui| {
                         if ui.button("Delete").clicked() {
                             remove = Some(i);
                             ui.close();
@@ -455,7 +473,12 @@ pub fn shelf_editor(app: &mut IncaApp, ctx: &egui::Context) {
     if app.shelves.is_empty() {
         app.shelves = default_shelves(&[]);
     }
-    egui::Window::new("Shelf Editor").open(&mut open).default_size([760.0, 420.0]).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Shelf Editor"), open, |app, fix| {
+        let mut window = egui::Window::new("Shelf Editor").open(&mut open).default_size([760.0, 420.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
         let (mut si, mut ii) = app.shelf_edit;
         si = si.min(app.shelves.len().saturating_sub(1));
         ui.horizontal_top(|ui| {
@@ -595,6 +618,7 @@ pub fn shelf_editor(app: &mut IncaApp, ctx: &egui::Context) {
             });
         });
         app.shelf_edit = (si, ii);
+    })
     });
     app.win.shelf_editor = open;
 }
@@ -628,7 +652,10 @@ pub fn tool_box(app: &mut IncaApp, ui: &mut egui::Ui) {
                         app.layout = Layout::Single;
                         app.active_vp = 0;
                     }
-                    1 => app.layout = Layout::Four,
+                    1 => {
+                        app.layout = Layout::Four;
+                        app.layout_before = Layout::Four;
+                    }
                     2 => {
                         app.layout = Layout::Single;
                         app.active_vp = 0;
@@ -648,15 +675,42 @@ pub fn tool_box(app: &mut IncaApp, ui: &mut egui::Ui) {
 
 /// Status line selection masks: may this object be picked?
 pub fn mask_allows(app: &IncaApp, id: &str) -> bool {
-    use inca_core::scene::Shape;
-    let Some(n) = app.s.node(id) else { return false };
-    let k = match &n.shape {
-        Shape::Mesh(_) => "mesh",
-        Shape::Curve(_) => "curve",
-        Shape::Light(_) => "light",
-        Shape::Camera(_) => "camera",
-        Shape::Locator => "locator",
-        Shape::Group => "group",
+    mask_allows_scene(&app.s, &app.sel_mask_off, id)
+}
+
+/// The JS `visibleNodes` mask test, keyed by the node's kind (only the six mask
+/// buttons are maskable; joints, handles and other rig kinds always pass).
+pub fn mask_allows_scene(s: &inca_core::scene::Scene, off: &std::collections::HashSet<String>, id: &str) -> bool {
+    let Some(n) = s.node(id) else { return false };
+    let k = match n.kind.as_str() {
+        "mesh" => "mesh",
+        "curve" => "curve",
+        "light" => "light",
+        "camera" => "camera",
+        "locator" => "locator",
+        "group" => "group",
+        _ => return true,
     };
-    !app.sel_mask_off.contains(k)
+    !off.contains(k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_mask_only_covers_the_six_kinds() {
+        let mut s = inca_core::scene::Scene::new();
+        let m = s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        let l = s.create_locator("loc1");
+        let j = s.create_handle("joint", "j1");
+        let mut off = std::collections::HashSet::new();
+        // a locator mask hides locators, but not joints (JS keys the mask by kind)
+        off.insert("locator".to_string());
+        assert!(!mask_allows_scene(&s, &off, &l));
+        assert!(mask_allows_scene(&s, &off, &j));
+        assert!(mask_allows_scene(&s, &off, &m));
+        off.insert("mesh".to_string());
+        assert!(!mask_allows_scene(&s, &off, &m));
+    }
 }

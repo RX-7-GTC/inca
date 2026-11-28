@@ -5,7 +5,7 @@
 //! `rig` record (kept in `passthrough`), keyable numbers in `extra` (saved as `extraAttrs` too).
 
 use crate::anim::{AnimCurve, Key};
-use crate::math::{euler_deg_from_quat, quat_from_euler_deg, DMat4, DQuat, DVec3};
+use crate::math::{euler_deg_from_quat, euler_deg_from_quat_near, quat_from_euler_deg, DMat4, DQuat, DVec3};
 use crate::scene::{Id, Scene};
 use serde_json::{json, Map, Value};
 
@@ -57,9 +57,9 @@ impl Scene {
     pub fn put_local(&mut self, id: &str, m: DMat4) {
         let Some(n) = self.nodes.get_mut(id) else { return };
         let (s, q, pos) = m.to_scale_rotation_translation();
-        let e = euler_deg_from_quat(n.xf.jo_quat().inverse() * q, &n.xf.ro);
+        let e = euler_deg_from_quat_near(n.xf.jo_quat().inverse() * q, &n.xf.ro, n.xf.r);
         let xf = &mut n.xf;
-        xf.r = [0, 1, 2].map(|i| crate::math::near_angle(xf.r[i], e[i]));
+        xf.r = e;
         xf.s = s.to_array();
         let rs = DMat4::from_scale_rotation_translation(s, q, DVec3::ZERO);
         let rp = rs.transform_point3(v3(xf.p));
@@ -531,10 +531,8 @@ impl Scene {
         if let Some(m) = self.nodes.get_mut(&d) {
             m.passthrough.insert("instanceOf".into(), json!(src));
             m.passthrough.insert("instanceRev".into(), json!(-1));
-            if let Some(ms) = m.mesh_mut() {
-                ms.history.clear();
-            }
         }
+        self.clear_history(&d);
         self.sync_instances();
         Some(d)
     }
@@ -587,22 +585,19 @@ impl Scene {
 
     /// Remove history nodes of the given types from a mesh (Unbind Skin, Delete Deformers).
     pub fn remove_history_types(&mut self, id: &str, types: &[&str]) -> usize {
-        let Some(m) = self.nodes.get(id).and_then(|n| n.mesh()) else { return 0 };
-        let first = m.history.iter().position(|h| types.contains(&h.ty.as_str()));
-        let Some(first) = first.filter(|f| *f > 0) else { return 0 };
-        let names: Vec<String> = m.history.iter().filter(|h| types.contains(&h.ty.as_str())).map(|h| h.name.clone()).collect();
-        for n in &names {
-            self.release_name(n);
+        let Some(ids) = self.nodes.get(id).and_then(|n| n.mesh()).map(|m| m.history.clone()) else { return 0 };
+        let dead: Vec<(usize, Id)> = ids.iter().enumerate().filter(|(_, hid)| self.deps.node(hid).is_some_and(|h| types.contains(&h.kind.as_str()))).map(|(i, hid)| (i, hid.clone())).collect();
+        let Some(first) = dead.first().map(|(i, _)| *i).filter(|f| *f > 0) else { return 0 };
+        for (_, hid) in &dead {
+            self.remove_history_node(id, hid);
         }
-        let m = self.nodes.get_mut(id).unwrap().mesh_mut().unwrap();
-        m.history.retain(|h| !types.contains(&h.ty.as_str()));
         self.evaluate(id, first);
-        names.len()
+        dead.len()
     }
 
     /// Deformer handles no mesh history uses any more.
     pub fn orphan_deformer_handles(&self) -> Vec<Id> {
-        let used: std::collections::HashSet<String> = self.nodes.values().filter_map(|n| n.mesh()).flat_map(|m| m.history.iter().filter_map(|h| h.params.get("handle").and_then(|v| v.as_str()).map(String::from))).collect();
+        let used: std::collections::HashSet<String> = self.nodes.values().filter_map(|n| n.mesh()).flat_map(|m| m.history.iter().filter_map(|hid| self.deps.node(hid)?.attrs.get("handle")?.as_str().map(String::from))).collect();
         self.nodes.values().filter(|n| matches!(n.kind.as_str(), "deformer" | "clusterHandle" | "lattice") && !used.contains(&n.id)).map(|n| n.id.clone()).collect()
     }
 
@@ -629,7 +624,7 @@ impl Scene {
             }
             let kind = self.nodes[&id].kind.clone();
             // a deformer this app made (or imported before) is already in mesh history
-            let in_history = self.nodes.values().filter_map(|n| n.mesh()).any(|m| m.history.iter().any(|h| h.params.get("handle").and_then(|v| v.as_str()) == Some(id.as_str())));
+            let in_history = self.nodes.values().filter_map(|n| n.mesh()).any(|m| m.history.iter().any(|hid| self.deps.node(hid).is_some_and(|h| h.attrs.get("handle").and_then(|v| v.as_str()) == Some(id.as_str()))));
             if in_history && rig.get("skin").is_none() && rig.get("blendShape").is_none() {
                 continue;
             }
@@ -875,9 +870,10 @@ impl Scene {
         // deformer handles and IK handles drive what they deform / move
         for n in self.nodes.values() {
             if let Some(m) = n.mesh() {
-                for h in &m.history {
+                for hid in &m.history {
+                    let Some(h) = self.deps.node(hid) else { continue };
                     for k in ["handle", "joints"] {
-                        match h.params.get(k) {
+                        match h.attrs.get(k) {
                             Some(Value::String(s)) => edges.push((s.clone(), n.id.clone())),
                             Some(Value::Array(a)) => edges.extend(a.iter().filter_map(|x| x.as_str()).map(|s| (s.to_string(), n.id.clone()))),
                             _ => {}

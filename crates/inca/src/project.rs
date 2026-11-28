@@ -117,11 +117,19 @@ pub fn open_project_window(app: &mut IncaApp) {
 }
 
 pub fn project_window(app: &mut IncaApp, ctx: &egui::Context) {
-    let Some(w) = app.project_win.as_mut() else { return };
+    if app.project_win.is_none() {
+        return;
+    }
     let mut open = true;
     let mut accept = false;
     let mut cancel = false;
-    egui::Window::new("Project Window").open(&mut open).default_size([560.0, 520.0]).show(ctx, |ui| {
+    let _ = crate::windows::place_window(app, ctx, egui::Id::new("Project Window"), open, |app, fix| {
+        let mut window = egui::Window::new("Project Window").open(&mut open).default_size([560.0, 520.0]).constrain(false);
+        if let Some(p) = fix {
+            window = window.fixed_pos(p);
+        }
+        window.show(ctx, |ui| {
+        let Some(w) = app.project_win.as_mut() else { return; };
         egui::Grid::new("pw").num_columns(2).show(ui, |ui| {
             ui.label("Current Project:");
             ui.add(egui::TextEdit::singleline(&mut w.name).desired_width(320.0));
@@ -153,14 +161,17 @@ pub fn project_window(app: &mut IncaApp, ctx: &egui::Context) {
             accept = ui.button("Accept").clicked();
             cancel = ui.button("Cancel").clicked();
         });
+        })
     });
     if accept {
-        let name = if w.name.trim().is_empty() { "new_project".to_string() } else { w.name.trim().to_string() };
-        let dirs: Vec<&str> = PROJECT_DIRS.iter().zip(&w.dirs).filter(|(_, on)| **on).map(|(d, _)| *d).collect();
-        let root = PathBuf::from(&w.location);
-        match create_project(&root, &name, &dirs) {
-            Ok(p) => set_project(app, &p.display().to_string(), false),
-            Err(e) => app.last_result = format!("// Error: could not create the project: {e}"),
+        if let Some(w) = app.project_win.as_ref() {
+            let name = if w.name.trim().is_empty() { "new_project".to_string() } else { w.name.trim().to_string() };
+            let dirs: Vec<&str> = PROJECT_DIRS.iter().zip(&w.dirs).filter(|(_, on)| **on).map(|(d, _)| *d).collect();
+            let root = PathBuf::from(&w.location);
+            match create_project(&root, &name, &dirs) {
+                Ok(p) => set_project(app, &p.display().to_string(), false),
+                Err(e) => app.last_result = format!("// Error: could not create the project: {e}"),
+            }
         }
     }
     if accept || cancel || !open {

@@ -567,7 +567,14 @@ impl Parser {
                 }
                 Some(Tok::Id(s)) => {
                     self.p += 1;
-                    args.push(Expr::Lit(Val::Str(s)));
+                    // JS `command()` parses positional values with `expr()`, so MEL booleans
+                    // (`setAttr node.visibility true`) arrive as 1/0 rather than strings.
+                    let v = match s.as_str() {
+                        "true" | "on" | "yes" => Val::Int(1),
+                        "false" | "off" | "no" => Val::Int(0),
+                        _ => Val::Str(s),
+                    };
+                    args.push(Expr::Lit(v));
                 }
                 Some(Tok::Op(o)) => {
                     self.p += 1;

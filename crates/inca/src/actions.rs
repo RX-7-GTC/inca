@@ -19,7 +19,9 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("pasteKeys", "Paste Keys", ""),
     ("bakeKeys", "Bake Simulation", ""),
     ("createGhost", "Ghost Selected", ""),
+    ("unghostSelected", "Unghost Selected", ""),
     ("unghostAll", "Unghost All", ""),
+    ("toggleGhosts", "Show/Hide ghosts", ""),
     ("motionTrail", "Create Motion Trail", ""),
     ("playblast", "Playblast", ""),
     ("deleteAllLights", "Lights (All)", ""),
@@ -57,6 +59,8 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("duplicateHistory", "Duplicate with Input Graph", ""),
     ("group", "Group", "Ctrl+G"),
     ("ungroup", "Ungroup", ""),
+    ("createContainer", "Create Container", ""),
+    ("publishAttributes", "Publish Attributes", ""),
     ("parent", "Parent", "P"),
     ("unparent", "Unparent", "Shift+P"),
     ("renameSel", "Rename...", ""),
@@ -151,6 +155,7 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("rotateTool", "Rotate Tool", "E"),
     ("scaleTool", "Scale Tool", "R"),
     ("lastToolUsed", "Last Tool", "Y"),
+    ("manipulatorTool", "Show Manipulator Tool", "T"),
     ("resetTransformations", "Reset Transformations", ""),
     ("freezeTransformations", "Freeze Transformations", ""),
     ("centerPivot", "Center Pivot", ""),
@@ -164,6 +169,7 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("toggleHud", "Heads Up Display", ""),
     ("toggleWireOnShaded", "Wireframe on Shaded", ""),
     ("toggleXray", "X-Ray", "Alt+A"),
+    ("toggleShadows", "Shadows", ""),
     ("toggleBackface", "Backface Culling", ""),
     ("shadeWire", "Wireframe", "4"),
     ("shadeSmooth", "Smooth Shade All", "5"),
@@ -189,6 +195,7 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("untemplateAll", "Untemplate All", ""),
     ("toggleNormals", "Face Normals", ""),
     ("toggleBorderEdges", "Border Edges", ""),
+    ("faceCenters", "Face Centers", ""),
     ("frameSelectedAll", "Frame Selection in All Views", "Shift+F"),
     ("frameAllAll", "Frame All in All Views", "Shift+A"),
     ("hudPolyCount", "Poly Count", ""),
@@ -200,6 +207,9 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("isolateSelect", "Isolate Select", "Ctrl+1"),
     ("frameSelected", "Frame Selection", "F"),
     ("frameAll", "Frame All", "A"),
+    ("undoView", "Undo View Change", "Alt+Z"),
+    ("redoView", "Redo View Change", "Alt+Y"),
+    ("defaultView", "Default View", "Alt+Home"),
     ("layoutSingle", "Single Pane", ""),
     ("layoutFour", "Four Panes", ""),
     ("layoutTwoSide", "Two Panes Side by Side", ""),
@@ -214,11 +224,30 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("hypershade", "Hypershade", ""),
     ("graphEditor", "Graph Editor", ""),
     ("dopeSheet", "Dope Sheet", ""),
+    ("graphFrameSelected", "Graph Editor: Frame Selected", "F"),
+    ("graphFrameAll", "Graph Editor: Frame All", "A"),
+    ("graphDeleteKey", "Graph Editor: Delete Selected Keys", "Del"),
+    ("graphCopy", "Graph Editor: Copy Keys", "Ctrl+C"),
+    ("graphPaste", "Graph Editor: Paste Keys", "Ctrl+V"),
+    ("graphScaleKeys", "Graph Editor: Scale Keys", "R"),
+    ("graphSelectKeys", "Graph Editor: Select Keys", "Q"),
+    ("timelineCopy", "Timeline: Copy Keys", "Ctrl+C"),
+    ("timelinePaste", "Timeline: Paste Keys", "Ctrl+V"),
+    ("dopeFrameSelected", "Dope Sheet: Frame Selected", "F"),
+    ("dopeFrameAll", "Dope Sheet: Frame All", "A"),
+    ("dopeDeleteKeys", "Dope Sheet: Delete Keys", "Del"),
     ("renderView", "Render View", ""),
     ("renderSettings", "Render Settings", ""),
     ("preferences", "Preferences", ""),
     ("hotkeyList", "Keyboard Shortcuts", ""),
     ("hotkeyEditor", "Hotkey Editor...", ""),
+    ("panelShelf", "Shelf Panel", ""),
+    ("panelToolbox", "Tool Box Panel", ""),
+    ("panelOutliner", "Outliner Panel", ""),
+    ("panelRight", "Attribute Editor / Channel Box Panel", ""),
+    ("panelTimeslider", "Time Slider Panel", ""),
+    ("panelRangeslider", "Range Slider Panel", ""),
+    ("panelCmdline", "Command Line Panel", ""),
     ("menuSetModeling", "Modeling Menu Set", "F2"),
     ("menuSetRigging", "Rigging Menu Set", "F3"),
     ("menuSetAnimation", "Animation Menu Set", "F4"),
@@ -246,7 +275,7 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("extrude", "Extrude", "Ctrl+E"),
     ("bevel", "Bevel", "Ctrl+B"),
     ("bridge", "Bridge", ""),
-    ("pivotEdit", "Edit Pivot", "Insert / hold D"),
+    ("pivotEdit", "Edit Pivot", "Insert"),
     ("insertEdgeLoop", "Insert Edge Loop (on selected edge)", ""),
     ("cleanup", "Cleanup", ""),
     ("insertEdgeLoopTool", "Insert Edge Loop Tool", "Ctrl+K"),
@@ -320,7 +349,9 @@ pub static ACTIONS: &[(&str, &str, &str)] = &[
     ("renderSequence", "Render Sequence...", ""),
     ("assignNewMaterial", "Assign New Material...", ""),
     ("materialAttributes", "Material Attributes...", ""),
-    ("snapGrid", "Snap to Grids (hold X)", ""),
+    ("snapGrid", "Snap to Grids (hold X)", "X"),
+    ("snapCurve", "Snap to Curves (hold C)", "C"),
+    ("snapPoint", "Snap to Points (hold V)", "V"),
     ("manipBigger", "Increase Manipulator Size", "="),
     ("manipSmaller", "Decrease Manipulator Size", "-"),
     ("toggleWorld", "World / Object space", ""),
@@ -355,7 +386,7 @@ pub fn available(id: &str) -> bool {
 /// completion, the transform tools, selection, view, playback, files and windows don't.
 pub fn repeatable(id: &str) -> bool {
     const NO: &[&str] = &[
-        "repeatLast", "undo", "redo", "finishTool", "toolUndoPoint", "cancelTool", "selectTool", "moveTool", "rotateTool", "scaleTool", "lastToolUsed", "lassoTool", "paintSelectTool",
+        "repeatLast", "undo", "redo", "undoView", "redoView", "defaultView", "finishTool", "toolUndoPoint", "cancelTool", "selectTool", "moveTool", "rotateTool", "scaleTool", "lastToolUsed", "lassoTool", "paintSelectTool",
         "objectMode", "vertexMode", "edgeMode", "faceMode", "uvMode", "componentTypeCycle", "softSelect", "pivotEdit", "manipBigger", "manipSmaller", "copy", "paste", "cut",
         "newScene", "openScene", "saveScene", "saveSceneAs", "incrementAndSave", "quit", "isolateSelect", "playToggle", "playBackwards", "stopPlayback", "nextFrame", "prevFrame",
         "nextKey", "prevKey", "goToStart", "goToEnd", "attributeEditor", "channelBox", "toolSettings", "modelingToolkit", "outlinerWindow", "cycleBackground", "invertSelection",
@@ -384,6 +415,26 @@ fn primitive_mel(ty: &str, history: bool) -> String {
     s
 }
 
+/// Publish the Channel Box picks of the selected node on its container.
+fn publish_attributes_mel(app: &IncaApp) -> Option<String> {
+    let Some(id) = app.s.lead() else {
+        return Some("warning \"Select a node inside a container.\";".into());
+    };
+    let Some(container) = app.s.container_of(id) else {
+        return Some("warning \"Select a node inside a container.\";".into());
+    };
+    if app.panels.cb_sel.is_empty() {
+        return Some("warning \"Select channels in the Channel Box first.\";".into());
+    }
+    let node = app.s.name_of(id);
+    let container = app.s.name_of(&container);
+    let mut src = String::new();
+    for ch in &app.panels.cb_sel {
+        src.push_str(&format!("container -e -ba {node}.{ch} {ch} {container};\n"));
+    }
+    Some(src)
+}
+
 /// MEL for an action, if it is a scripted one.
 /// Attach to Motion Path: the selected objects follow the curve selected last.
 fn motion_path_mel(app: &IncaApp) -> Option<String> {
@@ -394,6 +445,27 @@ fn motion_path_mel(app: &IncaApp) -> Option<String> {
     }
     let f = crate::options::get(app, "attachToMotionPath", "follow") as i64;
     Some(format!("pathAnimation -c {} -f {f} -fa x -ua y {};", app.s.name_of(curve), objs.join(" ")))
+}
+
+/// Graph-capable nodes selected in the Hypershade/Hypergraph, normalized to their actual ids.
+fn hypershade_selection(app: &IncaApp) -> std::collections::HashSet<String> {
+    let mut ids = app.windows_state.hs.graph_sel.clone();
+    // The work-area selection is authoritative; the AE/browser lead only supplies
+    // a target when nothing is selected in the graph or the scene.
+    if ids.is_empty() && app.s.sel.is_empty() {
+        if let Some(id) = &app.snode_sel {
+            ids.insert(id.clone());
+        }
+        if let Some(id) = &app.windows_state.hs_selected {
+            ids.insert(id.clone());
+        }
+    }
+    ids.retain(|id| {
+        let base = id.strip_prefix("sg:").unwrap_or(id);
+        let base = app.s.shading_group_material(base).unwrap_or_else(|| base.to_string());
+        app.s.is_shading(&base) || app.s.is_shading_engine(&base) || crate::hypershade::is_graph_dag(app, &base)
+    });
+    ids
 }
 
 pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
@@ -416,7 +488,13 @@ pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
             "instance" => "instance;".into(),
             "createLocator" => "spaceLocator -p 0 0 0;".into(),
             "createEmptyGroup" => "group -em;".into(),
-            "deleteSel" => "delete;".into(),
+            "deleteSel" => {
+                if hypershade_selection(app).is_empty() {
+                    "delete;".into()
+                } else {
+                    return None;
+                }
+            }
             "deleteHistory" => "delete -ch;".into(),
             "deleteAllHistory" => "delete -all -ch;".into(),
             "deleteChannels" => "delete -c;".into(),
@@ -424,6 +502,8 @@ pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
             "duplicateHistory" => "duplicate -rr -un;".into(),
             "group" => if opt("group", "pivot") == 0.0 { "group; xform -cp;".into() } else { "group;".into() },
             "ungroup" => return ungroup_mel(app),
+            "createContainer" => "container;".into(),
+            "publishAttributes" => return publish_attributes_mel(app),
             "parent" => "parent;".into(),
             "unparent" => "parent -w;".into(),
             "resetTransformations" => "makeIdentity;".into(),
@@ -446,7 +526,7 @@ pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
             "addDivisions" => format!("polySubdivideFacet -dv {};", opt("addDivisions", "divisions") as i64),
             "extrude" => match app.s.comp_mode {
                 Some(CompMode::Edge) => "polyExtrudeEdge -off 0.5;".into(),
-                _ => format!("polyExtrudeFacet -ltz {} -off {} -d {} -kft {} -ch {ch};", f(opt("extrude", "thickness")), f(opt("extrude", "offset")), opt("extrude", "divisions").max(1.0) as i64, opt("extrude", "keepFacesTogether") as i64),
+                _ => format!("polyExtrudeFacet -thickness {} -ltz 0 -off {} -d {} -kft {} -ch {ch};", f(opt("extrude", "thickness")), f(opt("extrude", "offset")), opt("extrude", "divisions").max(1.0) as i64, opt("extrude", "keepFacesTogether") as i64),
             },
             "bridge" => format!("polyBridgeEdge -dv {};", opt("bridge", "divisions") as i64),
             "bevel" => format!("polyBevel -f {} -ch {ch};", f(opt("bevel", "fraction"))),
@@ -526,6 +606,17 @@ pub fn mel_for(app: &IncaApp, id: &str) -> Option<String> {
             "planarSurface" => format!("planarSrf -ch {ch};"),
             "rebuildCurve" => "rebuildCurve -s 4 -d 3;".into(),
             "reverseCurve" => "reverseCurve;".into(),
+            "setKey" if app.panels.cb_sync_timeline && !app.panels.cb_pick.is_empty() => {
+                let mut m = String::new();
+                for p in &app.panels.cb_pick {
+                    for t in &p.targets {
+                        if matches!(t, inca_core::scene::NodeRef::Dag(_)) {
+                            m.push_str(&format!("setKeyframe -at {} {};\n", p.attr, app.s.ref_name(t)));
+                        }
+                    }
+                }
+                m
+            }
             "setKey" => "setKeyframe;".into(),
             "keyTranslate" => "setKeyframe -at translate;".into(),
             "keyRotate" => "setKeyframe -at rotate;".into(),
@@ -567,21 +658,45 @@ fn ungroup_mel(app: &IncaApp) -> Option<String> {
 pub fn builtin(app: &mut IncaApp, id: &str) {
     let vp = app.active_vp;
     match id {
-        "undo" => match app.s.undo() {
-            Some(l) => {
+        "undo" => {
+            // While a Multi-Cut is in progress, Ctrl+Z removes its last point instead of undoing
+            // the tool activation. Once the cut is committed it falls through to the scene undo.
+            if app.tool == Tool::MultiCut && !app.mesh_tool.cut.is_empty() {
+                app.mesh_tool.cut.pop();
+                app.mesh_tool.cut_cams.pop();
+                if app.mesh_tool.cut.is_empty() {
+                    app.mesh_tool.clear_cut();
+                }
                 app.echo("undo;");
-                app.last_result = format!("// Undo: {l}");
-                app.smooth_cache.clear();
+                app.last_result = "// Undo: Multi-Cut point".into();
+                return;
             }
-            None => app.last_result = "// Warning: There are no more commands to undo.".into(),
-        },
-        "redo" => match app.s.redo() {
-            Some(l) => {
-                app.echo("redo;");
-                app.last_result = format!("// Redo: {l}");
+            let cameras = app.view_cameras();
+            match app.s.undo() {
+                Some(l) => {
+                    app.restore_view_cameras(cameras);
+                    app.echo("undo;");
+                    app.last_result = format!("// Undo: {l}");
+                    app.smooth_cache.clear();
+                    app.sync_camera_names();
+                }
+                None => app.last_result = "// Warning: There are no more commands to undo.".into(),
             }
-            None => app.last_result = "// Warning: There are no more commands to redo.".into(),
-        },
+            app.mesh_tool.clear_cut();
+        }
+        "redo" => {
+            let cameras = app.view_cameras();
+            match app.s.redo() {
+                Some(l) => {
+                    app.restore_view_cameras(cameras);
+                    app.echo("redo;");
+                    app.last_result = format!("// Redo: {l}");
+                    app.sync_camera_names();
+                }
+                None => app.last_result = "// Warning: There are no more commands to redo.".into(),
+            }
+            app.mesh_tool.clear_cut();
+        }
         "repeatLast" => {
             if let Some(a) = app.last_action.clone() {
                 app.action(&a);
@@ -592,6 +707,9 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             app.s.reset();
             app.echo("file -f -new;");
             app.smooth_cache.clear();
+            app.windows_state.hs.reset_work_tabs();
+            app.reset_camera_names();
+            app.clear_view_history();
         }
         "openScene" => {
             if let Some(p) = rfd::FileDialog::new().add_filter("Scenes", &["inca", "ma", "mb", "fbx"]).add_filter("Inca scene", &["inca"]).add_filter("Maya ASCII", &["ma"]).add_filter("FBX", &["fbx"]).set_directory(crate::project::default_dir(app, "scenes")).pick_file() {
@@ -616,7 +734,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             }
         }
         "importFile" => {
-            if let Some(p) = rfd::FileDialog::new().add_filter("Scenes and models", inca_core::io::IMPORT_EXTS).pick_file() {
+            if let Some(p) = rfd::FileDialog::new().add_filter("Scenes, models and layers", inca_core::io::IMPORT_EXTS).pick_file() {
                 let _ = app.run_mel("import", &format!("file -i \"{}\";", p.display().to_string().replace('\\', "/")));
             }
         }
@@ -638,14 +756,39 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             app.action("deleteSel");
         }
         "copyKeys" => {
-            let ks = app.s.anim.key_times(&app.s.sel);
-            if let (Some(a), Some(b)) = (ks.first().copied(), ks.last().copied()) {
-                crate::timeline::copy_keys(app, a, b);
+            if app.win.graph_editor && !app.windows_state.ge_keys.is_empty() {
+                crate::windows::copy_selected_keys(app);
+            } else {
+                let ks = app.s.anim_key_times(&app.s.sel);
+                if let (Some(a), Some(b)) = (ks.first().copied(), ks.last().copied()) {
+                    crate::timeline::copy_keys(app, a, b);
+                    app.windows_state.key_clip_kind = crate::windows::KeyClipKind::Timeline;
+                    app.windows_state.key_clipboard_marker = true;
+                    let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+                    app.help = format!("Copied {n} timeline key{}", if n == 1 { "" } else { "s" });
+                }
             }
         }
-        "pasteKeys" => crate::timeline::paste_keys(app),
+        "pasteKeys" => {
+            let kind = app.windows_state.key_clip_kind;
+            if kind == crate::windows::KeyClipKind::Graph && !app.windows_state.ge_clipboard.is_empty() {
+                crate::windows::paste_keys(app);
+            } else if kind == crate::windows::KeyClipKind::Timeline && !app.key_clip.is_empty() {
+                let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+                crate::timeline::paste_keys(app);
+                app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
+            } else if app.win.graph_editor && !app.windows_state.ge_keys.is_empty() && !app.windows_state.ge_clipboard.is_empty() {
+                crate::windows::paste_keys(app);
+            } else {
+                let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+                crate::timeline::paste_keys(app);
+                app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
+            }
+        }
         "bakeKeys" => crate::edit_cmds::bake(app),
         "createGhost" => crate::anim_extras::ghost(app),
+        "unghostSelected" => crate::anim_extras::unghost_selected(app),
+        "toggleGhosts" => crate::anim_extras::toggle_ghosts(app),
         "dynamicsReset" => {
             app.s.reset_dynamics();
             let t = app.s.time.start;
@@ -745,21 +888,44 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "hudCameraNames" => app.hud.cam_names = !app.hud.cam_names,
         "hudViewAxis" => app.hud.view_axis = !app.hud.view_axis,
         "frameSelectedAll" | "frameAllAll" => {
-            let b = if id == "frameAllAll" || app.s.sel.is_empty() { viewport::scene_bbox(&app.s) } else { viewport::selection_bbox(&app.s) };
+            // JS `frameSelection`: frame the selected components/objects, and fall back to the
+            // whole scene when the selection box is empty (`frameSelection` -> `frameAll`)
+            let b = if id == "frameAllAll" {
+                viewport::scene_bbox(&app.s)
+            } else {
+                let sb = viewport::selection_bbox(&app.s);
+                if sb.is_empty() { viewport::scene_bbox(&app.s) } else { sb }
+            };
             for v in 0..app.vps.len() {
                 let r = app.vps[v].rect;
                 let aspect = if r.height() > 1.0 { (r.width() / r.height()) as f64 } else { 1.5 };
                 let cam = app.vps[v].camera.clone();
+                app.push_view_change(v);
                 viewport::frame_box(&mut app.s, &cam, &b, aspect);
             }
         }
         "addAttribute" => app.add_attr = Some(crate::edit_cmds::AddAttr { name: String::new(), ty: 0, default: 0.0 }),
         "copy" => {
-            let data: Vec<serde_json::Value> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).map(|i| app.s.serialize_node(&i)).collect();
-            app.clipboard = Some(serde_json::Value::Array(data));
+            if app.win.graph_editor && !app.windows_state.ge_keys.is_empty() {
+                crate::windows::copy_selected_keys(app);
+            } else {
+                let data: Vec<serde_json::Value> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).map(|i| app.s.serialize_node(&i)).collect();
+                let n = data.len();
+                app.clipboard = Some(serde_json::Value::Array(data));
+                app.windows_state.key_clip_kind = crate::windows::KeyClipKind::None;
+                app.windows_state.key_clipboard_marker = true;
+                app.help = format!("Copied {n} object{}", if n == 1 { "" } else { "s" });
+            }
         }
         "paste" => {
-            if let Some(serde_json::Value::Array(list)) = app.clipboard.clone() {
+            let kind = app.windows_state.key_clip_kind;
+            if kind == crate::windows::KeyClipKind::Graph && !app.windows_state.ge_clipboard.is_empty() {
+                crate::windows::paste_keys(app);
+            } else if kind == crate::windows::KeyClipKind::Timeline && !app.key_clip.is_empty() {
+                let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+                crate::timeline::paste_keys(app);
+                app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
+            } else if let Some(serde_json::Value::Array(list)) = app.clipboard.clone() {
                 app.s.checkpoint("paste");
                 let mut map = std::collections::HashMap::new();
                 let mut made = vec![];
@@ -771,7 +937,9 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
                         made.push(nid);
                     }
                 }
+                let n = made.len();
                 app.s.select(&made, SelMode::Replace);
+                app.help = format!("Pasted {n} object{}", if n == 1 { "" } else { "s" });
             }
         }
         "renameSel" => {
@@ -780,18 +948,37 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             }
         }
         "selectAll" => {
+            app.s.checkpoint_selection("select");
             if app.s.comp_mode.is_some() {
                 selection::all_components(&mut app.s, false);
             } else {
                 let _ = app.exec_mel("select -all;", true);
             }
         }
-        "deselectAll" => app.select_names(&[], SelMode::Replace),
+        "deselectAll" => {
+            // JS `deselectAll` in component mode clears the active component type, not the others
+            if app.s.comp_mode.is_some() {
+                if app.s.hilite().iter().any(|id| !app.s.comp_sel_active(id).is_empty()) {
+                    app.s.checkpoint_selection("select");
+                    for id in app.s.hilite() {
+                        app.s.clear_active_comp(&id);
+                    }
+                    app.s.rev += 1;
+                }
+            } else if !app.s.sel.is_empty() {
+                app.s.checkpoint_selection("select");
+                app.select_names(&[], SelMode::Replace);
+            }
+        }
         "selectHierarchy" => {
             let all: Vec<String> = app.s.sel.iter().flat_map(|i| app.s.subtree(i)).collect();
-            app.select_names(&all, SelMode::Replace);
+            if !all.is_empty() {
+                app.s.checkpoint_selection("select");
+                app.select_names(&all, SelMode::Replace);
+            }
         }
         "invertSelection" => {
+            app.s.checkpoint_selection("select");
             if app.s.comp_mode.is_some() {
                 selection::all_components(&mut app.s, true);
             } else {
@@ -800,7 +987,14 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             }
         }
         "objectMode" => {
-            let m = if app.s.comp_mode.is_some() { None } else { Some(CompMode::Vertex) };
+            let m = match app.s.comp_mode {
+                Some(c) => {
+                    // F8 remembers the component mode it is leaving (even if set by MEL).
+                    app.last_comp_mode = c;
+                    None
+                }
+                None => Some(app.last_comp_mode),
+            };
             app.set_comp_mode(m);
         }
         "vertexMode" => app.set_comp_mode(Some(CompMode::Vertex)),
@@ -813,35 +1007,59 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             app.echo("selectType -puv 1;");
         }
         "growSelection" => {
-            selection::grow(&mut app.s, false);
+            if app.s.comp_mode.is_some() {
+                app.s.checkpoint_selection("select");
+                selection::grow(&mut app.s, false);
+            }
             app.echo("GrowPolygonSelectionRegion;");
         }
         "shrinkSelection" => {
-            selection::grow(&mut app.s, true);
+            if app.s.comp_mode.is_some() {
+                app.s.checkpoint_selection("select");
+                selection::grow(&mut app.s, true);
+            }
             app.echo("ShrinkPolygonSelectionRegion;");
         }
         "selectEdgeLoop" => {
-            selection::loops(&mut app.s, false);
+            if app.s.comp_mode.is_some() {
+                app.s.checkpoint_selection("select");
+                selection::loops(&mut app.s, false);
+            }
             app.echo("SelectEdgeLoopSp;");
         }
         "selectEdgeRing" => {
-            selection::loops(&mut app.s, true);
+            if app.s.comp_mode.is_some() {
+                app.s.checkpoint_selection("select");
+                selection::loops(&mut app.s, true);
+            }
             app.echo("SelectEdgeRingSp;");
         }
         "selectBorder" => {
-            selection::border(&mut app.s);
+            if app.s.comp_mode.is_some() {
+                app.s.checkpoint_selection("select");
+                selection::border(&mut app.s);
+            }
             app.echo("SelectPolygonSelectionBoundary;");
         }
         "toVertices" => {
-            selection::convert(&mut app.s, CompMode::Vertex);
+            if app.s.comp_mode.is_some() {
+                app.s.checkpoint_selection("select");
+                selection::convert(&mut app.s, CompMode::Vertex);
+            }
             app.echo("ConvertSelectionToVertices;");
         }
         "toEdges" => {
-            selection::convert(&mut app.s, CompMode::Edge);
+            if app.s.comp_mode.is_some() {
+                app.s.checkpoint_selection("select");
+                selection::convert(&mut app.s, CompMode::Edge);
+            }
             app.echo("ConvertSelectionToEdges;");
         }
         "toFaces" => {
-            selection::convert(&mut app.s, CompMode::Face);
+            if app.s.comp_mode.is_some() {
+                app.s.checkpoint_selection("select");
+                selection::convert(&mut app.s, CompMode::Face);
+            }
             app.echo("ConvertSelectionToFaces;");
         }
         "selectTool" => app.set_tool(Tool::Select),
@@ -849,6 +1067,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "rotateTool" => app.set_tool(Tool::Rotate),
         "scaleTool" => app.set_tool(Tool::Scale),
         "lastToolUsed" => app.set_tool(app.last_tool),
+        "manipulatorTool" => app.show_manipulator(),
         "cvCurveTool" => app.set_tool(Tool::CvCurve),
         "epCurveTool" => app.set_tool(Tool::EpCurve),
         "arcTool" => app.set_tool(Tool::Arc),
@@ -881,8 +1100,9 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         },
         "toolUndoPoint" => {
             app.vp_state.tool_pts.pop();
+            app.mesh_tool.cut_cams.pop();
             if app.mesh_tool.cut.pop().is_some() && app.mesh_tool.cut.is_empty() {
-                app.mesh_tool.cut_obj = None;
+                app.mesh_tool.clear_cut();
             }
             if app.tool == Tool::QuadDraw {
                 app.mesh_tool.dots.pop();
@@ -890,8 +1110,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         }
         "cancelTool" => {
             app.vp_state.tool_pts.clear();
-            app.mesh_tool.cut.clear();
-            app.mesh_tool.cut_obj = None;
+            app.mesh_tool.clear_cut();
             app.set_tool(Tool::Select);
         }
         "snapToGround" => {
@@ -909,12 +1128,37 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "toggleGrid" => app.vps[vp].grid = !app.vps[vp].grid,
         "toggleHud" => app.vps[vp].hud = !app.vps[vp].hud,
         "toggleWireOnShaded" => app.vps[vp].wire_on_shaded = !app.vps[vp].wire_on_shaded,
+        "faceCenters" => app.vps[vp].face_centers = !app.vps[vp].face_centers,
         "toggleXray" => app.vps[vp].xray = !app.vps[vp].xray,
-        "toggleBackface" => app.vps[vp].backface = !app.vps[vp].backface,
-        "shadeWire" => app.vps[vp].shade = ShadeMode::Wire,
-        "shadeSmooth" => app.vps[vp].shade = ShadeMode::Shaded,
-        "shadeTextured" => app.vps[vp].shade = ShadeMode::Textured,
-        "shadeAllLights" => app.vps[vp].lights = LightMode::All,
+        "toggleShadows" => {
+            app.vps[vp].shadows = !app.vps[vp].shadows;
+            if app.vps[vp].shadows {
+                app.vps[vp].lights = LightMode::All;
+            }
+        }
+        "toggleBackface" => app.set_backface(!app.backface),
+        "shadeWire" => {
+            app.vps[vp].shade = ShadeMode::Wire;
+            if app.vps[vp].lights == LightMode::All {
+                app.vps[vp].lights = LightMode::Default;
+            }
+        }
+        "shadeSmooth" => {
+            app.vps[vp].shade = ShadeMode::Shaded;
+            if app.vps[vp].lights == LightMode::All {
+                app.vps[vp].lights = LightMode::Default;
+            }
+        }
+        "shadeTextured" => {
+            app.vps[vp].shade = ShadeMode::Textured;
+            if app.vps[vp].lights == LightMode::All {
+                app.vps[vp].lights = LightMode::Default;
+            }
+        }
+        "shadeAllLights" => {
+            // Maya's 7 hotkey selects Use All Lights; it does not toggle back off.
+            app.vps[vp].lights = LightMode::All;
+        }
         "shadeDefaultLights" => app.vps[vp].lights = LightMode::Default,
         "shadeFlatLights" => app.vps[vp].lights = LightMode::Flat,
         "smoothOff" | "smoothCage" | "smoothOn" => {
@@ -933,20 +1177,56 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             let v = &mut app.vps[vp];
             v.isolate = if v.isolate.is_some() || app.s.sel.is_empty() { None } else { Some(app.s.sel.clone()) };
         }
+        "undoView" => {
+            app.undo_view(app.active_vp);
+        }
+        "redoView" => {
+            app.redo_view(app.active_vp);
+        }
+        "defaultView" => {
+            app.push_view_change(app.active_vp);
+            let cam = app.vps[app.active_vp].camera.clone();
+            viewport::default_view(&mut app.s, &cam);
+        }
         "frameSelected" | "frameAll" => {
-            let b = if id == "frameAll" || app.s.sel.is_empty() { viewport::scene_bbox(&app.s) } else { viewport::selection_bbox(&app.s) };
+            // JS `frameSelection` falls back to `frameAll` when the selection box is empty, and
+            // frames the selected components even when the object selection is empty
+            let b = if id == "frameAll" {
+                viewport::scene_bbox(&app.s)
+            } else {
+                let sb = viewport::selection_bbox(&app.s);
+                if sb.is_empty() { viewport::scene_bbox(&app.s) } else { sb }
+            };
             let r = app.vps[vp].rect;
             let aspect = if r.height() > 1.0 { (r.width() / r.height()) as f64 } else { 1.5 };
             let cam = app.vps[vp].camera.clone();
+            app.push_view_change(vp);
             viewport::frame_box(&mut app.s, &cam, &b, aspect);
         }
         "layoutSingle" => app.layout = Layout::Single,
-        "layoutFour" => app.layout = Layout::Four,
-        "layoutTwoSide" => app.layout = Layout::TwoSide,
-        "layoutTwoStack" => app.layout = Layout::TwoStack,
-        "layoutThree" => app.layout = Layout::Three,
+        "layoutFour" => {
+            app.layout = Layout::Four;
+            app.layout_before = Layout::Four;
+        }
+        "layoutTwoSide" => {
+            app.layout = Layout::TwoSide;
+            app.layout_before = Layout::TwoSide;
+        }
+        "layoutTwoStack" => {
+            app.layout = Layout::TwoStack;
+            app.layout_before = Layout::TwoStack;
+        }
+        "layoutThree" => {
+            app.layout = Layout::Three;
+            app.layout_before = Layout::Three;
+        }
         "toggleLayout" => {
-            app.layout = if app.layout == Layout::Single { Layout::Four } else { Layout::Single };
+            if app.layout == Layout::Single {
+                app.layout = if app.layout_before == Layout::Single { Layout::Four } else { app.layout_before };
+            } else {
+                app.layout_before = app.layout;
+                app.layout = Layout::Single;
+            }
         }
         "outlinerWindow" => app.show_outliner = !app.show_outliner,
         "attributeEditor" => {
@@ -965,6 +1245,36 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "hypershade" => app.win.hypershade = !app.win.hypershade,
         "graphEditor" => app.win.graph_editor = !app.win.graph_editor,
         "dopeSheet" => app.win.dope_sheet = !app.win.dope_sheet,
+        "graphFrameSelected" => app.windows_state.ge_frame = Some(1),
+        "graphFrameAll" => app.windows_state.ge_frame = Some(2),
+        "graphDeleteKey" => crate::windows::delete_selected_keys(app),
+        "graphCopy" => crate::windows::copy_selected_keys(app),
+        "graphPaste" => crate::windows::paste_keys(app),
+        "graphScaleKeys" => {
+            crate::windows::finish_graph_scale(app);
+            app.windows_state.ge_scale = !app.windows_state.ge_scale;
+            app.help = if app.windows_state.ge_scale { "Scale Keys: ON - middle-drag in the graph".into() } else { "Scale Keys: OFF".into() };
+        }
+        "graphSelectKeys" => {
+            crate::windows::finish_graph_scale(app);
+            app.windows_state.ge_scale = false;
+        }
+        "dopeFrameSelected" => crate::windows::dope_frame(app, true),
+        "dopeFrameAll" => crate::windows::dope_frame(app, false),
+        "dopeDeleteKeys" => crate::windows::delete_keys_at_current_time(app),
+        "timelineCopy" => {
+            let (lo, hi) = crate::timeline::key_range(app);
+            crate::timeline::copy_keys(app, lo, hi);
+            app.windows_state.key_clipboard_marker = true;
+            app.windows_state.key_clip_kind = crate::windows::KeyClipKind::Timeline;
+            let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+            app.help = format!("Copied {n} timeline key{}", if n == 1 { "" } else { "s" });
+        }
+        "timelinePaste" => {
+            let n: usize = app.key_clip.iter().map(|c| c.2.len()).sum();
+            crate::timeline::paste_keys(app);
+            app.help = format!("Pasted {n} timeline key{}", if n == 1 { "" } else { "s" });
+        }
         "renderView" => app.win.render_view = !app.win.render_view,
         "renderSettings" => app.win.render_settings = !app.win.render_settings,
         "preferences" => app.win.prefs = !app.win.prefs,
@@ -979,11 +1289,15 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "hypergraph" => {
             app.win.hypergraph = true;
             app.hg.connections = false;
+            app.hg.active_key = None;
+            app.hg.frame_all();
         }
         "hypergraphConnections" => {
             app.win.hypergraph = true;
             app.hg.connections = true;
             app.hg.io = app.s.sel.clone();
+            app.hg.active_key = None;
+            app.hg.frame_all();
         }
         "connectionEditor" => {
             app.win.connection_editor = true;
@@ -997,7 +1311,8 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "about" => app.win.about = true,
         "mergeToCenter" => {
             let mut m = String::new();
-            for id in app.s.hilite() {
+            // mesh-only, as the JS `mergeToCenter` (`kind === 'mesh'`)
+            for id in app.s.hilite().into_iter().filter(|id| app.s.node(id).is_some_and(|n| n.mesh().is_some())) {
                 let v = app.s.comp_verts(&id);
                 if v.len() > 1 {
                     m += &format!("polyMergeVertex -d 1000000 {};\n", v.iter().map(|x| format!("{}.vtx[{x}]", app.s.name_of(&id))).collect::<Vec<_>>().join(" "));
@@ -1037,7 +1352,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
             app.s.set_time(nt);
         }
         "nextKey" | "prevKey" => {
-            let ts = app.s.anim.key_times(&app.s.sel);
+            let ts = app.s.anim_key_times(&app.s.sel);
             let cur = app.s.time.current;
             let t = if id == "nextKey" { ts.iter().copied().find(|&t| t > cur + 1e-6).or(ts.first().copied()) } else { ts.iter().rev().copied().find(|&t| t < cur - 1e-6).or(ts.last().copied()) };
             if let Some(t) = t {
@@ -1055,6 +1370,8 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         "assignNewMaterial" => app.win.assign_material = true,
         "materialAttributes" => crate::panels::show_material_attributes(app),
         "snapGrid" => app.snap_grid = !app.snap_grid,
+    "snapCurve" => app.snap_curve = !app.snap_curve,
+    "snapPoint" => app.snap_point = !app.snap_point,
         "manipBigger" | "manipSmaller" => {
             let f = if id == "manipBigger" { 1.15 } else { 1.0 / 1.15 };
             app.manip_size = (app.manip_size * f).clamp(0.2, 4.0);
@@ -1066,7 +1383,17 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
                 app.set_tool(Tool::Move);
             }
         }
-        "toggleWorld" => app.world_space = !app.world_space,
+        "toggleWorld" => {
+            let t = app.manip_tool();
+            app.set_space_world(t, !app.space_world(t));
+        }
+        "deleteSel" => {
+            // Graph nodes in the shared Hypershade/Hypergraph selection.
+            let ids = hypershade_selection(app);
+            if !ids.is_empty() {
+                crate::hypershade::delete_graph_nodes(app, &ids);
+            }
+        }
         "toggleHistory" => app.history_on = !app.history_on,
         "toggleShelf" => app.set_shown("shelf", !app.shown("shelf")),
         "toggleTimeline" => app.set_shown("timeslider", !app.shown("timeslider")),
@@ -1084,7 +1411,8 @@ pub fn hotkey(key: Key, m: Modifiers, app: &IncaApp) -> Option<&'static str> {
     if crate::mesh_tools::is_mesh_tool(app.tool) {
         match key {
             Key::Enter => return Some("finishTool"),
-            Key::Backspace if !app.mesh_tool.cut.is_empty() || !app.mesh_tool.dots.is_empty() => return Some("toolUndoPoint"),
+            // Maya uses both Backspace and Delete to remove the last Multi-Cut/Quad Draw point.
+            Key::Backspace | Key::Delete if !app.mesh_tool.cut.is_empty() || !app.mesh_tool.dots.is_empty() => return Some("toolUndoPoint"),
             Key::Escape => return Some("cancelTool"),
             _ => {}
         }
@@ -1120,6 +1448,9 @@ pub fn hotkey(key: Key, m: Modifiers, app: &IncaApp) -> Option<&'static str> {
         (Key::S, true, false, _) => "saveScene",
         (Key::S, true, true, _) => "saveSceneAs",
         (Key::Q, true, false, _) => "quit",
+        (Key::Z, false, false, true) => "undoView",
+        (Key::Y, false, false, true) => "redoView",
+        (Key::Home, false, false, true) => "defaultView",
         (Key::Z, true, false, _) => "undo",
         (Key::Z, true, true, _) | (Key::Y, true, _, _) => "redo",
         (Key::C, true, _, _) => "copy",
@@ -1143,6 +1474,10 @@ pub fn hotkey(key: Key, m: Modifiers, app: &IncaApp) -> Option<&'static str> {
         (Key::E, true, _, _) => "extrude",
         (Key::B, true, _, _) => "bevel",
         (Key::B, false, false, false) => "softSelect",
+        (Key::D, false, false, false) => "pivotEdit",
+        (Key::X, false, false, false) => "snapGrid",
+        (Key::C, false, false, false) => "snapCurve",
+        (Key::V, false, false, false) => "snapPoint",
         (Key::Equals | Key::Plus, false, _, false) => "manipBigger",
         (Key::Minus, false, false, false) => "manipSmaller",
         (Key::Q, false, true, false) => "componentTypeCycle",
@@ -1159,6 +1494,7 @@ pub fn hotkey(key: Key, m: Modifiers, app: &IncaApp) -> Option<&'static str> {
         (Key::E, false, false, false) => "rotateTool",
         (Key::R, false, false, false) => "scaleTool",
         (Key::Y, false, false, false) => "lastToolUsed",
+        (Key::T, false, false, false) => "manipulatorTool",
         (Key::W, false, true, _) => "keyTranslate",
         (Key::E, false, true, _) => "keyRotate",
         (Key::R, false, true, _) => "keyScale",

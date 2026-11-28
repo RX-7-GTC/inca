@@ -50,6 +50,154 @@ pub struct PolyMesh {
     pub display_edges: Option<Vec<[u32; 2]>>,
 }
 
+/// One triangle of a BVH: its corners and the face it belongs to.
+struct BvhTri {
+    face: u32,
+    v: [u32; 3],
+    /// centroid, used for the split
+    c: DVec3,
+}
+
+struct BvhNode {
+    min: DVec3,
+    max: DVec3,
+    /// first triangle (leaf) or unused (inner node)
+    start: u32,
+    /// triangles in a leaf, 0 for an inner node
+    count: u32,
+    /// right child of an inner node (the left child follows it directly), `u32::MAX` in a leaf
+    right: u32,
+}
+
+/// Bounding volume hierarchy over a mesh's triangles. `PolyMesh::raycast` scans every face,
+/// which takes ~60 ms on a 400k-face mesh; face picking uses this instead (cached per
+/// revision by the viewport).
+pub struct TriBvh {
+    nodes: Vec<BvhNode>,
+    tris: Vec<BvhTri>,
+}
+
+const BVH_LEAF: usize = 8;
+
+impl TriBvh {
+    pub fn build(pm: &PolyMesh) -> Self {
+        let mut tris = Vec::with_capacity(pm.tri_count());
+        for (fi, f) in pm.f.iter().enumerate() {
+            if f.len() < 3 {
+                continue;
+            }
+            let mut push = |c: [u32; 3]| {
+                let (a, b, d) = (pm.v[c[0] as usize], pm.v[c[1] as usize], pm.v[c[2] as usize]);
+                tris.push(BvhTri { face: fi as u32, v: c, c: (a + b + d) / 3.0 });
+            };
+            // triangles and quads are the overwhelming majority: fan them without an allocation
+            if f.len() == 3 {
+                push([f[0], f[1], f[2]]);
+            } else if f.len() == 4 {
+                push([f[0], f[1], f[2]]);
+                push([f[0], f[2], f[3]]);
+            } else {
+                for t in pm.triangulate_face(fi) {
+                    push([f[t[0]], f[t[1]], f[t[2]]]);
+                }
+            }
+        }
+        let mut nodes = Vec::new();
+        if !tris.is_empty() {
+            build_node(pm, &mut tris, 0, &mut nodes);
+        }
+        TriBvh { nodes, tris }
+    }
+
+    pub fn tri_count(&self) -> usize {
+        self.tris.len()
+    }
+
+    /// Nearest triangle hit: (distance along the ray, face index).
+    pub fn raycast(&self, pm: &PolyMesh, r: &Ray, cull_back: bool) -> Option<(f64, usize)> {
+        let root = self.nodes.first()?;
+        slab(r, root.min, root.max, f64::INFINITY)?;
+        let mut best: Option<(f64, usize)> = None;
+        let mut stack = vec![0u32];
+        while let Some(ni) = stack.pop() {
+            let n = &self.nodes[ni as usize];
+            if slab(r, n.min, n.max, best.map_or(f64::INFINITY, |b| b.0)).is_none() {
+                continue;
+            }
+            if n.right == u32::MAX {
+                let s = n.start as usize;
+                for t in &self.tris[s..s + n.count as usize] {
+                    let (a, b, c) = (pm.v[t.v[0] as usize], pm.v[t.v[1] as usize], pm.v[t.v[2] as usize]);
+                    if let Some(d) = crate::math::ray_triangle(r, a, b, c, cull_back) {
+                        if best.is_none_or(|(bt, _)| d < bt) {
+                            best = Some((d, t.face as usize));
+                        }
+                    }
+                }
+            } else {
+                // visit the near side first; it only changes the order, not the result
+                stack.push(n.right);
+                stack.push(ni + 1);
+            }
+        }
+        best
+    }
+}
+
+fn build_node(pm: &PolyMesh, tris: &mut [BvhTri], base: usize, nodes: &mut Vec<BvhNode>) -> usize {
+    let (mut mn, mut mx) = (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY));
+    for t in tris.iter() {
+        for &i in &t.v {
+            let p = pm.v[i as usize];
+            mn = mn.min(p);
+            mx = mx.max(p);
+        }
+    }
+    let ni = nodes.len();
+    nodes.push(BvhNode { min: mn, max: mx, start: base as u32, count: tris.len() as u32, right: u32::MAX });
+    if tris.len() <= BVH_LEAF {
+        return ni;
+    }
+    let ext = mx - mn;
+    let axis = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
+    let mid = tris.len() / 2;
+    tris.select_nth_unstable_by(mid, |a, b| a.c[axis].total_cmp(&b.c[axis]));
+    let (l, r) = tris.split_at_mut(mid);
+    build_node(pm, l, base, nodes);
+    let right = build_node(pm, r, base + mid, nodes);
+    nodes[ni].right = right as u32;
+    ni
+}
+
+/// Slab test: entry/exit distance of the ray through an axis-aligned box, clipped to `max_t`.
+fn slab(r: &Ray, mn: DVec3, mx: DVec3, max_t: f64) -> Option<(f64, f64)> {
+    let (mut t0, mut t1) = (0.0f64, max_t);
+    for k in 0..3 {
+        let (o, d) = (r.origin[k], r.dir[k]);
+        if d.abs() < 1e-12 {
+            if o < mn[k] || o > mx[k] {
+                return None;
+            }
+        } else {
+            let inv = 1.0 / d;
+            let (mut a, mut b) = ((mn[k] - o) * inv, (mx[k] - o) * inv);
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if a > t0 {
+                t0 = a;
+            }
+            if b < t1 {
+                t1 = b;
+            }
+            if t0 > t1 {
+                return None;
+            }
+        }
+    }
+    Some((t0, t1))
+}
+
 /// Edge/face adjacency, computed on demand.
 #[derive(Clone, Debug, Default)]
 pub struct Topo {
@@ -146,7 +294,19 @@ impl PolyMesh {
     }
 
     pub fn face_normal(&self, fi: usize) -> DVec3 {
-        newell(&self.f[fi].iter().map(|&i| self.v[i as usize]).collect::<Vec<_>>())
+        // the Newell sum straight from the vertex indices: this is called per face on
+        // every component overlay, so the old collect-into-a-Vec allocated 400k times
+        let f = &self.f[fi];
+        let k = f.len();
+        let mut n = DVec3::ZERO;
+        for i in 0..k {
+            let a = self.v[f[i] as usize];
+            let b = self.v[f[(i + 1) % k] as usize];
+            n.x += (a.y - b.y) * (a.z + b.z);
+            n.y += (a.z - b.z) * (a.x + b.x);
+            n.z += (a.x - b.x) * (a.y + b.y);
+        }
+        n * 0.5
     }
     pub fn face_center(&self, fi: usize) -> DVec3 {
         let f = &self.f[fi];
@@ -246,6 +406,11 @@ impl PolyMesh {
             }
         }
         best
+    }
+
+    /// Build a triangle BVH for fast ray picking (the JS app's three-mesh-bvh).
+    pub fn tri_bvh(&self) -> TriBvh {
+        TriBvh::build(self)
     }
 
     pub fn transformed(&self, m: &DMat4) -> PolyMesh {
@@ -762,9 +927,16 @@ pub fn op_bevel(pm: &PolyMesh, edges: &[(u32, u32)], fraction: f64) -> OpOut {
 /// Walk the edge ring (across quads) starting at edge (a,b). Returns directed ring edges,
 /// all oriented the same way as (a,b).
 pub fn edge_ring(pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> Vec<(u32, u32)> {
-    let Some(e0) = topo.edge(a, b) else { return vec![(a, b)] };
+    edge_ring_faces(pm, topo, a, b).0
+}
+
+/// The edge ring through (a,b) and the quad faces it crosses (the JS `edgeRing`).
+pub fn edge_ring_faces(pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> (Vec<(u32, u32)>, Vec<usize>) {
+    let Some(e0) = topo.edge(a, b) else { return (vec![(a, b)], vec![]) };
     let mut seen_e = HashSet::new();
     seen_e.insert(epair(a, b));
+    let mut seen_f = HashSet::new();
+    let mut faces = vec![];
     let mut sides: Vec<Vec<(u32, u32)>> = vec![];
     for &start_f in topo.edge_faces[e0].iter().take(2) {
         let mut cur = (a, b);
@@ -774,6 +946,9 @@ pub fn edge_ring(pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> Vec<(u32, u32)> 
             let face = &pm.f[f];
             if face.len() != 4 {
                 break;
+            }
+            if seen_f.insert(f) {
+                faces.push(f);
             }
             let i = face.iter().position(|&x| x == cur.0).unwrap();
             let j = face.iter().position(|&x| x == cur.1).unwrap();
@@ -801,7 +976,101 @@ pub fn edge_ring(pm: &PolyMesh, topo: &Topo, a: u32, b: u32) -> Vec<(u32, u32)> 
     if let Some(s) = sides.first() {
         ring.extend(s.iter().copied());
     }
-    ring
+    (ring, faces)
+}
+
+/// Path from `start` to `end` along the edge ring, both inclusive. None when they are not on
+/// the same ring.
+pub fn edge_ring_path(pm: &PolyMesh, topo: &Topo, start: (u32, u32), end: (u32, u32)) -> Option<Vec<(u32, u32)>> {
+    let start = epair(start.0, start.1);
+    let end = epair(end.0, end.1);
+    if start == end {
+        return Some(vec![start]);
+    }
+    let ring: Vec<(u32, u32)> = edge_ring(pm, topo, start.0, start.1).into_iter().map(|(a, b)| epair(a, b)).collect();
+    let si = ring.iter().position(|e| *e == start)?;
+    let ei = ring.iter().position(|e| *e == end)?;
+    let forward = |lo: usize, hi: usize| -> Vec<(u32, u32)> { ring[lo..=hi].to_vec() };
+    let slice = if si <= ei { forward(si, ei) } else { forward(ei, si).into_iter().rev().collect() };
+    // On a closed ring the other arc is the complement; pick the shorter one.
+    let first = topo.edge(ring[0].0, ring[0].1);
+    let last = topo.edge(ring[ring.len() - 1].0, ring[ring.len() - 1].1);
+    let closed = ring.len() > 2 && matches!((first, last), (Some(a), Some(b)) if topo.edge_faces[a].iter().any(|f| topo.edge_faces[b].contains(f)));
+    if !closed {
+        return Some(slice);
+    }
+    let other: Vec<(u32, u32)> = if si <= ei {
+        ring[..=si].iter().rev().chain(ring[ei..].iter().rev()).copied().collect()
+    } else {
+        ring[si..].iter().chain(ring[..=ei].iter()).copied().collect()
+    };
+    Some(if other.len() < slice.len() { other } else { slice })
+}
+
+/// One step along an edge loop from p -> c. Borders follow the rim; interior edges need a
+/// 4-valent vertex and continue through the edge that shares no face with the current one.
+fn loop_step(topo: &Topo, p: u32, c: u32) -> Option<u32> {
+    let ce = topo.edge(p, c)?;
+    if topo.edge_faces[ce].len() == 1 {
+        let mut borders = topo.vert_edges[c as usize]
+            .iter()
+            .filter(|&&e| topo.edge_faces[e].len() == 1)
+            .map(|&e| {
+                let (x, y) = topo.edges[e];
+                if x == c { y } else { x }
+            })
+            .filter(|&n| n != p);
+        let n = borders.next()?;
+        return borders.next().is_none().then_some(n);
+    }
+    if topo.vert_edges[c as usize].len() != 4 {
+        return None;
+    }
+    let cf: HashSet<usize> = topo.edge_faces[ce].iter().copied().collect();
+    let mut nxt = None;
+    for &e in &topo.vert_edges[c as usize] {
+        let (x, y) = topo.edges[e];
+        if e == ce {
+            continue;
+        }
+        if topo.edge_faces[e].iter().all(|f| !cf.contains(f)) {
+            nxt = Some(if x == c { y } else { x });
+        }
+    }
+    nxt
+}
+
+/// Path from `start` to `end` along the edge loop, both inclusive. None when they are not on
+/// the same loop.
+pub fn edge_loop_path(topo: &Topo, start: (u32, u32), end: (u32, u32)) -> Option<Vec<(u32, u32)>> {
+    let start = epair(start.0, start.1);
+    let end = epair(end.0, end.1);
+    if start == end {
+        return Some(vec![start]);
+    }
+    let mut best: Option<Vec<(u32, u32)>> = None;
+    for (from, to) in [(start.0, start.1), (start.1, start.0)] {
+        let mut path = vec![start];
+        let mut seen: HashSet<(u32, u32)> = path.iter().copied().collect();
+        let (mut p, mut c) = (from, to);
+        loop {
+            let Some(n) = loop_step(topo, p, c) else { break };
+            let e = epair(c, n);
+            if !seen.insert(e) {
+                break;
+            }
+            path.push(e);
+            if e == end {
+                if best.as_ref().is_none_or(|b| path.len() < b.len()) {
+                    best = Some(path);
+                }
+                break;
+            }
+            p = c;
+            c = n;
+        }
+    }
+    best
 }
 
 /// Edge loop through the edge (a,b): continue through 4-valent vertices.
@@ -1042,6 +1311,8 @@ pub fn op_chamfer_vertex(pm: &PolyMesh, verts: &[u32], width: f64) -> OpOut {
 pub enum SplitPoint {
     Vertex(u32),
     Edge(u32, u32, f64),
+    /// A new vertex inside a face, in object space.
+    Face(usize, DVec3),
 }
 
 /// Split a face between two of its vertices; false when they are neighbours.
@@ -1074,12 +1345,16 @@ fn split_face(m: &mut PolyMesh, fi: usize, u: u32, w: u32) -> bool {
 
 /// Connect: cut edges at the given points and join consecutive points across their shared faces (JS opSplit).
 pub fn op_split(pm: &PolyMesh, points: &[SplitPoint]) -> OpOut {
+    if points.iter().any(|p| matches!(p, SplitPoint::Face(..))) {
+        return op_split_faces(pm, points);
+    }
     let mut m = pm.clone();
     let mut made: HashMap<(u32, u32), u32> = HashMap::new();
     let mut ids = vec![];
     for p in points {
         match *p {
             SplitPoint::Vertex(v) => ids.push(v),
+            SplitPoint::Face(..) => unreachable!("face points use op_split_faces"),
             SplitPoint::Edge(a, b, t) => {
                 let key = epair(a, b);
                 let t = if a < b { t } else { 1.0 - t };
@@ -1126,6 +1401,128 @@ pub fn op_split(pm: &PolyMesh, points: &[SplitPoint]) -> OpOut {
         }
     }
     OpOut { mesh: m, select_edges: Some(pairs), ..Default::default() }
+}
+
+/// Insert a vertex at parameter `t` on edge `a-b`, adding it to every face using the edge.
+fn insert_edge_vertex(m: &mut PolyMesh, pm: &PolyMesh, a: u32, b: u32, t: f64, made: &mut HashMap<(u32, u32), u32>) -> u32 {
+    let key = epair(a, b);
+    let t = if a < b { t } else { 1.0 - t };
+    *made.entry(key).or_insert_with(|| {
+        m.v.push(pm.v[key.0 as usize].lerp(pm.v[key.1 as usize], t));
+        let nv = (m.v.len() - 1) as u32;
+        for fi in 0..m.f.len() {
+            let f = m.f[fi].clone();
+            let n = f.len();
+            for i in 0..n {
+                let (x, y) = (f[i], f[(i + 1) % n]);
+                if epair(x, y) == key {
+                    let mut nf = f.clone();
+                    nf.insert(i + 1, nv);
+                    m.f[fi] = nf;
+                    if let Some(all) = &mut m.uv {
+                        if let Some(Some(u)) = all.get_mut(fi) {
+                            let w = if x == key.0 { t } else { 1.0 - t };
+                            let nu = u[i].lerp(u[(i + 1) % n], w);
+                            u.insert(i + 1, nu);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        nv
+    })
+}
+
+/// Split a face along a polyline that passes through interior face points. A run is bounded by
+/// two vertices on the face: [A, P1..Pn, B] replaces the face with A..B + Pn..P1 and B..A + P1..Pn.
+fn op_split_faces(pm: &PolyMesh, points: &[SplitPoint]) -> OpOut {
+    #[derive(Clone, Copy)]
+    enum Node {
+        Boundary(u32),
+        Face(usize, DVec3),
+    }
+    let mut m = pm.clone();
+    let mut made: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut nodes = vec![];
+    for p in points {
+        match *p {
+            SplitPoint::Vertex(v) => nodes.push(Node::Boundary(v)),
+            SplitPoint::Edge(a, b, t) => nodes.push(Node::Boundary(insert_edge_vertex(&mut m, pm, a, b, t, &mut made))),
+            SplitPoint::Face(fi, q) => nodes.push(Node::Face(fi, q)),
+        }
+    }
+    let mut i = 0;
+    while i < nodes.len() {
+        let fi = match nodes[i] {
+            Node::Face(fi, _) => fi,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let start = i;
+        let mut end = i + 1;
+        while end < nodes.len() && matches!(nodes[end], Node::Face(f, _) if f == fi) {
+            end += 1;
+        }
+        let prev = if start > 0 {
+            match nodes[start - 1] {
+                Node::Boundary(v) => Some(v),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let next = nodes.get(end).and_then(|n| match n {
+            Node::Boundary(v) => Some(*v),
+            _ => None,
+        });
+        if let (Some(a), Some(b)) = (prev, next) {
+            if fi < m.f.len() && a != b {
+                let face = m.f[fi].clone();
+                if let (Some(ia), Some(ib)) = (face.iter().position(|&v| v == a), face.iter().position(|&v| v == b)) {
+                    if ia != ib {
+                        let n = face.len();
+                        let walk = |s: usize, e: usize| {
+                            let mut out = vec![s];
+                            let mut j = s;
+                            while j != e {
+                                j = (j + 1) % n;
+                                out.push(j);
+                            }
+                            out
+                        };
+                        let path: Vec<u32> = (start..end)
+                            .map(|k| match nodes[k] {
+                                Node::Face(_, p) => {
+                                    m.v.push(p);
+                                    (m.v.len() - 1) as u32
+                                }
+                                _ => unreachable!(),
+                            })
+                            .collect();
+                        let c1 = walk(ia, ib);
+                        let c2 = walk(ib, ia);
+                        let mut f1: Vec<u32> = c1.iter().map(|&k| face[k]).collect();
+                        f1.extend(path.iter().rev().copied());
+                        let mut f2: Vec<u32> = c2.iter().map(|&k| face[k]).collect();
+                        f2.extend(path.iter().copied());
+                        let mat = m.face_mat(fi).cloned();
+                        m.f[fi] = f1;
+                        if let Some(all) = &mut m.uv {
+                            if fi < all.len() {
+                                all[fi] = None;
+                            }
+                        }
+                        m.add_face(f2, None, mat);
+                    }
+                }
+            }
+        }
+        i = end;
+    }
+    OpOut { mesh: m, ..Default::default() }
 }
 
 pub fn op_delete_faces(pm: &PolyMesh, faces: &[usize]) -> PolyMesh {
@@ -1717,6 +2114,19 @@ mod chamfer_split_tests {
         assert_eq!(r.select_edges.unwrap().len(), 1);
         assert!(r.mesh.boundary_loops().is_empty());
     }
+
+    #[test]
+    fn face_point_between_two_vertices_splits_a_face() {
+        let pm = cube();
+        let f = pm.f[0].clone();
+        let p = (pm.v[f[0] as usize] + pm.v[f[2] as usize]) * 0.5;
+        let r = op_split(&pm, &[SplitPoint::Vertex(f[0]), SplitPoint::Face(0, p), SplitPoint::Vertex(f[2])]);
+        assert_eq!(r.mesh.f.len(), pm.f.len() + 1, "one face becomes two");
+        assert_eq!(r.mesh.v.len(), pm.v.len() + 1, "the interior point is a new vertex");
+        let newv = (r.mesh.v.len() - 1) as u32;
+        assert!(r.mesh.f[0].contains(&newv));
+        assert!(r.mesh.boundary_loops().is_empty(), "the mesh stays closed");
+    }
 }
 
 #[cfg(test)]
@@ -1743,6 +2153,38 @@ mod tests {
     }
 
     #[test]
+    fn bvh_matches_brute_force_raycast() {
+        let mut p = serde_json::Map::new();
+        p.insert("subdivisionsAxis".into(), serde_json::json!(12));
+        p.insert("subdivisionsHeight".into(), serde_json::json!(8));
+        let m = primitives::generate("polySphere", &p).unwrap();
+        let b = m.tri_bvh();
+        assert_eq!(b.tri_count(), m.tri_count());
+        let mut hits = 0;
+        for i in 0..64 {
+            let a = i as f64 * 0.37;
+            let d = DVec3::new(a.cos(), (a * 1.7).sin(), (a * 0.9).cos()).normalize();
+            let r = Ray { origin: d * 3.0, dir: -d };
+            for cull in [false, true] {
+                let brute = m.raycast(&r, cull);
+                let fast = b.raycast(&m, &r, cull);
+                let (bt, bf) = brute.unwrap();
+                let (ft, ff) = fast.unwrap();
+                assert_eq!(bf, ff);
+                assert!((bt - ft).abs() < 1e-9);
+            }
+            hits += 1;
+        }
+        assert_eq!(hits, 64);
+        // a ray that misses the mesh entirely
+        let r = Ray { origin: DVec3::new(0.0, 0.0, 5.0), dir: DVec3::new(1.0, 0.0, 0.0) };
+        assert_eq!(b.raycast(&m, &r, false), None);
+        assert_eq!(m.raycast(&r, false), None);
+        // an empty mesh builds an empty tree
+        assert_eq!(PolyMesh::default().tri_bvh().raycast(&m, &r, false), None);
+    }
+
+    #[test]
     fn extrude_keeps_closed() {
         let c = cube();
         let r = op_extrude_faces(&c, &[0], &ExtrudeParams { local_translate_z: 1.0, ..Default::default() });
@@ -1760,6 +2202,23 @@ mod tests {
     }
 
     #[test]
+    fn edge_ring_reports_its_faces() {
+        let c = cube();
+        let topo = c.topo();
+        let (a, b) = topo.edges[0];
+        let (ring, faces) = edge_ring_faces(&c, &topo, a, b);
+        assert_eq!(ring, edge_ring(&c, &topo, a, b));
+        // a cube edge ring crosses the four quads around it (the JS `edgeRing().faces`)
+        let mut fs = faces.clone();
+        fs.sort_unstable();
+        fs.dedup();
+        assert_eq!(fs.len(), 4);
+        for f in fs {
+            assert_eq!(c.f[f].len(), 4);
+        }
+    }
+
+    #[test]
     fn edge_loop_insert() {
         let c = cube();
         let f0 = &c.f[0];
@@ -1767,6 +2226,25 @@ mod tests {
         assert_eq!(r.mesh.f.len(), 10);
         assert!(is_closed(&r.mesh));
         assert!((r.mesh.signed_volume() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn partial_edge_ring_between_two_edges() {
+        let c = cube();
+        let topo = c.topo();
+        let (a, b) = topo.edges[0];
+        let ring = edge_ring(&c, &topo, a, b);
+        let start = epair(a, b);
+        let end = epair(ring.last().unwrap().0, ring.last().unwrap().1);
+        let path = edge_ring_path(&c, &topo, start, end).unwrap();
+        assert_eq!(path.first(), Some(&start));
+        assert_eq!(path.last(), Some(&end));
+        assert!(path.len() >= 2);
+        // the shorter arc between neighbouring ring edges is just the two of them
+        let si = ring.iter().position(|e| epair(e.0, e.1) == start).unwrap();
+        let next = ring[(si + 1) % ring.len()];
+        let short = edge_ring_path(&c, &topo, start, epair(next.0, next.1)).unwrap();
+        assert_eq!(short.len(), 2);
     }
 
     #[test]
@@ -1834,5 +2312,11 @@ mod border_loop_tests {
         let l = edge_loop(&pm, &topo, a, b);
         assert_eq!(l.len(), 20, "the full 20-edge rim");
         assert!(l.iter().all(|&(x, y)| topo.edge(x, y).is_some_and(|e| topo.edge_faces[e].len() == 1)));
+        let path = edge_loop_path(&topo, l[0], l[10]).unwrap();
+        assert_eq!(path.first(), Some(&l[0]));
+        assert_eq!(path.last(), Some(&l[10]));
+        assert_eq!(path.len(), 11);
+        // a closed loop takes the shorter arc, not the long way around
+        assert_eq!(edge_loop_path(&topo, l[0], l[2]).unwrap().len(), 3);
     }
 }

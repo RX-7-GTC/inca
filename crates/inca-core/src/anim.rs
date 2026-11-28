@@ -1,5 +1,6 @@
 //! Keyframe animation: anim curves with Maya-style tangents and infinity modes.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 pub const TANGENTS: &[&str] = &["auto", "spline", "clamped", "linear", "flat", "step", "plateau", "fixed"];
@@ -10,6 +11,75 @@ fn auto() -> String {
 }
 fn constant() -> String {
     "constant".into()
+}
+pub fn ghost_red() -> [f32; 3] {
+    [0.85, 0.10, 0.10]
+}
+
+/// One animation layer above BaseAnimation. Curves are keyed by "nodeId.attr", like `Anim`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AnimLayer {
+    pub id: String,
+    pub name: String,
+    /// Animated layer weight. Empty keys means the node's `weight` attribute is used.
+    #[serde(default)]
+    pub weight_curve: AnimCurve,
+    /// Objects explicitly assigned to the layer.
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Attributes assigned to the layer, keyed "node.attr".
+    #[serde(default)]
+    pub attrs: Vec<String>,
+    /// Parent layer in the stack; None = top level.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Legacy curve storage from before layer curves became `animCurve` dependency nodes.
+    /// `Scene::ensure_anim_layer_nodes` moves these into nodes and clears the map.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub curves: IndexMap<String, AnimCurve>,
+}
+
+impl AnimLayer {
+    /// Whether this layer owns `node.attr`. Old scenes without an attribute list keep
+    /// their object-level membership until the loader migrates them.
+    pub fn has_attr(&self, node: &str, attr: &str) -> bool {
+        let key = Anim::key(node, attr);
+        if self.attrs.is_empty() && !self.members.is_empty() {
+            return self.members.iter().any(|m| m == node);
+        }
+        self.attrs.iter().any(|a| a == &key)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MergeLayerMode {
+    #[default]
+    Automatic,
+    Additive,
+    Override,
+}
+
+/// Options shared by Merge Layers and its option box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeLayerOptions {
+    /// Merge child layers of a selected layer even when they are not selected.
+    pub include_children: bool,
+    pub result_mode: MergeLayerMode,
+    pub delete_layers: bool,
+    /// Sample every N frames when Smart Bake is off.
+    pub sample_by: u32,
+    /// Put result keys only where the source curves have keys.
+    pub smart_bake: bool,
+    /// Add keys between source keys when the blended shape deviates too far.
+    pub increase_fidelity: bool,
+    /// Allowed deviation percentage for Increase Fidelity.
+    pub fidelity_tolerance: u32,
+}
+
+impl Default for MergeLayerOptions {
+    fn default() -> Self {
+        Self { include_children: true, result_mode: MergeLayerMode::Automatic, delete_layers: true, sample_by: 1, smart_bake: false, increase_fidelity: false, fidelity_tolerance: 1 }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -25,6 +95,9 @@ pub struct Key {
     pub is: f64,
     #[serde(default)]
     pub os: f64,
+    /// A breakdown key: moved with its neighbours rather than independently.
+    #[serde(default)]
+    pub breakdown: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -36,11 +109,20 @@ pub struct AnimCurve {
     pub pre: String,
     #[serde(default = "constant")]
     pub post: String,
+    /// Muted animation curves are not evaluated during playback.
+    #[serde(default)]
+    pub mute: bool,
+}
+
+impl Default for AnimCurve {
+    fn default() -> Self {
+        Self::new("", "weight")
+    }
 }
 
 impl AnimCurve {
     pub fn new(node: &str, attr: &str) -> Self {
-        AnimCurve { node: node.into(), attr: attr.into(), keys: vec![], pre: constant(), post: constant() }
+        AnimCurve { node: node.into(), attr: attr.into(), keys: vec![], pre: constant(), post: constant(), mute: false }
     }
     pub fn find(&self, t: f64) -> Option<usize> {
         self.keys.iter().position(|k| (k.t - t).abs() < 1e-4)
@@ -51,9 +133,14 @@ impl AnimCurve {
             return i;
         }
         let ot = if tangent == "step" { "step" } else { tangent };
-        self.keys.push(Key { t, v, it: tangent.into(), ot: ot.into(), is: 0.0, os: 0.0 });
+        self.keys.push(Key { t, v, it: tangent.into(), ot: ot.into(), is: 0.0, os: 0.0, breakdown: false });
         self.sort();
         self.find(t).unwrap()
+    }
+    pub fn set_breakdown(&mut self, t: f64, v: f64, tangent: &str) -> usize {
+        let i = self.set_key(t, v, tangent);
+        self.keys[i].breakdown = true;
+        i
     }
     pub fn sort(&mut self) {
         self.keys.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
