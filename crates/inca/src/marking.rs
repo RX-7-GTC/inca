@@ -46,6 +46,22 @@ pub enum Act {
     BreakWire(crate::hypershade::ConnWire),
     IsolateWire(crate::hypershade::ConnWire),
     SelectWire(crate::hypershade::ConnWire),
+    /// Edit Pivot marking menu (RMB in pivot mode)
+    Pivot(PivotAct),
+}
+
+/// Items of Maya's Edit Pivot marking menu.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PivotAct {
+    PinComponentPivot,
+    SnapOrientation,
+    SnapPosition,
+    ShowOrientationHandle,
+    Exit,
+    ResetOrientation,
+    ResetPosition,
+    Reset,
+    BakeOrientation,
 }
 
 #[derive(Clone)]
@@ -102,6 +118,13 @@ fn menu(pos: Pos2, vp: usize, button: egui::PointerButton, title: Option<String>
 pub fn open_rmb(app: &mut IncaApp, idx: usize, cv: &CamView, pos: Pos2, mods: egui::Modifiers, now: f64) {
     let r = egui::PointerButton::Secondary;
     let vp = app.vps[idx].clone();
+    // Edit Pivot (D): Maya's pivot marking menu, whatever is under the cursor
+    if app.pivot_mode && app.s.comp_mode.is_none() {
+        app.marking_target = None;
+        let (radial, list) = pivot_menu_items(app);
+        app.marking = Some(menu(pos, idx, r, None, radial, list, now));
+        return;
+    }
     // Shift+RMB: tool menus per component mode
     if mods.shift && !mods.ctrl {
         let (radial, list): (Vec<(&'static str, Item)>, Vec<Option<Item>>) = match app.s.comp_mode {
@@ -272,6 +295,27 @@ fn paint_popup_frame(p: &egui::Painter, rect: Rect, visuals: &egui::Visuals) {
     p.rect_stroke(rect, visuals.menu_corner_radius, visuals.window_stroke, egui::StrokeKind::Inside);
 }
 
+/// Maya's Edit Pivot marking menu: the toggles around the cursor, the resets below and Bake
+/// Pivot Orientation in the list.
+pub(crate) fn pivot_menu_items(app: &IncaApp) -> (Vec<(&'static str, Item)>, Vec<Option<Item>>) {
+    let pe = &app.pivot_edit;
+    let pin = it("Pin Component Pivot", Act::Pivot(PivotAct::PinComponentPivot));
+    // Maya: pinning needs a custom pivot to pin
+    let pin = if pe.pinned || crate::vp_ui::has_custom_pivot(app) { checked(pin, pe.pinned) } else { disabled(checked(pin, false)) };
+    let radial = vec![
+        ("N", pin),
+        ("NW", checked(it("Snap Pivot Orientation", Act::Pivot(PivotAct::SnapOrientation)), pe.snap_orientation)),
+        ("NE", checked(it("Snap Pivot Position", Act::Pivot(PivotAct::SnapPosition)), pe.snap_position)),
+        ("W", checked(it("Show Orientation Handle", Act::Pivot(PivotAct::ShowOrientationHandle)), pe.show_orientation_handle)),
+        ("E", it("Exit", Act::Pivot(PivotAct::Exit))),
+        ("SW", it("Reset Pivot Orientation", Act::Pivot(PivotAct::ResetOrientation))),
+        ("SE", it("Reset Pivot Position", Act::Pivot(PivotAct::ResetPosition))),
+        ("S", it("Reset Pivot", Act::Pivot(PivotAct::Reset))),
+    ];
+    let list = vec![Some(checked(it("Bake Pivot Orientation", Act::Pivot(PivotAct::BakeOrientation)), pe.bake_orientation))];
+    (radial, list)
+}
+
 fn run(app: &mut IncaApp, act: Act) {
     let vp = app.marking.as_ref().map(|m| m.vp).unwrap_or(app.active_vp);
     // menus opened over an object act on it
@@ -341,6 +385,7 @@ fn run(app: &mut IncaApp, act: Act) {
         Act::ResetActive => {
             app.vp_state.reset_active_handle(app.tool);
         }
+        Act::Pivot(p) => crate::vp_ui::pivot_menu_action(app, p),
         Act::ResetTool => {
             // JS Reset Tool: move goes back to world, rotate and scale to object space; this
             // tool's discrete flag and step reset (the grid toggle and other tools' steps stay)
@@ -772,3 +817,34 @@ pub fn show(app: &mut IncaApp, ctx: &egui::Context) {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RMB in Edit Pivot opens Maya's pivot menu, even over an object, and without a target
+    /// object that a command could select; outside Edit Pivot the object menu comes back.
+    #[test]
+    fn rmb_in_edit_pivot_opens_the_pivot_menu() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let idx = app.active_vp;
+        app.vps[idx].rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let cam = app.vps[idx].camera.clone();
+        let cv = viewport::cam_view(&app.s, &cam, [800.0, 600.0]);
+        let on_cube = cv.project(glam::DVec3::ZERO, app.vps[idx].rect).unwrap();
+        app.pivot_mode = true;
+        open_rmb(&mut app, idx, &cv, on_cube, egui::Modifiers::NONE, 0.0);
+        let m = app.marking.take().expect("a menu opens");
+        let labels: Vec<&str> = m.radial.iter().map(|(_, i)| i.label.as_str()).collect();
+        assert!(labels.contains(&"Snap Pivot Orientation") && labels.contains(&"Reset Pivot") && labels.contains(&"Exit"), "{labels:?}");
+        assert!(app.marking_target.is_none());
+        app.pivot_mode = false;
+        open_rmb(&mut app, idx, &cv, on_cube, egui::Modifiers::NONE, 0.0);
+        let m = app.marking.take().expect("a menu opens");
+        assert!(!m.radial.iter().any(|(_, i)| i.label == "Snap Pivot Orientation"));
+    }
+}

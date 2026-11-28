@@ -1861,6 +1861,33 @@ impl Scene {
         n.xf.p = np;
         self.touch();
     }
+    /// World rotation of the object's axis frame: parent * jointOrient * rotateAxis * rotate. With
+    /// no rotate axis this is the object's own world rotation; a rotate axis turns the frame
+    /// (the manipulator's object axes) without turning the object.
+    pub fn axis_frame(&self, id: &str) -> DQuat {
+        let Some(n) = self.nodes.get(id) else { return DQuat::IDENTITY };
+        let (_, parent, _) = self.parent_world(id).to_scale_rotation_translation();
+        let ra = quat_from_euler_deg(n.xf.ra, "xyz");
+        let r = quat_from_euler_deg(n.xf.r, &n.xf.ro);
+        (parent * n.xf.jo_quat() * ra * r).normalize()
+    }
+
+    /// Rotate axis and rotate channels (degrees) that turn the object's axis frame
+    /// (`axis_frame`) to the world orientation `o` while its world matrix stays the same:
+    /// Maya's Bake Pivot orientation. The effective rotation `jo * ra * r * ra^-1` is kept.
+    pub fn baked_axis_channels(&self, id: &str, o: DQuat) -> Option<([f64; 3], [f64; 3])> {
+        let n = self.nodes.get(id)?;
+        let (_, parent, _) = self.parent_world(id).to_scale_rotation_translation();
+        let jo = n.xf.jo_quat();
+        let ra = quat_from_euler_deg(n.xf.ra, "xyz");
+        let r = quat_from_euler_deg(n.xf.r, &n.xf.ro);
+        let q = ra * r * ra.inverse();
+        let o_l = parent.inverse() * o.normalize();
+        let ra2 = (q.inverse() * jo.inverse() * o_l).normalize();
+        let r2 = (ra2.inverse() * jo.inverse() * o_l).normalize();
+        Some((euler_deg_from_quat(ra2, "xyz"), euler_deg_from_quat_near(r2, &n.xf.ro, n.xf.r)))
+    }
+
     pub fn set_pivot_world(&mut self, id: &str, wp: DVec3) {
         let lp = self.world_matrix(id).inverse().transform_point3(wp);
         self.set_pivot_local(id, lp.to_array());
@@ -5256,6 +5283,34 @@ mod tests {
     fn set_layer_weight(s: &mut Scene, index: usize, weight: f64) {
         let id = s.anim_layers[index].id.clone();
         s.set_anim_layer_weight(&id, weight);
+    }
+
+    /// Baking a pivot orientation into rotateAxis / rotate turns the axis frame to it and leaves
+    /// the object exactly where it was, under a rotated, scaled parent and for a joint orient too.
+    #[test]
+    fn baked_axis_channels_keep_the_world_matrix() {
+        let mut s = Scene::new();
+        let g = s.create_group("g", None);
+        let c = s.create_mesh("polyCube", &Params::new(), Some("c"));
+        s.reparent(&c, Some(&g), None);
+        for (a, v) in [("rx", 25.0), ("ry", -40.0), ("sx", 2.0), ("tx", 3.0)] {
+            s.set_attr_f(&g, a, v);
+        }
+        for (a, v) in [("rx", 10.0), ("ry", 20.0), ("rz", 30.0), ("tx", 1.0), ("ty", -2.0)] {
+            s.set_attr_f(&c, a, v);
+        }
+        s.nodes.get_mut(&c).unwrap().xf.jo = [5.0, 0.0, -15.0];
+        s.nodes.get_mut(&c).unwrap().xf.ra = [0.0, 30.0, 0.0];
+        let before = s.world_matrix(&c);
+        for o in [DQuat::IDENTITY, DQuat::from_euler(glam::EulerRot::XYZ, 0.3, -1.1, 2.0), DQuat::from_axis_angle(DVec3::new(1.0, 1.0, 0.0).normalize(), 2.5)] {
+            let (ra, r) = s.baked_axis_channels(&c, o).unwrap();
+            let n = s.nodes.get_mut(&c).unwrap();
+            n.xf.ra = ra;
+            n.xf.r = r;
+            assert!(s.world_matrix(&c).abs_diff_eq(before, 1e-9), "the object moved for {o:?}");
+            let f = s.axis_frame(&c);
+            assert!(f.dot(o).abs() > 1.0 - 1e-9, "axis frame {f:?} should be {o:?}");
+        }
     }
 
     #[test]

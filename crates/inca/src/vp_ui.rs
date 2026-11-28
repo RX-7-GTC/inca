@@ -2052,6 +2052,143 @@ fn draw_center_square(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &Ca
     }
 }
 
+/// Edit Pivot options from Maya's D-mode marking menu, and the custom pivot orientation.
+#[derive(Clone, Debug)]
+pub struct PivotEdit {
+    /// a component click moves the pivot onto it (Maya default: on)
+    pub snap_position: bool,
+    /// a component click also orients the pivot to it (Maya default: on)
+    pub snap_orientation: bool,
+    /// keep the custom pivot orientation when the selection changes
+    pub pinned: bool,
+    /// show the rotate rings that turn the pivot orientation in Edit Pivot
+    pub show_orientation_handle: bool,
+    /// write every pivot orientation change into the objects' rotate axis straight away
+    pub bake_orientation: bool,
+    /// The custom (unbaked) pivot orientation in world space, with the selection it was set on.
+    /// Like Maya's Custom axis orientation it lives in the tool, not in the scene.
+    pub orientation: Option<(Vec<String>, DQuat)>,
+}
+
+impl Default for PivotEdit {
+    fn default() -> Self {
+        PivotEdit { snap_position: true, snap_orientation: true, pinned: false, show_orientation_handle: true, bake_orientation: false, orientation: None }
+    }
+}
+
+/// The custom pivot orientation in effect: set on the current selection, or pinned.
+pub(crate) fn custom_pivot_orientation(app: &IncaApp) -> Option<DQuat> {
+    if app.s.comp_mode.is_some() {
+        return None;
+    }
+    let (sel, q) = app.pivot_edit.orientation.as_ref()?;
+    (app.pivot_edit.pinned || *sel == app.s.sel).then_some(*q)
+}
+
+pub(crate) fn has_custom_pivot(app: &IncaApp) -> bool {
+    custom_pivot_orientation(app).is_some()
+}
+
+/// Turn the custom pivot orientation (live, while the orientation rings are dragged).
+fn set_custom_pivot_orientation(app: &mut IncaApp, q: DQuat) {
+    app.pivot_edit.orientation = Some((app.s.sel.clone(), q.normalize()));
+}
+
+/// A finished pivot orientation change: baked into the selected objects' rotate axis when Bake
+/// Pivot Orientation is on, otherwise kept as the custom pivot orientation.
+fn commit_pivot_orientation(app: &mut IncaApp, q: DQuat) {
+    if app.pivot_edit.bake_orientation {
+        bake_pivot_orientation(app, q);
+    } else {
+        set_custom_pivot_orientation(app, q);
+    }
+}
+
+/// Write a world orientation into the selected objects' rotateAxis / rotate so their axes take
+/// it and they do not move (one undo step), and drop the custom orientation.
+fn bake_pivot_orientation(app: &mut IncaApp, q: DQuat) {
+    // full precision: the rotate axis and rotate must cancel exactly for the object to stay put
+    let f = |x: f64| format!("{x}");
+    let mut mel = String::new();
+    for id in app.s.sel.clone() {
+        if app.s.node(&id).is_none_or(|n| n.startup()) || app.s.world_matrix(&id).determinant().abs() < 1e-12 {
+            continue;
+        }
+        let Some((ra, r)) = app.s.baked_axis_channels(&id, q) else { continue };
+        let n = app.s.name_of(&id);
+        mel += &format!("setAttr {n}.rotateAxis {} {} {};\nsetAttr {n}.rotate {} {} {};\n", f(ra[0]), f(ra[1]), f(ra[2]), f(r[0]), f(r[1]), f(r[2]));
+    }
+    if !mel.is_empty() {
+        if let Err(e) = app.run_mel("bake pivot orientation", &mel) {
+            app.last_result = format!("// Error: {e} //");
+        }
+    }
+    app.pivot_edit.orientation = None;
+}
+
+/// An item of the Edit Pivot marking menu.
+pub(crate) fn pivot_menu_action(app: &mut IncaApp, act: crate::marking::PivotAct) {
+    use crate::marking::PivotAct as P;
+    let pe = &mut app.pivot_edit;
+    match act {
+        P::PinComponentPivot => {
+            pe.pinned = !pe.pinned;
+            // Maya: unpinning resets the custom pivot
+            if !pe.pinned {
+                pe.orientation = None;
+            }
+        }
+        P::SnapOrientation => pe.snap_orientation = !pe.snap_orientation,
+        P::SnapPosition => pe.snap_position = !pe.snap_position,
+        P::ShowOrientationHandle => pe.show_orientation_handle = !pe.show_orientation_handle,
+        P::BakeOrientation => pe.bake_orientation = !pe.bake_orientation,
+        P::Exit => app.pivot_mode = false,
+        P::ResetOrientation => pe.orientation = None,
+        // Maya resets an object pivot to its bounding-box centre
+        P::ResetPosition => app.action("centerPivot"),
+        P::Reset => {
+            pe.orientation = None;
+            app.action("centerPivot");
+        }
+    }
+}
+
+/// World orientation a component gives the pivot (Maya's Snap Pivot Orientation): X along a
+/// face's normal, along an edge, or along a vertex's normal; Y the face's first edge, the edge's
+/// faces' normal or the vertex's first edge, made perpendicular; Z completes the frame.
+pub(crate) fn component_frame(pm: &inca_core::mesh::PolyMesh, comp: &Comp) -> DQuat {
+    let topo = pm.topo();
+    let normal = |f: usize| pm.face_normal(f).normalize_or_zero();
+    let (x, y_hint) = match *comp {
+        Comp::F(f) => {
+            let face = &pm.f[f];
+            (normal(f), pm.v[face[1 % face.len()] as usize] - pm.v[face[0] as usize])
+        }
+        Comp::E(a, b) => {
+            let n = topo.edge(a, b).map(|e| topo.edge_faces[e].iter().map(|&f| normal(f)).sum::<DVec3>()).unwrap_or(DVec3::ZERO);
+            (pm.v[b as usize] - pm.v[a as usize], n)
+        }
+        Comp::V(v) => {
+            let n: DVec3 = topo.vert_faces.get(v as usize).map(|fs| fs.iter().map(|&f| normal(f)).sum()).unwrap_or(DVec3::ZERO);
+            let e = topo.vert_edges.get(v as usize).and_then(|es| es.first()).map(|&e| {
+                let (a, b) = topo.edges[e];
+                pm.v[if a == v { b } else { a } as usize] - pm.v[v as usize]
+            });
+            (n, e.unwrap_or(DVec3::ZERO))
+        }
+    };
+    let x = x.normalize_or_zero();
+    if x == DVec3::ZERO {
+        return DQuat::IDENTITY;
+    }
+    let mut y = y_hint - x * y_hint.dot(x);
+    if y.length() < 1e-9 {
+        y = x.any_orthonormal_vector();
+    }
+    let y = y.normalize();
+    DQuat::from_mat3(&glam::DMat3::from_cols(x, y, x.cross(y))).normalize()
+}
+
 /// A component a pivot can snap to: its world-space outline (a point, two edge ends or a face
 /// loop) and the point the pivot goes to.
 #[derive(Debug, Clone, PartialEq)]
@@ -2060,6 +2197,9 @@ pub(crate) struct PivotSnapTarget {
     pub comp: Comp,
     pub outline: Vec<DVec3>,
     pub point: DVec3,
+    /// Pivot orientation the component gives (world): X along a face's normal, along an edge,
+    /// or along a vertex normal, as Maya's Snap Pivot Orientation does.
+    pub frame: DQuat,
 }
 
 /// The vertex, edge or face of a selected mesh under the cursor, in that order of preference
@@ -2087,7 +2227,8 @@ pub(crate) fn pivot_snap_target(s: &inca_core::scene::Scene, vp: &viewport::View
         Comp::F(f) => pm.face_center(f),
         _ => outline.iter().copied().sum::<DVec3>() / outline.len() as f64,
     };
-    Some(PivotSnapTarget { mesh, comp, outline, point })
+    let frame = component_frame(&pm, &comp);
+    Some(PivotSnapTarget { mesh, comp, outline, point, frame })
 }
 
 /// Maya's red pre-selection highlight of the pivot snap target.
@@ -2294,6 +2435,9 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     }
     let pivot_mode = app.pivot_mode && app.s.comp_mode.is_none();
     let tool = if extrude_active { Tool::Move } else { chan.map(|c| c.0).unwrap_or(app.tool) };
+    // a custom pivot orientation (Edit Pivot) orients the pivot manipulator and the Move and
+    // Rotate tools, as Maya's Custom axis orientation does; Scale keeps the object's axes
+    let custom_ori = if !extrude_active && (pivot_mode || matches!(tool, Tool::Move | Tool::Rotate)) { custom_pivot_orientation(app) } else { None };
     let (pivot, rot) = if let Some(d) = &app.vp_state.drag {
         (DVec3::from(d.cur.translation), DQuat::from(d.cur.rotation))
     } else if !comp_targets.is_empty() {
@@ -2322,10 +2466,15 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         }
         (c / n.max(1) as f64, rot)
     } else if let Some(lead) = objects.last() {
-        let rot = if tool == Tool::Scale {
+        let rot = if let Some(q) = custom_ori {
+            q
+        } else if tool == Tool::Scale {
             rotation_without_scale(app, lead)
         } else if app.space_world(tool) {
             DQuat::IDENTITY
+        } else if app.s.node(lead).is_some_and(|n| n.xf.ra != [0.0; 3]) {
+            // a rotate axis (e.g. a baked pivot orientation) turns the object's axes
+            app.s.axis_frame(lead)
         } else {
             finite_quat(app.s.world_matrix(lead).to_scale_rotation_translation().1)
         };
@@ -2341,6 +2490,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     // the face centre every frame discards transform-gizmo's incremental delta (the drag sticks).
     let (pivot, rot) = if app.vp_state.drag.is_some() { (pivot, rot) } else { extrude_axes.unwrap_or((pivot, rot)) };
     let mut modes = match tool {
+        _ if pivot_mode && app.pivot_edit.show_orientation_handle => GizmoMode::all_translate() | GizmoMode::RotateX | GizmoMode::RotateY | GizmoMode::RotateZ,
         _ if pivot_mode => GizmoMode::all_translate(),
         _ if chan.is_some() => chan.unwrap().1,
         Tool::Move => GizmoMode::all_translate(),
@@ -2380,7 +2530,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     };
     let mut active = app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)).or_else(|| modes.contains(default_handle).then_some(default_handle)).or_else(|| modes.iter().next());
     let ppp = ui.ctx().pixels_per_point();
-    let space_world = app.space_world(tool) && extrude_axes.is_none();
+    let space_world = app.space_world(tool) && extrude_axes.is_none() && custom_ori.is_none();
     let pointer = ui.input(|i| i.pointer.clone());
     let mods = ui.input(|i| i.modifiers);
     let ctrl = mods.ctrl || mods.command;
@@ -2623,7 +2773,8 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     // or a face's centre) instead of changing the selection
     // Ctrl / Shift / Tab clicks and Lock Selection keep their usual meaning.
     let selection_edit = mods.ctrl || mods.shift || mods.command || ui.input(|i| i.key_down(egui::Key::Tab)) || app.lock_selection;
-    if pivot_mode && interact && resp.hovered() && hover_handle.is_none() && app.vp_state.drag.is_none() && !interaction.dragging && !selection_edit {
+    let snaps = app.pivot_edit.snap_position || app.pivot_edit.snap_orientation;
+    if pivot_mode && snaps && interact && resp.hovered() && hover_handle.is_none() && app.vp_state.drag.is_none() && !interaction.dragging && !selection_edit {
         let clicked = resp.clicked_by(egui::PointerButton::Primary);
         let key = {
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2650,7 +2801,12 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         if let Some(target) = target {
             draw_pivot_snap_target(painter, cv, app.vps[idx].rect, &target);
             if clicked {
-                snap_pivots_to(app, &objects, target.point);
+                if app.pivot_edit.snap_position {
+                    snap_pivots_to(app, &objects, target.point);
+                }
+                if app.pivot_edit.snap_orientation {
+                    commit_pivot_orientation(app, target.frame);
+                }
                 app.vp_state.pivot_snap = None;
                 ui.ctx().request_repaint();
                 return true;
@@ -3013,6 +3169,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             let objs = d.objects.clone();
             let local_scales = d.local_scales.clone();
             let pivots = d.pivots.clone();
+            let (d_handle, d_cur_rot) = (d.handle, DQuat::from(d.cur.rotation));
             let comps: Vec<(String, Vec<u32>, DragGeom)> = d.comps.iter().map(|(a, b, c)| match c {
                 DragGeom::Mesh(pm) => (a.clone(), b.clone(), DragGeom::Mesh(pm.clone())),
                 DragGeom::Curve(cu) => (a.clone(), b.clone(), DragGeom::Curve(cu.clone())),
@@ -3020,6 +3177,10 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             let (weights, mirror) = (d.weights.clone(), d.mirror.clone());
             let sym = app.symmetry;
             match pivots {
+                // Edit Pivot orientation handle: turn the custom pivot orientation, not the object
+                Some(_) if d_handle.is_some_and(|h| h.is_rotate()) => {
+                    set_custom_pivot_orientation(app, d_cur_rot);
+                }
                 Some(pv) => {
                     for ((id, _), p0) in objs.iter().zip(pv) {
                         app.s.set_pivot_world(id, delta.transform_point3(p0));
@@ -3510,6 +3671,11 @@ fn finish_drag(app: &mut IncaApp, d: GizmoDrag) {
         p.insert("verts".into(), serde_json::json!(verts));
         p.insert("deltas".into(), serde_json::json!(deltas));
         app.s.apply_op(id, "polyTweak", p, true);
+    }
+    if d.pivots.is_some() && d.handle.is_some_and(|h| h.is_rotate()) {
+        let q = DQuat::from(d.cur.rotation);
+        commit_pivot_orientation(app, q);
+        return;
     }
     if d.pivots.is_some() {
         for (id, _) in &d.objects {
@@ -4282,6 +4448,121 @@ mod tests {
 
     /// In Edit Pivot mode a click on a component moves the pivot there (one undo step) and keeps
     /// the selection; the object itself does not move.
+    /// The pivot frame a component gives follows Maya: X along a face normal, an edge, or a
+    /// vertex normal.
+    #[test]
+    fn component_frame_follows_mayas_axes() {
+        let pm = inca_core::primitives::generate("polyCube", &serde_json::Map::new()).unwrap();
+        let axes = |q: DQuat| (q * DVec3::X, q * DVec3::Y, q * DVec3::Z);
+        let orthonormal = |q: DQuat| {
+            let (x, y, z) = axes(q);
+            assert!(x.dot(y).abs() < 1e-9 && (x.cross(y) - z).length() < 1e-9, "not a right-handed frame");
+        };
+        // a face: X along its normal, Y in the face
+        let top = (0..pm.f.len()).find(|&f| pm.face_normal(f).normalize().dot(DVec3::Y) > 0.99).unwrap();
+        let q = component_frame(&pm, &Comp::F(top));
+        orthonormal(q);
+        assert!(axes(q).0.distance(DVec3::Y) < 1e-9);
+        assert!(axes(q).1.dot(DVec3::Y).abs() < 1e-9);
+        // an edge: X along it, Y towards its two faces (their normals' bisector)
+        let t = pm.topo();
+        let (e, &(a, b)) = t.edges.iter().enumerate().find(|(_, &(a, b))| (pm.v[b as usize] - pm.v[a as usize]).normalize().dot(DVec3::X).abs() > 0.99).unwrap();
+        let q = component_frame(&pm, &Comp::E(a, b));
+        orthonormal(q);
+        assert!(axes(q).0.dot(DVec3::X).abs() > 1.0 - 1e-9);
+        let bis: DVec3 = t.edge_faces[e].iter().map(|&f| pm.face_normal(f).normalize()).sum::<DVec3>().normalize();
+        assert!(axes(q).1.distance(bis) < 1e-9);
+        // a corner: X along its normal (the diagonal)
+        let v = pm.v.iter().position(|p| p.x > 0.0 && p.y > 0.0 && p.z > 0.0).unwrap() as u32;
+        let q = component_frame(&pm, &Comp::V(v));
+        orthonormal(q);
+        assert!(axes(q).0.distance(DVec3::ONE.normalize()) < 1e-9);
+    }
+
+    /// Maya's Edit Pivot marking menu: the items in place, the toggles, pin, resets and Exit.
+    #[test]
+    fn pivot_menu_items_and_actions() {
+        use crate::marking::PivotAct as P;
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        let other = app.s.create_mesh("polySphere", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        app.pivot_mode = true;
+        let (radial, list) = crate::marking::pivot_menu_items(&app);
+        let at = |d: &str| radial.iter().find(|(k, _)| *k == d).map(|(_, i)| (i.label.clone(), i.check, i.enabled)).unwrap();
+        assert_eq!(at("N"), ("Pin Component Pivot".into(), Some(false), false), "pin needs a custom pivot");
+        assert_eq!(at("NW"), ("Snap Pivot Orientation".into(), Some(true), true));
+        assert_eq!(at("NE"), ("Snap Pivot Position".into(), Some(true), true));
+        assert_eq!(at("W"), ("Show Orientation Handle".into(), Some(true), true));
+        assert_eq!(at("E").0, "Exit");
+        assert_eq!(at("SW").0, "Reset Pivot Orientation");
+        assert_eq!(at("SE").0, "Reset Pivot Position");
+        assert_eq!(at("S").0, "Reset Pivot");
+        let bake = list[0].as_ref().unwrap();
+        assert_eq!((bake.label.as_str(), bake.check), ("Bake Pivot Orientation", Some(false)));
+        // toggles
+        for (a, get) in [(P::SnapPosition, (|a: &IncaApp| a.pivot_edit.snap_position) as fn(&IncaApp) -> bool), (P::SnapOrientation, |a| a.pivot_edit.snap_orientation), (P::ShowOrientationHandle, |a| a.pivot_edit.show_orientation_handle), (P::BakeOrientation, |a| a.pivot_edit.bake_orientation)] {
+            let before = get(&app);
+            pivot_menu_action(&mut app, a);
+            assert_eq!(get(&app), !before, "{a:?}");
+            pivot_menu_action(&mut app, a);
+        }
+        // a custom orientation belongs to its selection, unless pinned
+        let q = DQuat::from_rotation_z(0.7);
+        commit_pivot_orientation(&mut app, q);
+        assert_eq!(custom_pivot_orientation(&app), Some(q.normalize()));
+        assert!(crate::marking::pivot_menu_items(&app).0[0].1.enabled, "pin is available now");
+        app.s.select(std::slice::from_ref(&other), SelMode::Replace);
+        assert_eq!(custom_pivot_orientation(&app), None, "another selection has its own pivot");
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        pivot_menu_action(&mut app, P::PinComponentPivot);
+        app.s.select(std::slice::from_ref(&other), SelMode::Replace);
+        assert!(custom_pivot_orientation(&app).is_some(), "a pinned pivot survives a selection change");
+        pivot_menu_action(&mut app, P::PinComponentPivot);
+        assert_eq!(custom_pivot_orientation(&app), None, "unpinning resets the custom pivot");
+        // resets: orientation, position (to the bounding-box centre), both
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        commit_pivot_orientation(&mut app, q);
+        pivot_menu_action(&mut app, P::ResetOrientation);
+        assert_eq!(custom_pivot_orientation(&app), None);
+        app.s.set_pivot_world(&id, DVec3::new(2.0, 1.0, -3.0));
+        pivot_menu_action(&mut app, P::ResetPosition);
+        assert!(app.s.world_pivot(&id).distance(app.s.world_bbox(&id).center()) < 1e-9);
+        app.s.set_pivot_world(&id, DVec3::new(2.0, 1.0, -3.0));
+        commit_pivot_orientation(&mut app, q);
+        pivot_menu_action(&mut app, P::Reset);
+        assert!(app.s.world_pivot(&id).distance(app.s.world_bbox(&id).center()) < 1e-9);
+        assert_eq!(custom_pivot_orientation(&app), None);
+        pivot_menu_action(&mut app, P::Exit);
+        assert!(!app.pivot_mode);
+    }
+
+    /// Bake Pivot Orientation writes the orientation into rotateAxis / rotate: the object's axes
+    /// take it, the object does not move, and one undo puts the channels back.
+    #[test]
+    fn baked_pivot_orientation_turns_the_axes_not_the_object() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        for (a, v) in [("rx", 15.0), ("ry", 40.0), ("tx", 2.0)] {
+            app.s.set_attr_f(&id, a, v);
+        }
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let before = app.s.world_matrix(&id);
+        let xf0 = (app.s.nodes[&id].xf.ra, app.s.nodes[&id].xf.r);
+        app.pivot_edit.bake_orientation = true;
+        let q = DQuat::from_euler(glam::EulerRot::XYZ, 0.4, 1.0, -0.6);
+        commit_pivot_orientation(&mut app, q);
+        assert!(app.s.world_matrix(&id).abs_diff_eq(before, 1e-6), "the object must not move");
+        assert!(app.s.axis_frame(&id).dot(q).abs() > 1.0 - 1e-6, "its axes take the orientation");
+        assert_eq!(custom_pivot_orientation(&app), None, "baked, so no custom orientation is left");
+        app.s.undo();
+        assert_eq!((app.s.nodes[&id].xf.ra, app.s.nodes[&id].xf.r), xf0, "undo restores the channels");
+    }
+
     #[test]
     fn pivot_mode_click_snaps_the_pivot_and_keeps_the_selection() {
         let ctx = egui::Context::default();
