@@ -237,9 +237,13 @@ pub struct IncaApp {
     pub manip_size: f32,
     /// Edit Pivot: the move manipulator moves pivots instead of objects
     pub pivot_mode: bool,
+    /// Edit Pivot options and the custom pivot orientation (Maya's D-mode marking menu).
+    pub pivot_edit: crate::vp_ui::PivotEdit,
     /// Key holding Edit Pivot: key, the pivot mode to restore on release, press time, and
     /// whether both press and release are bound (tap toggles, hold is temporary).
     pub pivot_hold: Option<(egui::Key, bool, f64, bool)>,
+    /// Whether something was selected last frame (Edit Pivot ends when the selection is cleared).
+    pub pivot_had_selection: bool,
     /// Key holding a snap toggle: key, action, and the state to restore on release.
     pub snap_hold: Option<(egui::Key, String, bool)>,
     /// Last known window focus, so hold keys are only released on an actual focus loss.
@@ -421,6 +425,8 @@ impl IncaApp {
             _ => 0,
         };
         self.world_space[i] = world;
+        // picking World or Object drops a custom pivot orientation, like Maya's Custom axis
+        self.pivot_edit.orientation = None;
     }
     pub fn set_shown(&mut self, element: &str, on: bool) {
         if on {
@@ -436,6 +442,21 @@ impl IncaApp {
             v.backface = on;
         }
     }
+    /// Maya leaves Edit Pivot when the selection is cleared (a click on empty space, Deselect
+    /// All, ...). A held D stays down but no longer turns the mode back on when released.
+    pub fn end_pivot_mode_on_deselect(&mut self) {
+        let has = !self.s.sel.is_empty();
+        if self.pivot_mode && self.pivot_had_selection && !has {
+            self.pivot_mode = false;
+            // the release must neither restore it nor count as a tap that turns it back on
+            if let Some(h) = self.pivot_hold.as_mut() {
+                h.1 = false;
+                h.3 = false;
+            }
+        }
+        self.pivot_had_selection = has;
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         let mut prefs: crate::prefs::Prefs = cc.storage.and_then(|s| eframe::get_value(s, "prefs")).unwrap_or_default();
@@ -505,7 +526,9 @@ impl IncaApp {
             history_on: true,
             manip_size: cc.storage.and_then(|s| eframe::get_value(s, "manipSize")).unwrap_or(1.0),
             pivot_mode: false,
+            pivot_edit: Default::default(),
             pivot_hold: None,
+            pivot_had_selection: false,
             snap_hold: None,
             was_focused: true,
             gpu,
@@ -1602,6 +1625,7 @@ impl eframe::App for IncaApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.end_pivot_mode_on_deselect();
         self.windows_state.window_seen_now.clear();
         self.windows_state.timeline_rect = None;
         crate::marking::block_pointer(self, &ctx);
@@ -1851,6 +1875,34 @@ mod tests {
         assert_eq!(app.s.comp_mode, None);
         app.action("objectMode");
         assert_eq!(app.s.comp_mode, Some(CompMode::Face), "F8 must restore Face, not Vertex");
+    }
+
+    #[test]
+    fn edit_pivot_ends_when_the_selection_is_cleared() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), inca_core::scene::SelMode::Replace);
+        app.pivot_mode = true;
+        app.end_pivot_mode_on_deselect();
+        assert!(app.pivot_mode, "still on while the cube is selected");
+        // a click on empty space / Deselect All clears the selection: Maya leaves Edit Pivot
+        app.s.select(&[], inca_core::scene::SelMode::Replace);
+        app.end_pivot_mode_on_deselect();
+        assert!(!app.pivot_mode);
+        // turning it on with nothing selected is not undone by this (no selection was lost)
+        app.pivot_mode = true;
+        app.end_pivot_mode_on_deselect();
+        assert!(app.pivot_mode);
+        // while D is held, clearing the selection ends the mode and the release keeps it off
+        app.s.select(std::slice::from_ref(&id), inca_core::scene::SelMode::Replace);
+        app.end_pivot_mode_on_deselect();
+        app.pivot_hold = Some((egui::Key::D, true, 0.0, true));
+        app.s.select(&[], inca_core::scene::SelMode::Replace);
+        app.end_pivot_mode_on_deselect();
+        assert!(!app.pivot_mode);
+        assert_eq!(app.pivot_hold.map(|h| (h.1, h.3)), Some((false, false)), "releasing D must not turn it back on, even as a quick tap");
     }
 
     #[test]
