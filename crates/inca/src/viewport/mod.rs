@@ -593,6 +593,49 @@ pub fn lattice_div(s: &Scene, id: &str) -> [usize; 3] {
 }
 
 /// Object-space icon lines for lights, cameras, locators and curves.
+/// Bones of a joint (world space): a thin pyramid from the joint to each child joint.
+pub fn joint_bone_lines(s: &Scene, id: &str, col: [f32; 4]) -> Vec<LineVertex> {
+    let mut l = vec![];
+    let Some(n) = s.node(id) else { return l };
+    let wm = s.world_matrix(id);
+    let a = wm.transform_point3(DVec3::ZERO);
+    // as thick as the joint's own circles (drawn in its space, so scaled with it), whatever the
+    // bone's length
+    let scale = (wm.x_axis.truncate().length() + wm.y_axis.truncate().length() + wm.z_axis.truncate().length()) / 3.0;
+    let r = n.passthrough.get("rig").and_then(|r| r["radius"].as_f64()).unwrap_or(0.5) * 0.5 * scale;
+    // the base turns with the joint (its world Y axis), not with the bone's direction alone
+    let side = wm.transform_vector3(DVec3::Y);
+    let side2 = wm.transform_vector3(DVec3::Z);
+    for k in n.children.iter().filter(|k| s.node(k).is_some_and(|c| c.kind == "joint")) {
+        let b = s.world_matrix(k).transform_point3(DVec3::ZERO);
+        bone_lines(&mut l, a, b, r, side, side2, col);
+    }
+    l
+}
+
+/// One bone from `a` to `b`: a pyramid whose square base sits 15% along it, `half_width` from
+/// the axis (at most a quarter of the bone's length). The base's corners point along `side`
+/// projected across the bone, or along `side2` when `side` runs (almost exactly) along the bone.
+/// The projection turns smoothly as the bone moves; it can only jump when the bone passes
+/// right through `side`.
+fn bone_lines(l: &mut Vec<LineVertex>, a: DVec3, b: DVec3, half_width: f64, side: DVec3, side2: DVec3, col: [f32; 4]) {
+    let d = b - a;
+    let len = d.length();
+    if len < 1e-6 {
+        return;
+    }
+    let dir = d / len;
+    let across = |v: DVec3| v - dir * v.dot(dir);
+    let u = [side, side2].into_iter().map(|v| (across(v), v.length())).find(|(u, l)| u.length() > 1e-4 * l.max(1e-12)).map(|(u, _)| u).unwrap_or_else(|| dir.any_orthonormal_vector());
+    let u = u.normalize() * half_width.min(len * 0.25);
+    let v = dir.cross(u);
+    let base = a + d * 0.15;
+    for corner in [u, v, -u, -v] {
+        push_line(l, a, base + corner, col);
+        push_line(l, base + corner, b, col);
+    }
+}
+
 pub fn icon_lines(s: &Scene, id: &str, col: [f32; 4]) -> Vec<LineVertex> {
     let mut o = vec![];
     let Some(n) = s.node(id) else { return o };
@@ -1585,25 +1628,7 @@ pub fn build_draws(
                 };
                 draws.push(DrawCmd { pass: Pass::LinesTop, geo: Geo::TransientLines(icon_lines(s, &id, c)), u: DrawUniform::new(wm) });
                 if n.kind == "joint" {
-                    // bones: a thin pyramid from the joint to each child joint (world space)
-                    let a = wm.as_dmat4().transform_point3(DVec3::ZERO);
-                    let mut l = vec![];
-                    for k in n.children.iter().filter(|k| s.node(k).is_some_and(|c| c.kind == "joint")) {
-                        let b = s.world_matrix(k).transform_point3(DVec3::ZERO);
-                        let d = b - a;
-                        let len = d.length();
-                        if len < 1e-6 {
-                            continue;
-                        }
-                        let u = d.any_orthonormal_vector() * len * 0.08;
-                        let v = d.normalize().cross(u);
-                        let base = a + d * 0.15;
-                        for corner in [u, v, -u, -v] {
-                            push_line(&mut l, a, base + corner, c);
-                            push_line(&mut l, base + corner, b, c);
-                        }
-                    }
-                    draws.push(DrawCmd { pass: Pass::LinesTop, geo: Geo::TransientLines(l), u: DrawUniform::new(Mat4::IDENTITY) });
+                    draws.push(DrawCmd { pass: Pass::LinesTop, geo: Geo::TransientLines(joint_bone_lines(s, &id, c)), u: DrawUniform::new(Mat4::IDENTITY) });
                 }
             }
             _ => {}
@@ -2691,6 +2716,98 @@ pub fn scene_bbox(s: &Scene) -> Aabb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A parent joint at the origin and a child joint at `child` (world space): (scene, parent).
+    fn bone_scene(child: DVec3) -> (Scene, String) {
+        let mut s = Scene::new();
+        let j1 = s.create_handle("joint", "j1");
+        let j2 = s.create_handle("joint", "j2");
+        s.reparent(&j2, Some(&j1), None);
+        for (attr, v) in [("tx", child.x), ("ty", child.y), ("tz", child.z)] {
+            s.set_attr_f(&j2, attr, v);
+        }
+        (s, j1)
+    }
+
+    /// The four base corners of the first bone, relative to the base centre, and its direction.
+    fn bone_corners(s: &Scene, j: &str) -> (Vec<DVec3>, DVec3) {
+        let l = joint_bone_lines(s, j, [1.0; 4]);
+        assert_eq!(l.len(), 16, "one bone is 8 lines");
+        let p = |i: usize| DVec3::new(l[i].pos[0] as f64, l[i].pos[1] as f64, l[i].pos[2] as f64);
+        let (a, b) = (p(0), p(3));
+        let base = a + (b - a) * 0.15;
+        ([1, 5, 9, 13].iter().map(|&i| p(i) - base).collect(), (b - a).normalize())
+    }
+
+    /// #46: a bone that doesn't lie along an axis used to blow up, because the base corners came
+    /// from `any_orthonormal_vector` of the unnormalised bone vector.
+    #[test]
+    fn bone_base_stays_small_and_square_off_axis() {
+        for child in [DVec3::new(3.0, 4.0, 12.0), DVec3::new(4.0, 4.0, 0.05), DVec3::new(-2.0, 7.0, -5.0), DVec3::new(0.0, 6.0, 0.0)] {
+            let (s, j1) = bone_scene(child);
+            let (corners, dir) = bone_corners(&s, &j1);
+            for c in &corners {
+                assert!((c.length() - 0.25).abs() < 1e-5, "{child}: corner {c} should be the joint radius 0.25 from the axis");
+                assert!(c.dot(dir).abs() < 1e-5, "{child}: corner {c} isn't across the bone");
+            }
+            assert!(corners[0].dot(corners[1]).abs() < 1e-5, "{child}: the base isn't square");
+        }
+    }
+
+    /// The bone's thickness follows the joint radius, not its length (short bones are capped).
+    #[test]
+    fn bone_width_follows_the_joint_radius_not_the_length() {
+        for (len, want) in [(2.0, 0.25), (20.0, 0.25), (200.0, 0.25), (0.4, 0.1)] {
+            let (s, j1) = bone_scene(DVec3::new(len, 0.0, 0.0));
+            let (corners, _) = bone_corners(&s, &j1);
+            assert!((corners[0].length() - want).abs() < 1e-5, "length {len}: half width {}", corners[0].length());
+        }
+        let (mut s, j1) = bone_scene(DVec3::new(10.0, 0.0, 0.0));
+        s.nodes.get_mut(&j1).unwrap().passthrough.insert("rig".into(), serde_json::json!({ "radius": 2.0 }));
+        let (corners, _) = bone_corners(&s, &j1);
+        assert!((corners[0].length() - 1.0).abs() < 1e-5, "radius 2: half width {}", corners[0].length());
+    }
+
+    /// The bone follows the joint circles when the rig is scaled (e.g. a cm rig under a 0.01 group).
+    #[test]
+    fn bone_width_scales_with_the_joint() {
+        for k in [0.01, 3.0] {
+            let (mut s, j1) = bone_scene(DVec3::new(4.0, 2.0, 1.0));
+            let g = s.create_group("rig", None);
+            s.reparent(&j1, Some(&g), None);
+            for a in ["sx", "sy", "sz"] {
+                s.set_attr_f(&g, a, k);
+            }
+            let (corners, dir) = bone_corners(&s, &j1);
+            for c in &corners {
+                assert!((c.length() - 0.25 * k).abs() < 1e-6 * k.max(1.0), "scale {k}: half width {} should be {}", c.length(), 0.25 * k);
+                assert!(c.dot(dir).abs() < 1e-6, "scale {k}: corner not across the bone");
+            }
+        }
+    }
+
+    /// Nudging the child joint across a plane doesn't make the bone spin: its base moves only a
+    /// little, as the bone itself does.
+    #[test]
+    fn nudging_a_joint_does_not_flip_its_bone() {
+        let cases = [
+            (DVec3::new(4.0, 4.0, 0.05), DVec3::new(4.0, 4.0, -0.05)),
+            (DVec3::new(4.0, 0.05, 3.0), DVec3::new(4.0, -0.05, 3.0)),
+            (DVec3::new(0.05, 4.0, 3.0), DVec3::new(-0.05, 4.0, 3.0)),
+            // nearly along the joint's Y axis, leaning diagonally (where a fallback threshold
+            // used to swap the reference axis)
+            (DVec3::new(0.42, 6.0, 0.42), DVec3::new(0.43, 6.0, 0.43)),
+            (DVec3::new(0.05, 6.0, 0.05), DVec3::new(0.06, 6.0, 0.06)),
+        ];
+        for (p, q) in cases {
+            let (s1, j) = bone_scene(p);
+            let (s2, _) = bone_scene(q);
+            let (c1, _) = bone_corners(&s1, &j);
+            let (c2, _) = bone_corners(&s2, &j);
+            let moved = c1.iter().zip(&c2).map(|(a, b)| a.distance(*b)).fold(0.0, f64::max);
+            assert!(moved < 0.02, "{p} -> {q}: a base corner jumped {moved}");
+        }
+    }
     use inca_core::params::Params;
     use egui::pos2;
 
