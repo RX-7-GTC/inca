@@ -659,6 +659,18 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
     let vp = app.active_vp;
     match id {
         "undo" => {
+            // While a Multi-Cut is in progress, Ctrl+Z removes its last point instead of undoing
+            // the tool activation. Once the cut is committed it falls through to the scene undo.
+            if app.tool == Tool::MultiCut && !app.mesh_tool.cut.is_empty() {
+                app.mesh_tool.cut.pop();
+                app.mesh_tool.cut_cams.pop();
+                if app.mesh_tool.cut.is_empty() {
+                    app.mesh_tool.clear_cut();
+                }
+                app.echo("undo;");
+                app.last_result = "// Undo: Multi-Cut point".into();
+                return;
+            }
             let cameras = app.view_cameras();
             match app.s.undo() {
                 Some(l) => {
@@ -670,6 +682,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
                 }
                 None => app.last_result = "// Warning: There are no more commands to undo.".into(),
             }
+            app.mesh_tool.clear_cut();
         }
         "redo" => {
             let cameras = app.view_cameras();
@@ -682,6 +695,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
                 }
                 None => app.last_result = "// Warning: There are no more commands to redo.".into(),
             }
+            app.mesh_tool.clear_cut();
         }
         "repeatLast" => {
             if let Some(a) = app.last_action.clone() {
@@ -1086,8 +1100,9 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         },
         "toolUndoPoint" => {
             app.vp_state.tool_pts.pop();
+            app.mesh_tool.cut_cams.pop();
             if app.mesh_tool.cut.pop().is_some() && app.mesh_tool.cut.is_empty() {
-                app.mesh_tool.cut_obj = None;
+                app.mesh_tool.clear_cut();
             }
             if app.tool == Tool::QuadDraw {
                 app.mesh_tool.dots.pop();
@@ -1095,8 +1110,7 @@ pub fn builtin(app: &mut IncaApp, id: &str) {
         }
         "cancelTool" => {
             app.vp_state.tool_pts.clear();
-            app.mesh_tool.cut.clear();
-            app.mesh_tool.cut_obj = None;
+            app.mesh_tool.clear_cut();
             app.set_tool(Tool::Select);
         }
         "snapToGround" => {
@@ -1397,7 +1411,8 @@ pub fn hotkey(key: Key, m: Modifiers, app: &IncaApp) -> Option<&'static str> {
     if crate::mesh_tools::is_mesh_tool(app.tool) {
         match key {
             Key::Enter => return Some("finishTool"),
-            Key::Backspace if !app.mesh_tool.cut.is_empty() || !app.mesh_tool.dots.is_empty() => return Some("toolUndoPoint"),
+            // Maya uses both Backspace and Delete to remove the last Multi-Cut/Quad Draw point.
+            Key::Backspace | Key::Delete if !app.mesh_tool.cut.is_empty() || !app.mesh_tool.dots.is_empty() => return Some("toolUndoPoint"),
             Key::Escape => return Some("cancelTool"),
             _ => {}
         }

@@ -1083,6 +1083,11 @@ impl IncaApp {
     }
 
     pub fn set_tool(&mut self, t: Tool) {
+        // Maya's Multi-Cut switches into component mode; without a dedicated Multi selection
+        // mode, use the last component mode and let the tool highlight the closest edge itself.
+        if t == Tool::MultiCut && self.s.comp_mode.is_none() {
+            self.set_comp_mode(Some(self.last_comp_mode));
+        }
         // Choosing any tool leaves Show Manipulator: close its editor and extrude session.
         if self.show_manips_tool {
             self.inview = None;
@@ -1097,8 +1102,7 @@ impl IncaApp {
             if self.tool == Tool::MultiCut {
                 crate::mesh_tools::multi_cut_complete(self);
             }
-            self.mesh_tool.cut.clear();
-            self.mesh_tool.cut_obj = None;
+            self.mesh_tool.clear_cut();
             self.rig_tool.ik_start = None;
         }
         self.tool = t;
@@ -1115,7 +1119,7 @@ impl IncaApp {
             Tool::Polygon => "Create Polygon Tool: click to place vertices, Enter to create the face",
             Tool::Joint => "Joint Tool: click to place joints (each new joint is parented to the last), Enter to finish the chain",
             Tool::EdgeLoop => "Insert Edge Loop Tool: click and drag on an edge to insert an edge loop and slide it. Set multiple loops in Tool Settings",
-            Tool::MultiCut => "Multi-Cut Tool: click on edges/vertices to cut. Shift snaps to 10% steps, middle-click cuts an edge at its midpoint, Ctrl+click inserts an edge loop (Ctrl+middle-click: through the midpoint). Enter or right-click completes, Backspace undoes the last point",
+            Tool::MultiCut => "Multi-Cut Tool: click on edges/vertices to cut. Shift snaps to 10% steps, middle-click cuts an edge at its midpoint, Ctrl+click inserts an edge loop (Ctrl+middle-click: through the midpoint). Enter or right-click completes, Backspace/Delete undoes the last point",
             Tool::TargetWeld => "Target Weld Tool: drag from a vertex onto another vertex to weld them together",
             Tool::Sculpt => "Sculpt: drag on a mesh to sculpt. Ctrl inverts, Shift smooths. Brush and size in Tool Settings",
             Tool::Pencil => "Pencil Curve Tool: drag to draw a curve freehand",
@@ -1405,7 +1409,13 @@ impl IncaApp {
                         }
                     }
                     if let Some(a) = crate::hotkey_editor::resolve(self, key, modifiers, scope) {
-                        self.action(&a);
+                        // Maya deletes the highlighted edge/face with Delete/Backspace when no
+                        // component is selected; otherwise Delete acts on the selection.
+                        if a == "deleteSel" && crate::vp_ui::delete_hovered_component(self, ctx) {
+                            // handled
+                        } else {
+                            self.action(&a);
+                        }
                     }
                     if let Some(a) = crate::hotkey_editor::release_action(self, key, modifiers, scope) {
                         self.release_keys.insert(key, a);
@@ -1729,6 +1739,18 @@ impl eframe::App for IncaApp {
         crate::project::autosave_tick(self, ctx.input(|i| i.time));
         crate::menus::hotbox(self, &ctx);
         crate::test_hook::step(self, &ctx);
+        // Multi-Cut uses Maya's knife cursor over the 3D view. Set it after every window and
+        // menu so a floating panel on top of the viewport keeps its own cursor.
+        let cursor = match self.tool {
+            Tool::MultiCut if self.mesh_tool.move_drag.is_some() || self.mesh_tool.hover_point.is_some() => crate::icons::move_point_cursor(),
+            Tool::MultiCut => crate::icons::multicut_cursor(),
+            _ => None,
+        };
+        let pointer = ctx.pointer_hover_pos();
+        let over_viewport = pointer.is_some_and(|p| self.vps.iter().any(|v| v.rect.contains(p)));
+        let top_layer = pointer.and_then(|p| ctx.layer_id_at(p));
+        let cursor = (over_viewport && top_layer.is_some_and(|l| l == egui::LayerId::background())).then_some(cursor).flatten();
+        ctx.set_cursor_image(cursor);
         std::mem::swap(&mut self.windows_state.window_seen, &mut self.windows_state.window_seen_now);
         if self.panels.quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

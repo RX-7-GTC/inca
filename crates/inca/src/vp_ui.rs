@@ -756,8 +756,12 @@ fn interact(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Respo
     let now = ui.input(|i| i.time);
     if resp.hovered() && !mods.alt {
         if let Some(p) = pointer.press_origin().filter(|_| pointer.button_pressed(egui::PointerButton::Secondary)) {
-            crate::marking::open_rmb(app, idx, cv, p, mods, now);
-            return;
+            // Maya's Multi-Cut owns RMB once a cut point exists: RMB commits the cut and the
+            // marking menu is suppressed. Before the first point it still opens normally.
+            if !(app.tool == Tool::MultiCut && !app.mesh_tool.cut.is_empty()) {
+                crate::marking::open_rmb(app, idx, cv, p, mods, now);
+                return;
+            }
         }
         if pointer.button_pressed(egui::PointerButton::Primary) {
             let held = ui.input(|i| [(egui::Key::W, Tool::Move), (egui::Key::E, Tool::Rotate), (egui::Key::R, Tool::Scale)].into_iter().find(|(k, _)| i.key_down(*k)).map(|x| x.1));
@@ -1076,6 +1080,39 @@ fn hover_pick(app: &mut IncaApp, ctx: &egui::Context, idx: usize, cv: &CamView, 
     app.hover_pick = Some((idx, key, found.clone()));
     app.hover_at = std::time::Instant::now();
     found
+}
+
+/// Maya's Delete key deletes the highlighted edge or face when no component is selected.
+/// Vertices are not hover-deleted. Returns true when it deleted something.
+pub fn delete_hovered_component(app: &mut IncaApp, ctx: &egui::Context) -> bool {
+    let Some(mode) = app.s.comp_mode else { return false };
+    if !matches!(mode, CompMode::Edge | CompMode::Face) {
+        return false;
+    }
+    if app.s.comp.values().any(|c| !c.is_empty()) {
+        return false;
+    }
+    let Some(p) = ctx.pointer_hover_pos() else { return false };
+    let Some(idx) = app.vps.iter().position(|v| v.rect.contains(p)) else { return false };
+    let vp = app.vps[idx].clone();
+    let cv = viewport::cam_view(&app.s, &vp.camera, [vp.rect.width(), vp.rect.height()]);
+    let hil = app.s.hilite();
+    let Some((id, comp)) = viewport::pick_best_component(&app.s, &vp, &cv, &hil, mode, p, &mut app.mesh_cache) else { return false };
+    let mut params = inca_core::params::Params::new();
+    match (mode, comp) {
+        (CompMode::Face, Comp::F(f)) => {
+            params.insert("faces".into(), serde_json::json!([f]));
+        }
+        (CompMode::Edge, Comp::E(a, b)) => {
+            params.insert("edges".into(), inca_core::params::edges_value(&[(a, b)]));
+        }
+        _ => return false,
+    }
+    app.s.checkpoint("delete component");
+    app.s.apply_op(&id, "deleteComponent", params, true);
+    app.s.comp.remove(&id);
+    app.echo("delete;");
+    true
 }
 
 fn click_select(app: &mut IncaApp, idx: usize, cv: &CamView, p: Pos2, mode: SelMode) {

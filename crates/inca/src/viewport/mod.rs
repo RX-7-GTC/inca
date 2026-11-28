@@ -2149,7 +2149,7 @@ fn marquee_exact(pm: &PolyMesh) -> bool {
 
 /// Component visibility: exact raycasts where the JS does them, plus the front-facing test
 /// when backface culling is on (the JS `frontFaces`, which is a no-op when culling is off).
-struct Vis<'a> {
+struct Vis<'a, 'o> {
     pm: &'a PolyMesh,
     wm: DMat4,
     cv: &'a CamView,
@@ -2157,10 +2157,10 @@ struct Vis<'a> {
     /// Front-facing flags from `MeshCache::facing`, `None` when the test does not apply.
     facing: Option<Arc<Vec<bool>>>,
     topo: Option<Arc<Topo>>,
-    occluders: &'a [Occluder<'a>],
+    occluders: &'o [Occluder<'o>],
 }
 
-impl<'a> Vis<'a> {
+impl<'a, 'o> Vis<'a, 'o> {
     /// `facing` and its `topo` are only needed for the front-facing test, `occluders` only
     /// when `exact` is set.
     fn new(
@@ -2170,7 +2170,7 @@ impl<'a> Vis<'a> {
         exact: bool,
         facing: Option<Arc<Vec<bool>>>,
         topo: Option<Arc<Topo>>,
-        occluders: &'a [Occluder<'a>],
+        occluders: &'o [Occluder<'o>],
     ) -> Self {
         Vis { pm, wm, cv, exact, facing, topo, occluders }
     }
@@ -2205,6 +2205,38 @@ impl<'a> Vis<'a> {
     }
     pub fn face(&self, f: usize) -> bool {
         self.facing.as_ref().is_none_or(|x| x[f]) && self.visible(self.pm.face_center(f))
+    }
+}
+
+/// Per-pick visibility for mesh tools, with the same rules as `pick_component_hit`: shaded modes
+/// hide points behind a surface, and backface culling hides components with no front face.
+pub struct MeshPick<'a> {
+    occ: Vec<Occluder<'a>>,
+    exact: bool,
+    backface: bool,
+}
+
+impl<'a> MeshPick<'a> {
+    pub fn new(s: &'a Scene, vp: &Viewport, mesh_cache: &mut MeshCache) -> Self {
+        let exact = !vp.xray && vp.shade != ShadeMode::Wire;
+        Self { occ: if exact { scene_occluders(s, mesh_cache) } else { vec![] }, exact, backface: vp.backface }
+    }
+
+    pub fn vertex(&self, s: &Scene, cv: &CamView, id: &str, v: u32, mesh_cache: &mut MeshCache) -> bool {
+        let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return false };
+        let wm = s.world_matrix(id);
+        let facing = if self.backface { mesh_cache.facing(s, id, wm, cv) } else { None };
+        let topo = if facing.is_some() { mesh_cache.topo(s, id) } else { None };
+        Vis::new(pm, wm, cv, self.exact, facing, topo, &self.occ).vertex(v)
+    }
+
+    pub fn edge(&self, s: &Scene, cv: &CamView, id: &str, a: u32, b: u32, t: f64, mesh_cache: &mut MeshCache) -> bool {
+        let Some(pm) = s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { return false };
+        let wm = s.world_matrix(id);
+        let facing = if self.backface { mesh_cache.facing(s, id, wm, cv) } else { None };
+        let topo = mesh_cache.topo(s, id);
+        let Some(e) = topo.as_ref().and_then(|topo| topo.edge(a, b)) else { return false };
+        Vis::new(pm, wm, cv, self.exact, facing, topo, &self.occ).edge_idx_at(e, a, b, t)
     }
 }
 

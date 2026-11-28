@@ -1311,6 +1311,8 @@ pub fn op_chamfer_vertex(pm: &PolyMesh, verts: &[u32], width: f64) -> OpOut {
 pub enum SplitPoint {
     Vertex(u32),
     Edge(u32, u32, f64),
+    /// A new vertex inside a face, in object space.
+    Face(usize, DVec3),
 }
 
 /// Split a face between two of its vertices; false when they are neighbours.
@@ -1343,12 +1345,16 @@ fn split_face(m: &mut PolyMesh, fi: usize, u: u32, w: u32) -> bool {
 
 /// Connect: cut edges at the given points and join consecutive points across their shared faces (JS opSplit).
 pub fn op_split(pm: &PolyMesh, points: &[SplitPoint]) -> OpOut {
+    if points.iter().any(|p| matches!(p, SplitPoint::Face(..))) {
+        return op_split_faces(pm, points);
+    }
     let mut m = pm.clone();
     let mut made: HashMap<(u32, u32), u32> = HashMap::new();
     let mut ids = vec![];
     for p in points {
         match *p {
             SplitPoint::Vertex(v) => ids.push(v),
+            SplitPoint::Face(..) => unreachable!("face points use op_split_faces"),
             SplitPoint::Edge(a, b, t) => {
                 let key = epair(a, b);
                 let t = if a < b { t } else { 1.0 - t };
@@ -1395,6 +1401,128 @@ pub fn op_split(pm: &PolyMesh, points: &[SplitPoint]) -> OpOut {
         }
     }
     OpOut { mesh: m, select_edges: Some(pairs), ..Default::default() }
+}
+
+/// Insert a vertex at parameter `t` on edge `a-b`, adding it to every face using the edge.
+fn insert_edge_vertex(m: &mut PolyMesh, pm: &PolyMesh, a: u32, b: u32, t: f64, made: &mut HashMap<(u32, u32), u32>) -> u32 {
+    let key = epair(a, b);
+    let t = if a < b { t } else { 1.0 - t };
+    *made.entry(key).or_insert_with(|| {
+        m.v.push(pm.v[key.0 as usize].lerp(pm.v[key.1 as usize], t));
+        let nv = (m.v.len() - 1) as u32;
+        for fi in 0..m.f.len() {
+            let f = m.f[fi].clone();
+            let n = f.len();
+            for i in 0..n {
+                let (x, y) = (f[i], f[(i + 1) % n]);
+                if epair(x, y) == key {
+                    let mut nf = f.clone();
+                    nf.insert(i + 1, nv);
+                    m.f[fi] = nf;
+                    if let Some(all) = &mut m.uv {
+                        if let Some(Some(u)) = all.get_mut(fi) {
+                            let w = if x == key.0 { t } else { 1.0 - t };
+                            let nu = u[i].lerp(u[(i + 1) % n], w);
+                            u.insert(i + 1, nu);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        nv
+    })
+}
+
+/// Split a face along a polyline that passes through interior face points. A run is bounded by
+/// two vertices on the face: [A, P1..Pn, B] replaces the face with A..B + Pn..P1 and B..A + P1..Pn.
+fn op_split_faces(pm: &PolyMesh, points: &[SplitPoint]) -> OpOut {
+    #[derive(Clone, Copy)]
+    enum Node {
+        Boundary(u32),
+        Face(usize, DVec3),
+    }
+    let mut m = pm.clone();
+    let mut made: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut nodes = vec![];
+    for p in points {
+        match *p {
+            SplitPoint::Vertex(v) => nodes.push(Node::Boundary(v)),
+            SplitPoint::Edge(a, b, t) => nodes.push(Node::Boundary(insert_edge_vertex(&mut m, pm, a, b, t, &mut made))),
+            SplitPoint::Face(fi, q) => nodes.push(Node::Face(fi, q)),
+        }
+    }
+    let mut i = 0;
+    while i < nodes.len() {
+        let fi = match nodes[i] {
+            Node::Face(fi, _) => fi,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let start = i;
+        let mut end = i + 1;
+        while end < nodes.len() && matches!(nodes[end], Node::Face(f, _) if f == fi) {
+            end += 1;
+        }
+        let prev = if start > 0 {
+            match nodes[start - 1] {
+                Node::Boundary(v) => Some(v),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let next = nodes.get(end).and_then(|n| match n {
+            Node::Boundary(v) => Some(*v),
+            _ => None,
+        });
+        if let (Some(a), Some(b)) = (prev, next) {
+            if fi < m.f.len() && a != b {
+                let face = m.f[fi].clone();
+                if let (Some(ia), Some(ib)) = (face.iter().position(|&v| v == a), face.iter().position(|&v| v == b)) {
+                    if ia != ib {
+                        let n = face.len();
+                        let walk = |s: usize, e: usize| {
+                            let mut out = vec![s];
+                            let mut j = s;
+                            while j != e {
+                                j = (j + 1) % n;
+                                out.push(j);
+                            }
+                            out
+                        };
+                        let path: Vec<u32> = (start..end)
+                            .map(|k| match nodes[k] {
+                                Node::Face(_, p) => {
+                                    m.v.push(p);
+                                    (m.v.len() - 1) as u32
+                                }
+                                _ => unreachable!(),
+                            })
+                            .collect();
+                        let c1 = walk(ia, ib);
+                        let c2 = walk(ib, ia);
+                        let mut f1: Vec<u32> = c1.iter().map(|&k| face[k]).collect();
+                        f1.extend(path.iter().rev().copied());
+                        let mut f2: Vec<u32> = c2.iter().map(|&k| face[k]).collect();
+                        f2.extend(path.iter().copied());
+                        let mat = m.face_mat(fi).cloned();
+                        m.f[fi] = f1;
+                        if let Some(all) = &mut m.uv {
+                            if fi < all.len() {
+                                all[fi] = None;
+                            }
+                        }
+                        m.add_face(f2, None, mat);
+                    }
+                }
+            }
+        }
+        i = end;
+    }
+    OpOut { mesh: m, ..Default::default() }
 }
 
 pub fn op_delete_faces(pm: &PolyMesh, faces: &[usize]) -> PolyMesh {
@@ -1985,6 +2113,19 @@ mod chamfer_split_tests {
         assert_eq!(r.mesh.v.len(), pm.v.len() + 2);
         assert_eq!(r.select_edges.unwrap().len(), 1);
         assert!(r.mesh.boundary_loops().is_empty());
+    }
+
+    #[test]
+    fn face_point_between_two_vertices_splits_a_face() {
+        let pm = cube();
+        let f = pm.f[0].clone();
+        let p = (pm.v[f[0] as usize] + pm.v[f[2] as usize]) * 0.5;
+        let r = op_split(&pm, &[SplitPoint::Vertex(f[0]), SplitPoint::Face(0, p), SplitPoint::Vertex(f[2])]);
+        assert_eq!(r.mesh.f.len(), pm.f.len() + 1, "one face becomes two");
+        assert_eq!(r.mesh.v.len(), pm.v.len() + 1, "the interior point is a new vertex");
+        let newv = (r.mesh.v.len() - 1) as u32;
+        assert!(r.mesh.f[0].contains(&newv));
+        assert!(r.mesh.boundary_loops().is_empty(), "the mesh stays closed");
     }
 }
 

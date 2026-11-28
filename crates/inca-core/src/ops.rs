@@ -208,6 +208,13 @@ pub fn apply(ty: &str, pm: &PolyMesh, p: &Params, ctx: &dyn OpCtx) -> Result<OpO
                             if let Some(v) = q.get("vertex").and_then(|v| v.as_u64()) {
                                 return Some(mesh::SplitPoint::Vertex(v as u32));
                             }
+                            if let Some(fi) = q.get("face").and_then(|v| v.as_u64()) {
+                                let p = q.get("point")?.as_array()?;
+                                let x = p.first()?.as_f64()?;
+                                let y = p.get(1)?.as_f64()?;
+                                let z = p.get(2)?.as_f64()?;
+                                return Some(mesh::SplitPoint::Face(fi as usize, DVec3::new(x, y, z)));
+                            }
                             let e = q.get("edge")?.as_array()?;
                             Some(mesh::SplitPoint::Edge(e.first()?.as_u64()? as u32, e.get(1)?.as_u64()? as u32, q.get("t").and_then(|t| t.as_f64()).unwrap_or(0.5)))
                         })
