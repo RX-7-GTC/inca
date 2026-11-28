@@ -219,10 +219,20 @@ fn pick_vertex(app: &mut IncaApp, idx: usize, cv: &CamView, rect: Rect, p: Pos2,
 
 /// Ray hit on meshes: (mesh, world point, world face normal).
 fn hit_mesh(app: &IncaApp, cv: &CamView, rect: Rect, p: Pos2, objs: &[String]) -> Option<(String, DVec3, DVec3)> {
+    hit_mesh_on(app, cv, rect, p, objs, false)
+}
+
+/// `hit_mesh`, optionally against the surface that is drawn: with Smooth Mesh Preview on that is
+/// the subdivided mesh the viewport caches, not the cage.
+fn hit_mesh_on(app: &IncaApp, cv: &CamView, rect: Rect, p: Pos2, objs: &[String], displayed: bool) -> Option<(String, DVec3, DVec3)> {
     let ray = cv.ray(p, rect);
     let mut best: Option<(f64, String, DVec3, DVec3)> = None;
     for id in objs {
-        let Some(pm) = app.s.node(id).and_then(|n| n.mesh()).map(|m| &m.mesh) else { continue };
+        let Some(m) = app.s.node(id).and_then(|n| n.mesh()) else { continue };
+        let pm = match app.smooth_cache.get(id) {
+            Some((_, smooth)) if displayed && m.smooth_level > 0 => smooth,
+            _ => &m.mesh,
+        };
         let wm = app.s.world_matrix(id);
         let lr = ray.transformed(&wm.inverse());
         if let Some((t, f)) = pm.raycast(&lr, false) {
@@ -1063,16 +1073,16 @@ fn sculpt(app: &mut IncaApp, resp: &egui::Response, cv: &CamView, rect: Rect, pa
     let size = app.mesh_opts.size;
     let objs = sculpt_targets(app);
     let q = resp.interact_pointer_pos().or(resp.hover_pos());
-    let hit = q.and_then(|q| hit_mesh(app, cv, rect, q, &objs));
+    // aim at the surface the user sees, which is the smoothed one when the preview is on
+    let hit = q.and_then(|q| hit_mesh_on(app, cv, rect, q, &objs, true));
     if let Some((_, w, n)) = &hit {
         ring(painter, cv, rect, *w, *n, size);
     }
     let mods = resp.ctx.input(|i| i.modifiers);
     if resp.drag_started_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Primary) {
         if let Some((id, w, _)) = &hit {
-            if let Some(m) = app.s.nodes.get_mut(id).and_then(|n| n.mesh_mut()) {
-                m.smooth_level = 0;
-            }
+            // the stroke edits the cage; Smooth Mesh Preview stays on and follows it, since every
+            // stroke step bumps the node's rev and the smooth display re-subdivides (#44)
             let orig = app.s.node(id).unwrap().mesh().unwrap().mesh.clone();
             let brush = if mods.shift { 1 } else { app.mesh_opts.brush };
             let grab = (BRUSHES[brush] == "grab").then(|| (*w, vec![]));
@@ -2195,5 +2205,82 @@ mod tests {
         let w = world_verts(&app, &cube);
         assert!(w.iter().any(|v| v.distance(mid) < 1e-9), "no new vertex at the edge midpoint {mid}");
         assert!(app.mesh_tool.cut.is_empty());
+    }
+
+    /// A sculpt stroke on a mesh with Smooth Mesh Preview on keeps the preview (#44): the level
+    /// stays the same during and after the stroke, and the stroke still moves the cage.
+    #[test]
+    fn sculpt_stroke_keeps_smooth_mesh_preview() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let ball = app.s.create_mesh("polySphere", &Params::new(), None);
+        for a in ["sx", "sy", "sz"] {
+            app.s.set_attr_f(&ball, a, 8.0);
+        }
+        app.s.nodes.get_mut(&ball).and_then(|n| n.mesh_mut()).unwrap().smooth_level = 2;
+        app.tool = Tool::Sculpt;
+        let before = app.s.node(&ball).unwrap().mesh().unwrap().mesh.v.clone();
+        let shown_before = viewport::display_mesh(&app.s, &ball, &mut app.smooth_cache, 2).unwrap();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let persp = app.s.find("persp").unwrap();
+        let cv = viewport::cam_view(&app.s, &persp, [rect.width(), rect.height()]);
+        let c = cv.project(app.s.world_matrix(&ball).transform_point3(DVec3::ZERO), rect).unwrap();
+        let b = egui::PointerButton::Primary;
+        let m = egui::Modifiers::NONE;
+        let frames = [
+            vec![egui::Event::PointerMoved(c)],
+            vec![egui::Event::PointerButton { pos: c, button: b, pressed: true, modifiers: m }],
+            vec![egui::Event::PointerMoved(c + vec2(12.0, 4.0))],
+            vec![egui::Event::PointerMoved(c + vec2(24.0, 8.0))],
+            vec![egui::Event::PointerMoved(c + vec2(36.0, 12.0))],
+            vec![egui::Event::PointerButton { pos: c + vec2(36.0, 12.0), button: b, pressed: false, modifiers: m }],
+            vec![],
+        ];
+        let level = |app: &IncaApp| app.s.node(&ball).unwrap().mesh().unwrap().smooth_level;
+        for (i, events) in frames.into_iter().enumerate() {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(rect);
+            raw.time = Some(i as f64 * 0.05);
+            raw.events = events;
+            let mut out = ctx.run_ui(raw, |ui| {
+                let resp = ui.interact(rect, egui::Id::new("sculpt test"), egui::Sense::click_and_drag());
+                let painter = ui.painter().clone();
+                sculpt(&mut app, &resp, &cv, rect, &painter);
+            });
+            out.textures_delta.clear();
+            assert_eq!(level(&app), 2, "smooth level changed at frame {i}");
+        }
+        assert!(app.mesh_tool.sculpt.is_none(), "the stroke should have finished");
+        let after = &app.s.node(&ball).unwrap().mesh().unwrap().mesh.v;
+        assert!(before.iter().zip(after).any(|(a, b)| a.distance(*b) > 1e-6), "the stroke didn't move any vertex");
+        // and the smoothed display follows the sculpted cage
+        let shown_after = viewport::display_mesh(&app.s, &ball, &mut app.smooth_cache, 2).unwrap();
+        assert_eq!(shown_before.v.len(), shown_after.v.len());
+        assert!(shown_before.v.iter().zip(&shown_after.v).any(|(a, b)| a.distance(*b) > 1e-6), "the smooth display didn't update");
+    }
+
+    /// With Smooth Mesh Preview on, the sculpt brush aims at the smoothed surface that is drawn,
+    /// not the cage around it: a cube's corner lies outside its smoothed shape.
+    #[test]
+    fn sculpt_aims_at_the_smoothed_surface() {
+        let ctx = egui::Context::default();
+        let (mut app, cube, cv, rect) = cube_scene(&ctx);
+        app.s.nodes.get_mut(&cube).and_then(|n| n.mesh_mut()).unwrap().smooth_level = 2;
+        viewport::display_mesh(&app.s, &cube, &mut app.smooth_cache, 2).unwrap();
+        let objs = [cube.clone()];
+        let w = world_verts(&app, &cube);
+        let centre = cv.project(app.s.world_matrix(&cube).transform_point3(DVec3::ZERO), rect).unwrap();
+        // the nearest visible cage corner, pulled 4% towards the centre so the cage is surely hit
+        let corner = w.iter().filter_map(|v| cv.project(*v, rect)).min_by(|a, b| a.distance(centre).total_cmp(&b.distance(centre)).reverse()).unwrap();
+        let p = corner + (centre - corner) * 0.04;
+        assert!(hit_mesh_on(&app, &cv, rect, p, &objs, false).is_some(), "the cage should be hit near its corner");
+        assert!(hit_mesh_on(&app, &cv, rect, p, &objs, true).is_none(), "the smoothed cube doesn't reach its cage corner");
+        // in the middle both hit, the smoothed surface no nearer than the cage
+        let cage = hit_mesh_on(&app, &cv, rect, centre, &objs, false).unwrap();
+        let shown = hit_mesh_on(&app, &cv, rect, centre, &objs, true).unwrap();
+        assert!((shown.1 - cv.eye).length() >= (cage.1 - cv.eye).length() - 1e-9);
+        // without the preview the brush aims at the cage as before
+        app.s.nodes.get_mut(&cube).and_then(|n| n.mesh_mut()).unwrap().smooth_level = 0;
+        assert!(hit_mesh_on(&app, &cv, rect, p, &objs, true).is_some());
     }
 }
