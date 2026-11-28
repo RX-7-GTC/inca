@@ -163,7 +163,7 @@ pub fn common(name: &str) -> Vec<M> {
             A("toggleBackface"),
             A("cycleBackground"),
             Sep,
-            Sub("Polygons", vec![A("faceCenters"), Sep, A("smoothOff"), A("smoothCage"), A("smoothOn"), Sep, A("toggleNormals"), A("toggleBorderEdges"), A("softenEdge"), A("hardenEdge")]),
+            Sub("Polygons", vec![A("faceCenters"), Sep, A("smoothOff"), A("smoothCage"), A("smoothOn"), Sep, A("toggleNormals"), A("toggleBorderEdges"), A("toggleSoftHardEdges")]),
             A("frameAll"),
             A("frameSelected"),
             A("frameAllAll"),

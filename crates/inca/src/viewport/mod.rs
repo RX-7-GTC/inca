@@ -521,6 +521,45 @@ pub fn build_wire_lines(pm: &PolyMesh) -> Vec<LineVertex> {
     wire
 }
 
+/// The GPU mesh-buffer key: `mesh_key` plus whether the wire shows Soft/Hard Edges.
+fn mesh_wire_key(key: u64, soft_hard: bool) -> u64 {
+    if soft_hard {
+        key.rotate_left(17) ^ 0x5f0f_7a8d_0000_0037
+    } else {
+        key
+    }
+}
+
+/// Dashes per soft edge in the Soft/Hard Edges display.
+const SOFT_EDGE_DASHES: usize = 4;
+
+/// Display > Polygons > Soft/Hard Edges: the mesh's wireframe with hard edges solid and soft
+/// edges dashed (Maya draws soft edges dotted). Same culling normals as `build_wire_lines`.
+pub fn soft_hard_wire(pm: &PolyMesh) -> Vec<LineVertex> {
+    if pm.display_edges.is_some() {
+        return build_wire_lines(pm);
+    }
+    let col = [1.0, 1.0, 1.0, 1.0];
+    let topo = pm.topo();
+    let hard = pm.hard_edges(&topo);
+    let fnorm: Vec<DVec3> = (0..pm.f.len()).map(|i| pm.face_normal(i)).collect();
+    let mut out = vec![];
+    for (e, &(a, b)) in topo.edges.iter().enumerate() {
+        let (na, nb) = edge_normals(&topo, &fnorm, a, b);
+        let (pa, pb) = (pm.v[a as usize], pm.v[b as usize]);
+        if hard[e] {
+            push_line_n(&mut out, pa, pb, col, na, nb);
+        } else {
+            // N dashes with N - 1 equal gaps between them
+            let parts = (2 * SOFT_EDGE_DASHES - 1) as f64;
+            for i in (0..2 * SOFT_EDGE_DASHES - 1).step_by(2) {
+                push_line_n(&mut out, pa.lerp(pb, i as f64 / parts), pa.lerp(pb, (i + 1) as f64 / parts), col, na, nb);
+            }
+        }
+    }
+    out
+}
+
 /// Grid on the ground plane (or facing an ortho camera).
 pub fn grid_lines(cv: &CamView, cfg: (f64, f64, i32)) -> Vec<LineVertex> {
     let mut out = vec![];
@@ -1354,6 +1393,7 @@ pub fn build_draws(
     mesh_cache: &mut MeshCache,
     soft: Option<(f64, bool)>,
     smooth_divisions: u32,
+    soft_hard: &std::collections::HashSet<String>,
 ) -> Vec<DrawCmd> {
     let mut draws = vec![];
     // transparent meshes, sorted back-to-front like three.js's transparent pass
@@ -1403,7 +1443,10 @@ pub fn build_draws(
                     }
                     continue;
                 }
-                let key = mesh_key(s, &id, smooth_divisions);
+                // Display > Polygons > Soft/Hard Edges goes into the cached wire buffer, so
+                // switching it re-uploads once and drawing costs nothing extra per frame
+                let soft_hard_on = soft_hard.contains(&id);
+                let key = mesh_wire_key(mesh_key(s, &id, smooth_divisions), soft_hard_on);
                 if g.mesh_key(&id) != Some(key) || live.contains(&id) {
                     if let Some(pm) = display_mesh(s, &id, smooth_cache, smooth_divisions) {
                         let texs = mesh_textures(g, s, m);
@@ -1415,7 +1458,10 @@ pub fn build_draws(
                         );
                         // the JS draws the base cage for levels 1 and 3 and the smooth mesh
                         // only for \"cage + smooth\" (level 2)
-                        if m.smooth_level == 1 || m.smooth_level == 3 {
+                        let wire_mesh = if m.smooth_level == 1 || m.smooth_level == 3 { &m.mesh } else { &pm };
+                        if soft_hard_on {
+                            w = soft_hard_wire(wire_mesh);
+                        } else if m.smooth_level == 1 || m.smooth_level == 3 {
                             w = build_wire_lines(&m.mesh);
                         }
                         g.upload_mesh(&id, if live.contains(&id) { 0 } else { key }, &t, &w);
@@ -2691,6 +2737,54 @@ pub fn scene_bbox(s: &Scene) -> Aabb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Soft/Hard Edges: hard edges are one solid line, soft edges SOFT_EDGE_DASHES dashes that
+    /// cover 4/7 of the edge, all with the edge's culling normals.
+    #[test]
+    fn soft_hard_wire_dashes_only_soft_edges() {
+        let gen = |ty: &str| inca_core::primitives::generate(ty, &serde_json::Map::new()).unwrap();
+        let lines = |pm: &PolyMesh| soft_hard_wire(pm).len() / 2;
+        // a cube is all hard: exactly its 12 edges, like the plain wire
+        let cube = gen("polyCube");
+        assert_eq!(lines(&cube), 12);
+        assert_eq!(soft_hard_wire(&cube).len(), build_wire_lines(&cube).len());
+        // a sphere is all soft: every edge becomes dashes
+        let sphere = gen("polySphere");
+        let n = sphere.topo().edges.len();
+        assert_eq!(lines(&sphere), n * SOFT_EDGE_DASHES);
+        // a cylinder mixes both, and the counts follow hard_edges
+        let cyl = gen("polyCylinder");
+        let t = cyl.topo();
+        let hard = cyl.hard_edges(&t).iter().filter(|&&h| h).count();
+        let soft = t.edges.len() - hard;
+        assert!(hard > 0 && soft > 0);
+        assert_eq!(lines(&cyl), hard + soft * SOFT_EDGE_DASHES);
+        // the dashes of one soft edge lie on it and cover 4/7 of its length
+        let w = soft_hard_wire(&sphere);
+        let (a, b) = sphere.topo().edges[0];
+        let (pa, pb) = (sphere.v[a as usize], sphere.v[b as usize]);
+        let p = |i: usize| DVec3::new(w[i].pos[0] as f64, w[i].pos[1] as f64, w[i].pos[2] as f64);
+        let covered: f64 = (0..SOFT_EDGE_DASHES).map(|k| p(2 * k).distance(p(2 * k + 1))).sum();
+        assert!((covered / pa.distance(pb) - 4.0 / 7.0).abs() < 1e-5, "{covered}");
+        assert!(p(0).distance(pa) < 1e-5 && p(2 * SOFT_EDGE_DASHES - 1).distance(pb) < 1e-5);
+        assert!(w.iter().all(|v| v.normal != [0.0; 3]), "dashes keep the culling normals");
+    }
+
+    /// Switching Soft/Hard Edges on or off, or softening the mesh, changes the GPU buffer key,
+    /// so the cached wire is rebuilt.
+    #[test]
+    fn soft_hard_display_changes_the_mesh_buffer_key() {
+        let mut s = Scene::new();
+        let c = s.create_mesh("polyCube", &inca_core::params::Params::new(), None);
+        let k = mesh_key(&s, &c, 2);
+        assert_eq!(mesh_wire_key(k, false), k);
+        assert_ne!(mesh_wire_key(k, true), k);
+        let mut p = inca_core::params::Params::new();
+        p.insert("angle".into(), serde_json::json!(180.0));
+        s.apply_op(&c, "polySoftEdge", p, true);
+        let k2 = mesh_key(&s, &c, 2);
+        assert_ne!(mesh_wire_key(k2, true), mesh_wire_key(k, true));
+    }
     use inca_core::params::Params;
     use egui::pos2;
 

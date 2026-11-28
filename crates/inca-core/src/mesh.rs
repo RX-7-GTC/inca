@@ -333,14 +333,42 @@ impl PolyMesh {
         triangulate(&pts)
     }
 
+    /// Cosine of `soft_angle`: two faces meeting at least this closely share a soft edge.
+    fn cos_soft_angle(&self) -> f64 {
+        (self.soft_angle.clamp(0.0, 180.0) * crate::math::D2R).cos()
+    }
+
+    /// Whether the edge `a`-`b` between two faces with unit normals `na` and `nb` is soft: its
+    /// explicit `edge_hard` override if there is one, otherwise whether the faces meet within
+    /// `soft_angle`. Shading (`corner_normals`) and the Soft/Hard Edges display both use this.
+    fn edge_is_soft(&self, a: u32, b: u32, na: DVec3, nb: DVec3, cos_soft: f64) -> bool {
+        match self.edge_hard.as_ref().and_then(|m| m.get(&ekey(a, b).to_string()).copied()) {
+            Some(hard) => !hard,
+            None => na.dot(nb) >= cos_soft - 1e-9,
+        }
+    }
+
+    /// For each edge of `topo` (in `topo.edges` order), whether it is hard: for an edge between
+    /// two faces, the same rule shading uses. Border, non-manifold and degenerate edges (a face
+    /// using the edge twice) are drawn hard.
+    pub fn hard_edges(&self, topo: &Topo) -> Vec<bool> {
+        let fnorm: Vec<DVec3> = (0..self.f.len()).map(|i| self.face_normal(i).normalize_or_zero()).collect();
+        let cos_soft = self.cos_soft_angle();
+        topo.edges
+            .iter()
+            .zip(&topo.edge_faces)
+            .map(|(&(a, b), fs)| match fs.as_slice() {
+                [f, g] if f != g => !self.edge_is_soft(a, b, fnorm[*f], fnorm[*g], cos_soft),
+                _ => true,
+            })
+            .collect()
+    }
+
     /// Per-corner normals with smoothing groups from `soft_angle` and `edge_hard`.
     pub fn corner_normals(&self) -> Vec<Vec<DVec3>> {
         let fnorm: Vec<DVec3> = (0..self.f.len()).map(|i| self.face_normal(i).normalize_or_zero()).collect();
         let topo = self.topo();
-        let cos_soft = (self.soft_angle.clamp(0.0, 180.0) * crate::math::D2R).cos();
-        let hard_edge = |a: u32, b: u32| -> Option<bool> {
-            self.edge_hard.as_ref().and_then(|m| m.get(&ekey(a, b).to_string()).copied())
-        };
+        let cos_soft = self.cos_soft_angle();
         let mut out = Vec::with_capacity(self.f.len());
         for (fi, face) in self.f.iter().enumerate() {
             let n = face.len();
@@ -363,11 +391,7 @@ impl PolyMesh {
                         if seen.contains(&g) {
                             break;
                         }
-                        let soft = match hard_edge(v, via) {
-                            Some(h) => !h,
-                            None => fnorm[cur_f].dot(fnorm[g]) >= cos_soft - 1e-9,
-                        };
-                        if !soft {
+                        if !self.edge_is_soft(v, via, fnorm[cur_f], fnorm[g], cos_soft) {
                             break;
                         }
                         seen.insert(g);
@@ -2140,6 +2164,60 @@ mod tests {
 
     fn is_closed(m: &PolyMesh) -> bool {
         m.topo().edge_faces.iter().all(|f| f.len() == 2)
+    }
+
+    /// The Soft/Hard Edges display (`hard_edges`) and shading (`corner_normals`) agree: the two
+    /// faces of a soft edge share their corner normals along it. (A hard edge's faces may still
+    /// share them when a lone hard edge sits in an otherwise soft fan, as shading walks around
+    /// the vertex the other way; where every edge at its ends is hard they must differ.)
+    fn assert_hard_edges_match_shading(m: &PolyMesh, what: &str) {
+        let topo = m.topo();
+        let hard = m.hard_edges(&topo);
+        let normals = m.corner_normals();
+        let corner = |f: usize, v: u32| normals[f][m.f[f].iter().position(|&x| x == v).unwrap()];
+        for (e, &(a, b)) in topo.edges.iter().enumerate() {
+            let [f, g] = topo.edge_faces[e][..] else {
+                assert!(hard[e], "{what}: border edge {a}-{b} should be hard");
+                continue;
+            };
+            let shared = corner(f, a).distance(corner(g, a)) < 1e-9 && corner(f, b).distance(corner(g, b)) < 1e-9;
+            if !hard[e] {
+                assert!(shared, "{what}: edge {a}-{b} is soft but shading breaks along it");
+            } else if [a, b].iter().all(|&v| topo.vert_edges[v as usize].iter().all(|&k| hard[k])) {
+                assert!(!shared, "{what}: edge {a}-{b} is hard but shading is smooth along it");
+            }
+        }
+    }
+
+    #[test]
+    fn hard_edges_follow_the_soft_angle_and_overrides() {
+        let mut c = cube();
+        let topo = c.topo();
+        // 90 degree corners are hard at the default 60 degrees, soft at 180
+        assert!(c.hard_edges(&topo).iter().all(|&h| h));
+        assert_hard_edges_match_shading(&c, "cube");
+        c.soft_angle = 180.0;
+        assert!(c.hard_edges(&topo).iter().all(|&h| !h));
+        assert_hard_edges_match_shading(&c, "soft cube");
+        // an explicit override wins over the angle
+        let (a, b) = topo.edges[3];
+        c.edge_hard = Some(BTreeMap::from([(ekey(a, b).to_string(), true)]));
+        let hard = c.hard_edges(&topo);
+        assert_eq!(hard.iter().filter(|&&h| h).count(), 1);
+        assert!(hard[3]);
+        assert_hard_edges_match_shading(&c, "cube with one hard edge");
+        // a sphere is soft everywhere; a cylinder has soft sides and hard caps
+        let sphere = primitives::generate("polySphere", &serde_json::Map::new()).unwrap();
+        assert!(sphere.hard_edges(&sphere.topo()).iter().all(|&h| !h));
+        assert_hard_edges_match_shading(&sphere, "sphere");
+        let cyl = primitives::generate("polyCylinder", &serde_json::Map::new()).unwrap();
+        let ct = cyl.topo();
+        let ch = cyl.hard_edges(&ct);
+        assert!(ch.iter().any(|&h| h) && ch.iter().any(|&h| !h), "cylinder should have both");
+        assert_hard_edges_match_shading(&cyl, "cylinder");
+        // an open mesh: border edges are hard
+        let plane = primitives::generate("polyPlane", &serde_json::Map::new()).unwrap();
+        assert_hard_edges_match_shading(&plane, "plane");
     }
 
     #[test]

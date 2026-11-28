@@ -206,6 +206,10 @@ fn vp_render_key(app: &IncaApp, idx: usize, px: [u32; 2], cv: &CamView) -> u64 {
     let mut live: Vec<String> = app.vp_state.live_meshes().into_iter().collect();
     live.sort();
     live.hash(&mut h);
+    // Display > Polygons > Soft/Hard Edges changes the drawn wire without a scene change
+    let mut soft_hard: Vec<&String> = app.overlay_softhard.iter().collect();
+    soft_hard.sort();
+    soft_hard.hash(&mut h);
     for x in cv.view_proj().to_cols_array() {
         x.to_bits().hash(&mut h);
     }
@@ -285,7 +289,7 @@ fn pane(app: &mut IncaApp, ui: &mut egui::Ui, frame: &mut eframe::Frame, idx: us
         if force_render || app.vp_state.render_keys[idx] != Some(render_key) {
             let live = app.vp_state.live_meshes();
             let soft = app.soft.on.then_some((app.soft.radius, app.soft.linear));
-            let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.mesh_cache, soft, app.prefs.smooth_divisions);
+            let mut draws = viewport::build_draws(&app.s, &app.vps[idx], &cv, gpu, &mut app.smooth_cache, &live, &mut app.mesh_cache, soft, app.prefs.smooth_divisions, &app.overlay_softhard);
             draws.extend(crate::anim_extras::draws(&app.viz));
             let mut fu = viewport::frame_uniform(&app.s, &app.vps[idx], &cv, app.bg_mode);
             let mut sky_warning = None;
@@ -3638,6 +3642,26 @@ mod tests {
         let (t, z) = extrude_drag_offsets(DVec3::ZERO, 0.0, DVec3::X, DVec3::new(0.0, 0.0, 3.0));
         assert_eq!(t, DVec3::new(0.0, 0.0, 3.0));
         assert_eq!(z, 0.0);
+    }
+
+    /// Switching Display > Polygons > Soft/Hard Edges must redraw the viewport: it changes the
+    /// drawn wire without touching the scene, so it has to be part of the render key.
+    #[test]
+    fn soft_hard_edges_toggle_changes_the_render_key() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx);
+        let mut app = IncaApp::new(&cc);
+        let id = app.s.create_mesh("polyCube", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let idx = app.active_vp;
+        let cam = app.vps[idx].camera.clone();
+        let cv = viewport::cam_view(&app.s, &cam, [800.0, 600.0]);
+        let off = vp_render_key(&app, idx, [800, 600], &cv);
+        app.action("toggleSoftHardEdges");
+        let on = vp_render_key(&app, idx, [800, 600], &cv);
+        assert_ne!(on, off, "turning Soft/Hard Edges on must redraw");
+        app.action("toggleSoftHardEdges");
+        assert_eq!(vp_render_key(&app, idx, [800, 600], &cv), off, "turning it off again restores the key");
     }
 
     #[test]

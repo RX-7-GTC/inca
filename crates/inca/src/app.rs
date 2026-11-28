@@ -306,6 +306,8 @@ pub struct IncaApp {
     pub hud: crate::edit_cmds::Hud,
     pub overlay_normals: HashSet<String>,
     pub overlay_border: HashSet<String>,
+    /// Display > Polygons > Soft/Hard Edges: meshes whose wireframe dashes soft edges
+    pub overlay_softhard: HashSet<String>,
     /// measured redraw rate for the fps HUD
     pub fps_measured: f32,
     /// Last window title sent to the OS; avoid a window event every frame.
@@ -557,6 +559,7 @@ impl IncaApp {
             hud: cc.storage.and_then(|s| eframe::get_value(s, "hud")).unwrap_or_default(),
             overlay_normals: HashSet::new(),
             overlay_border: HashSet::new(),
+            overlay_softhard: HashSet::new(),
             fps_measured: 0.0,
             window_title: String::new(),
             mesh_tool: Default::default(),
