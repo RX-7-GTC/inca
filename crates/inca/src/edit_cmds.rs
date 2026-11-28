@@ -431,10 +431,22 @@ pub fn template(app: &mut IncaApp, on: bool, all: bool) {
     }
 }
 
-/// Face Normals / Border Edges: toggle the overlay on the selected meshes.
-pub fn toggle_overlay(app: &mut IncaApp, normals: bool) {
+/// Display > Polygons per-mesh displays toggled by `toggle_overlay`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MeshOverlay {
+    Normals,
+    BorderEdges,
+    SoftHardEdges,
+}
+
+/// Face Normals / Border Edges / Soft/Hard Edges: toggle the display on the selected meshes.
+pub fn toggle_overlay(app: &mut IncaApp, which: MeshOverlay) {
     let meshes: Vec<String> = app.s.sel.iter().filter(|i| app.s.node(i).is_some_and(|n| n.mesh().is_some())).cloned().collect();
-    let set = if normals { &mut app.overlay_normals } else { &mut app.overlay_border };
+    let set = match which {
+        MeshOverlay::Normals => &mut app.overlay_normals,
+        MeshOverlay::BorderEdges => &mut app.overlay_border,
+        MeshOverlay::SoftHardEdges => &mut app.overlay_softhard,
+    };
     if meshes.is_empty() {
         set.clear();
         return;

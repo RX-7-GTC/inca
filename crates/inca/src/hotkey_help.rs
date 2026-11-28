@@ -305,6 +305,7 @@ pub fn describe(id: &str) -> Option<&'static str> {
         "showAllGeometry" => "Shows all hidden geometry.",
         "toggleNormals" => "Shows or hides face normals.",
         "toggleBorderEdges" => "Shows or hides border edges.",
+        "toggleSoftHardEdges" => "Draws soft edges of the selected meshes dashed and hard edges solid.",
         "faceCenters" => "Shows or hides face center dots.",
         "hudPolyCount" => "Shows polygon counts in the heads-up display.",
         "hudFrameRate" => "Shows the frame rate in the heads-up display.",

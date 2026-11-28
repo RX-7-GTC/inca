@@ -142,7 +142,7 @@ fn hardware(app: &mut IncaApp, cam: &str) {
     // JS makeRenderCamera: aspect = W * pixelAspect / H
     let aspect_w = size[0] as f32 * settings.pixel_aspect.max(1e-3);
     let cv = crate::viewport::cam_view(&app.s, cam, [aspect_w, size[1] as f32]);
-    let draws = crate::viewport::build_draws(&app.s, &vp, &cv, gpu, &mut app.smooth_cache, &Default::default(), &mut app.mesh_cache, None, app.prefs.smooth_divisions);
+    let draws = crate::viewport::build_draws(&app.s, &vp, &cv, gpu, &mut app.smooth_cache, &Default::default(), &mut app.mesh_cache, None, app.prefs.smooth_divisions, &Default::default());
     let mut fu = crate::viewport::frame_uniform(&app.s, &vp, &cv, 1);
     fu.render[0] = tone_id(settings.hw_tone);
     fu.render[1] = if settings.transparent { 1.0 } else { 0.0 };

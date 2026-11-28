@@ -1543,6 +1543,30 @@ mod tests {
         (app, cube, cv, rect)
     }
 
+    /// Display > Polygons > Soft/Hard Edges toggles the display on the selected meshes only, and
+    /// the menu lists it in place of the Soften/Harden Edge commands (#37).
+    #[test]
+    fn soft_hard_edges_toggles_on_the_selected_meshes() {
+        let ctx = egui::Context::default();
+        let (mut app, cube, _, _) = cube_scene(&ctx);
+        let other = app.s.create_mesh("polySphere", &Params::new(), None);
+        app.s.select(std::slice::from_ref(&cube), SelMode::Replace);
+        app.action("toggleSoftHardEdges");
+        assert!(app.overlay_softhard.contains(&cube) && !app.overlay_softhard.contains(&other));
+        assert!(app.overlay_border.is_empty() && app.overlay_normals.is_empty());
+        app.action("toggleSoftHardEdges");
+        assert!(app.overlay_softhard.is_empty());
+        let polys: Vec<&str> = crate::menus::common("Display")
+            .into_iter()
+            .find_map(|m| match m {
+                crate::menus::M::Sub("Polygons", items) => Some(items.into_iter().filter_map(|i| if let crate::menus::M::A(a) = i { Some(a) } else { None }).collect()),
+                _ => None,
+            })
+            .expect("Display > Polygons");
+        assert!(polys.contains(&"toggleSoftHardEdges"), "{polys:?}");
+        assert!(!polys.contains(&"softenEdge") && !polys.contains(&"hardenEdge"), "{polys:?}");
+    }
+
     /// A screen point `frac` of the way along the edge `pick_edge` finds there, with that edge.
     fn point_on_edge(app: &mut IncaApp, cube: &str, cv: &CamView, rect: Rect, frac: f32) -> (Pos2, u32, u32) {
         let pm = app.s.node(cube).unwrap().mesh().unwrap().mesh.clone();
