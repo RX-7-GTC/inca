@@ -20,6 +20,12 @@ const MANIP_SIZE: f32 = 115.0;
 const MANIP_HOVER: Color32 = Color32::from_rgb(255, 245, 170);
 /// Colour of the remembered / active handle.
 const MANIP_SELECTED: Color32 = Color32::from_rgb(240, 225, 80);
+/// Manipulator axis colours, Maya's pure red / green / blue for X / Y / Z.
+const AXIS_COLORS: [Color32; 3] = [Color32::from_rgb(255, 0, 0), Color32::from_rgb(0, 255, 0), Color32::from_rgb(0, 0, 255)];
+/// The Move centre square at rest: Maya's pale yellow, drawn with a 1 px outline.
+const MOVE_CENTER_IDLE: Color32 = Color32::from_rgb(253, 255, 136);
+/// The Move centre square under the cursor: Maya's bright yellow, distinct from the pale idle one.
+const MOVE_CENTER_HOVER: Color32 = Color32::from_rgb(255, 255, 0);
 
 /// Camera navigation mode of an Alt+drag in progress (JS `onDown`).
 #[derive(Clone, Copy, PartialEq)]
@@ -1710,10 +1716,28 @@ fn negative_handle_at(tool: Tool, axes: &[bool; 3], pivot: DVec3, rot: DQuat, cv
     None
 }
 
-/// Draw the negative-axis arrows (JS `manipNegativeHandles`, on by default).
+/// The manipulator's look for a tool: Maya's pure axis colours, and for Move its one-pixel,
+/// fully opaque shafts.
+fn manip_visuals(tool: Tool, manip_size: f32) -> GizmoVisuals {
+    let mut visuals = GizmoVisuals { gizmo_size: MANIP_SIZE * manip_size, stroke_width: 3.0, ..Default::default() };
+    if tool == Tool::Move {
+        // drawn 1 px; sizes and the pick distance keep the 3 px stroke
+        visuals.shaft_width = Some(1.0);
+        visuals.inactive_alpha = 1.0;
+    }
+    [visuals.x_color, visuals.y_color, visuals.z_color] = AXIS_COLORS;
+    visuals.s_color = match tool {
+        Tool::Rotate => Color32::from_rgb(120, 190, 255),
+        Tool::Move => MOVE_CENTER_IDLE,
+        _ => Color32::from_rgb(220, 220, 220),
+    };
+    visuals
+}
+
+/// Draw the negative-axis arrows (JS `manipNegativeHandles`; off by default, as in Maya).
 fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, cursor: Option<Pos2>, size: f32) {
     let Some((p, dirs)) = screen_axes(pivot, rot, cv, rect) else { return };
-    let colors = [Color32::from_rgb(230, 57, 62), Color32::from_rgb(92, 214, 92), Color32::from_rgb(74, 132, 255)];
+    let colors = AXIS_COLORS;
     for i in 0..3 {
         if !axes[i] {
             continue;
@@ -1729,13 +1753,27 @@ fn draw_negative_handles(painter: &egui::Painter, tool: Tool, axes: &[bool; 3], 
         if hot {
             color = MANIP_HOVER;
         }
-        painter.line_segment([a, b], Stroke::new(if hot { 4.0 } else { 2.5 }, color));
+        // Move handles are thin with a long head, like the positive Maya-style arrows
+        let thin = tool == Tool::Move;
+        let width = match (thin, hot) {
+            (true, false) => 1.0,
+            (true, true) => 2.0,
+            (false, false) => 2.5,
+            (false, true) => 4.0,
+        };
+        painter.line_segment([a, b], Stroke::new(width, color));
         if tool == Tool::Scale {
             painter.rect_filled(Rect::from_center_size(b, vec2(7.0, 7.0)), 0.0, color);
         } else {
-            // arrow head pointing along -u
-            let base = b + u * 8.0;
-            let perp = vec2(-u.y, u.x) * 4.0;
+            // arrow head pointing along -u (Move: Maya's long head, shorter on tiny manipulators)
+            let (len, half) = if thin {
+                let len = 20.0f32.min((b - a).length() * 0.4);
+                (len, len * 0.25)
+            } else {
+                (8.0, 4.0)
+            };
+            let base = b + u * len;
+            let perp = vec2(-u.y, u.x) * half;
             painter.add(egui::Shape::convex_polygon(vec![b, base + perp, base - perp], color, Stroke::NONE));
         }
     }
@@ -1883,7 +1921,7 @@ fn draw_scale_axis_cubes(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: 
     };
     let start_len = (scale_factor * (size * 0.2 + 1.5)) as f64;
     let base_len = (scale_factor * (size - 6.0)) as f64;
-    let colors = [Color32::from_rgb(230, 57, 62), Color32::from_rgb(92, 214, 92), Color32::from_rgb(74, 132, 255)];
+    let colors = AXIS_COLORS;
     let modes = [GizmoMode::ScaleX, GizmoMode::ScaleY, GizmoMode::ScaleZ];
     let half = MANIP_SIZE * 0.045 * scale;
     for i in 0..3 {
@@ -2018,7 +2056,7 @@ fn center_square_color(active: Option<GizmoMode>) -> Color32 {
     if matches!(active, Some(GizmoMode::TranslateX | GizmoMode::TranslateY | GizmoMode::TranslateZ)) {
         Color32::from_rgb(0, 200, 200)
     } else {
-        Color32::from_rgb(240, 225, 80)
+        MOVE_CENTER_IDLE
     }
 }
 
@@ -2039,12 +2077,13 @@ fn draw_center_square(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &Ca
         let v = rot * b * half;
         let pts: Vec<Pos2> = [pivot + u + v, pivot - u + v, pivot - u - v, pivot + u - v].into_iter().filter_map(|p| cv.project(p, rect)).collect();
         if pts.len() == 4 {
-            painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, color)));
+            painter.add(egui::Shape::closed_line(pts, Stroke::new(1.0, color)));
         }
     } else if let Some(p) = cv.project(pivot, rect) {
+        // Maya: a thin square with a one-pixel dot at the pivot
         let half = MANIP_SIZE * 0.107 * scale;
-        painter.rect_stroke(Rect::from_center_size(p, vec2(half * 2.0, half * 2.0)), 0.0, Stroke::new(2.0, color), egui::StrokeKind::Inside);
-        painter.circle_filled(p, 1.5, color);
+        painter.rect_stroke(Rect::from_center_size(p, vec2(half * 2.0, half * 2.0)), 0.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+        painter.circle_filled(p, 1.0, color);
     }
 }
 
@@ -2335,15 +2374,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         app.vp_state.mmb = None;
     }
     let g = &mut app.vp_state.gizmos[idx];
-    let mut visuals = GizmoVisuals { gizmo_size: MANIP_SIZE * app.manip_size, stroke_width: 3.0, ..Default::default() };
-    visuals.x_color = Color32::from_rgb(230, 57, 62);
-    visuals.y_color = Color32::from_rgb(92, 214, 92);
-    visuals.z_color = Color32::from_rgb(74, 132, 255);
-    visuals.s_color = match mode_tool {
-        Tool::Rotate => Color32::from_rgb(120, 190, 255),
-        Tool::Move => Color32::from_rgb(240, 225, 80),
-        _ => Color32::from_rgb(220, 220, 220),
-    };
+    let mut visuals = manip_visuals(mode_tool, app.manip_size);
     // The interaction gizmo (drawn while rotating) keeps the strong yellow; the drawing gizmo
     // below overrides this to pale yellow so hover and selected stay distinct.
     visuals.highlight_color = Some(MANIP_SELECTED);
@@ -2554,7 +2585,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
             scale_center_color(active_draw.or(active))
         }
     } else if hover_handle == Some(GizmoMode::TranslateView) {
-        MANIP_HOVER
+        MOVE_CENTER_HOVER
     } else {
         center_square_color(active_draw)
     };
@@ -3640,6 +3671,27 @@ mod tests {
         assert_eq!(z, 0.0);
     }
 
+    /// The Move manipulator matches Maya's look: pure red / green / blue axes, one-pixel opaque
+    /// shafts and a pale yellow centre; the other tools keep their wider strokes.
+    #[test]
+    fn move_manipulator_uses_mayas_look() {
+        let v = manip_visuals(Tool::Move, 1.0);
+        assert_eq!([v.x_color, v.y_color, v.z_color], [Color32::from_rgb(255, 0, 0), Color32::from_rgb(0, 255, 0), Color32::from_rgb(0, 0, 255)]);
+        assert_eq!(v.shaft_width, Some(1.0));
+        // the drawn shaft is thin, but sizes and picking keep the 3 px stroke
+        assert_eq!(v.stroke_width, 3.0);
+        assert_eq!(v.inactive_alpha, 1.0);
+        assert_eq!(v.s_color, Color32::from_rgb(253, 255, 136));
+        assert_eq!(center_square_color(None), Color32::from_rgb(253, 255, 136));
+        assert_eq!(center_square_color(Some(GizmoMode::TranslateX)), Color32::from_rgb(0, 200, 200));
+        assert_ne!(MOVE_CENTER_HOVER, MOVE_CENTER_IDLE, "hovering the centre must show");
+        let r = manip_visuals(Tool::Rotate, 1.0);
+        assert_eq!(r.stroke_width, 3.0);
+        assert_eq!(r.shaft_width, None);
+        assert_eq!(r.x_color, Color32::from_rgb(255, 0, 0));
+        assert_eq!(manip_visuals(Tool::Move, 2.0).gizmo_size, MANIP_SIZE * 2.0);
+    }
+
     #[test]
     fn extrude_manip_visibility_and_cap_position() {
         let ctx = egui::Context::default();
@@ -3822,7 +3874,8 @@ mod tests {
     #[test]
     fn center_square_is_cyan_while_an_axis_is_selected() {
         let cyan = Color32::from_rgb(0, 200, 200);
-        let yellow = Color32::from_rgb(240, 225, 80);
+        // Maya's pale yellow
+        let yellow = Color32::from_rgb(253, 255, 136);
         for axis in [GizmoMode::TranslateX, GizmoMode::TranslateY, GizmoMode::TranslateZ] {
             assert_eq!(center_square_color(Some(axis)), cyan, "{axis:?} should deselect the centre");
         }

@@ -439,6 +439,7 @@ impl IncaApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         let mut prefs: crate::prefs::Prefs = cc.storage.and_then(|s| eframe::get_value(s, "prefs")).unwrap_or_default();
+        prefs.migrate();
         prefs.backend = crate::prefs::read_backend();
         let gpu_rs = cc.wgpu_render_state.clone();
         let gpu = gpu_rs.as_ref().map(|rs| Gpu::new(rs, prefs.msaa));
