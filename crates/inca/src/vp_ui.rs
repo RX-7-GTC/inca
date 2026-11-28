@@ -86,11 +86,15 @@ pub struct VpState {
     pub gizmo_solo: [Option<GizmoMode>; 4],
     /// Tab+drag select in progress: the components it has already toggled, and the last point
     pub tab_drag: Option<(HashSet<String>, Option<Pos2>)>,
+    /// Edit Pivot snap target under the cursor: (cursor/view/scene key, when picked, target).
+    /// Re-picked only when the key changes, at most every 30 ms while the cursor moves.
+    pub pivot_snap: Option<(u64, std::time::Instant, Option<PivotSnapTarget>)>,
 }
 
 impl Default for VpState {
     fn default() -> Self {
         VpState {
+            pivot_snap: None,
             gizmos: (0..4).map(|_| Gizmo::default()).collect(),
             drag: None,
             marquee: None,
@@ -2048,6 +2052,81 @@ fn draw_center_square(painter: &egui::Painter, pivot: DVec3, rot: DQuat, cv: &Ca
     }
 }
 
+/// A component a pivot can snap to: its world-space outline (a point, two edge ends or a face
+/// loop) and the point the pivot goes to.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PivotSnapTarget {
+    pub mesh: String,
+    pub comp: Comp,
+    pub outline: Vec<DVec3>,
+    pub point: DVec3,
+}
+
+/// The vertex, edge or face of a selected mesh under the cursor, in that order of preference
+/// (Maya's multi-component pick), and where the pivot would snap to on it.
+pub(crate) fn pivot_snap_target(s: &inca_core::scene::Scene, vp: &viewport::Viewport, mesh_cache: &mut viewport::MeshCache, cv: &CamView, cursor: Pos2, objects: &[String]) -> Option<PivotSnapTarget> {
+    let meshes: Vec<String> = objects.iter().filter(|i| s.node(i).is_some_and(|n| n.mesh().is_some())).cloned().collect();
+    if meshes.is_empty() {
+        return None;
+    }
+    let (mesh, comp) = [CompMode::Vertex, CompMode::Edge, CompMode::Face]
+        .into_iter()
+        .find_map(|mode| viewport::pick_best_component(s, vp, cv, &meshes, mode, cursor, mesh_cache))?;
+    // a selected mesh hidden behind another object under the cursor is not a target: the click
+    // belongs to the object in front
+    if viewport::pick_object_if(s, vp, cv, cursor, mesh_cache, &|_| true).is_some_and(|front| !meshes.contains(&front)) {
+        return None;
+    }
+    let pm = s.mesh_world(&mesh)?;
+    let outline: Vec<DVec3> = match comp {
+        Comp::V(v) => vec![*pm.v.get(v as usize)?],
+        Comp::E(a, b) => vec![*pm.v.get(a as usize)?, *pm.v.get(b as usize)?],
+        Comp::F(f) => pm.f.get(f)?.iter().map(|&v| pm.v[v as usize]).collect(),
+    };
+    let point = match comp {
+        Comp::F(f) => pm.face_center(f),
+        _ => outline.iter().copied().sum::<DVec3>() / outline.len() as f64,
+    };
+    Some(PivotSnapTarget { mesh, comp, outline, point })
+}
+
+/// Maya's red pre-selection highlight of the pivot snap target.
+fn draw_pivot_snap_target(painter: &egui::Painter, cv: &CamView, rect: Rect, t: &PivotSnapTarget) {
+    const RED: Color32 = Color32::from_rgb(255, 0, 0);
+    let pts: Vec<Pos2> = t.outline.iter().filter_map(|p| cv.project(*p, rect)).collect();
+    if pts.len() != t.outline.len() {
+        return;
+    }
+    match t.comp {
+        Comp::V(_) => {
+            painter.circle_filled(pts[0], 3.5, RED);
+        }
+        Comp::E(..) => {
+            painter.line_segment([pts[0], pts[1]], Stroke::new(2.0, RED));
+        }
+        Comp::F(_) => {
+            painter.add(egui::Shape::closed_line(pts, Stroke::new(2.0, RED)));
+        }
+    }
+}
+
+/// Move the pivots of `objects` to a world point, as one undoable `xform -ws -piv` (run_mel
+/// echoes it). Objects flattened to zero scale are skipped: their world matrix can't be inverted.
+fn snap_pivots_to(app: &mut IncaApp, objects: &[String], p: DVec3) {
+    let f = |x: f64| format!("{}", (x * 1e6).round() / 1e6);
+    let cmds: Vec<String> = objects
+        .iter()
+        .filter(|o| app.s.world_matrix(o).determinant().abs() > 1e-12)
+        .map(|o| format!("xform -ws -piv {} {} {} {};", f(p.x), f(p.y), f(p.z), app.s.name_of(o)))
+        .collect();
+    if cmds.is_empty() {
+        return;
+    }
+    if let Err(e) = app.run_mel("snap pivot", &cmds.join("\n")) {
+        app.last_result = format!("// Error: {e} //");
+    }
+}
+
 /// Shift+drag: the axis whose screen direction best matches the drag (JS `middleDrag` auto).
 fn auto_axis(tool: Tool, pivot: DVec3, rot: DQuat, cv: &CamView, rect: Rect, origin: Pos2, cursor: Pos2) -> GizmoMode {
     let (dx, dy) = (cursor.x - origin.x, cursor.y - origin.y);
@@ -2539,6 +2618,45 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     } else {
         None
     };
+    // Edit Pivot, as in Maya: the vertex / edge / face of a selected mesh under the cursor is
+    // highlighted in red, and clicking it snaps the pivot there (to a vertex, an edge's midpoint
+    // or a face's centre) instead of changing the selection
+    // Ctrl / Shift / Tab clicks and Lock Selection keep their usual meaning.
+    let selection_edit = mods.ctrl || mods.shift || mods.command || ui.input(|i| i.key_down(egui::Key::Tab)) || app.lock_selection;
+    if pivot_mode && interact && resp.hovered() && hover_handle.is_none() && app.vp_state.drag.is_none() && !interaction.dragging && !selection_edit {
+        let clicked = resp.clicked_by(egui::PointerButton::Primary);
+        let key = {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (idx, cursor.x.to_bits(), cursor.y.to_bits(), app.s.rev, &app.s.sel).hash(&mut h);
+            for x in cv.view_proj().to_cols_array() {
+                x.to_bits().hash(&mut h);
+            }
+            h.finish()
+        };
+        // the component picks are costly on dense meshes: reuse the last one while nothing
+        // changed, and while the cursor moves re-pick at most every 30 ms
+        let target = match &app.vp_state.pivot_snap {
+            Some((k, _, t)) if *k == key => t.clone(),
+            Some((_, at, t)) if !clicked && at.elapsed() < std::time::Duration::from_millis(30) => {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
+                t.clone()
+            }
+            _ => {
+                let t = pivot_snap_target(&app.s, &app.vps[idx], &mut app.mesh_cache, cv, cursor, &objects);
+                app.vp_state.pivot_snap = Some((key, std::time::Instant::now(), t.clone()));
+                t
+            }
+        };
+        if let Some(target) = target {
+            draw_pivot_snap_target(painter, cv, app.vps[idx].rect, &target);
+            if clicked {
+                snap_pivots_to(app, &objects, target.point);
+                app.vp_state.pivot_snap = None;
+                ui.ctx().request_repaint();
+                return true;
+            }
+        }
+    }
     let active_draw = app.vp_state.drag.as_ref().filter(|d| d.vp == idx).and_then(|d| d.handle).or_else(|| app.vp_state.active_handles[mi].filter(|m| modes.contains(*m)));
     let plane_lock = if mode_tool == Tool::Move { active_draw.and_then(plane_lock_axis) } else { None };
     let snap = app.snap_grid || app.snap_point || app.snap_curve || ui.input(|i| i.key_down(egui::Key::X) || i.key_down(egui::Key::V) || i.key_down(egui::Key::C));
@@ -4104,6 +4222,153 @@ mod tests {
             assert!(t[keep].abs() < 1e-9, "{mode:?} must keep axis {keep} fixed: {t:?}");
             assert!(t.iter().enumerate().any(|(i, v)| i != keep && v.abs() > 1e-6), "{mode:?} did not move: {t:?}");
         }
+    }
+
+    /// A selected 6-unit cube framed in an 800 x 600 persp view: (scene, cube, viewport, camera).
+    fn pivot_scene() -> (Scene, String, viewport::Viewport, CamView) {
+        let mut s = Scene::new();
+        let id = s.create_mesh("polyCube", &Params::new(), None);
+        for a in ["sx", "sy", "sz"] {
+            s.set_attr_f(&id, a, 6.0);
+        }
+        s.select(std::slice::from_ref(&id), SelMode::Replace);
+        let mut vp = viewport::Viewport::new("persp");
+        vp.rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let b = s.world_bbox(&id);
+        viewport::frame_box(&mut s, "persp", &b, 800.0 / 600.0);
+        let cv = viewport::cam_view(&s, "persp", [800.0, 600.0]);
+        (s, id, vp, cv)
+    }
+
+    /// The cube corner nearest the camera, and one of its edges and faces, in world space.
+    fn front_corner(s: &Scene, id: &str, cv: &CamView) -> (u32, (u32, u32), usize) {
+        let pm = s.mesh_world(id).unwrap();
+        let v = (0..pm.v.len()).min_by(|&a, &b| pm.v[a].distance(cv.eye).total_cmp(&pm.v[b].distance(cv.eye))).unwrap() as u32;
+        let t = pm.topo();
+        let e = *t.edges.iter().find(|(a, b)| *a == v || *b == v).unwrap();
+        let f = (0..pm.f.len()).find(|&f| pm.f[f].contains(&v)).unwrap();
+        (v, e, f)
+    }
+
+    /// Edit Pivot snaps to the vertex, edge midpoint or face centre under the cursor (#Maya D).
+    #[test]
+    fn pivot_snap_targets_vertex_edge_and_face() {
+        let (s, id, vp, cv) = pivot_scene();
+        let mut cache = viewport::MeshCache::default();
+        let pm = s.mesh_world(&id).unwrap();
+        let (v, (a, b), f) = front_corner(&s, &id, &cv);
+        let objs = [id.clone()];
+        // on the corner: the vertex
+        let p = cv.project(pm.v[v as usize], vp.rect).unwrap();
+        let t = pivot_snap_target(&s, &vp, &mut cache, &cv, p, &objs).unwrap();
+        assert_eq!(t.comp, Comp::V(v));
+        assert!(t.point.distance(pm.v[v as usize]) < 1e-9);
+        // halfway along one of its edges: the edge, snapping to its midpoint
+        let mid = (pm.v[a as usize] + pm.v[b as usize]) * 0.5;
+        let p = cv.project(mid, vp.rect).unwrap();
+        let t = pivot_snap_target(&s, &vp, &mut cache, &cv, p, &objs).unwrap();
+        assert!(matches!(t.comp, Comp::E(x, y) if (x, y) == (a, b) || (x, y) == (b, a)), "{:?}", t.comp);
+        assert!(t.point.distance(mid) < 1e-9);
+        // a face centre: the face, snapping to its centre
+        let c = pm.face_center(f);
+        let p = cv.project(c, vp.rect).unwrap();
+        let t = pivot_snap_target(&s, &vp, &mut cache, &cv, p, &objs).unwrap();
+        assert_eq!(t.comp, Comp::F(f));
+        assert!(t.point.distance(c) < 1e-9);
+        // empty space and unselected meshes give nothing
+        assert!(pivot_snap_target(&s, &vp, &mut cache, &cv, pos2(5.0, 5.0), &objs).is_none());
+        assert!(pivot_snap_target(&s, &vp, &mut cache, &cv, p, &[]).is_none());
+    }
+
+    /// In Edit Pivot mode a click on a component moves the pivot there (one undo step) and keeps
+    /// the selection; the object itself does not move.
+    #[test]
+    fn pivot_mode_click_snaps_the_pivot_and_keeps_the_selection() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = IncaApp::new(&cc);
+        let (s, id, vp, cv) = pivot_scene();
+        app.s = s;
+        let idx = app.active_vp;
+        app.vps[idx].camera = vp.camera.clone();
+        app.vps[idx].rect = vp.rect;
+        app.tool = Tool::Move;
+        app.pivot_mode = true;
+        let pm = app.s.mesh_world(&id).unwrap();
+        // a front corner well away from the manipulator at the pivot (a click on a handle
+        // rightly goes to the handle)
+        let centre = cv.project(DVec3::ZERO, vp.rect).unwrap();
+        let corner = pm
+            .v
+            .iter()
+            .copied()
+            .filter(|v| v.distance(cv.eye) < cv.eye.length())
+            .max_by(|a, b| cv.project(*a, vp.rect).unwrap().distance(centre).total_cmp(&cv.project(*b, vp.rect).unwrap().distance(centre)))
+            .unwrap();
+        let p = cv.project(corner, vp.rect).unwrap();
+        assert!(p.distance(centre) > MANIP_SIZE + 20.0, "test corner too close to the manipulator");
+        let before_t = app.s.world_matrix(&id);
+        let rect = vp.rect;
+        // click at `p` with `modifiers`, starting at time `t0`; true if gizmo() took the click
+        let click = |app: &mut IncaApp, modifiers: egui::Modifiers, t0: f64| -> bool {
+            let mut used = false;
+            for (i, events) in [
+                vec![egui::Event::ModifiersChanged(modifiers), egui::Event::PointerMoved(p)],
+                vec![egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers }],
+                vec![egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers }],
+                vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(rect);
+                raw.time = Some(t0 + i as f64 * 0.05);
+                raw.events = events;
+                let mut out = ctx.run_ui(raw, |ui| {
+                    let resp = ui.interact(rect, egui::Id::new("pivot snap test"), Sense::click_and_drag());
+                    let painter = ui.painter().clone();
+                    // the viewport skips click-selection when gizmo() takes the click
+                    used |= gizmo(app, ui, idx, &resp, &cv, &painter, true) && resp.clicked();
+                });
+                out.textures_delta.clear();
+            }
+            used
+        };
+        // Ctrl+click is a selection edit, not a snap
+        assert!(!click(&mut app, egui::Modifiers::CTRL, 0.0), "Ctrl+click must reach the selection");
+        assert!(app.s.world_pivot(&id).distance(DVec3::ZERO) < 1e-9, "Ctrl+click must not snap");
+        // a plain click snaps, and gizmo() takes it so the selection code never runs
+        assert!(click(&mut app, egui::Modifiers::NONE, 1.0), "the snap click must be consumed");
+        assert!(app.s.world_pivot(&id).distance(corner) < 1e-5, "pivot {} should be at {corner}", app.s.world_pivot(&id));
+        assert_eq!(app.s.sel, vec![id.clone()]);
+        assert!(app.s.world_matrix(&id).abs_diff_eq(before_t, 1e-9), "the object must not move");
+        app.s.undo();
+        assert!(app.s.world_pivot(&id).distance(DVec3::ZERO) < 1e-9, "undo restores the pivot");
+    }
+
+    /// Unselected meshes are never targets, and one in front of the selected mesh hides it.
+    #[test]
+    fn pivot_snap_ignores_unselected_and_hidden_meshes() {
+        let (mut s, id, vp, _) = pivot_scene();
+        let pm = s.mesh_world(&id).unwrap();
+        // a second, unselected cube between the camera and the selected one's front corner
+        let cv0 = viewport::cam_view(&s, "persp", [800.0, 600.0]);
+        let (v, _, _) = front_corner(&s, &id, &cv0);
+        let corner = pm.v[v as usize];
+        let blocker = s.create_mesh("polyCube", &Params::new(), None);
+        let between = corner + (cv0.eye - corner) * 0.3;
+        for (a, x) in [("tx", between.x), ("ty", between.y), ("tz", between.z)] {
+            s.set_attr_f(&blocker, a, x);
+        }
+        let cv = viewport::cam_view(&s, "persp", [800.0, 600.0]);
+        let mut cache = viewport::MeshCache::default();
+        let p = cv.project(corner, vp.rect).unwrap();
+        assert_eq!(viewport::pick_object_if(&s, &vp, &cv, p, &mut cache, &|_| true).as_deref(), Some(blocker.as_str()), "test setup: the blocker is in front");
+        assert!(pivot_snap_target(&s, &vp, &mut cache, &cv, p, std::slice::from_ref(&id)).is_none(), "a hidden component is not a target");
+        // with only the blocker selected, its own components are the targets, never the cube's
+        let t = pivot_snap_target(&s, &vp, &mut cache, &cv, p, std::slice::from_ref(&blocker)).unwrap();
+        assert_eq!(t.mesh, blocker);
     }
 
     #[test]
