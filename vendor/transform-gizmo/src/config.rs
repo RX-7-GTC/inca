@@ -471,6 +471,10 @@ pub struct GizmoVisuals {
     pub highlight_color: Option<Color32>,
     /// Width (thickness) of the gizmo strokes
     pub stroke_width: f32,
+    /// Drawn width of the translate arrow shafts, when it differs from `stroke_width`. Only the
+    /// drawing changes: handle sizes, arrow lengths and the pick distance still follow
+    /// `stroke_width`.
+    pub shaft_width: Option<f32>,
     /// Gizmo size in pixels
     pub gizmo_size: f32,
 }
@@ -486,6 +490,7 @@ impl Default for GizmoVisuals {
             highlight_alpha: 1.0,
             highlight_color: None,
             stroke_width: 4.0,
+            shaft_width: None,
             gizmo_size: 75.0,
         }
     }

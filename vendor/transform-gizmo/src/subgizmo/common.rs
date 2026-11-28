@@ -214,16 +214,17 @@ pub(crate) fn draw_arrow(
     let mut draw_data = GizmoDrawData::default();
     if mode.is_translate() {
         // Maya's move handles end in a 3D cone rather than a flat triangle.
-        const CONE_RADIUS_PX: f32 = 5.0;
-        const CONE_HEIGHT_PX: f32 = 14.0;
+        // Maya's cone: about 10 px across and 21 px long, shrunk on very small manipulators so
+        // it never runs back past the start of the shaft
+        let (cone_radius_px, cone_height_px) = cone_size_px((arrow_params.length / config.scale_factor as f64) as f32);
         let cone_base = arrow_params.end
-            - arrow_params.direction * (CONE_HEIGHT_PX * config.scale_factor) as f64;
+            - arrow_params.direction * (cone_height_px * config.scale_factor) as f64;
         draw_data = draw_data.add(
             shape_builder
                 .line_segment(
                     arrow_params.start,
                     cone_base,
-                    (config.visuals.stroke_width, color),
+                    (config.visuals.shaft_width.unwrap_or(config.visuals.stroke_width), color),
                 )
                 .into(),
         );
@@ -231,8 +232,8 @@ pub(crate) fn draw_arrow(
             config,
             transform.transform_point3(cone_base),
             transform.transform_vector3(arrow_params.direction).normalize_or_zero(),
-            CONE_RADIUS_PX,
-            CONE_HEIGHT_PX,
+            cone_radius_px,
+            cone_height_px,
             cone_color,
         ));
         return draw_data;
@@ -261,6 +262,13 @@ pub(crate) fn draw_arrow(
     }
 
     draw_data
+}
+
+/// Translate cone (radius, height) in points for an arrow `arrow_len` points long: Maya's 5 x 20,
+/// at most 40 % of the arrow so the shaft keeps a visible part on tiny manipulators.
+pub(crate) fn cone_size_px(arrow_len: f32) -> (f32, f32) {
+    let height = 20.0f32.min(arrow_len.max(0.0) * 0.4);
+    (height * 0.25, height)
 }
 
 /// Local-space endpoint of an axis arrow. Used to place the scale cube on the gizmo's own tip.
@@ -395,12 +403,6 @@ pub(crate) fn draw_gizmo_cone(
         return GizmoDrawData::default();
     }
 
-    let light = (config.view_up() + config.view_right() * 0.25 + config.view_forward() * 0.75).normalize();
-    let shade = |n: DVec3| {
-        let k = (0.82 + 0.18 * n.dot(light).max(0.0)) as f32;
-        Color32::from_rgb((color.r() as f32 * k) as u8, (color.g() as f32 * k) as u8, (color.b() as f32 * k) as u8)
-    };
-
     // A raw triangle mesh, not `Shape::convex_polygon`: epaint's feathering turns the sharp,
     // near-edge-on side triangles into long miter spikes.
     let mut mesh = Mesh::default();
@@ -410,7 +412,8 @@ pub(crate) fn draw_gizmo_cone(
         if n.dot(config.eye_to_model_dir) <= 0.0 {
             continue;
         }
-        let face_color = shade(n);
+        // flat, unshaded, like Maya's move cones
+        let face_color = color;
         let base = mesh.vertices.len() as u32;
         for p in [ring_screen[i], ring_screen[j], tip_screen] {
             mesh.vertices.push(Vertex { pos: p, uv: epaint::Pos2::ZERO, color: face_color });
@@ -419,6 +422,9 @@ pub(crate) fn draw_gizmo_cone(
     }
     GizmoDrawData::from(mesh)
 }
+
+/// Overall opacity of an idle plane handle.
+const PLANE_REST_ALPHA: f32 = 0.6;
 
 pub(crate) fn draw_plane(
     config: &PreparedGizmoConfig,
@@ -431,7 +437,10 @@ pub(crate) fn draw_plane(
         return GizmoDrawData::default();
     }
 
-    let color = gizmo_color(config, focused, direction).gamma_multiply(opacity as _);
+    // Maya's plane handles are see-through at rest, even when the axis lines are opaque: scale
+    // the inactive alpha (already in `gizmo_color`) so the plane ends up at PLANE_REST_ALPHA
+    let rest_alpha = if focused { 1.0 } else { (PLANE_REST_ALPHA / config.visuals.inactive_alpha.max(1e-3)).min(1.0) };
+    let color = gizmo_color(config, focused, direction).gamma_multiply(opacity as f32 * rest_alpha);
 
     let transform = if config.local_space() {
         DMat4::from_rotation_translation(config.rotation, config.translation)
@@ -640,4 +649,19 @@ pub(crate) fn gizmo_color(
     };
 
     gizmo_color_solid(config, focused, direction).linear_multiply(alpha)
+}
+
+#[cfg(test)]
+mod cone_tests {
+    use super::cone_size_px;
+
+    /// Maya's 5 x 20 px cone on a normal arrow, never more than 40 % of a tiny one.
+    #[test]
+    fn cone_keeps_mayas_size_and_shrinks_on_short_arrows() {
+        assert_eq!(cone_size_px(100.0), (5.0, 20.0));
+        assert_eq!(cone_size_px(50.0), (5.0, 20.0));
+        let (r, h) = cone_size_px(20.0);
+        assert!((h - 8.0).abs() < 1e-6 && (r - 2.0).abs() < 1e-6);
+        assert_eq!(cone_size_px(-1.0), (0.0, 0.0));
+    }
 }

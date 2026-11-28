@@ -14,6 +14,9 @@ pub struct AttributePreset {
     pub values: Vec<(String, serde_json::Value)>,
 }
 
+/// Current manipulator defaults revision. 1: negative axis handles off by default, like Maya.
+pub const MANIP_DEFAULTS_REV: u32 = 1;
+
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -50,8 +53,12 @@ pub struct Prefs {
     pub manip_active_only: bool,
     /// show the move / scale plane handles (JS `manipPlaneHandles`)
     pub manip_plane_handles: bool,
-    /// show the handles on the negative axes (JS `manipNegativeHandles`)
+    /// show the handles on the negative axes (JS `manipNegativeHandles`; off by default, as in Maya)
     pub manip_negative_handles: bool,
+    /// Revision of the manipulator defaults these preferences have been migrated to (see
+    /// `migrate`). Missing in older saved preferences, so it reads as 0 there.
+    #[serde(default)]
+    pub manip_defaults_rev: u32,
     /// hide the manipulator while Ctrl is held
     pub hide_manip_ctrl: bool,
     /// hide the manipulator while Shift is held
@@ -70,7 +77,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, follow_os_scale: false, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_prev_size: 4.0, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: true, hide_manip_ctrl: false, hide_manip_shift: false, hide_manip_ctrl_shift: false, msaa: 4, menu_shadow: true, backend: "auto".into(), attr_presets: vec![] }
+        Prefs { ui_scale: 1.0, follow_os_scale: false, menu_set: 0, tooltips: true, confirm_quit: true, ortho_tumble: false, grid_size: 12.0, grid_spacing: 1.0, grid_divisions: 12, grid_major: 5, tangent_in: "auto".into(), tangent_out: "auto".into(), playback_speed: 1, linear_unit: 1, angular_unit: 0, recent_count: 10, recent_projects_count: 5, autosave_limit: 10, incremental_save: false, smooth_divisions: 2, preselect: true, manip_guides: true, manip_prev_size: 4.0, manip_active_only: false, manip_plane_handles: true, manip_negative_handles: false, manip_defaults_rev: MANIP_DEFAULTS_REV, hide_manip_ctrl: false, hide_manip_shift: false, hide_manip_ctrl_shift: false, msaa: 4, menu_shadow: true, backend: "auto".into(), attr_presets: vec![] }
     }
 }
 
@@ -85,6 +92,36 @@ impl Prefs {
     pub fn speed(&self) -> Option<f64> {
         let s = SPEEDS[self.playback_speed.min(3)].1;
         (s > 0.0).then_some(s)
+    }
+
+    /// Bring saved preferences up to the current manipulator defaults, once. Revision 1 turns
+    /// the negative axis handles off, as Maya shows none; turning them back on afterwards sticks.
+    pub fn migrate(&mut self) {
+        if self.manip_defaults_rev < 1 {
+            self.manip_negative_handles = false;
+        }
+        self.manip_defaults_rev = self.manip_defaults_rev.max(MANIP_DEFAULTS_REV);
+    }
+}
+
+#[cfg(test)]
+mod manip_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn negative_handles_default_off_and_migrate_once() {
+        assert!(!Prefs::default().manip_negative_handles);
+        // preferences saved before the revision existed: the old default (on) is switched off
+        let mut old: Prefs = serde_json::from_str(r#"{"manip_negative_handles": true, "grid_size": 20.0}"#).unwrap();
+        assert_eq!(old.manip_defaults_rev, 0);
+        old.migrate();
+        assert!(!old.manip_negative_handles);
+        assert_eq!(old.manip_defaults_rev, MANIP_DEFAULTS_REV);
+        assert_eq!(old.grid_size, 20.0, "other saved settings are kept");
+        // turned back on after the migration: kept
+        let mut on: Prefs = serde_json::from_str(r#"{"manip_negative_handles": true, "manip_defaults_rev": 1}"#).unwrap();
+        on.migrate();
+        assert!(on.manip_negative_handles);
     }
 }
 
