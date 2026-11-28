@@ -425,6 +425,8 @@ impl IncaApp {
             _ => 0,
         };
         self.world_space[i] = world;
+        // picking World or Object drops a custom pivot orientation, like Maya's Custom axis
+        self.pivot_edit.orientation = None;
     }
     pub fn set_shown(&mut self, element: &str, on: bool) {
         if on {
@@ -446,8 +448,10 @@ impl IncaApp {
         let has = !self.s.sel.is_empty();
         if self.pivot_mode && self.pivot_had_selection && !has {
             self.pivot_mode = false;
+            // the release must neither restore it nor count as a tap that turns it back on
             if let Some(h) = self.pivot_hold.as_mut() {
                 h.1 = false;
+                h.3 = false;
             }
         }
         self.pivot_had_selection = has;
@@ -1898,7 +1902,7 @@ mod tests {
         app.s.select(&[], inca_core::scene::SelMode::Replace);
         app.end_pivot_mode_on_deselect();
         assert!(!app.pivot_mode);
-        assert_eq!(app.pivot_hold.map(|h| h.1), Some(false), "releasing D must not turn it back on");
+        assert_eq!(app.pivot_hold.map(|h| (h.1, h.3)), Some((false, false)), "releasing D must not turn it back on, even as a quick tap");
     }
 
     #[test]

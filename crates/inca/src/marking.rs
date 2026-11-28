@@ -836,6 +836,11 @@ mod tests {
         let cam = app.vps[idx].camera.clone();
         let cv = viewport::cam_view(&app.s, &cam, [800.0, 600.0]);
         let on_cube = cv.project(glam::DVec3::ZERO, app.vps[idx].rect).unwrap();
+        // a normal object menu first leaves a target behind; the pivot menu must drop it, or a
+        // pivot command would re-select that object
+        open_rmb(&mut app, idx, &cv, on_cube, egui::Modifiers::NONE, 0.0);
+        app.marking = None;
+        assert_eq!(app.marking_target.as_deref(), Some(id.as_str()), "the object menu targets the cube");
         app.pivot_mode = true;
         open_rmb(&mut app, idx, &cv, on_cube, egui::Modifiers::NONE, 0.0);
         let m = app.marking.take().expect("a menu opens");
@@ -846,5 +851,6 @@ mod tests {
         open_rmb(&mut app, idx, &cv, on_cube, egui::Modifiers::NONE, 0.0);
         let m = app.marking.take().expect("a menu opens");
         assert!(!m.radial.iter().any(|(_, i)| i.label == "Snap Pivot Orientation"));
+        assert!(!m.radial.is_empty(), "the object menu opens instead");
     }
 }

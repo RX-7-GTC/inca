@@ -2082,7 +2082,9 @@ pub(crate) fn custom_pivot_orientation(app: &IncaApp) -> Option<DQuat> {
         return None;
     }
     let (sel, q) = app.pivot_edit.orientation.as_ref()?;
-    (app.pivot_edit.pinned || *sel == app.s.sel).then_some(*q)
+    // the same objects, in any order (component-mode round trips reorder the selection)
+    let same = sel.len() == app.s.sel.len() && sel.iter().all(|o| app.s.sel.contains(o));
+    (app.pivot_edit.pinned || same).then_some(*q)
 }
 
 pub(crate) fn has_custom_pivot(app: &IncaApp) -> bool {
@@ -2104,26 +2106,53 @@ fn commit_pivot_orientation(app: &mut IncaApp, q: DQuat) {
     }
 }
 
-/// Write a world orientation into the selected objects' rotateAxis / rotate so their axes take
-/// it and they do not move (one undo step), and drop the custom orientation.
-fn bake_pivot_orientation(app: &mut IncaApp, q: DQuat) {
+/// MEL that writes a world orientation into the selected objects' rotateAxis / rotate so
+/// their axes take it and they do not move. Objects whose rotate is locked, limited or keyed are
+/// left out (the rotate would not hold, so the object would turn); their names come back too.
+fn bake_pivot_mel(app: &IncaApp, q: DQuat) -> (String, Vec<String>) {
     // full precision: the rotate axis and rotate must cancel exactly for the object to stay put
     let f = |x: f64| format!("{x}");
-    let mut mel = String::new();
-    for id in app.s.sel.clone() {
-        if app.s.node(&id).is_none_or(|n| n.startup()) || app.s.world_matrix(&id).determinant().abs() < 1e-12 {
+    let (mut mel, mut skipped) = (String::new(), vec![]);
+    const ATTRS: [&str; 8] = ["rotate", "rotateX", "rotateY", "rotateZ", "rotateAxis", "rotateAxisX", "rotateAxisY", "rotateAxisZ"];
+    for id in &app.s.sel {
+        let Some(node) = app.s.node(id) else { continue };
+        if node.startup() || app.s.world_matrix(id).determinant().abs() < 1e-12 {
             continue;
         }
-        let Some((ra, r)) = app.s.baked_axis_channels(&id, q) else { continue };
-        let n = app.s.name_of(&id);
-        mel += &format!("setAttr {n}.rotateAxis {} {} {};\nsetAttr {n}.rotate {} {} {};\n", f(ra[0]), f(ra[1]), f(ra[2]), f(r[0]), f(r[1]), f(r[2]));
+        let n = app.s.name_of(id);
+        let fixed = ATTRS.iter().any(|a| node.is_locked(a)) || node.xf.lim.rotate.on || ["rotateX", "rotateY", "rotateZ"].iter().any(|a| app.s.anim_is_keyed(id, a));
+        if fixed {
+            skipped.push(n);
+            continue;
+        }
+        let Some((ra, r)) = app.s.baked_axis_channels(id, q) else { continue };
+        mel += &format!("setAttr {n}.rotateAxis {} {} {};
+setAttr {n}.rotate {} {} {};
+", f(ra[0]), f(ra[1]), f(ra[2]), f(r[0]), f(r[1]), f(r[2]));
     }
+    (mel, skipped)
+}
+
+/// Run pivot MEL (a snap and/or a bake) as one undo step, and keep `q` as the custom
+/// orientation so the manipulator keeps showing it, also in World space after a bake.
+fn run_pivot_edit(app: &mut IncaApp, mel: &str, skipped: &[String], q: Option<DQuat>) {
     if !mel.is_empty() {
-        if let Err(e) = app.run_mel("bake pivot orientation", &mel) {
+        if let Err(e) = app.run_mel("edit pivot", mel) {
             app.last_result = format!("// Error: {e} //");
         }
     }
-    app.pivot_edit.orientation = None;
+    if !skipped.is_empty() {
+        app.last_result = format!("// Warning: pivot orientation not baked on {} (rotate is locked, limited or keyed) //", skipped.join(", "));
+    }
+    if let Some(q) = q {
+        set_custom_pivot_orientation(app, q);
+    }
+}
+
+/// Bake a world orientation into the selected objects (one undo step).
+fn bake_pivot_orientation(app: &mut IncaApp, q: DQuat) {
+    let (mel, skipped) = bake_pivot_mel(app, q);
+    run_pivot_edit(app, &mel, &skipped, Some(q));
 }
 
 /// An item of the Edit Pivot marking menu.
@@ -2141,7 +2170,15 @@ pub(crate) fn pivot_menu_action(app: &mut IncaApp, act: crate::marking::PivotAct
         P::SnapOrientation => pe.snap_orientation = !pe.snap_orientation,
         P::SnapPosition => pe.snap_position = !pe.snap_position,
         P::ShowOrientationHandle => pe.show_orientation_handle = !pe.show_orientation_handle,
-        P::BakeOrientation => pe.bake_orientation = !pe.bake_orientation,
+        P::BakeOrientation => {
+            pe.bake_orientation = !pe.bake_orientation;
+            // Maya bakes the custom orientation that is already there
+            if pe.bake_orientation {
+                if let Some(q) = custom_pivot_orientation(app) {
+                    bake_pivot_orientation(app, q);
+                }
+            }
+        }
         P::Exit => app.pivot_mode = false,
         P::ResetOrientation => pe.orientation = None,
         // Maya resets an object pivot to its bounding-box centre
@@ -2251,21 +2288,16 @@ fn draw_pivot_snap_target(painter: &egui::Painter, cv: &CamView, rect: Rect, t: 
     }
 }
 
-/// Move the pivots of `objects` to a world point, as one undoable `xform -ws -piv` (run_mel
-/// echoes it). Objects flattened to zero scale are skipped: their world matrix can't be inverted.
-fn snap_pivots_to(app: &mut IncaApp, objects: &[String], p: DVec3) {
+/// MEL that moves the pivots of `objects` to a world point (`xform -ws -piv`). Objects
+/// flattened to zero scale are skipped: their world matrix can't be inverted.
+fn snap_pivots_mel(app: &IncaApp, objects: &[String], p: DVec3) -> String {
     let f = |x: f64| format!("{}", (x * 1e6).round() / 1e6);
     let cmds: Vec<String> = objects
         .iter()
         .filter(|o| app.s.world_matrix(o).determinant().abs() > 1e-12)
         .map(|o| format!("xform -ws -piv {} {} {} {};", f(p.x), f(p.y), f(p.z), app.s.name_of(o)))
         .collect();
-    if cmds.is_empty() {
-        return;
-    }
-    if let Err(e) = app.run_mel("snap pivot", &cmds.join("\n")) {
-        app.last_result = format!("// Error: {e} //");
-    }
+    cmds.iter().map(|c| format!("{c}\n")).collect()
 }
 
 /// Shift+drag: the axis whose screen direction best matches the drag (JS `middleDrag` auto).
@@ -2437,7 +2469,7 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
     let tool = if extrude_active { Tool::Move } else { chan.map(|c| c.0).unwrap_or(app.tool) };
     // a custom pivot orientation (Edit Pivot) orients the pivot manipulator and the Move and
     // Rotate tools, as Maya's Custom axis orientation does; Scale keeps the object's axes
-    let custom_ori = if !extrude_active && (pivot_mode || matches!(tool, Tool::Move | Tool::Rotate)) { custom_pivot_orientation(app) } else { None };
+    let custom_ori = if !extrude_active && chan.is_none() && (pivot_mode || matches!(tool, Tool::Move | Tool::Rotate)) { custom_pivot_orientation(app) } else { None };
     let (pivot, rot) = if let Some(d) = &app.vp_state.drag {
         (DVec3::from(d.cur.translation), DQuat::from(d.cur.rotation))
     } else if !comp_targets.is_empty() {
@@ -2801,12 +2833,19 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
         if let Some(target) = target {
             draw_pivot_snap_target(painter, cv, app.vps[idx].rect, &target);
             if clicked {
-                if app.pivot_edit.snap_position {
-                    snap_pivots_to(app, &objects, target.point);
-                }
+                // position and a baked orientation go in as one undo step (the bake keeps the
+                // object's world matrix, so it does not depend on where the pivot is)
+                let mut mel = if app.pivot_edit.snap_position { snap_pivots_mel(app, &objects, target.point) } else { String::new() };
+                let (mut skipped, mut q) = (vec![], None);
                 if app.pivot_edit.snap_orientation {
-                    commit_pivot_orientation(app, target.frame);
+                    q = Some(target.frame);
+                    if app.pivot_edit.bake_orientation {
+                        let (bake, s) = bake_pivot_mel(app, target.frame);
+                        mel += &bake;
+                        skipped = s;
+                    }
                 }
+                run_pivot_edit(app, &mel, &skipped, q);
                 app.vp_state.pivot_snap = None;
                 ui.ctx().request_repaint();
                 return true;
@@ -3033,7 +3072,11 @@ fn gizmo(app: &mut IncaApp, ui: &mut egui::Ui, idx: usize, resp: &egui::Response
                         _ => "scale",
                     }
                 };
-                app.s.checkpoint(label);
+                // turning the pivot orientation changes tool state, not the scene (a bake makes
+                // its own undo step when the drag ends)
+                if !(pivot_mode && drag_handle.is_some_and(|h| h.is_rotate())) {
+                    app.s.checkpoint(label);
+                }
                 let objs: Vec<(String, DMat4)> = objects.iter().filter(|o| !objects.iter().any(|p| p != *o && app.s.is_ancestor(p, o))).map(|o| (o.clone(), app.s.world_matrix(o))).collect();
                 // soft selection widens the moved set with falloff weights; symmetry adds mirror partners
                 let mut comps = vec![];
@@ -4446,8 +4489,6 @@ mod tests {
         assert!(pivot_snap_target(&s, &vp, &mut cache, &cv, p, &[]).is_none());
     }
 
-    /// In Edit Pivot mode a click on a component moves the pivot there (one undo step) and keeps
-    /// the selection; the object itself does not move.
     /// The pivot frame a component gives follows Maya: X along a face normal, an edge, or a
     /// vertex normal.
     #[test]
@@ -4558,11 +4599,49 @@ mod tests {
         commit_pivot_orientation(&mut app, q);
         assert!(app.s.world_matrix(&id).abs_diff_eq(before, 1e-6), "the object must not move");
         assert!(app.s.axis_frame(&id).dot(q).abs() > 1.0 - 1e-6, "its axes take the orientation");
-        assert_eq!(custom_pivot_orientation(&app), None, "baked, so no custom orientation is left");
+        assert!(custom_pivot_orientation(&app).is_some_and(|c| c.dot(q).abs() > 1.0 - 1e-9), "the manipulator keeps showing it, also in World space");
         app.s.undo();
         assert_eq!((app.s.nodes[&id].xf.ra, app.s.nodes[&id].xf.r), xf0, "undo restores the channels");
+        app.s.redo();
+
+        // picking World / Object in the tool settings drops the custom orientation
+        app.set_space_world(Tool::Move, true);
+        assert_eq!(custom_pivot_orientation(&app), None);
+
+        // turning Bake on bakes the custom orientation that is already there
+        app.pivot_edit.bake_orientation = false;
+        let q2 = DQuat::from_euler(glam::EulerRot::XYZ, -0.3, 0.2, 0.9);
+        commit_pivot_orientation(&mut app, q2);
+        let before = app.s.world_matrix(&id);
+        pivot_menu_action(&mut app, crate::marking::PivotAct::BakeOrientation);
+        assert!(app.s.axis_frame(&id).dot(q2).abs() > 1.0 - 1e-6, "the existing orientation is baked");
+        assert!(app.s.world_matrix(&id).abs_diff_eq(before, 1e-6));
+
+        // a locked, limited or keyed rotate would not hold the compensation: no bake, a warning
+        for fix in ["lock", "limit", "key"] {
+            let c = app.s.create_mesh("polyCube", &Params::new(), None);
+            app.s.set_attr_f(&c, "ry", 30.0);
+            match fix {
+                "lock" => {
+                    app.s.nodes.get_mut(&c).unwrap().locks.insert("rotateY".into(), serde_json::json!(true));
+                }
+                "limit" => app.s.nodes.get_mut(&c).unwrap().xf.lim.rotate.on = true,
+                _ => {
+                    app.run_mel("key", &format!("setKeyframe -at rotateY {};", app.s.name_of(&c))).unwrap();
+                }
+            }
+            app.s.select(std::slice::from_ref(&c), SelMode::Replace);
+            let (before, xf) = (app.s.world_matrix(&c), (app.s.nodes[&c].xf.ra, app.s.nodes[&c].xf.r));
+            bake_pivot_orientation(&mut app, q);
+            assert_eq!((app.s.nodes[&c].xf.ra, app.s.nodes[&c].xf.r), xf, "{fix}: channels untouched");
+            assert!(app.s.world_matrix(&c).abs_diff_eq(before, 1e-9), "{fix}: the object does not turn");
+            assert!(app.last_result.contains("not baked"), "{fix}: {}", app.last_result);
+            assert!(custom_pivot_orientation(&app).is_some(), "{fix}: still shown as a custom orientation");
+        }
     }
 
+    /// In Edit Pivot mode a click on a component moves the pivot there (one undo step) and keeps
+    /// the selection; the object itself does not move.
     #[test]
     fn pivot_mode_click_snaps_the_pivot_and_keeps_the_selection() {
         let ctx = egui::Context::default();
