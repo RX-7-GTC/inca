@@ -8550,12 +8550,13 @@ fn shape_tab(app: &mut IncaApp, ui: &mut egui::Ui, id: &str) {
         }
         ui.label(RichText::new("Select objects and the field, then Fields > Affect Selected Object(s)").color(theme::TEXT_DIM));
     }
+    // shared UV count, cached per mesh revision (the same numbers as the HUD)
+    let uvs = app.node_stats(id).map_or(0, |st| st[4]);
     let Some(n) = app.s.node(id) else { return };
     let xray = n.xray;
     match &n.shape {
         Shape::Mesh(m) => {
             let (v, f, t) = (m.mesh.v.len(), m.mesh.f.len(), m.mesh.tri_count());
-            let uvs = m.mesh.uv.as_ref().map(|u| u.iter().flatten().map(|x| x.len()).sum::<usize>()).unwrap_or(0);
             let mat = m.material.clone();
             if theme::fold(ui, "Mesh Info") {
                 ui.label(format!("{v} vertices, {f} faces, {t} triangles, {uvs} UVs"));

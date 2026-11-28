@@ -58,10 +58,15 @@ pub fn all_corners(pm: &PolyMesh, ci: &CornerIndex) -> Vec<usize> {
     (0..ci.len()).filter(|&id| corner_uv(pm, ci, id).is_some()).collect()
 }
 
+/// Whether two UVs are the same point (within 1e-6 on both axes; a NaN never matches).
+fn same_uv(a: DVec2, b: DVec2) -> bool {
+    (a - b).abs().cmple(DVec2::splat(1e-6)).all()
+}
+
 /// Corners that are the same UV point as `id` (same vertex, coincident UV).
 pub fn coincident(pm: &PolyMesh, ci: &CornerIndex, id: usize) -> Vec<usize> {
     let Some(u0) = corner_uv(pm, ci, id) else { return vec![] };
-    ci.by_vert[&ci.cv[id]].iter().copied().filter(|&j| corner_uv(pm, ci, j).is_some_and(|u| (u - u0).abs().max_element() <= 1e-6)).collect()
+    ci.by_vert[&ci.cv[id]].iter().copied().filter(|&j| corner_uv(pm, ci, j).is_some_and(|u| same_uv(u, u0))).collect()
 }
 
 /// UV point groups: corners sharing a vertex and a UV. Returns (group per corner or -1, count).
@@ -79,7 +84,7 @@ pub fn uv_groups(pm: &PolyMesh, ci: &CornerIndex) -> (Vec<i64>, usize) {
             }
             g[ids[a]] = n as i64;
             for &b in &ids[a + 1..] {
-                if g[b] < 0 && corner_uv(pm, ci, b).is_some_and(|ub| (ub - ua).abs().max_element() <= 1e-6) {
+                if g[b] < 0 && corner_uv(pm, ci, b).is_some_and(|ub| same_uv(ub, ua)) {
                     g[b] = n as i64;
                 }
             }
@@ -87,6 +92,45 @@ pub fn uv_groups(pm: &PolyMesh, ci: &CornerIndex) -> (Vec<i64>, usize) {
         }
     }
     (g, n)
+}
+
+/// Shared UV points, as Maya counts and stores them (map1): face corners on the same vertex with
+/// the same UV are one UV. Returns the points and, per face, the UV index of each corner (`None`
+/// for a face without a full set of UVs).
+pub fn shared_uvs(pm: &PolyMesh) -> (Vec<DVec2>, Vec<Option<Vec<usize>>>) {
+    if pm.uv.is_none() {
+        return (vec![], vec![None; pm.f.len()]);
+    }
+    let ci = CornerIndex::new(pm);
+    let (group, count) = uv_groups(pm, &ci);
+    // only UV points used by faces with a full set of UVs, numbered in first-use order (a face
+    // with a short UV list is written without UVs, so its points would be orphans)
+    let mut index = vec![usize::MAX; count];
+    let mut pts = vec![];
+    let faces = (0..pm.f.len())
+        .map(|f| {
+            let n = pm.f[f].len();
+            let uv = pm.face_uv(f).filter(|u| u.len() == n)?;
+            Some(
+                (0..n)
+                    .map(|j| {
+                        let g = group[ci.base[f] + j] as usize;
+                        if index[g] == usize::MAX {
+                            index[g] = pts.len();
+                            pts.push(uv[j]);
+                        }
+                        index[g]
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    (pts, faces)
+}
+
+/// Number of shared UV points (`shared_uvs`), e.g. 14 for a default cube.
+pub fn uv_count(pm: &PolyMesh) -> usize {
+    shared_uvs(pm).0.len()
 }
 
 /// Faces connected through shared UV points: (shell per face or -1, faces per shell).

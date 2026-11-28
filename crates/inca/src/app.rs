@@ -775,7 +775,7 @@ impl IncaApp {
             let n = self.s.node(id)?;
             let m = n.mesh()?;
             let pm = &m.mesh;
-            let uvs = pm.uv.as_ref().map(|u| u.iter().flatten().map(|f| f.len()).sum()).unwrap_or(0);
+            let uvs = inca_core::uv::uv_count(pm);
             (n.rev, [pm.v.len(), pm.edge_count(), pm.f.len(), pm.tri_count(), uvs])
         };
         self.stats_cache.insert(id.to_string(), (rev, st));
