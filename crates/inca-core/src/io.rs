@@ -515,17 +515,12 @@ fn export_obj(s: &Scene, path: &Path, sel_only: bool) -> Result<(), String> {
         for p in &pm.v {
             o += &format!("v {} {} {}\n", p.x, p.y, p.z);
         }
-        let mut tcount = 0;
-        for fi in 0..pm.f.len() {
-            if let Some(u) = pm.face_uv(fi) {
-                for t in u {
-                    o += &format!("vt {} {}\n", t.x, t.y);
-                }
-                tcount += u.len();
-            }
+        // shared UVs, as Maya writes them: one `vt` per UV point, not per face corner
+        let (uvs, face_uv) = crate::uv::shared_uvs(&pm);
+        for t in &uvs {
+            o += &format!("vt {} {}\n", t.x, t.y);
         }
         let mut cur_mat = String::new();
-        let mut tk = tbase;
         for fi in 0..pm.f.len() {
             let mat = pm.face_mat(fi).cloned().unwrap_or(ms.material.clone());
             if mat != cur_mat {
@@ -537,19 +532,16 @@ fn export_obj(s: &Scene, path: &Path, sel_only: bool) -> Result<(), String> {
                 cur_mat = mat;
             }
             o += "f";
-            let has_uv = pm.face_uv(fi).is_some();
-            for &vi in &pm.f[fi] {
-                if has_uv {
-                    o += &format!(" {}/{}", vi as usize + vbase, tk);
-                    tk += 1;
-                } else {
-                    o += &format!(" {}", vi as usize + vbase);
+            for (k, &vi) in pm.f[fi].iter().enumerate() {
+                match &face_uv[fi] {
+                    Some(t) => o += &format!(" {}/{}", vi as usize + vbase, t[k] + tbase),
+                    None => o += &format!(" {}", vi as usize + vbase),
                 }
             }
             o += "\n";
         }
         vbase += pm.v.len();
-        tbase += tcount;
+        tbase += uvs.len();
     }
     std::fs::write(path, o).map_err(|e| e.to_string())?;
     let mut m = String::new();
@@ -778,6 +770,115 @@ mod tests {
             assert_eq!(n.mesh().unwrap().mesh.f.len(), if e == "3mf" { 12 } else { 6 }, "{e}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The UV of every face corner of `id`, keyed by the corner's world position (so it doesn't
+    /// depend on face or vertex order after a round trip).
+    fn corner_uvs(s: &Scene, id: &str) -> Vec<([i64; 3], [i64; 2])> {
+        let pm = s.mesh_world(id).unwrap();
+        let q = |x: f64| (x * 1e5).round() as i64;
+        let mut out = vec![];
+        for (fi, f) in pm.f.iter().enumerate() {
+            let uv = pm.face_uv(fi).expect("face has UVs");
+            for (k, &v) in f.iter().enumerate() {
+                let p = pm.v[v as usize];
+                out.push(([q(p.x), q(p.y), q(p.z)], [q(uv[k].x), q(uv[k].y)]));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// #39: OBJ and Maya ASCII write shared UVs (14 for a cube, as in Maya), not one per face
+    /// corner (24), and every corner keeps its UV through the round trip.
+    #[test]
+    fn obj_and_ma_write_shared_uvs() {
+        let dir = std::env::temp_dir().join(format!("inca-uvs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Scene::new();
+        let c = s.create_mesh("polyCube", &Params::new(), None);
+        assert_eq!(crate::uv::uv_count(&s.nodes[&c].mesh().unwrap().mesh), 14);
+        let want = corner_uvs(&s, &c);
+
+        let obj = dir.join("cube.obj");
+        export(&s, &obj, false).unwrap();
+        let txt = std::fs::read_to_string(&obj).unwrap();
+        assert_eq!(txt.lines().filter(|l| l.starts_with("vt ")).count(), 14, "OBJ vt lines");
+        let mut s2 = Scene::new();
+        let made = import(&mut s2, &obj).unwrap();
+        assert_eq!(corner_uvs(&s2, &made[0]), want, "OBJ round trip");
+
+        let ma = crate::maya::export_ma(&s, false);
+        assert!(ma.contains(".uvst[0].uvsp[0:13]"), "MA should hold 14 UVs");
+        let mut s3 = Scene::new();
+        crate::maya::import_ma(&mut s3, &ma).unwrap();
+        let c3 = s3.find(&s.nodes[&c].name).unwrap();
+        assert_eq!(corner_uvs(&s3, &c3), want, "MA round trip");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two quads sharing an edge, with and without a UV seam, plus a face without UVs: shared
+    /// UVs are exactly the distinct (vertex, UV) pairs, and the UV-less face is written without UVs.
+    #[test]
+    fn shared_uvs_follow_seams_and_skip_faces_without_uvs() {
+        use glam::DVec2;
+        let v = vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0), DVec3::new(1.0, 1.0, 0.0), DVec3::new(0.0, 1.0, 0.0), DVec3::new(2.0, 0.0, 0.0), DVec3::new(2.0, 1.0, 0.0), DVec3::new(0.0, 2.0, 0.0)];
+        let mut pm = PolyMesh::new(v, vec![vec![0, 1, 2, 3], vec![1, 4, 5, 2], vec![3, 2, 6]]);
+        let d = DVec2::new;
+        // a seam along the shared edge: nothing is shared, 8 UVs
+        pm.uv = Some(vec![Some(vec![d(0.0, 0.0), d(0.5, 0.0), d(0.5, 1.0), d(0.0, 1.0)]), Some(vec![d(0.6, 0.0), d(1.0, 0.0), d(1.0, 1.0), d(0.6, 1.0)]), None]);
+        let (pts, faces) = crate::uv::shared_uvs(&pm);
+        assert_eq!(pts.len(), 8);
+        assert_eq!(crate::uv::uv_count(&pm), 8);
+        assert!(faces[2].is_none());
+        for f in 0..2 {
+            for (k, &i) in faces[f].as_ref().unwrap().iter().enumerate() {
+                assert_eq!(pts[i], pm.uv.as_ref().unwrap()[f].as_ref().unwrap()[k]);
+            }
+        }
+        // no seam: the two corners on each shared vertex are one UV, 6 UVs
+        pm.uv.as_mut().unwrap()[1] = Some(vec![d(0.5, 0.0), d(1.0, 0.0), d(1.0, 1.0), d(0.5, 1.0)]);
+        assert_eq!(crate::uv::uv_count(&pm), 6);
+        let (pts, faces) = crate::uv::shared_uvs(&pm);
+        assert_eq!(pts.len(), 6);
+        assert_eq!(faces[0].as_ref().unwrap()[1], faces[1].as_ref().unwrap()[0], "the corners on vertex 1 are one UV");
+        // OBJ: 6 vt lines, and the UV-less triangle has no /vt
+        let mut s = Scene::new();
+        s.create_mesh_from(pm, "seam", None, None);
+        let dir = std::env::temp_dir().join(format!("inca-uvseam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = dir.join("seam.obj");
+        export(&s, &obj, false).unwrap();
+        let txt = std::fs::read_to_string(&obj).unwrap();
+        assert_eq!(txt.lines().filter(|l| l.starts_with("vt ")).count(), 6);
+        let tri = txt.lines().filter(|l| l.starts_with("f ")).find(|l| l.split_whitespace().count() == 4).unwrap();
+        assert!(!tri.contains('/'), "{tri}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A face with a short (malformed) UV list is written without UVs and adds no orphan UV
+    /// points; a NaN UV never merges with a real UV on the same vertex.
+    #[test]
+    fn shared_uvs_ignore_short_uv_lists_and_keep_nan_apart() {
+        use glam::DVec2;
+        let d = DVec2::new;
+        let v = vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0), DVec3::new(1.0, 1.0, 0.0), DVec3::new(0.0, 1.0, 0.0), DVec3::new(2.0, 0.0, 0.0), DVec3::new(2.0, 1.0, 0.0)];
+        let mut pm = PolyMesh::new(v, vec![vec![0, 1, 2, 3], vec![1, 4, 5, 2]]);
+        // the second quad has only 3 UVs, at UV points nobody else uses
+        pm.uv = Some(vec![Some(vec![d(0.0, 0.0), d(0.5, 0.0), d(0.5, 1.0), d(0.0, 1.0)]), Some(vec![d(0.7, 0.0), d(0.9, 0.0), d(0.9, 1.0)])]);
+        let (pts, faces) = crate::uv::shared_uvs(&pm);
+        assert_eq!(pts.len(), 4, "only the full quad's UVs: {pts:?}");
+        assert_eq!(crate::uv::uv_count(&pm), 4);
+        assert!(faces[1].is_none());
+        // NaN: the second quad's corner on vertex 1 is (NaN, 0) next to the first quad's (0.5, 0)
+        pm.uv.as_mut().unwrap()[1] = Some(vec![d(f64::NAN, 0.0), d(1.0, 0.0), d(1.0, 1.0), d(0.5, 1.0)]);
+        let (pts, faces) = crate::uv::shared_uvs(&pm);
+        let (a, b) = (faces[0].as_ref().unwrap()[1], faces[1].as_ref().unwrap()[0]);
+        assert_ne!(a, b, "a NaN UV must not merge with (0.5, 0)");
+        assert_eq!(pts[a], d(0.5, 0.0));
+        assert!(pts[b].x.is_nan());
+        // the corners on vertex 2 do share (0.5, 1)
+        assert_eq!(faces[0].as_ref().unwrap()[2], faces[1].as_ref().unwrap()[3]);
     }
 
     /// A slicer-style 3MF: the build item places a component object in centimetres, and the

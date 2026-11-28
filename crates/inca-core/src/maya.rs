@@ -993,19 +993,8 @@ fn write_mesh(o: &mut String, shape: &str, parent: &str, pm: &PolyMesh) {
     let _ = writeln!(o, "\tsetAttr -k off \".v\";");
     let _ = writeln!(o, "\tsetAttr \".uvst[0].uvsn\" -type \"string\" \"map1\";");
     let _ = writeln!(o, "\tsetAttr \".cuvs\" -type \"string\" \"map1\";");
-    // UVs: one per face corner
-    let mut uvs: Vec<DVec2> = vec![];
-    let mut face_uv: Vec<Option<Vec<usize>>> = vec![];
-    for f in 0..pm.f.len() {
-        match pm.uv.as_ref().and_then(|u| u.get(f)).and_then(|u| u.as_ref()) {
-            Some(list) if list.len() == pm.f[f].len() => {
-                let base = uvs.len();
-                uvs.extend(list.iter().copied());
-                face_uv.push(Some((base..base + list.len()).collect()));
-            }
-            _ => face_uv.push(None),
-        }
-    }
+    // UVs: shared per UV point, as Maya stores map1 (a cube has 14, not one per face corner)
+    let (uvs, face_uv) = crate::uv::shared_uvs(pm);
     if !uvs.is_empty() {
         let vals: Vec<String> = uvs.iter().map(|u| format!("{} {}", n(u.x), n(u.y))).collect();
         let _ = writeln!(o, "\tsetAttr -s {} \".uvst[0].uvsp[0:{}]\" -type \"float2\" {};", uvs.len(), uvs.len() - 1, vals.join(" "));

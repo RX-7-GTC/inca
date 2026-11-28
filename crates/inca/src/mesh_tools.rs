@@ -1543,6 +1543,14 @@ mod tests {
         (app, cube, cv, rect)
     }
 
+    /// #39: the HUD / Mesh Info counts shared UVs like Maya: a cube has 14, not 24.
+    #[test]
+    fn poly_count_hud_counts_shared_uvs() {
+        let ctx = egui::Context::default();
+        let (mut app, cube, _, _) = cube_scene(&ctx);
+        assert_eq!(app.node_stats(&cube), Some([8, 12, 6, 12, 14]));
+    }
+
     /// A screen point `frac` of the way along the edge `pick_edge` finds there, with that edge.
     fn point_on_edge(app: &mut IncaApp, cube: &str, cv: &CamView, rect: Rect, frac: f32) -> (Pos2, u32, u32) {
         let pm = app.s.node(cube).unwrap().mesh().unwrap().mesh.clone();
